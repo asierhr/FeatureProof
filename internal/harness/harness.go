@@ -10,6 +10,7 @@ import (
 	"github.com/asierhr/featureProof/internal/evidence"
 )
 
+// Dependencies contains every replaceable boundary required to execute a run.
 type Dependencies struct {
 	Model     Model
 	Registry  Registry
@@ -22,17 +23,20 @@ type Dependencies struct {
 	Waiter    Waiter
 }
 
+// Config defines the identity, objective, budgets, and retry timing for one run.
 type Config struct {
 	RunID, Objective, ConstraintID string
 	Limits                         Limits
 	RetryDelay                     time.Duration
 }
 
+// Harness owns orchestration and all mutation of its run aggregate.
 type Harness struct {
 	deps Dependencies
 	cfg  Config
 }
 
+// New validates configuration and wires the deterministic orchestration boundaries.
 func New(cfg Config, deps Dependencies) (*Harness, error) {
 	if _, err := NewRun(cfg.RunID, cfg.Objective, cfg.ConstraintID, cfg.Limits); err != nil {
 		return nil, err
@@ -43,10 +47,12 @@ func New(cfg Config, deps Dependencies) (*Harness, error) {
 	return &Harness{deps: deps, cfg: cfg}, nil
 }
 
+// Run executes the bounded model-tool-evidence loop and confirms one terminal event.
 func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 	run, _ = NewRun(h.cfg.RunID, h.cfg.Objective, h.cfg.ConstraintID, h.cfg.Limits)
 	terminalWritten := false
 	terminalReason := RejectReason("")
+	// finish owns terminal transition and journal confirmation for every exit path.
 	finish := func(status Status, reason RejectReason) error {
 		if terminalWritten {
 			return nil
@@ -67,6 +73,7 @@ func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 		terminalWritten = true
 		return nil
 	}
+	// end preserves both the operational cause and a possible terminal journal failure.
 	end := func(status Status, reason RejectReason, cause error) error {
 		terminalErr := finish(status, reason)
 		if cause != nil && terminalErr != nil {
@@ -77,6 +84,7 @@ func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 		}
 		return terminalErr
 	}
+	// audit prevents the harness from continuing after an unconfirmed mandatory event.
 	audit := func(event Event) error {
 		if appendErr := h.append(ctx, run, event); appendErr != nil {
 			return fmt.Errorf("append %s event: %w", event.Type, appendErr)
@@ -280,22 +288,31 @@ func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 	}
 }
 
+// isCancellation normalizes cancellation reported by context or a blocking dependency.
 func isCancellation(ctx context.Context, err error) bool {
 	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
+
+// cancellationError preserves the most authoritative cancellation cause.
 func cancellationError(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	return err
 }
+
+// append attaches run identity before delegating durable audit confirmation.
 func (h *Harness) append(ctx context.Context, run *Run, event Event) error {
 	event.RunID = run.ID
 	return h.deps.Journal.Append(ctx, event)
 }
+
+// remaining builds the budget view exposed to the model without granting mutations.
 func remaining(run *Run) Limits {
 	return Limits{MaxSteps: run.Limits.MaxSteps - run.Consumed.Steps, MaxToolCalls: run.Limits.MaxToolCalls - run.Consumed.ToolCalls, MaxRetries: run.Limits.MaxRetries - run.Consumed.Retries}
 }
+
+// evaluate derives a verdict only from valid evidence persisted for the current run.
 func (h *Harness) evaluate(ctx context.Context, run *Run, assertion *Assertion, ids []string) (Verdict, error) {
 	if assertion == nil || len(ids) == 0 {
 		return Verdict{Status: VerdictInconclusive}, nil

@@ -9,8 +9,10 @@ import (
 	"github.com/asierhr/featureProof/internal/harness"
 )
 
+// Registry is the explicit capability boundary that prevents arbitrary tool execution.
 type Registry struct{ specs map[string]harness.ToolSpec }
 
+// NewRegistry validates and indexes the complete set of allowed tool capabilities.
 func NewRegistry(specs ...harness.ToolSpec) (*Registry, error) {
 	r := &Registry{specs: map[string]harness.ToolSpec{}}
 	for _, s := range specs {
@@ -24,10 +26,14 @@ func NewRegistry(specs ...harness.ToolSpec) (*Registry, error) {
 	}
 	return r, nil
 }
+
+// Resolve returns a capability only when its exact registered name exists.
 func (r *Registry) Resolve(name string) (harness.ToolSpec, bool) {
 	s, ok := r.specs[name]
 	return s, ok
 }
+
+// Descriptors returns a stable model-facing capability list without implementations.
 func (r *Registry) Descriptors() []harness.ToolDescriptor {
 	names := make([]string, 0, len(r.specs))
 	for n := range r.specs {
@@ -41,6 +47,7 @@ func (r *Registry) Descriptors() []harness.ToolDescriptor {
 	return out
 }
 
+// Fake is a programmable tool implementation for hermetic harness tests.
 type Fake struct {
 	mu        sync.Mutex
 	Results   []harness.ToolResult
@@ -50,6 +57,7 @@ type Fake struct {
 	OnExecute func()
 }
 
+// Execute records one authorized call and returns its programmed result or error.
 func (f *Fake) Execute(ctx context.Context, c harness.ToolCall) (harness.ToolResult, error) {
 	if f.OnExecute != nil {
 		f.OnExecute()
@@ -76,4 +84,6 @@ func (f *Fake) Execute(ctx context.Context, c harness.ToolCall) (harness.ToolRes
 	}
 	return result, err
 }
+
+// CallCount reports how many tool executions reached this adapter.
 func (f *Fake) CallCount() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.Calls) }

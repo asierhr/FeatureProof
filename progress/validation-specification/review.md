@@ -1,47 +1,78 @@
-# Review de validation-specification
+# Segunda review de validation-specification
 
 ## Veredicto
 
-**Rechazada.** Las comprobaciones automáticas pasan, pero permanecen tres
-hallazgos bloqueantes: el adapter acepta escalares YAML con tipos ajenos al
-contrato en campos `string`, los errores de parser pierden su causa original y
-el árbol contiene un perfil de coverage fuera del alcance declarado.
+**Aprobada.** La implementación satisface R1–R7, las correcciones de REV-1,
+REV-2 y REV-3 son completas, y todas las comprobaciones obligatorias pasan de
+forma independiente. No quedan hallazgos bloqueantes.
 
 ## Precondiciones
 
 - Existe exactamente una feature `in_progress`: `validation-specification`
   (id 2).
-- `requirements.md` registra aprobación humana de `user` en
-  `2026-10-11T16:51:43+02:00`.
+- La aprobación humana sigue registrada en `requirements.md`:
+  `approved_by: user`, `approved_at: 2026-10-11T16:51:43+02:00`.
 - T1–T5 están marcadas `[x]`.
-- Existe `progress/validation-specification/implementation.md`.
-- La spec completa y los archivos declarados como modificados fueron
-  inspeccionados. El checkout no contiene metadatos Git, por lo que el alcance
-  se contrastó contra el informe, el árbol actual y los archivos indicados por
-  el leader.
+- Existe y fue revisado
+  `progress/validation-specification/implementation.md`.
+- Se releyeron la spec completa, el modelo, el validador, el adapter, todos los
+  tests y fixtures de la feature, `go.mod` y `go.sum`.
 
-## Trazabilidad revisada
+## Correcciones de la primera review
 
-| Requirement | Implementación | Tests reales inspeccionados | Resultado de review |
-|---|---|---|---|
-| R1 | `specyaml.Load`, `decodeOne`, `translate` | `TestLoadV1Specification`, `TestLoadRejectsUnreadableMalformedAndMultipleDocuments`, `TestLoadRejectsInvalidRoots` | Conforme |
-| R2 | DTO v1 privados y traducción a `specification.Specification` | `TestLoadV1Specification`, `TestV1LoadIsDeterministicAndStateless`, `TestV1LoadsConcurrentlyWithoutSharedState` | Conforme |
-| R3 | `checkV1Fields` y `specification.Validate` | Tests de required, duplicados, referencias, campos desconocidos y valores | No conforme: REV-1 |
-| R4 | extracción de versión antes del esquema v1 y `UnsupportedVersionError` | `TestLoadRejectsUnsupportedVersionWithReceivedAndSupported`, `TestUnsupportedVersionErrorReportsContract` | Conforme |
-| R5 | `ValidationError`, categorías, field paths y `syntaxError` | tests de categorías, primer error y localización | No conforme: REV-1 y REV-2 |
-| R6 | lectura local mediante `os.ReadFile`, sin imports de red/environment | `TestV1CompatibilityFixtures`, `TestLoadDoesNotRequireEnvironment`, `TestLoadObservesPreCancelledContext` | Conforme |
-| R7 | contrato v1 y fixtures locales | `TestV1CompatibilityFixtures`, `TestV1InvalidFixturesRemainRejected` | Conforme, sujeto a corregir REV-1 |
+### REV-1 — Resuelta
 
-La inspección confirma DTO y tipos de `go.yaml.in/yaml/v3` confinados al
-adapter, modelo interno independiente de `harness`, loader sin estado global
-mutable, ausencia de goroutines de producción, cancelación antes y después de
-la lectura, y ausencia de accesos a red o variables de entorno. La suite
-completa confirma que el harness conserva su comportamiento observable.
+`internal/specification/yaml/loader.go` valida `Kind` y `Tag` antes de traducir
+los campos v1: `requireString` exige escalar `!!str`, `requireInteger` exige
+escalar `!!int`, y los mappings y la secuencia de constraints también validan
+su clase de nodo. La versión se inspecciona antes del decode v1. Ningún fallo
+devuelve un modelo parcial.
+
+`TestLoadRejectsWrongScalarTypesWithFieldPathAndNoPartialModel` demuestra
+`invalid_value`, field path estable y modelo cero para números, booleanos y
+`null` en campos string, y strings en los tres campos integer. El test cubre
+feature, target, constraints y limits. Además,
+`TestLoadRejectsNullConstraintWithFieldPathAndNoPartialModel` comprueba una
+entrada `constraints[0]` nula con el mismo contrato de error.
+
+### REV-2 — Resuelta
+
+`syntaxError` usa `fmt.Errorf("decode YAML: %w", cause)`, por lo que conserva la
+identidad de la causa original a través de `ValidationError.Unwrap`.
+`TestSyntaxErrorPreservesOriginalCauseIdentity` utiliza una causa canario y
+demuestra la cadena real mediante `errors.Is`; los tests públicos mantienen las
+comprobaciones de categoría y tipo mediante `errors.Is`/`errors.As`.
+
+### REV-3 — Resuelta
+
+El perfil `specification` ya no existe. Una búsqueda recursiva antes y después
+de la verificación no encontró `specification`, `coverage.out`, nombres de
+coverage ni archivos cuyo encabezado fuera `mode: set`. El perfil de esta
+review se creó en el directorio temporal del sistema y se eliminó al terminar.
+
+## Trazabilidad R1–R7
+
+| Requirement | Evidencia revisada | Resultado |
+|---|---|---|
+| R1 | `Load`, `decodeOne`, `translate`; carga válida, lectura, sintaxis, roots y múltiples documentos | Conforme |
+| R2 | DTO YAML privados, retorno exclusivo de modelos internos, cargas repetidas y concurrentes | Conforme |
+| R3 | required, tipos, IDs, URL, límites, duplicados, referencias y campos desconocidos; siempre modelo cero al fallar | Conforme |
+| R4 | extracción prioritaria de versión y `UnsupportedVersionError{Received, Supported}` | Conforme |
+| R5 | categorías propias, field paths estables, localización sintáctica, orden determinista y causa envuelta | Conforme |
+| R6 | solo lectura del archivo local; sin imports o llamadas de red/environment; literales no expandidos | Conforme |
+| R7 | fixtures válidos e inválidos v1 y equivalencia determinista | Conforme |
+
+La dirección de dependencias permanece correcta: el dominio `specification`
+no importa YAML ni harness, mientras que el adapter depende del modelo interno.
+Los tipos externos quedan confinados al subpaquete YAML. El loader no conserva
+estado mutable, no crea goroutines, observa el contexto antes y después de la
+lectura y no realiza I/O bajo locks. El harness no fue modificado y su suite
+completa conserva el comportamiento previo.
 
 ## Verificación independiente
 
-Entorno: `GOPATH=C:\Users\asier\AppData\Local\Temp\featureproof-go125-gopath`,
-`GOTOOLCHAIN=go1.25.1`; para race también `CGO_ENABLED=1`, `CC=gcc` y
+Entorno usado: `GOPATH=C:\Users\asier\AppData\Local\Temp\featureproof-go125-gopath`,
+`GOTOOLCHAIN=go1.25.1`; para race, `CGO_ENABLED=1`, `CC=gcc` y
 `C:\msys64\ucrt64\bin` al inicio de `PATH`.
 
 | Comando | Resultado |
@@ -52,81 +83,19 @@ Entorno: `GOPATH=C:\Users\asier\AppData\Local\Temp\featureproof-go125-gopath`,
 | `go test ./...` | pass |
 | `go test -race ./...` | pass |
 | `go test -race -count=20 ./internal/specification/...` | pass |
-| `go test -coverprofile=<temp> ./...` | pass |
-| `go tool cover -func=<temp>` | pass; total 90,8 % |
+| `go test -coverprofile=<ruta temporal> ./...` | pass |
+| `go tool cover -func=<ruta temporal>` | pass |
 
-Coverage de los paquetes nuevos: `internal/specification` 97,2 % e
-`internal/specification/yaml` 89,3 %. Ambos superan el mínimo de 85 %, pero el
-porcentaje no cubre los defectos contractuales siguientes.
+Coverage observado:
 
-## REV-1 — Se aceptan tipos YAML ajenos al contrato en campos string
+- global: 90,1 %;
+- `internal/specification`: 97,2 %;
+- `internal/specification/yaml`: 87,0 %.
 
-- Severidad: blocker
-- Requirement o regla: R3, R5, contrato YAML v1 de `requirements.md`,
-  CONV-009
-- Archivo y línea: `internal/specification/yaml/loader.go:202` y
-  `internal/specification/yaml/loader.go:85`; cobertura insuficiente en
-  `internal/specification/yaml/loader_test.go:174`
-- Evidencia: `checkV1Fields` comprueba mappings, claves y secuencias, pero no
-  comprueba que `feature.id`, descripciones, `target.id`, `base_url` y los
-  campos de cada constraint tengan tag YAML `!!str`. Después, `root.Decode`
-  decodifica directamente a campos Go `string`. La implementación usada de
-  `go.yaml.in/yaml/v3` convierte cualquier escalar a `string` en
-  `decode.go:608-617` mediante `out.SetString(n.Value)`. Por tanto, por ejemplo,
-  `feature.id: 123` o `feature.description: true` se convierten en `"123"` y
-  `"true"` y pueden superar `Validate`, aunque el contrato exige tipo YAML
-  `string`. El único test de tipos añade `max_steps: "8"`; no cubre escalares
-  no string en campos string. Los errores de tipo producidos por el decode de
-  enteros tampoco incluyen el field path determinable y se reclasifican como
-  `syntax`.
-- Impacto: un documento no conforme puede producir una `Specification`
-  utilizable, incumpliendo la validación completa previa al run y debilitando
-  la compatibilidad estable de v1. En otros casos el usuario recibe una
-  categoría/ruta no accionable.
-- Corrección requerida: validar `Kind`/`Tag` de todos los escalares del contrato
-  antes de traducir, devolver `ValidationError` con categoría y field path
-  estables para cada tipo inválido, y añadir tests que demuestren rechazo sin
-  modelo parcial para números, booleanos y `null` en campos string, además de
-  strings en campos integer.
+Los dos paquetes modificados superan el mínimo de 85 %, y las ramas relevantes
+de R1–R7 tienen tests de comportamiento concretos. El race detector completo y
+las 20 repeticiones de los paquetes afectados terminaron sin carreras.
 
-## REV-2 — `syntaxError` no conserva la causa original
+## Hallazgos
 
-- Severidad: blocker
-- Requirement o regla: R5, CONV-005
-- Archivo y línea: `internal/specification/yaml/loader.go:138` y
-  `internal/specification/yaml/loader_test.go:132`
-- Evidencia: `syntaxError` crea la causa con
-  `fmt.Errorf("decode YAML: %s", cause)`. El verbo `%s` copia el texto y rompe la
-  cadena de errores, de modo que `errors.Is`/`errors.As` no pueden recuperar la
-  causa original. `TestSyntaxErrorPreservesLocation` solo comprueba que
-  `Unwrap()` no sea `nil`, por lo que pasa aunque la identidad de la causa se
-  haya perdido. Esto contradice la regla explícita de conservar causas con
-  `%w` y el criterio de R5 que exige conservar la causa del parser.
-- Impacto: consumidores y diagnóstico no pueden distinguir ni inspeccionar la
-  causa real de un fallo YAML; el error propio aparenta envolverla, pero solo
-  contiene un error textual nuevo.
-- Corrección requerida: envolver la causa con `%w` (o conservarla directamente
-  añadiendo contexto sin perder identidad) y reforzar el test con una causa
-  identificable comprobada mediante `errors.Is`/`errors.As`.
-
-## REV-3 — Perfil de coverage generado dentro del repositorio
-
-- Severidad: blocker
-- Requirement o regla: alcance de `design.md`, CONV-010; cambio fuera de
-  alcance según `.codex/agents/reviewer.md`
-- Archivo y línea: `specification` (raíz del repositorio; archivo completo)
-- Evidencia: existe un archivo de 13.679 bytes creado durante la implementación
-  cuyo contenido comienza por `mode: set` y enumera bloques de coverage de
-  `internal/specification`. No figura entre los archivos modificados del
-  informe y no es código, fixture ni artefacto aprobado de la feature.
-- Impacto: queda basura generada en el árbol entregable y el informe de alcance
-  no representa todos los archivos creados.
-- Corrección requerida: eliminar el perfil `specification`, generar futuros
-  perfiles fuera del repositorio o en una ruta ignorada acordada y actualizar
-  la evidencia de archivos modificados si corresponde.
-
-## Condición para nueva review
-
-Resolver REV-1, REV-2 y REV-3, añadir los tests señalados y repetir todas las
-comprobaciones canónicas, incluido race completo, repetición del paquete y
-coverage.
+Ninguno.

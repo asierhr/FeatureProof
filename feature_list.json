@@ -43,7 +43,7 @@
           "La carga y validación de la especificación no accede a red, variables de entorno ni servicios externos",
           "Los tests cubren especificaciones válidas, errores sintácticos, errores semánticos y compatibilidad de la versión 1"
         ],
-        "status": "in_progress"
+        "status": "done"
     },
     {
         "id": 3,
@@ -60,7 +60,7 @@
           "El journal permite reconstruir qué pasos se ejecutaron, omitieron o bloquearon y en qué orden",
           "Los tests usan herramientas falsas y no dependen de red ni de un modelo real"
         ],
-        "status": "pending"
+        "status": "spec_ready"
     },
     {
         "id": 4,

@@ -12,9 +12,13 @@ import (
 	"time"
 )
 
+// ErrAlreadyExists prevents confirmed evidence identifiers from being rewritten.
 var ErrAlreadyExists = errors.New("evidence already exists")
+
+// ErrIntegrity reports that persisted evidence no longer matches its recorded hash.
 var ErrIntegrity = errors.New("evidence integrity mismatch")
 
+// Record is the immutable, sanitized fact produced by one tool execution attempt.
 type Record struct {
 	ID, RunID, ToolCallID, ToolName string
 	Step, Attempt                   int
@@ -25,13 +29,16 @@ type Record struct {
 	IntegrityHash                   string
 }
 
+// Store is the persistence boundary the harness uses before trusting an observation.
 type Store interface {
 	Save(context.Context, Record) error
 	Get(context.Context, string) (Record, error)
 }
 
+// Sanitizer defines the fields that must be redacted before persistence or model use.
 type Sanitizer struct{ Sensitive map[string]bool }
 
+// Map returns an isolated copy with configured sensitive values removed.
 func (s Sanitizer) Map(in map[string]any) map[string]any {
 	out := make(map[string]any, len(in))
 	for k, v := range in {
@@ -44,8 +51,10 @@ func (s Sanitizer) Map(in map[string]any) map[string]any {
 	return out
 }
 
+// FileStore persists immutable evidence records under a run-controlled directory.
 type FileStore struct{ dir string }
 
+// NewFileStore prepares the local evidence directory with restrictive permissions.
 func NewFileStore(dir string) (*FileStore, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create evidence directory: %w", err)
@@ -53,6 +62,7 @@ func NewFileStore(dir string) (*FileStore, error) {
 	return &FileStore{dir: dir}, nil
 }
 
+// Save hashes and atomically confirms a record without allowing ID replacement.
 func (s *FileStore) Save(ctx context.Context, r Record) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -94,6 +104,8 @@ func (s *FileStore) Save(ctx context.Context, r Record) error {
 	}
 	return nil
 }
+
+// Get loads a record and verifies its integrity before returning it to the harness.
 func (s *FileStore) Get(ctx context.Context, id string) (Record, error) {
 	if err := ctx.Err(); err != nil {
 		return Record{}, err

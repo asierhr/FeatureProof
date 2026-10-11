@@ -22,6 +22,8 @@ const (
 )
 
 var (
+	// Stable sentinels let callers branch on validation failures without
+	// depending on human-readable error messages.
 	ErrRequired           = errors.New("required field")
 	ErrInvalidValue       = errors.New("invalid value")
 	ErrDuplicateID        = errors.New("duplicate identifier")
@@ -40,6 +42,7 @@ type ValidationError struct {
 	Cause    error
 }
 
+// Error renders an actionable validation failure for CLI and adapter callers.
 func (e *ValidationError) Error() string {
 	location := e.Field
 	if location == "" && e.Line > 0 {
@@ -51,10 +54,13 @@ func (e *ValidationError) Error() string {
 	return fmt.Sprintf("validate specification %s: %s", location, e.Category)
 }
 
+// Unwrap exposes the underlying parser or validation cause for diagnostics.
 func (e *ValidationError) Unwrap() error { return e.Cause }
 
+// Is maps the error category to FeatureProof's stable validation sentinels.
 func (e *ValidationError) Is(target error) bool { return target == categorySentinel(e.Category) }
 
+// categorySentinel translates an internal category into its public sentinel.
 func categorySentinel(category Category) error {
 	switch category {
 	case CategoryRequired:
@@ -82,18 +88,22 @@ type UnsupportedVersionError struct {
 	Supported []int
 }
 
+// Error reports the received contract version and the versions FeatureProof accepts.
 func (e *UnsupportedVersionError) Error() string {
 	return fmt.Sprintf("validate specification version: unsupported_version received=%d supported=%v", e.Received, e.Supported)
 }
 
+// Is makes unsupported versions distinguishable through errors.Is.
 func (e *UnsupportedVersionError) Is(target error) bool { return target == ErrUnsupportedVersion }
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
+// validationError builds the domain error returned by deterministic validation rules.
 func validationError(category Category, field string, cause error) error {
 	return &ValidationError{Category: category, Field: field, Cause: cause}
 }
 
+// requiredString enforces presence before more specific string rules run.
 func requiredString(value, field string) error {
 	if value == "" {
 		return validationError(CategoryRequired, field, nil)
@@ -101,6 +111,7 @@ func requiredString(value, field string) error {
 	return nil
 }
 
+// validID checks the stable identifier syntax shared by specification entities.
 func validID(value, field string) error {
 	if err := requiredString(value, field); err != nil {
 		return err
@@ -111,6 +122,7 @@ func validID(value, field string) error {
 	return nil
 }
 
+// validDescription rejects missing or whitespace-only human descriptions.
 func validDescription(value, field string) error {
 	if value == "" {
 		return validationError(CategoryRequired, field, nil)

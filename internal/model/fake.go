@@ -8,6 +8,7 @@ import (
 	"github.com/asierhr/featureProof/internal/harness"
 )
 
+// Fake is a programmable model adapter that keeps harness tests offline and deterministic.
 type Fake struct {
 	mu        sync.Mutex
 	Decisions []harness.ModelDecision
@@ -16,6 +17,7 @@ type Fake struct {
 	Block     <-chan struct{}
 }
 
+// Decide captures model context and returns the next programmed decision or failure.
 func (f *Fake) Decide(ctx context.Context, r harness.ModelRequest) (harness.ModelDecision, error) {
 	if f.Block != nil {
 		select {
@@ -39,6 +41,8 @@ func (f *Fake) Decide(ctx context.Context, r harness.ModelRequest) (harness.Mode
 	}
 	return d, err
 }
+
+// CapturedRequests returns an isolated history for assertions about model context.
 func (f *Fake) CapturedRequests() []harness.ModelRequest {
 	f.mu.Lock()
 	defer f.mu.Unlock()

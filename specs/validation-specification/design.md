@@ -174,6 +174,21 @@ Los errores incluyen operación, ruta de archivo cuando corresponde, categoría
 y field path. No se registra el cuerpo YAML, la URL completa ni descripciones.
 Una futura CLI podrá mostrar estos errores sin inspeccionar código interno.
 
+## Convención de documentación del código
+
+Esta feature establece una convención para sus siguientes iteraciones: toda
+entidad y toda función, exportada o interna, debe incluir un comentario breve
+que explique su responsabilidad dentro de FeatureProof y su relación con el
+flujo o la frontera a la que pertenece. El comentario debe expresar intención,
+invariantes o motivo arquitectónico; no debe limitarse a repetir el nombre, los
+parámetros o la sintaxis del código.
+
+Los comentarios se mantienen junto al símbolo y se actualizan cuando cambia su
+responsabilidad. Los DTO de adapters deben explicar qué contrato externo aíslan
+y las funciones auxiliares deben indicar qué regla del sistema protegen. Las
+iteraciones posteriores deben aplicar esta convención al código nuevo y
+preservarla al modificar código existente.
+
 ## Estrategia de pruebas
 
 Los tests usan `t.TempDir`, bytes y fixtures locales. No abren sockets, no leen

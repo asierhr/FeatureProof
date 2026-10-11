@@ -13,9 +13,9 @@ ni modifica `internal/harness`.
 |---|---|---|---|
 | R1 | `TestLoadV1Specification`, `TestLoadRejectsUnreadableMalformedAndMultipleDocuments`, `TestLoadRejectsInvalidRoots` | `internal/specification/yaml/loader_test.go` | pass |
 | R2 | `TestLoadV1Specification`, `TestV1LoadIsDeterministicAndStateless`, `TestV1LoadsConcurrentlyWithoutSharedState` | `internal/specification/yaml/{loader,compatibility}_test.go` | pass |
-| R3 | `TestValidateRejectsMissingRequiredFields`, `TestValidateRejectsDuplicateConstraintIDs`, `TestValidateRejectsUnknownTargetReference`, `TestLoadRejectsUnknownAndDuplicateKeys`, `TestLoadRejectsSemanticErrorsWithoutPartialModel`, `TestLoadRejectsNullConstraintAndStringNumber` | `internal/specification/validate_test.go`, `internal/specification/yaml/loader_test.go` | pass |
+| R3 | `TestValidateRejectsMissingRequiredFields`, `TestValidateRejectsDuplicateConstraintIDs`, `TestValidateRejectsUnknownTargetReference`, `TestLoadRejectsUnknownAndDuplicateKeys`, `TestLoadRejectsSemanticErrorsWithoutPartialModel`, `TestLoadRejectsWrongScalarTypesWithFieldPathAndNoPartialModel`, `TestLoadRejectsNullConstraintWithFieldPathAndNoPartialModel` | `internal/specification/validate_test.go`, `internal/specification/yaml/loader_test.go` | pass |
 | R4 | `TestLoadRejectsUnsupportedVersionWithReceivedAndSupported`, `TestUnsupportedVersionErrorReportsContract` | `internal/specification/yaml/loader_test.go`, `internal/specification/validate_test.go` | pass |
-| R5 | `TestValidationErrorIdentifiesCategoryAndField`, `TestValidationReturnsStableFirstError`, `TestValidationErrorsExposeStableCategoriesAndContext`, `TestSyntaxErrorPreservesLocation` | `internal/specification/validate_test.go`, `internal/specification/yaml/loader_test.go` | pass |
+| R5 | `TestValidationErrorIdentifiesCategoryAndField`, `TestValidationReturnsStableFirstError`, `TestValidationErrorsExposeStableCategoriesAndContext`, `TestSyntaxErrorPreservesLocation`, `TestSyntaxErrorPreservesOriginalCauseIdentity`, `TestLoadRejectsWrongScalarTypesWithFieldPathAndNoPartialModel` | `internal/specification/validate_test.go`, `internal/specification/yaml/{loader,loader_internal}_test.go` | pass |
 | R6 | `TestV1CompatibilityFixtures`, `TestLoadDoesNotRequireEnvironment`, `TestLoadObservesPreCancelledContext` | `internal/specification/yaml/{compatibility,loader}_test.go` | pass |
 | R7 | `TestV1CompatibilityFixtures`, `TestV1InvalidFixturesRemainRejected`, `TestV1LoadIsDeterministicAndStateless` | `internal/specification/yaml/compatibility_test.go` | pass |
 
@@ -43,14 +43,14 @@ Todos los comandos finales se ejecutaron con `GOTOOLCHAIN=go1.25.1`,
 | `go test ./...` | pass |
 | `go test -race ./...` | pass |
 | `go test -race -count=20 ./internal/specification/...` | pass |
-| `go test -coverprofile=coverage.out ./...` | pass |
-| `go tool cover -func=coverage.out` | pass |
+| `go test -coverprofile=<ruta temporal fuera del repo> ./...` | pass |
+| `go tool cover -func=<ruta temporal fuera del repo>` | pass |
 
 ## Coverage
 
-- Global: 90,8 % de statements.
+- Global: 90,1 % de statements.
 - `internal/specification`: 97,2 %.
-- `internal/specification/yaml`: 89,3 %.
+- `internal/specification/yaml`: 87,0 %.
 - Todo el código nuevo supera el mínimo del 85 %.
 - Las ramas relevantes de campos requeridos, tipos y valores inválidos,
   duplicados, referencias, versiones, roots, documentos extra, lectura,
@@ -61,8 +61,8 @@ Todos los comandos finales se ejecutaron con `GOTOOLCHAIN=go1.25.1`,
 - `go.mod`, `go.sum`: dependencia mantenida `go.yaml.in/yaml/v3 v3.0.4` fijada.
 - `internal/specification/model.go`.
 - `internal/specification/validate.go` y `validate_test.go`.
-- `internal/specification/yaml/loader.go`, `loader_test.go` y
-  `compatibility_test.go`.
+- `internal/specification/yaml/loader.go`, `loader_test.go`,
+  `loader_internal_test.go` y `compatibility_test.go`.
 - `internal/specification/yaml/testdata/{valid_v1,invalid_syntax_v1,invalid_semantic_v1,unsupported_version}.yaml`.
 - `specs/validation-specification/tasks.md`.
 - `progress/current.md`.
@@ -70,6 +70,21 @@ Todos los comandos finales se ejecutaron con `GOTOOLCHAIN=go1.25.1`,
 
 No se modificó `internal/harness` ni ninguna feature distinta de
 `validation-specification`.
+
+El perfil de coverage no forma parte del entregable: se generó en el directorio
+temporal del sistema. También se eliminó el perfil no aprobado `specification`
+que la primera verificación había dejado en la raíz.
+
+## Correcciones tras la primera review
+
+- **REV-1:** el adapter comprueba `Kind` y `Tag` YAML de todos los escalares
+  antes de traducir. Números, booleanos y `null` en campos string, y strings
+  en campos integer, devuelven `invalid_value` con field path estable y modelo
+  interno cero.
+- **REV-2:** `syntaxError` envuelve la causa original con `%w`; un test con
+  causa canario demuestra su identidad mediante `errors.Is`.
+- **REV-3:** se eliminó el perfil `specification`; toda cobertura posterior se
+  generó fuera del repositorio.
 
 ## Riesgos o limitaciones
 
