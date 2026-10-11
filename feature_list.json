@@ -60,7 +60,7 @@
           "El journal permite reconstruir qué pasos se ejecutaron, omitieron o bloquearon y en qué orden",
           "Los tests usan herramientas falsas y no dependen de red ni de un modelo real"
         ],
-        "status": "spec_ready"
+        "status": "done"
     },
     {
         "id": 4,

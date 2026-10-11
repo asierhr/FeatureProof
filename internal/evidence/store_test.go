@@ -9,8 +9,9 @@ import (
 	"time"
 )
 
+// sample creates a fully related plan-attempt record for persistence tests.
 func sample() Record {
-	return Record{ID: "ev-1", RunID: "run-1", Step: 1, ToolCallID: "call-1", Attempt: 1, ToolName: "probe", StartedAt: time.Unix(1, 0).UTC(), Duration: time.Millisecond, Input: map[string]any{"token": "[REDACTED]"}, Output: map[string]any{"status": "ok"}}
+	return Record{ID: "ev-1", RunID: "run-1", PlanID: "plan-1", StepID: "step-1", Step: 1, ToolCallID: "call-1", Attempt: 1, ToolName: "probe", StartedAt: time.Unix(1, 0).UTC(), Duration: time.Millisecond, Input: map[string]any{"token": "[REDACTED]"}, Output: map[string]any{"status": "ok"}}
 }
 
 func TestFileEvidenceStoreDoesNotRewriteConfirmedEvidence(t *testing.T) {
@@ -45,7 +46,7 @@ func TestEvidenceStoreDetectsTamperingAndRelatesIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RunID != r.RunID || got.ToolCallID != r.ToolCallID || got.IntegrityHash == "" {
+	if got.RunID != r.RunID || got.PlanID != r.PlanID || got.StepID != r.StepID || got.ToolCallID != r.ToolCallID || got.IntegrityHash == "" {
 		t.Fatalf("bad relation: %+v", got)
 	}
 }

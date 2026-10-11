@@ -307,6 +307,6 @@ aplazados a sus features correspondientes.
 Esta spec requiere aprobación humana antes de implementar.
 
 ```yaml
-approved_by: null
-approved_at: null
+approved_by: user
+approved_at: 2026-10-11T17:46:51+02:00
 ```

@@ -27,6 +27,13 @@ const (
 	EventRunInconclusive    EventType = "run_inconclusive"
 	EventRunFailed          EventType = "run_failed"
 	EventRunCancelled       EventType = "run_cancelled"
+	EventPlanValidated      EventType = "plan_validated"
+	EventPlanExecutionStart EventType = "plan_execution_started"
+	EventPlanCompleted      EventType = "plan_completed"
+	EventPlanStepStarted    EventType = "plan_step_started"
+	EventPlanInputResolved  EventType = "plan_step_input_resolved"
+	EventPlanStepCompleted  EventType = "plan_step_completed"
+	EventPlanStepBlocked    EventType = "plan_step_blocked"
 )
 
 // RejectReason is the stable machine-readable cause for refusing model-proposed work.
@@ -43,13 +50,25 @@ const (
 
 // Event is one ordered, append-only fact associated with a validation run.
 type Event struct {
-	Sequence   int
-	Type       EventType
-	RunID      string
-	Step       int
-	ToolCallID string
-	Reason     RejectReason
-	Detail     string
+	Sequence      int
+	Type          EventType
+	RunID         string
+	PlanID        string
+	StepID        string
+	ConstraintID  string
+	Step          int
+	ToolCallID    string
+	Reason        RejectReason
+	Detail        string
+	Status        string
+	EvidenceIDs   []string
+	BlockingCause []EventBlockingCause
+}
+
+// EventBlockingCause preserves one direct dependency outcome without requiring consumers to parse text.
+type EventBlockingCause struct {
+	StepID string
+	Status string
 }
 
 // Journal is the audit port used to confirm and reconstruct run activity.
@@ -75,7 +94,7 @@ func (j *MemoryJournal) Append(ctx context.Context, e Event) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	e.Sequence = len(j.byRun[e.RunID]) + 1
-	j.byRun[e.RunID] = append(j.byRun[e.RunID], e)
+	j.byRun[e.RunID] = append(j.byRun[e.RunID], cloneEvent(e))
 	return nil
 }
 
@@ -86,7 +105,18 @@ func (j *MemoryJournal) Events(ctx context.Context, id string) ([]Event, error) 
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return append([]Event(nil), j.byRun[id]...), nil
+	events := make([]Event, len(j.byRun[id]))
+	for i, event := range j.byRun[id] {
+		events[i] = cloneEvent(event)
+	}
+	return events, nil
+}
+
+// cloneEvent protects append-only evidence and blocking slices from caller mutation.
+func cloneEvent(event Event) Event {
+	event.EvidenceIDs = append([]string(nil), event.EvidenceIDs...)
+	event.BlockingCause = append([]EventBlockingCause(nil), event.BlockingCause...)
+	return event
 }
 
 // terminalEvent maps a terminal run state to the single event that closes its journal.

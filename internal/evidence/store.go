@@ -20,13 +20,13 @@ var ErrIntegrity = errors.New("evidence integrity mismatch")
 
 // Record is the immutable, sanitized fact produced by one tool execution attempt.
 type Record struct {
-	ID, RunID, ToolCallID, ToolName string
-	Step, Attempt                   int
-	StartedAt                       time.Time
-	Duration                        time.Duration
-	Input, Output                   map[string]any
-	ErrorClass                      string
-	IntegrityHash                   string
+	ID, RunID, PlanID, StepID, ToolCallID, ToolName string
+	Step, Attempt                                   int
+	StartedAt                                       time.Time
+	Duration                                        time.Duration
+	Input, Output                                   map[string]any
+	ErrorClass                                      string
+	IntegrityHash                                   string
 }
 
 // Store is the persistence boundary the harness uses before trusting an observation.

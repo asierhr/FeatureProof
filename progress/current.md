@@ -2,11 +2,131 @@
 
 ## Estado
 
-La feature `multi-step-validation-plan` está en estado `spec_ready`. El leader
-ha validado su especificación SDD y está pendiente de aprobación humana
-explícita. No se ha autorizado implementación.
+La feature `multi-step-validation-plan` está en estado `done`. La quinta review
+independiente aprobó R1-R9 y el leader completó la verificación final.
 
 ## Última actualización
+
+- Fecha: 2026-10-11
+- Trabajo: quinta review aprobada y transición de `in_progress` a `done`
+  realizada por el leader.
+- Evidencia: R1-R9 trazados a tests; formato, vet, compilación, suite, race,
+  repetición race y coverage en pass.
+- Coverage: 90,1 % global; 89,8 % en `internal/planning`; paquetes modificados
+  por encima del mínimo de 85 %.
+- Resumen añadido a `progress/history.md`.
+
+- Fecha: 2026-10-11
+- Trabajo: correcciones REV-5 y REV-6 de `multi-step-validation-plan`
+  implementadas tras la cuarta revisión.
+- REV-5: el diagnóstico comprueba pertenencia real al ciclo y escoge el nodo
+  cíclico de menor declaration order, sin confundir descendientes bloqueados.
+- REV-6: literales `NaN`, `+Inf` y `-Inf` se rechazan como `invalid_value`
+  antes de policy o herramienta.
+- Verificación final: formato, vet, compilación, suite, `-race`, repetición
+  `-race -count=20` y coverage en pass; global 90,1 % y `planning` 89,8 %.
+- Estado: correcciones preparadas para una quinta revisión; feature continúa
+  `in_progress`.
+
+- Fecha: 2026-10-11
+- Trabajo: cuarta review de `multi-step-validation-plan` rechazada; REV-1 a
+  REV-4 confirmadas como corregidas y REV-5/REV-6 devueltas al implementer.
+- Hallazgos: el diagnóstico de ciclos podía señalar un descendiente externo al
+  ciclo y los literales aceptaban `NaN` e infinitos, incompatibles con JSON.
+- Estado: `in_progress`; requiere diagnóstico sobre nodos realmente cíclicos,
+  rechazo de floats no finitos, tests de regresión y quinta review.
+
+- Fecha: 2026-10-11
+- Trabajo: corrección REV-4 de `multi-step-validation-plan` implementada tras
+  la tercera revisión.
+- REV-4: añadido journal fake configurable y tests de fallo antes de ejecutar
+  y después de confirmar evidencia; prueban error operativo, detención de
+  selección, preservación del prefijo confirmado y ausencia de
+  `plan_completed`.
+- Código productivo: revisado; la propagación existente ya detenía el ejecutor
+  correctamente, por lo que la corrección requerida es de evidencia de tests.
+- Verificación final: formato, vet, compilación, suite, `-race`, repetición
+  `-race -count=20` y coverage en pass; global 90,1 % y `planning` 89,8 %.
+- Estado: corrección preparada para una cuarta revisión; feature continúa
+  `in_progress`.
+
+- Fecha: 2026-10-11
+- Trabajo: tercera review de `multi-step-validation-plan` rechazada; REV-1 a
+  REV-3 confirmadas como corregidas y REV-4 devuelta al implementer.
+- Hallazgo: faltaban tests del fallo operativo del journal antes de ejecutar y
+  después de confirmar evidencia, incluida la preservación de hechos previos.
+- Estado: `in_progress`; requiere fake de journal configurable, tests de ambas
+  fronteras, reverificación y cuarta review.
+
+- Fecha: 2026-10-11
+- Trabajo: corrección REV-3 de `multi-step-validation-plan` implementada tras
+  la segunda revisión.
+- REV-3: cada `PathSegment` clona ahora individualmente sus punteros `Field` e
+  `Index`; el test de snapshot muta ambos desde el plan original y desde
+  `ValidatedPlan.Plan()` sin alterar el path validado.
+- Verificación final: formato, vet, compilación, suite, `-race`, repetición
+  `-race -count=20` y coverage en pass; global 89,8 % y `planning` 89,2 %.
+- Estado: corrección preparada para una tercera revisión; feature continúa
+  `in_progress`.
+
+- Fecha: 2026-10-11
+- Trabajo: segunda review de `multi-step-validation-plan` rechazada; REV-1 y
+  REV-2 confirmadas como corregidas y REV-3 devuelta al implementer.
+- Hallazgo: los punteros `Field`/`Index` de `PathSegment` seguían compartidos
+  entre el plan original, el snapshot interno y las copias devueltas.
+- Estado: `in_progress`; requiere clonado individual de esos punteros, tests de
+  regresión, reverificación y tercera review.
+
+- Fecha: 2026-10-11
+- Trabajo: correcciones REV-1 y REV-2 de `multi-step-validation-plan`
+  implementadas tras la primera revisión.
+- REV-1: eliminado `null` del contrato cerrado de `value_type`; un test prueba
+  `invalid_reference` antes de policy o herramienta.
+- REV-2: las definitions de assertions se copian recursivamente, incluidos
+  maps, slices y arrays anidados; el test de snapshot cubre mutaciones desde el
+  plan original y desde `Plan()`.
+- Verificación final: formato, vet, compilación, suite, `-race`, repetición
+  `-race -count=20` y coverage en pass; global 89,7 % y `planning` 89,0 %.
+- Estado: correcciones preparadas para una nueva revisión; feature continúa
+  `in_progress`.
+
+- Fecha: 2026-10-11
+- Trabajo: primera review de `multi-step-validation-plan` rechazada; corrección
+  devuelta al implementer.
+- Hallazgos: `value_type: null` se aceptaba fuera del conjunto cerrado de R3
+  y la copia de definitions de assertions no era profunda para maps/slices.
+- Estado: `in_progress`; requiere corrección, reverificación y nueva review.
+
+- Fecha: 2026-10-11
+- Trabajo: T6 completada; implementación de `multi-step-validation-plan`
+  preparada para revisión independiente.
+- Verificación final: formato, vet, compilación, suite completa, `-race`,
+  `-race -count=20` y coverage en pass. Coverage global 90,4 % y paquete
+  `internal/planning` 90,5 %.
+- Trazabilidad: R1-R9 enlazados con tests reales en
+  `progress/multi-step-validation-plan/implementation.md`.
+
+- Fecha: 2026-10-11
+- Trabajo: T1-T5 completadas para `multi-step-validation-plan`.
+- Resultado: modelo y errores tipados, validador de grafo con orden topológico
+  estable, referencias desde evidencia confirmada, ejecutor secuencial con
+  controles/retries/bloqueos y eventos reconstruibles implementados.
+- Verificación intermedia: `go test ./internal/planning ./internal/harness
+  ./internal/evidence` en pass; coverage del paquete nuevo `planning`: 89,1 %.
+- Siguiente paso: T6, suite canónica completa, race detector y trazabilidad.
+
+- Fecha: 2026-10-11
+- Trabajo: T1 iniciada para `multi-step-validation-plan`; definición mediante
+  tests del modelo de plan, referencias tipadas, estados y errores estructurados.
+- Integración prevista: nuevo paquete `internal/planning` sobre los puertos ya
+  existentes de registry, policy, presupuesto, evidence y journal.
+
+- Fecha: 2026-10-11
+- Trabajo: aprobación humana registrada y transición de `spec_ready` a
+  `in_progress` realizada por el leader.
+- Aprobación: `approved_by: user`, `approved_at: 2026-10-11T17:46:51+02:00`.
+- Siguiente fase: implementación T1-T6, comentarios funcionales en cada
+  entidad y función, y verificación canónica.
 
 - Fecha: 2026-10-11
 - Trabajo: spec de `multi-step-validation-plan` completada y transición de
