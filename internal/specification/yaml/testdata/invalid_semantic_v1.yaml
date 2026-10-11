@@ -1,0 +1,15 @@
+version: 1
+feature:
+  id: invalid id
+  description: Invalid identifier
+target:
+  id: local
+  base_url: https://example.test
+constraints:
+  - id: constraint
+    description: Constraint
+    target_id: local
+limits:
+  max_steps: 1
+  max_tool_calls: 1
+  max_retries: 0

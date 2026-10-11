@@ -1,0 +1,15 @@
+version: 1
+feature:
+  id: env-literal
+  description: ${FEATURE_DESCRIPTION}
+target:
+  id: unreachable-local
+  base_url: http://127.0.0.1:1/application
+constraints:
+  - id: literal-value
+    description: The environment expression stays literal
+    target_id: unreachable-local
+limits:
+  max_steps: 1
+  max_tool_calls: 1
+  max_retries: 0

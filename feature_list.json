@@ -1,0 +1,136 @@
+{  
+  "project": "featureproof",
+  "description": "Plataforma de validación bajo demanda que permite a un equipo describir qué condiciones debe cumplir una nueva funcionalidad y obtener evidencias de su funcionamiento en una aplicación realmente desplegada",
+  "rules": {
+    "one_feature_at_a_time": true,
+    "require_tests_to_close": true,
+    "valid_status": [
+      "pending",
+      "spec_ready",
+      "in_progress",
+      "done",
+      "blocked"
+    ]
+  },
+  "features": [
+    {
+        "id": 1,
+        "name": "agent-harness",
+        "title": "Harness agéntico acotado",
+        "sdd": true,
+        "acceptance": [
+          "Un modelo falso puede proponer una llamada a una herramienta registrada y recibir su observación",
+          "Toda llamada pasa por validación estructural, política y presupuesto antes de ejecutarse",
+          "Cada resultado ejecutado se persiste como evidencia y queda relacionado con la ejecución",
+          "El veredicto se calcula de forma determinista y no a partir de una afirmación del modelo",
+          "Una herramienta desconocida o denegada nunca se ejecuta y genera un evento auditable",
+          "La ejecución termina de forma inconclusa al agotar su límite de pasos",
+          "Los tests del harness se ejecutan sin red y sin un modelo real"
+        ],
+        "status": "done"
+    },
+    {
+        "id": 2,
+        "name": "validation-specification",
+        "title": "Especificación versionada de validación",
+        "sdd": true,
+        "acceptance": [
+          "FeatureProof puede cargar un archivo YAML versionado que define la feature, el target, las restricciones y los límites de ejecución",
+          "La versión 1 del formato se convierte a modelos internos sin exponer tipos propios de la librería YAML fuera del adapter",
+          "Los campos obligatorios, identificadores duplicados, valores inválidos y referencias inexistentes se rechazan antes de iniciar un run",
+          "Una versión desconocida se rechaza con un error que identifica la versión recibida y las versiones soportadas",
+          "Los errores indican el campo afectado y permiten corregir la especificación sin inspeccionar código interno",
+          "La carga y validación de la especificación no accede a red, variables de entorno ni servicios externos",
+          "Los tests cubren especificaciones válidas, errores sintácticos, errores semánticos y compatibilidad de la versión 1"
+        ],
+        "status": "in_progress"
+    },
+    {
+        "id": 3,
+        "name": "multi-step-validation-plan",
+        "title": "Planes de validación de varios pasos",
+        "sdd": true,
+        "acceptance": [
+          "Un plan puede contener varios pasos identificados y relacionados con una restricción existente",
+          "Cada paso declara su herramienta, input, assertions y dependencias de forma estructurada",
+          "Un paso puede utilizar outputs de pasos anteriores mediante referencias explícitas y tipadas",
+          "El validador rechaza IDs duplicados, dependencias desconocidas, referencias inválidas y ciclos antes de ejecutar el plan",
+          "Los pasos se ejecutan en un orden determinista que respeta todas sus dependencias",
+          "Cuando un paso falla o queda inconcluso, sus dependientes no se ejecutan y registran la causa del bloqueo",
+          "El journal permite reconstruir qué pasos se ejecutaron, omitieron o bloquearon y en qué orden",
+          "Los tests usan herramientas falsas y no dependen de red ni de un modelo real"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 4,
+        "name": "assertion-engine",
+        "title": "Motor determinista de assertions",
+        "sdd": true,
+        "acceptance": [
+          "El motor puede evaluar igualdad, existencia, ausencia y comparaciones numéricas sobre resultados estructurados",
+          "Los valores JSON se localizan mediante una sintaxis de rutas documentada y validada antes de la ejecución",
+          "Las assertions pueden combinarse mediante grupos all y any con semántica determinista",
+          "Cada resultado contiene operador, valor esperado, valor observado, estado y referencia a la evidencia utilizada",
+          "Una assertion inválida se distingue de una assertion válida que no se cumple",
+          "El modelo no participa en el cálculo de ningún resultado de assertion",
+          "La ausencia de evidencia necesaria produce un resultado inconcluso y nunca un passed",
+          "Los tests cubren operadores, tipos incompatibles, rutas inexistentes, grupos anidados y errores de configuración"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 5,
+        "name": "http-tool",
+        "title": "Herramienta HTTP controlada",
+        "sdd": true,
+        "acceptance": [
+          "La herramienta ejecuta métodos HTTP permitidos con path, query parameters, headers no sensibles y body JSON estructurados",
+          "Toda URL se resuelve a partir del target autorizado por el run y no desde una URL absoluta propuesta por el modelo",
+          "Los destinos, esquemas y puertos no autorizados se rechazan antes de abrir una conexión",
+          "Cada redirección se valida de nuevo y no puede escapar del target permitido",
+          "La operación respeta context cancellation y un timeout obligatorio",
+          "El resultado captura status, headers permitidas, body limitado, duración y error operativo de forma estructurada",
+          "Las cabeceras Authorization, Cookie, Set-Cookie y Proxy-Authorization nunca aparecen con su valor real en eventos o evidencias",
+          "La herramienta no escribe evidencias ni modifica el run directamente",
+          "Los tests utilizan servidores HTTP locales controlados para éxito, error, timeout, cancelación, redirección y destino denegado"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 6,
+        "name": "evidence-redaction",
+        "title": "Redacción y limitación de evidencias",
+        "sdd": true,
+        "acceptance": [
+          "Los valores sensibles se redactan antes de persistirse, registrarse o enviarse al modelo",
+          "La configuración permite declarar headers y rutas JSON sensibles adicionales a las protegidas por defecto",
+          "La redacción se aplica tanto a inputs como a outputs y conserva suficiente estructura para evaluar assertions permitidas",
+          "Los cuerpos que superan el límite configurado se truncan de forma explícita y registran tamaño original y tamaño conservado",
+          "El resumen enviado al modelo puede ser más restrictivo que la evidencia persistida y nunca contiene valores marcados como sensibles",
+          "Una configuración de redacción inválida detiene el run antes de ejecutar herramientas",
+          "Un fallo durante la redacción impide persistir o publicar el contenido sin tratar",
+          "Los tests usan secretos canario y demuestran que no aparecen en artefactos, eventos, reportes ni contexto del modelo"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 7,
+        "name": "local-validation-cli",
+        "title": "CLI local de validación",
+        "sdd": true,
+        "acceptance": [
+          "El comando featureproof validate recibe una especificación y permite proporcionar el target autorizado mediante una opción explícita",
+          "La CLI valida todos los argumentos y la especificación antes de iniciar el run",
+          "Durante la ejecución muestra el run ID, la fase actual y un resumen de cada restricción sin exponer información sensible",
+          "Al finalizar genera run.json, events.jsonl, plan.json, evidence, report.json y report.md bajo .featureproof/runs/<run-id>",
+          "La salida final distingue restricciones passed, failed e inconclusive y enlaza sus evidence IDs",
+          "La CLI devuelve códigos de salida diferentes para éxito, incumplimiento funcional, resultado inconcluso y error de FeatureProof",
+          "La cancelación desde el terminal se propaga al harness y deja el run en estado cancelled cuando puede persistirse",
+          "La CLI puede ejecutar un flujo determinista completo sin credenciales de un modelo real",
+          "Los tests cubren argumentos inválidos, ejecución correcta, fallo funcional, resultado inconcluso, cancelación y códigos de salida"
+        ],
+        "status": "pending"
+    }
+  ]
+}

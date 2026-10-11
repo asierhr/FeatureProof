@@ -1,0 +1,3 @@
+version: 99
+future:
+  arbitrary: value
