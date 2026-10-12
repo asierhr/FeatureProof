@@ -159,9 +159,19 @@ func checkMapping(node *yaml.Node, path string, allowed map[string]struct{}) err
 	seen := make(map[string]struct{}, len(node.Content)/2)
 	for index := 0; index < len(node.Content); index += 2 {
 		key := node.Content[index]
-		field := key.Value
+		field := fmt.Sprintf("$mapping.members[%d]", index/2)
 		if path != "" {
-			field = path + "." + field
+			field = fmt.Sprintf("%s.members[%d]", path, index/2)
+		}
+		diagnosticFields := allowed
+		if diagnosticFields == nil && path == "" {
+			diagnosticFields = rootFields
+		}
+		if _, trusted := diagnosticFields[key.Value]; trusted {
+			field = key.Value
+			if path != "" {
+				field = path + "." + key.Value
+			}
 		}
 		if _, exists := seen[key.Value]; exists {
 			return &specification.ValidationError{Category: specification.CategorySyntax, Field: field, Line: key.Line, Column: key.Column, Cause: errors.New("duplicate mapping key")}

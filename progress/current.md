@@ -2,10 +2,398 @@
 
 ## Estado
 
-La feature `multi-step-validation-plan` está en estado `done`. La quinta review
-independiente aprobó R1-R9 y el leader completó la verificación final.
+La feature `local-validation-cli` está en estado `done`. La tercera review
+independiente aprobó R1-R11, T1-T7 y el cierre de REV-1 a REV-6.
 
 ## Última actualización
+
+- Fecha: 2026-10-11
+- Trabajo: tercera review aprobada y transición de `in_progress` a `done`
+  realizada por el leader.
+- Evidencia: R1-R11 y T1-T7 verificados; formato, vet, suite, race fresca,
+  repetición race x20, builds Linux/macOS y regresiones de canarios en pass.
+- Coverage: 91,0 % global; todos los paquetes modificados superan 85 %.
+- Resumen añadido a `progress/history.md`.
+
+- Fecha: 2026-10-11
+- Trabajo: REV-6 de `local-validation-cli` corregida tras la segunda review.
+- Resultado: paths de errores derivados de mapas externos usan índices
+  `members[n]`; nombres del schema siguen siendo legibles; la salida CLI aplica
+  un vocabulario cerrado y cae en `document` ante cualquier segmento ajeno.
+- Regresiones: claves con CR/LF, tabulador, control, separadores y canarios
+  cubiertas en specification, manifest, duplicate keys y planning; stderr se
+  mantiene en una sola línea sin contenido externo.
+- Verificación: formato, vet, compilación, suite fresca, race completa y race
+  x20 en los siete paquetes afectados en pass.
+- Coverage: 91,0 % global; 100,0 % cmd, 92,3 % localvalidation, 92,7 %
+  planmanifest, 89,9 % planning, 90,6 % assertion, 87,5 % specification/yaml
+  y 91,1 % tools/http.
+- Estado: preparada para tercera review; continúa `in_progress`.
+
+- Fecha: 2026-10-11
+- Trabajo: segunda review de `local-validation-cli` rechazada; REV-1, REV-3,
+  REV-4 y REV-5 confirmadas como corregidas; REV-6 devuelta al implementer.
+- Hallazgo: claves JSON controladas pueden filtrarse e inyectar saltos de línea
+  en el `field` seguro de stderr.
+- Estado: requiere paths públicos con segmentos confiables, regresiones de
+  control characters/canarios y tercera review.
+
+- Fecha: 2026-10-11
+- Trabajo: correcciones REV-1 a REV-5 de `local-validation-cli` completadas.
+- Resultado: decode anidado estricto; diagnósticos CLI tipados y seguros;
+  filesystem/publicación inyectable con commit no-replace; cancelación
+  determinista en policy/evidence/assertions; auditoría de comentarios.
+- Verificación: formato, vet, compilación, suite completa, race completa, race
+  x20 y compilación cruzada Linux/macOS en pass.
+- Coverage: 90,8 % global, 100,0 % en `cmd/featureproof`, 92,3 % en
+  `internal/localvalidation` y 92,4 % en `internal/planmanifest`.
+- Estado: preparada para segunda review; continúa `in_progress`.
+
+- Fecha: 2026-10-11
+- Trabajo: primera review de `local-validation-cli` rechazada; REV-1 a REV-5
+  devueltas al implementer.
+- Hallazgos: strict JSON incompleto en referencias, diagnósticos CLI sin
+  categoría/path, filesystem/publicación no totalmente sustituibles,
+  cancelación no cubierta durante policy/evidence/assertions y dos comentarios
+  sistémicos ausentes.
+- Verificación base: formato, vet, suite, race y coverage global 90,5 % pasan.
+- Estado: `in_progress`; requiere correcciones, regresiones y nueva review.
+
+- Fecha: 2026-10-11
+- Trabajo: T7 completada; `local-validation-cli` preparada para review
+  independiente.
+- Verificación: formato, vet, compilación, suite completa, race completa y race
+  x20 en paquetes afectados en pass.
+- Coverage: 90,5 % global, 100,0 % en `cmd/featureproof`, 89,6 % en
+  `internal/localvalidation` y 93,8 % en `internal/planmanifest`.
+- Trazabilidad: R1–R11 enlazados con tests reales en
+  `progress/local-validation-cli/implementation.md`.
+
+- Fecha: 2026-10-11
+- Trabajo: T1–T6 completadas para `local-validation-cli`.
+- Resultado: comando estricto, manifiesto JSON v1, composición de features
+  1–6, runner secuencial, reportes seguros y bundle atómico implementados.
+- Verificación intermedia: suite completa en pass; coverage de paquetes nuevos
+  `localvalidation` 85,2 % y `planmanifest` 85,0 %. Pendiente T7 y verificación
+  canónica con race detector.
+
+- Fecha: 2026-10-11
+- Trabajo: implementación iniciada por T1 tras verificar la aprobación SDD
+  y los contratos reutilizables de las features 1–6.
+- Estrategia: contrato del comando primero, manifiesto estricto después y
+  composición, ejecución y publicación en el orden aprobado.
+
+- Fecha: 2026-10-11
+- Trabajo: aprobación humana registrada y transición de `spec_ready` a
+  `in_progress` realizada por el leader.
+- Aprobación: `approved_by: user`, `approved_at: 2026-10-11T21:15:19+02:00`.
+- Siguiente fase: implementación T1-T7 con TDD, comentarios funcionales,
+  pruebas herméticas, canarios y verificación canónica.
+
+- Fecha: 2026-10-11
+- Trabajo: spec de `local-validation-cli` completada y transición de `pending`
+  a `spec_ready` realizada por el leader.
+- Artefactos: `requirements.md`, `design.md` y `tasks.md` bajo
+  `specs/local-validation-cli/`.
+- Verificación: R1-R11 contienen criterios observables; T1-T7 cubren todos los
+  requisitos; las tareas siguen pendientes y la aprobación humana está vacía.
+- Contrato: `--plan` JSON v1 incluye planes, assertions y runtime explícito;
+  target, exit codes, cancelación y publicación atómica quedan cerrados.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-11
+- Trabajo: la instrucción humana de continuar se registra como aceptación de
+  la propuesta `runtime`; transición de `blocked` a `pending` realizada por el
+  leader.
+- Decisión: el documento versionado de `--plan` incluye configuración explícita
+  de HTTP, redacción y policy, validada antes de componer capacidades.
+- Siguiente fase: cerrar la spec concreta y presentarla para aprobación SDD.
+
+- Fecha: 2026-10-11
+- Trabajo: tercer bloqueo de la spec de `local-validation-cli` y transición de
+  `pending` a `blocked` realizada por el leader.
+- Ambigüedad: las fronteras HTTP, redaction y policy requieren configuración
+  explícita que no existe en YAML v1 ni en los flags acordados.
+- Propuesta: incluir una sección `runtime` confiable y validada dentro del
+  documento versionado recibido mediante `--plan`.
+- Informe y pregunta: `progress/local-validation-cli/spec.md`.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-11
+- Trabajo: segundo conjunto de decisiones humanas registrado y transición de
+  `blocked` a `pending` realizada por el leader.
+- Decisión: `--target` obligatorio sustituye la URL del YAML; exit codes
+  0/1/2/3/130; publicación atómica sin sobrescritura, bundle cancelado cuando
+  sea seguro y temporal incompleto conservado para diagnóstico si falla la
+  persistencia.
+- Siguiente fase: completar y validar los tres documentos de la spec.
+
+- Fecha: 2026-10-11
+- Trabajo: segundo bloqueo de la spec de `local-validation-cli` y transición
+  de `pending` a `blocked` realizada por el leader.
+- Decisiones pendientes: precedencia de `--target`, valores de exit code y
+  semántica atómica de colisiones, cancelación y fallos de persistencia.
+- Propuesta completa: `progress/local-validation-cli/spec.md`.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-11
+- Trabajo: decisión humana registrada y transición de `blocked` a `pending`
+  realizada por el leader.
+- Decisión: `featureproof validate` recibirá un segundo archivo versionado con
+  planes y assertions mediante `--plan <ruta>`, además de `--spec` y
+  `--target`.
+- Siguiente fase: completar y validar los tres documentos de la spec.
+
+- Fecha: 2026-10-11
+- Trabajo: spec de `local-validation-cli` bloqueada y transición de `pending`
+  a `blocked` realizada por el leader.
+- Ambigüedad: el YAML v1 no contiene planes ni assertions y no existe todavía
+  un productor determinista que los derive del texto de las constraints.
+- Decisión propuesta: recibir un archivo versionado explícito mediante
+  `--plan <ruta>` junto con `--spec` y `--target`.
+- Informe y pregunta: `progress/local-validation-cli/spec.md`.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-11
+- Trabajo: preflight de `local-validation-cli` completado e inicio de la
+  redacción de `specs/local-validation-cli/{requirements,design,tasks}.md`.
+- Precondiciones: primera feature pendiente, `sdd: true`, criterios de
+  aceptación presentes, features 1-6 `done` y ninguna feature `in_progress`.
+- Contexto clave: componer el flujo local, persistir el layout completo,
+  presentar progreso seguro y mapear resultados a códigos de salida.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-11
+- Trabajo: tercera review aprobada y transición de `in_progress` a `done`
+  realizada por el leader.
+- Evidencia: R1-R10 trazados a tests; formato, vet, compilación, suite, race,
+  repetición race, canarios y coverage en pass.
+- Coverage: 90,5 % global; todos los paquetes modificados superan 85 %.
+- Resumen añadido a `progress/history.md`.
+
+- Fecha: 2026-10-11
+- Trabajo: T7 de la spec revisada de `evidence-redaction` completada y feature
+  preparada para una nueva revisión independiente.
+- Resultado: canarios cubren headers raíz default/adicionales, header anidado
+  con path explícito, paths JSON, body, input, output y proyección del modelo;
+  persistencia numérica y fin de stream quedan trazados a regresiones.
+- Verificación: formato, vet, compilación, suite completa, repetición funcional
+  x20, race completa y race x20 en pass. Coverage global 90,5 %; `evidence`
+  91,0 %, `assertion` 90,6 %, `planning` 89,9 %, `harness` 88,0 % y `jsonpath`
+  100,0 %.
+- Evidencia: `progress/evidence-redaction/implementation.md`.
+- Bloqueos: ninguno.
+
+- Fecha: 2026-10-11
+- Trabajo: T2-T4 reabiertas de `evidence-redaction` completadas conforme a la
+  spec revisada y aprobada.
+- Resultado: headers implícitos limitados a `/headers` raíz exacto; headers
+  anidados protegidos solo por paths explícitos; validación estática alineada;
+  `FileStore.Get` conserva tokens numéricos con `UseNumber` y exige EOF.
+- Verificación intermedia: paquetes afectados repetidos x20 en pass.
+- Siguiente fase: T7, suite canónica, race, coverage y trazabilidad actualizada.
+- Bloqueos: ninguno.
+
+- Fecha: 2026-10-11
+- Trabajo: spec revisada aprobada y transición de `spec_ready` a `in_progress`
+  realizada por el leader.
+- Aprobación: `approved_by: user`, `approved_at: 2026-10-11T20:43:32+02:00`.
+- Alcance revisado: headers automáticos solo en `/headers` raíz; ubicaciones
+  anidadas mediante paths explícitos; round-trip exacto de números JSON.
+- Siguiente fase: completar tareas reabiertas y repetir review completa.
+
+- Fecha: 2026-10-11
+- Trabajo: segunda review rechazada y transición de `in_progress` a
+  `spec_ready` por cambio material requerido en la spec.
+- Hallazgo de diseño: sin un esquema de output, no puede conocerse antes de
+  ejecutar si un path arbitrario contendrá una colección `headers` recursiva.
+- Trabajo independiente autorizado: corregir round-trip exacto de
+  `json.Number` en `FileStore`; la regla de headers queda pausada.
+- Estado: requiere spec revisada y nueva aprobación humana antes de reanudar.
+
+- Fecha: 2026-10-11
+- Trabajo: REV-1 a REV-4 de `evidence-redaction` corregidas tras la primera
+  revisión y preparadas para una nueva revisión independiente.
+- Resultado: ancestros de headers protegidos en assertions; resultado del
+  sanitizer opaco; records con copia profunda y sello revalidable; ciclos de
+  colecciones nombradas detectados desde su identidad original; race
+  reproducible mediante la toolchain UCRT64 de MSYS2.
+- Verificación: formato, vet, compilación, suite completa, race completa y race
+  x20 en paquetes afectados en pass. Coverage global 90,5 %; `evidence` 91,2 %,
+  `assertion` 90,6 %, `planning` 89,9 %, `harness` 88,0 % y `jsonpath` 100,0 %.
+- Evidencia: `progress/evidence-redaction/implementation.md`.
+- Bloqueos: ninguno.
+
+- Fecha: 2026-10-11
+- Trabajo: primera review de `evidence-redaction` rechazada; correcciones
+  devueltas al implementer.
+- Hallazgos: solapamiento incompleto de ancestros de headers sensibles, sello
+  de evidence fabricable/aliases mutables, ciclos en colecciones nombradas y
+  race detector no reproducible con la configuración usada.
+- Estado: `in_progress`; requiere correcciones, tests de regresión, toolchain
+  race reproducible y nueva review.
+
+- Fecha: 2026-10-11
+- Trabajo: implementación T1-T7 de `evidence-redaction` completada y preparada
+  para revisión independiente.
+- Resultado: policy inmutable, sanitizer recursivo/cancelable, persistencia
+  sellada fail-closed, assertions sensibles restringidas, truncación auditable,
+  proyección monotónica del modelo y journal sin payloads.
+- Verificación: formato, vet, compilación, suite, race completa, race x20 y
+  coverage en pass; 90,5 % global y todos los paquetes modificados >= 85 %.
+- Evidencia: `progress/evidence-redaction/implementation.md`.
+- Bloqueos: ninguno.
+
+- Fecha: 2026-10-11
+- Trabajo: T1-T3 de `evidence-redaction` completadas. Policy inmutable,
+  JSON Pointer compartido, redacción recursiva/cancelable, headers protegidos,
+  truncación UTF-8 y rechazo previo de comparadores sobre paths sensibles.
+- Verificación intermedia: `go test ./internal/...` en pass.
+- Siguiente fase: cerrar la frontera sellada de persistencia (T4), proyección
+  del modelo (T5) y propagación/canarios (T6-T7).
+- Bloqueos: ninguno.
+
+- Fecha: 2026-10-11
+- Trabajo: aprobación humana registrada y transición de `spec_ready` a
+  `in_progress` realizada por el leader.
+- Aprobación: `approved_by: user`, `approved_at: 2026-10-11T19:51:22+02:00`.
+- Siguiente fase: implementación T1-T7 con TDD, comentarios funcionales,
+  canarios y verificación canónica.
+
+- Fecha: 2026-10-11
+- Trabajo: spec de `evidence-redaction` completada y transición de `pending` a
+  `spec_ready` realizada por el leader.
+- Artefactos: `requirements.md`, `design.md` y `tasks.md` bajo
+  `specs/evidence-redaction/`.
+- Verificación: R1-R10 contienen criterios de aceptación; T1-T7 cubren todos
+  los requisitos; tareas pendientes y aprobación humana vacía.
+- Decisión incorporada: solo `exists`/`absent` pueden solaparse con rutas
+  sensibles; cualquier comparación de valor se rechaza antes del run.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-11
+- Trabajo: decisión humana registrada y transición de `blocked` al estado
+  anterior `pending` realizada por el leader.
+- Decisión: las rutas sensibles solo admiten assertions `exists`/`absent`; los
+  operadores que necesiten leer el valor se rechazan antes del run.
+- Siguiente fase: completar y validar los tres documentos de la spec.
+
+- Fecha: 2026-10-11
+- Trabajo: spec de `evidence-redaction` bloqueada y transición de `pending` a
+  `blocked` realizada por el leader.
+- Ambigüedad: no está definido si una assertion puede evaluar el valor original
+  de una ruta sensible o debe limitarse a comprobar su presencia/ausencia.
+- Informe y pregunta: `progress/evidence-redaction/spec.md`.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-11
+- Trabajo: preflight de `evidence-redaction` completado e inicio de la redacción
+  de `specs/evidence-redaction/{requirements,design,tasks}.md`.
+- Precondiciones: primera feature pendiente, `sdd: true`, criterios de
+  aceptación presentes, features 1-5 `done` y ninguna feature `in_progress`.
+- Contexto clave: sustituir el sanitizer superficial por una frontera previa a
+  persistencia/modelo que soporte rutas anidadas, límites y vistas distintas.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-11
+- Trabajo: segunda review aprobada y transición de `in_progress` a `done`
+  realizada por el leader.
+- Evidencia: R1-R11 trazados a tests; formato, vet, compilación, suite, race,
+  repetición race y coverage en pass.
+- Coverage: 90,3 % global; 90,4 % en `internal/tools/http` y 90,3 % en
+  `internal/planning`.
+- Limpieza: eliminado el perfil temporal `$cov` generado en la raíz.
+- Resumen añadido a `progress/history.md`.
+
+- Fecha: 2026-10-11
+- Trabajo: primera review de `http-tool` rechazada; correcciones devueltas al
+  implementer.
+- Hallazgos: el dial probaba varias IPs tras un fallo, incumpliendo cero
+  retries, y el límite de request headers no incluía headers automáticos del
+  transporte.
+- Estado: `in_progress`; requiere un único dial, tamaño completo previo a DNS,
+  tests de regresión y nueva review.
+
+- Fecha: 2026-10-11
+- Trabajo: aprobación humana registrada y transición de `spec_ready` a
+  `in_progress` realizada por el leader.
+- Aprobación: `approved_by: user`, `approved_at: 2026-10-11T19:14:19+02:00`.
+- Siguiente fase: implementación T1-T7 con TDD, comentarios funcionales y
+  verificación canónica.
+
+- Fecha: 2026-10-11
+- Trabajo: spec de `http-tool` completada y transición de `pending` a
+  `spec_ready` realizada por el leader.
+- Artefactos: `requirements.md`, `design.md` y `tasks.md` bajo
+  `specs/http-tool/`.
+- Verificación: R1-R11 contienen criterios de aceptación; T1-T7 cubren todos
+  los requisitos; tareas pendientes y aprobación humana vacía.
+- Decisión de alcance: no hay defaults silenciosos; target, métodos, headers,
+  timeout, límites y redirects se configuran explícitamente fuera del input.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-11
+- Trabajo: preflight de `http-tool` completado e inicio de la redacción de
+  `specs/http-tool/{requirements,design,tasks}.md`.
+- Precondiciones: primera feature pendiente, `sdd: true`, criterios de
+  aceptación presentes, features 1-4 `done` y ninguna feature `in_progress`.
+- Contexto clave: el adapter debe quedar detrás del registry, resolver siempre
+  contra el target autorizado, revalidar redirects y no persistir evidencia.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-11
+- Trabajo: tercera review aprobada y transición de `in_progress` a `done`
+  realizada por el leader.
+- Evidencia: R1-R9 trazados a tests; formato, vet, compilación, suite, race,
+  repetición race y coverage en pass.
+- Coverage: 90,2 % global; 90,0 % en `internal/assertion` y 90,3 % en
+  `internal/planning`.
+- Resumen añadido a `progress/history.md`.
+
+- Fecha: 2026-10-11
+- Trabajo: segunda review de `assertion-engine` rechazada; REV-1 y REV-2
+  confirmadas como corregidas y REV-3 devuelta al implementer.
+- Hallazgo: coverage global reproducible de 89,0 %, por debajo del 90,1 % de la
+  feature anterior y sin justificación aprobada.
+- Estado: `in_progress`; requiere tests de comportamiento relevantes hasta
+  recuperar el baseline, reverificación y tercera review.
+
+- Fecha: 2026-10-11
+- Trabajo: primera review de `assertion-engine` rechazada; correcciones
+  devueltas al implementer.
+- Hallazgos: la representación numérica expandía o rechazaba exponentes JSON
+  extremos y la cancelación no se observaba durante compilación ni al construir
+  resultados sin evidencia.
+- Estado: `in_progress`; requiere comparación decimal acotada, propagación de
+  contexto por ambas rutas, tests deterministas y nueva review.
+
+- Fecha: 2026-10-11
+- Trabajo: aprobación humana registrada y transición de `spec_ready` a
+  `in_progress` realizada por el leader.
+- Aprobación: `approved_by: user`, `approved_at: 2026-10-11T18:41:50+02:00`.
+- Siguiente fase: implementación T1-T6 con TDD, comentarios funcionales y
+  verificación canónica.
+
+- Fecha: 2026-10-11
+- Trabajo: spec de `assertion-engine` completada y transición de `pending` a
+  `spec_ready` realizada por el leader.
+- Artefactos: `requirements.md`, `design.md` y `tasks.md` bajo
+  `specs/assertion-engine/`.
+- Verificación: R1-R9 contienen criterios de aceptación; T1-T6 cubren todos los
+  requisitos; bloque de aprobación humana pendiente y código productivo sin
+  cambios.
+- Revisión del leader: se eliminó la ambigüedad de tokens numéricos en paths;
+  las formas con signo o ceros iniciales son inválidas globalmente.
+
+- Fecha: 2026-10-11
+- Trabajo: preflight de `assertion-engine` completado e inicio de la redacción
+  de `specs/assertion-engine/{requirements,design,tasks}.md`.
+- Precondiciones: primera feature pendiente, `sdd: true`, criterios de
+  aceptación suficientes, features 1-3 `done` y ninguna feature
+  `in_progress`.
+- Contexto clave: debe implementar el puerto `StepAssertionEvaluator` creado
+  por la feature 3 sin introducir participación del modelo en el resultado.
+- Código productivo modificado para esta feature: no.
 
 - Fecha: 2026-10-11
 - Trabajo: quinta review aprobada y transición de `in_progress` a `done`
@@ -268,3 +656,67 @@ independiente aprobó R1-R9 y el leader completó la verificación final.
   y coverage pasan; coverage global final 90.1 %.
 - Segunda review corregida: agotamiento de retries y tool calls reserva ambos
   presupuestos atómicamente y termina el run de forma inconclusa y auditable.
+
+- Fecha: 2026-10-11
+- Trabajo: T1-T5 de `assertion-engine` implementadas y verificadas incrementalmente.
+- Código: contratos tipados de resultado en `planning`; puerto obligatorio de validación; paquete `internal/assertion` con compilador, paths, comparación exacta, grupos y adapter del executor.
+- Tests: validación previa, paths, operadores, grupos completos, resultados inmutables, falta de evidencia, cancelación e integración real con bloqueo de dependientes.
+- Estado: pendiente T6, verificación canónica y trazabilidad final.
+
+- Fecha: 2026-10-11
+- Trabajo: T6 completada para `assertion-engine`; implementación preparada para revisión independiente.
+- Verificación: gofmt, vet, compilación, suite completa, race completa y repetición race x20 en paquetes afectados en pass.
+- Coverage: 90,6 % global; 91,6 % en `internal/assertion`; 90,3 % en `internal/planning`.
+- Trazabilidad: R1-R9 vinculados a tests reales en `progress/assertion-engine/implementation.md`.
+- Estado: `in_progress`; el implementer solicita review y no modifica `feature_list.json`.
+
+- Fecha: 2026-10-11
+- Trabajo: correcciones REV-1 y REV-2 de `http-tool` implementadas tras la primera review.
+- REV-1: selección determinista de una sola IP fijada y exactamente un intento de dial por `Execute`, incluso si DNS devuelve alternativas.
+- REV-2: medición pre-red del bloque completo de headers serializados y supresión de `Accept-Encoding`/`Connection: close` automáticos no medidos; redirects usan el mismo límite antes del siguiente dial.
+- Tests de regresión: varias IPs con primer dial fallido; límite menor que headers automáticos con cero resolver/dial; conteo explícito de Host, User-Agent, Content-Length y headers controlados.
+- Estado: pendiente reverificación canónica y nueva review independiente.
+
+- Fecha: 2026-10-11
+- Trabajo: REV-1 y REV-2 reverificadas y preparadas para segunda review independiente.
+- Verificación: formato, vet, compilación, suite completa, race completa, race x20 y coverage en pass.
+- Coverage final: 90,3 % global, 90,4 % en `internal/tools/http` y 90,3 % en `internal/planning`; baseline global 90,2 % preservado.
+- Estado: `in_progress`; el implementer solicita nueva review y no modifica `feature_list.json` ni `review.md`.
+
+- Fecha: 2026-10-11
+- Trabajo: correcciones REV-1 y REV-2 de `assertion-engine` implementadas tras la primera revisión.
+- REV-1: representación decimal simbólica con exponente arbitrario y comparación exacta sin expandir potencias; tests con exponentes fuera de `int32` y coste acotado.
+- REV-2: cancelación observada en compilación, construcción de roots sin evidencia y antes de retornos funcionales; tests deterministas sin `time.Sleep`.
+- Verificación: gofmt, vet, compilación, suite, race completa y race x20 en pass.
+- Coverage: 89,0 % global; 86,1 % en `internal/assertion`; 90,3 % en `internal/planning`.
+- Estado: correcciones preparadas para una segunda revisión; feature continúa `in_progress`.
+
+- Fecha: 2026-10-11
+- Trabajo: corrección REV-3 de `assertion-engine` implementada tras la segunda revisión.
+- Tests añadidos: límites reales de configuración, ciclos de colecciones, igualdad estricta de objetos/arrays/null/bool, numeric missing y agregación de múltiples roots.
+- Coverage: 90,2 % global, recuperando el baseline de 90,1 %; 90,0 % en `internal/assertion`; 90,3 % en `internal/planning`.
+- Verificación: gofmt, vet, compilación, suite completa, race completa y race x20 en paquetes afectados en pass.
+- Estado: corrección preparada para tercera revisión independiente; feature continúa `in_progress`.
+- Fecha: 2026-10-11
+- Trabajo: implementación de `http-tool` iniciada; precondiciones SDD verificadas y T1 en curso.
+- Alcance: adapter `internal/tools/http` con target y permisos externos al input, sin ownership de run, journal o evidence.
+- Estrategia: contratos y errores tipados primero; después validación, scope, transporte fijado, captura acotada e integración.
+
+- Fecha: 2026-10-11
+- Trabajo: T1-T5 de `http-tool` implementadas y verificadas con tests locales controlados.
+- Resultado: configuración inmutable, input v1, target scope, DNS fijado, transporte sin proxy, redirects, timeout/cancelación, límites, filtrado de secretos y output estructurado.
+- Verificación intermedia: `go test -cover ./internal/tools/http ./internal/planning` en pass; cobertura `internal/tools/http` 88,3 % y `internal/planning` 90,3 %.
+- Siguiente paso: cerrar integración T6, endurecer límites de headers en transporte y ejecutar T7 canónica.
+
+- Fecha: 2026-10-11
+- Trabajo: T6 completada para `http-tool` mediante integración real con registry y plan executor.
+- Evidencia: la ejecución directa no toca store/journal; al ejecutar el plan, solo el executor persiste y evalúa status/body estructurados.
+- Endurecimiento: el transporte corta el bloque de headers en el límite configurado antes de entregarlo al parser HTTP y clasifica `response_limit`.
+- Siguiente paso: T7, suite hermética completa, race, coverage global y trazabilidad R1-R11.
+
+- Fecha: 2026-10-11
+- Trabajo: T7 completada; `http-tool` preparada para review independiente.
+- Verificación: formato, vet, compilación, suite completa, race completa y repetición race x20 en paquetes afectados en pass.
+- Coverage: 90,4 % global, 91,2 % en `internal/tools/http` y 90,3 % en `internal/planning`.
+- Trazabilidad: R1-R11 vinculados a tests reales en `progress/http-tool/implementation.md`.
+- Estado: `in_progress`; el implementer solicita review y no modifica `feature_list.json`.

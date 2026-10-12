@@ -42,7 +42,7 @@ type ModelDecision struct {
 // Observation is the sanitized evidence summary returned to the next model step.
 type Observation struct {
 	EvidenceID string
-	Output     map[string]any
+	Output     any
 	ErrorClass ErrorClass
 }
 

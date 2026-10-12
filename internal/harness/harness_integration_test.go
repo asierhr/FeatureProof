@@ -2,8 +2,12 @@ package harness_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +18,14 @@ import (
 	"github.com/asierhr/featureProof/internal/policy"
 	"github.com/asierhr/featureProof/internal/tools"
 )
+
+// rejectingProjector simulates a safe context-construction failure after evidence confirmation.
+type rejectingProjector struct{}
+
+// Project rejects the model view without exposing persisted content in its error.
+func (rejectingProjector) Project(context.Context, evidence.Record) (any, error) {
+	return nil, errors.New("projection unavailable")
+}
 
 type clock struct{ now time.Time }
 
@@ -104,6 +116,16 @@ type fixture struct {
 	waiter  *waiter
 }
 
+// sanitizerFor creates explicit safe evidence configuration for harness tests.
+func sanitizerFor(t *testing.T, paths ...string) evidence.Sanitizer {
+	t.Helper()
+	configured, err := evidence.NewPolicy(evidence.Config{MaxBodyBytes: 1024, SensitiveJSONPaths: paths})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return evidence.NewSanitizer(configured)
+}
+
 func fixtureFor(t *testing.T, decisions []harness.ModelDecision, results []harness.ToolResult, limits harness.Limits) fixture {
 	t.Helper()
 	m := &model.Fake{Decisions: decisions}
@@ -124,7 +146,7 @@ func fixtureFor(t *testing.T, decisions []harness.ModelDecision, results []harne
 	}
 	j := harness.NewMemoryJournal()
 	w := &waiter{}
-	h, err := harness.New(harness.Config{RunID: "run-1", Objective: "check", ConstraintID: "constraint-1", Limits: limits}, harness.Dependencies{Model: m, Registry: reg, Policy: p, Evidence: store, Journal: j, Sanitizer: evidence.Sanitizer{Sensitive: map[string]bool{"token": true}}, Clock: &clock{}, IDs: &ids{}, Waiter: w})
+	h, err := harness.New(harness.Config{RunID: "run-1", Objective: "check", ConstraintID: "constraint-1", Limits: limits}, harness.Dependencies{Model: m, Registry: reg, Policy: p, Evidence: store, Journal: j, Sanitizer: sanitizerFor(t, "/token"), Clock: &clock{}, IDs: &ids{}, Waiter: w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,11 +166,83 @@ func TestHarnessReturnsPersistedToolObservationToModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	reqs := f.model.CapturedRequests()
-	if len(reqs) != 2 || len(reqs[1].Observations) != 1 || reqs[1].Observations[0].EvidenceID != "ev-1" || reqs[1].Observations[0].Output["token"] != "[REDACTED]" {
+	if len(reqs) != 2 || len(reqs[1].Observations) != 1 {
+		t.Fatalf("observation missing: %#v", reqs)
+	}
+	observedOutput, _ := reqs[1].Observations[0].Output.(map[string]any)
+	if reqs[1].Observations[0].EvidenceID != "ev-1" || observedOutput["token"] != "[REDACTED]" {
 		t.Fatalf("observation not persisted/sanitized: %#v", reqs)
 	}
 	if r.Verdict.Status != harness.VerdictPassed {
 		t.Fatalf("model claim controlled verdict: %+v", r.Verdict)
+	}
+}
+
+// TestModelProjectionFailurePreventsModelCall traces R8's fail-closed context boundary.
+func TestModelProjectionFailurePreventsModelCall(t *testing.T) {
+	m := &model.Fake{Decisions: []harness.ModelDecision{proposal("probe"), complete(harness.VerdictPassed, "ev-1")}}
+	tool := &tools.Fake{Results: []harness.ToolResult{{Output: map[string]any{"status": "ok"}}}}
+	reg, _ := tools.NewRegistry(harness.ToolSpec{Name: "probe", Validate: func(map[string]any) error { return nil }, Tool: tool})
+	store, _ := evidence.NewFileStore(t.TempDir())
+	policyConfig, _ := evidence.NewPolicy(evidence.Config{MaxBodyBytes: 64})
+	h, err := harness.New(harness.Config{RunID: "projection", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 2, MaxToolCalls: 1}}, harness.Dependencies{Model: m, Registry: reg, Policy: &policy.Static{Decisions: map[string]harness.PolicyDecision{"probe": {Allowed: true}}}, Evidence: store, Journal: harness.NewMemoryJournal(), Sanitizer: evidence.NewSanitizer(policyConfig), Projector: rejectingProjector{}, Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := h.Run(context.Background())
+	if err == nil || run.Status != harness.StatusFailed || len(m.CapturedRequests()) != 1 || tool.CallCount() != 1 {
+		t.Fatalf("projection failure crossed model boundary: run=%#v calls=%d err=%v", run, len(m.CapturedRequests()), err)
+	}
+}
+
+// TestCanarySecretsNeverAppearInArtifactsEventsReportsOrModelContext traces R9 end to end.
+func TestCanarySecretsNeverAppearInArtifactsEventsReportsOrModelContext(t *testing.T) {
+	canaries := []string{"auth-canary", "extra-header-canary", "nested-header-canary", "json-canary", "body-canary", "model-canary", "input-canary"}
+	policyConfig, err := evidence.NewPolicy(evidence.Config{MaxBodyBytes: 8, AdditionalHeaders: []string{"X-Api-Key"}, SensitiveJSONPaths: []string{"/token", "/exchange/headers/Authorization", "/credentials/secret", "/body"}, ModelSensitiveJSONPaths: []string{"/model_only"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &model.Fake{Decisions: []harness.ModelDecision{{Version: 1, Kind: harness.DecisionPropose, Call: &harness.ToolCall{ID: "call", Tool: "probe", ConstraintID: "constraint-1", Input: map[string]any{"target": "local", "token": canaries[6]}}, Assertion: &harness.Assertion{Field: "status", Expected: "ok"}}, complete(harness.VerdictPassed, "ev-1")}}
+	tool := &tools.Fake{Results: []harness.ToolResult{{Output: map[string]any{"status": "ok", "headers": map[string]any{"Authorization": canaries[0], "X-Api-Key": canaries[1]}, "exchange": map[string]any{"headers": map[string]any{"Authorization": canaries[2]}}, "credentials": map[string]any{"secret": canaries[3]}, "body": canaries[4], "model_only": canaries[5]}}}}
+	reg, _ := tools.NewRegistry(harness.ToolSpec{Name: "probe", Validate: func(map[string]any) error { return nil }, Tool: tool})
+	dir := t.TempDir()
+	store, _ := evidence.NewFileStore(dir)
+	journal := harness.NewMemoryJournal()
+	h, err := harness.New(harness.Config{RunID: "run-canary", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 2, MaxToolCalls: 1}}, harness.Dependencies{Model: m, Registry: reg, Policy: &policy.Static{Decisions: map[string]harness.PolicyDecision{"probe": {Allowed: true}}}, Evidence: store, Journal: journal, Sanitizer: evidence.NewSanitizer(policyConfig), Projector: evidence.NewModelEvidenceProjector(policyConfig), Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := h.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(context.Background(), "ev-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := journal.Events(context.Background(), "run-canary")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := json.Marshal([]any{run, record, events, m.CapturedRequests()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, canary := range []string{canaries[0], canaries[1], canaries[2], canaries[3], canaries[4], canaries[6]} {
+		if strings.Contains(string(artifact), canary) {
+			t.Fatalf("canary leaked: %s in %s", canary, artifact)
+		}
+		disk, readErr := os.ReadFile(filepath.Join(dir, "ev-1.json"))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if strings.Contains(string(disk), canary) {
+			t.Fatalf("canary leaked to evidence file: %s", canary)
+		}
+	}
+	modelArtifact, err := json.Marshal(m.CapturedRequests())
+	if err != nil || strings.Contains(string(modelArtifact), canaries[5]) {
+		t.Fatalf("model-only canary leaked to model: %s", modelArtifact)
 	}
 }
 
@@ -283,7 +377,7 @@ func TestHarnessDoesNotRetryEffectfulToolWithoutIdempotency(t *testing.T) {
 		t.Fatal(err)
 	}
 	store, _ := evidence.NewFileStore(t.TempDir())
-	h, err := harness.New(harness.Config{RunID: "run-effect", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 1, MaxToolCalls: 2, MaxRetries: 1}}, harness.Dependencies{Model: m, Registry: reg, Policy: &policy.Static{Decisions: map[string]harness.PolicyDecision{"probe": {Allowed: true}}}, Evidence: store, Journal: harness.NewMemoryJournal(), Sanitizer: evidence.Sanitizer{}, Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
+	h, err := harness.New(harness.Config{RunID: "run-effect", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 1, MaxToolCalls: 2, MaxRetries: 1}}, harness.Dependencies{Model: m, Registry: reg, Policy: &policy.Static{Decisions: map[string]harness.PolicyDecision{"probe": {Allowed: true}}}, Evidence: store, Journal: harness.NewMemoryJournal(), Sanitizer: sanitizerFor(t), Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +433,7 @@ func TestHarnessPersistsRelatedEvidenceBeforeUse(t *testing.T) {
 
 func TestHarnessFailsWhenEvidenceCannotBePersisted(t *testing.T) {
 	f := fixtureFor(t, []harness.ModelDecision{proposal("probe")}, []harness.ToolResult{{Output: map[string]any{"status": "ok"}}}, harness.Limits{MaxSteps: 1, MaxToolCalls: 1})
-	h, err := harness.New(harness.Config{RunID: "run-x", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 1, MaxToolCalls: 1}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: failingStore{}, Journal: f.journal, Sanitizer: evidence.Sanitizer{}, Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
+	h, err := harness.New(harness.Config{RunID: "run-x", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 1, MaxToolCalls: 1}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: failingStore{}, Journal: f.journal, Sanitizer: sanitizerFor(t), Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +530,7 @@ func TestHarnessPropagatesCancellationAndPreservesConfirmedRecords(t *testing.T)
 func TestHarnessCancelsDuringEvidencePersistenceAndPreservesConfirmedRecords(t *testing.T) {
 	f := fixtureFor(t, []harness.ModelDecision{proposal("probe"), proposal("probe")}, []harness.ToolResult{{Output: map[string]any{"status": "first"}}, {Output: map[string]any{"status": "second"}}}, harness.Limits{MaxSteps: 2, MaxToolCalls: 2})
 	store := &blockingStore{inner: f.store, blockSaveAt: 2, started: make(chan struct{})}
-	h, err := harness.New(harness.Config{RunID: "run-save-cancel", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 2, MaxToolCalls: 2}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: store, Journal: f.journal, Sanitizer: evidence.Sanitizer{}, Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
+	h, err := harness.New(harness.Config{RunID: "run-save-cancel", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 2, MaxToolCalls: 2}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: store, Journal: f.journal, Sanitizer: sanitizerFor(t), Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -458,7 +552,7 @@ func TestHarnessCancelsDuringEvidencePersistenceAndPreservesConfirmedRecords(t *
 func TestHarnessCancelsDuringEvidenceRecoveryAndPreservesConfirmedRecords(t *testing.T) {
 	f := fixtureFor(t, []harness.ModelDecision{proposal("probe"), complete("", "ev-1")}, []harness.ToolResult{{Output: map[string]any{"status": "ok"}}}, harness.Limits{MaxSteps: 2, MaxToolCalls: 1})
 	store := &blockingStore{inner: f.store, blockGet: true, started: make(chan struct{})}
-	h, err := harness.New(harness.Config{RunID: "run-get-cancel", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 2, MaxToolCalls: 1}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: store, Journal: f.journal, Sanitizer: evidence.Sanitizer{}, Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
+	h, err := harness.New(harness.Config{RunID: "run-get-cancel", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 2, MaxToolCalls: 1}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: store, Journal: f.journal, Sanitizer: sanitizerFor(t), Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +580,7 @@ func TestHarnessStopsWhenJournalFailsBeforeOrDuringExecution(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := fixtureFor(t, []harness.ModelDecision{proposal("probe")}, []harness.ToolResult{{Output: map[string]any{"status": "ok"}}}, harness.Limits{MaxSteps: 1, MaxToolCalls: 1})
 			journal := &failingJournal{inner: harness.NewMemoryJournal(), failAt: tc.failAt, failType: tc.failType, failRemaining: 1}
-			h, err := harness.New(harness.Config{RunID: "run-journal-" + tc.name, Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 1, MaxToolCalls: 1}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: f.store, Journal: journal, Sanitizer: evidence.Sanitizer{}, Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
+			h, err := harness.New(harness.Config{RunID: "run-journal-" + tc.name, Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 1, MaxToolCalls: 1}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: f.store, Journal: journal, Sanitizer: sanitizerFor(t), Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -505,7 +599,7 @@ func TestHarnessStopsWhenJournalFailsBeforeOrDuringExecution(t *testing.T) {
 func TestHarnessConfirmsTerminalAfterTransientJournalFailure(t *testing.T) {
 	f := fixtureFor(t, []harness.ModelDecision{complete("")}, nil, harness.Limits{MaxSteps: 1})
 	journal := &failingJournal{inner: harness.NewMemoryJournal(), failType: harness.EventRunCompleted, failRemaining: 1}
-	h, err := harness.New(harness.Config{RunID: "run-terminal-retry", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 1}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: f.store, Journal: journal, Sanitizer: evidence.Sanitizer{}, Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
+	h, err := harness.New(harness.Config{RunID: "run-terminal-retry", Objective: "check", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 1}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: f.store, Journal: journal, Sanitizer: sanitizerFor(t), Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +639,7 @@ func TestHarnessPropagatesMandatoryJournalFailures(t *testing.T) {
 				f.model.Errors = []error{tc.modelError}
 			}
 			journal := &failingJournal{inner: harness.NewMemoryJournal(), failType: tc.event, failRemaining: 1}
-			h, err := harness.New(harness.Config{RunID: "run-audit-" + tc.name, Objective: "check", ConstraintID: "constraint-1", Limits: tc.limits}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: f.store, Journal: journal, Sanitizer: evidence.Sanitizer{}, Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
+			h, err := harness.New(harness.Config{RunID: "run-audit-" + tc.name, Objective: "check", ConstraintID: "constraint-1", Limits: tc.limits}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: f.policy, Evidence: f.store, Journal: journal, Sanitizer: sanitizerFor(t), Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -640,6 +734,24 @@ func TestHarnessConstructorRejectsMissingDependencies(t *testing.T) {
 	}
 }
 
+// TestHarnessConstructorRejectsInvalidRedactionComposition traces R1 before any model or tool effect.
+func TestHarnessConstructorRejectsInvalidRedactionComposition(t *testing.T) {
+	m := &model.Fake{}
+	tool := &tools.Fake{}
+	registry, _ := tools.NewRegistry(harness.ToolSpec{Name: "probe", Validate: func(map[string]any) error { return nil }, Tool: tool})
+	store, _ := evidence.NewFileStore(t.TempDir())
+	base := harness.Dependencies{Model: m, Registry: registry, Policy: &policy.Static{}, Evidence: store, Journal: harness.NewMemoryJournal(), Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}}
+	config := harness.Config{RunID: "r", Objective: "o", ConstraintID: "c", Limits: harness.Limits{MaxSteps: 1}}
+	if _, err := harness.New(config, base); err == nil || len(m.CapturedRequests()) != 0 || tool.CallCount() != 0 {
+		t.Fatal("unconfigured sanitizer reached execution")
+	}
+	modelPolicy, _ := evidence.NewPolicy(evidence.Config{MaxBodyBytes: 64, ModelSensitiveJSONPaths: []string{"/private"}})
+	base.Sanitizer = evidence.NewSanitizer(modelPolicy)
+	if _, err := harness.New(config, base); err == nil || len(m.CapturedRequests()) != 0 || tool.CallCount() != 0 {
+		t.Fatal("missing model projector reached execution")
+	}
+}
+
 func TestHarnessClassifiesPermanentModelAndPolicyErrors(t *testing.T) {
 	t.Run("model", func(t *testing.T) {
 		f := fixtureFor(t, []harness.ModelDecision{complete("")}, nil, harness.Limits{MaxSteps: 1})
@@ -651,7 +763,7 @@ func TestHarnessClassifiesPermanentModelAndPolicyErrors(t *testing.T) {
 	})
 	t.Run("policy", func(t *testing.T) {
 		f := fixtureFor(t, []harness.ModelDecision{proposal("probe")}, nil, harness.Limits{MaxSteps: 1, MaxToolCalls: 1})
-		h, err := harness.New(harness.Config{RunID: "run-policy", Objective: "goal", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 1, MaxToolCalls: 1}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: failingPolicy{err: errors.New("policy failed")}, Evidence: f.store, Journal: f.journal, Sanitizer: evidence.Sanitizer{}, Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
+		h, err := harness.New(harness.Config{RunID: "run-policy", Objective: "goal", ConstraintID: "constraint-1", Limits: harness.Limits{MaxSteps: 1, MaxToolCalls: 1}}, harness.Dependencies{Model: f.model, Registry: registryFrom(t, f.tool), Policy: failingPolicy{err: errors.New("policy failed")}, Evidence: f.store, Journal: f.journal, Sanitizer: sanitizerFor(t), Clock: &clock{}, IDs: &ids{}, Waiter: &waiter{}})
 		if err != nil {
 			t.Fatal(err)
 		}

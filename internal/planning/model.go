@@ -62,7 +62,7 @@ const (
 	ValueArray ValueType = "array"
 )
 
-// AssertionDeclaration carries opaque structured assertion configuration until the assertion-engine feature owns its semantics.
+// AssertionDeclaration keeps structured assertion configuration opaque to planning while the assertion engine owns its semantics.
 type AssertionDeclaration struct {
 	ID         string
 	Definition map[string]any
@@ -82,27 +82,67 @@ const (
 	StepBlocked StepStatus = "blocked"
 )
 
+// AssertionStatus is the deterministic functional outcome shared across the assertion boundary.
+type AssertionStatus string
+
+const (
+	// AssertionPassed means confirmed evidence satisfies the assertion node.
+	AssertionPassed AssertionStatus = "passed"
+	// AssertionFailed means confirmed evidence contradicts the assertion node.
+	AssertionFailed AssertionStatus = "failed"
+	// AssertionInconclusive means no confirmed terminal evidence can support a decision.
+	AssertionInconclusive AssertionStatus = "inconclusive"
+)
+
+// AssertionValue preserves explicit presence so JSON null remains distinct from a missing path.
+type AssertionValue struct {
+	Present bool
+	Value   any
+}
+
+// AssertionCause records a stable machine-readable explanation for a non-passing assertion node.
+type AssertionCause struct {
+	Category  string `json:"category"`
+	FieldPath string `json:"field_path"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+// AssertionResult is the auditable tree returned by the deterministic assertion evaluator.
+type AssertionResult struct {
+	DeclarationID string            `json:"declaration_id"`
+	NodePath      string            `json:"node_path"`
+	Operator      string            `json:"operator"`
+	Path          string            `json:"path"`
+	Expected      AssertionValue    `json:"expected,omitempty"`
+	Observed      AssertionValue    `json:"observed,omitempty"`
+	Status        AssertionStatus   `json:"status"`
+	EvidenceIDs   []string          `json:"evidence_ids"`
+	Children      []AssertionResult `json:"children,omitempty"`
+	Cause         *AssertionCause   `json:"cause,omitempty"`
+}
+
 // BlockingCause records one direct non-passing dependency in declaration order.
 type BlockingCause struct {
-	StepID string
-	Status StepStatus
+	StepID string     `json:"step_id"`
+	Status StepStatus `json:"status"`
 }
 
 // StepCause records a stable machine-readable reason for an inconclusive step.
 type StepCause struct {
-	Category  ErrorCategory
-	FieldPath string
-	Detail    string
+	Category  ErrorCategory `json:"category"`
+	FieldPath string        `json:"field_path"`
+	Detail    string        `json:"detail,omitempty"`
 }
 
 // StepResult is the immutable terminal view of one selected or blocked step.
 type StepResult struct {
-	StepID             string
-	Status             StepStatus
-	EvidenceIDs        []string
-	TerminalEvidenceID string
-	BlockingCauses     []BlockingCause
-	Cause              *StepCause
+	StepID             string            `json:"step_id"`
+	Status             StepStatus        `json:"status"`
+	EvidenceIDs        []string          `json:"evidence_ids"`
+	TerminalEvidenceID string            `json:"terminal_evidence_id,omitempty"`
+	BlockingCauses     []BlockingCause   `json:"blocking_causes,omitempty"`
+	Cause              *StepCause        `json:"cause,omitempty"`
+	AssertionResults   []AssertionResult `json:"assertions"`
 }
 
 // PlanResult aggregates terminal step results in declaration order.

@@ -32,7 +32,7 @@ type Constraint struct {
 
 // Limits bounds the work allowed for a validation.
 type Limits struct {
-	MaxSteps     int
-	MaxToolCalls int
-	MaxRetries   int
+	MaxSteps     int `json:"max_steps"`
+	MaxToolCalls int `json:"max_tool_calls"`
+	MaxRetries   int `json:"max_retries"`
 }

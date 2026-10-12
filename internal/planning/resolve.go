@@ -16,9 +16,9 @@ func ResolveStepInput(ctx context.Context, runID string, step PlanStep, results 
 		return nil, fmt.Errorf("evidence store is required")
 	}
 	out := make(map[string]any, len(step.Input))
-	for _, key := range sortedInputKeys(step.Input) {
+	for keyIndex, key := range sortedInputKeys(step.Input) {
 		value := step.Input[key]
-		resolved, err := resolveInputValue(ctx, runID, value, results, store, "input."+key)
+		resolved, err := resolveInputValue(ctx, runID, value, results, store, fmt.Sprintf("input.members[%d]", keyIndex))
 		if err != nil {
 			return nil, err
 		}
@@ -34,9 +34,9 @@ func resolveInputValue(ctx context.Context, runID string, value InputValue, resu
 	}
 	if value.Object != nil {
 		out := make(map[string]any, len(value.Object))
-		for _, key := range sortedInputKeys(value.Object) {
+		for keyIndex, key := range sortedInputKeys(value.Object) {
 			child := value.Object[key]
-			resolved, err := resolveInputValue(ctx, runID, child, results, store, path+"."+key)
+			resolved, err := resolveInputValue(ctx, runID, child, results, store, fmt.Sprintf("%s.members[%d]", path, keyIndex))
 			if err != nil {
 				return nil, err
 			}

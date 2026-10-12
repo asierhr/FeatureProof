@@ -11,15 +11,20 @@ import (
 	"github.com/asierhr/featureProof/internal/harness"
 )
 
-// StepEvaluation is the minimal deterministic outcome supplied by the assertion-engine boundary.
+// StepEvaluation carries the deterministic step outcome and complete auditable assertion trees.
 type StepEvaluation struct {
-	Status   StepStatus
-	Metadata map[string]any
+	Status  StepStatus
+	Results []AssertionResult
 }
 
 // StepAssertionEvaluator derives a step outcome from confirmed evidence without using a model.
 type StepAssertionEvaluator interface {
-	Evaluate(context.Context, PlanStep, map[string]any, []string) (StepEvaluation, error)
+	Evaluate(context.Context, PlanStep, any, []string) (StepEvaluation, error)
+}
+
+// TruncationAwareEvaluator prevents value assertions from treating a body prefix as complete evidence.
+type TruncationAwareEvaluator interface {
+	EvaluateWithTruncation(context.Context, PlanStep, any, []evidence.Truncation, []string) (StepEvaluation, error)
 }
 
 // ExecutorDependencies contains every replaceable boundary used during deterministic plan execution.
@@ -54,6 +59,9 @@ func NewPlanExecutor(config ExecutorConfig, dependencies ExecutorDependencies) (
 	}
 	if dependencies.Registry == nil || dependencies.Policy == nil || dependencies.Evidence == nil || dependencies.Journal == nil || dependencies.Clock == nil || dependencies.IDs == nil || dependencies.Waiter == nil || dependencies.Evaluator == nil {
 		return nil, fmt.Errorf("all plan executor dependencies are required")
+	}
+	if !dependencies.Sanitizer.Configured() {
+		return nil, fmt.Errorf("validated evidence sanitizer is required")
 	}
 	return &PlanExecutor{config: config, deps: dependencies}, nil
 }
@@ -168,7 +176,18 @@ func (e *PlanExecutor) executeStep(ctx context.Context, plan ValidationPlan, ste
 		if err := e.append(ctx, plan, harness.Event{Type: harness.EventExecutionFinished, StepID: step.ID, ToolCallID: call.ID}); err != nil {
 			return StepResult{}, err
 		}
-		record := evidence.Record{ID: e.deps.IDs.Next(), RunID: e.config.Run.ID, PlanID: plan.ID, StepID: step.ID, ToolCallID: call.ID, ToolName: call.Tool, Attempt: attempt, StartedAt: started, Duration: duration, Input: e.deps.Sanitizer.Map(input), Output: e.deps.Sanitizer.Map(toolResult.Output), ErrorClass: string(toolResult.ErrorClass)}
+		sanitizedInput, sanitizeErr := e.deps.Sanitizer.Sanitize(ctx, input)
+		if sanitizeErr != nil {
+			return StepResult{}, fmt.Errorf("sanitize step %s input: %w", step.ID, sanitizeErr)
+		}
+		sanitizedOutput, sanitizeErr := e.deps.Sanitizer.Sanitize(ctx, toolResult.Output)
+		if sanitizeErr != nil {
+			return StepResult{}, fmt.Errorf("sanitize step %s output: %w", step.ID, sanitizeErr)
+		}
+		record, recordErr := evidence.NewRecord(evidence.Record{ID: e.deps.IDs.Next(), RunID: e.config.Run.ID, PlanID: plan.ID, StepID: step.ID, ToolCallID: call.ID, ToolName: call.Tool, Attempt: attempt, StartedAt: started, Duration: duration, ErrorClass: string(toolResult.ErrorClass)}, sanitizedInput, sanitizedOutput)
+		if recordErr != nil {
+			return StepResult{}, fmt.Errorf("seal step %s evidence: %w", step.ID, recordErr)
+		}
 		if err := e.deps.Evidence.Save(ctx, record); err != nil {
 			if cancellation(ctx, err) {
 				return StepResult{}, cancellationCause(ctx, err)
@@ -176,7 +195,7 @@ func (e *PlanExecutor) executeStep(ctx context.Context, plan ValidationPlan, ste
 			return StepResult{}, fmt.Errorf("persist step %s evidence: %w", step.ID, err)
 		}
 		evidenceIDs = append(evidenceIDs, record.ID)
-		if err := e.append(ctx, plan, harness.Event{Type: harness.EventEvidencePersisted, StepID: step.ID, ToolCallID: call.ID, EvidenceIDs: []string{record.ID}}); err != nil {
+		if err := e.append(ctx, plan, harness.Event{Type: harness.EventEvidencePersisted, StepID: step.ID, ToolCallID: call.ID, EvidenceIDs: []string{record.ID}, Truncations: planEventTruncations(sanitizedInput.Truncations(), sanitizedOutput.Truncations())}); err != nil {
 			return StepResult{}, err
 		}
 		if toolResult.ErrorClass != harness.ErrorTransient {
@@ -193,7 +212,12 @@ func (e *PlanExecutor) executeStep(ctx context.Context, plan ValidationPlan, ste
 			if confirmed.RunID != e.config.Run.ID || confirmed.PlanID != plan.ID || confirmed.StepID != step.ID || confirmed.ErrorClass != "" {
 				return StepResult{}, fmt.Errorf("terminal evidence %s has invalid origin", record.ID)
 			}
-			evaluation, err := e.deps.Evaluator.Evaluate(ctx, step, confirmed.Output, append([]string(nil), evidenceIDs...))
+			var evaluation StepEvaluation
+			if aware, ok := e.deps.Evaluator.(TruncationAwareEvaluator); ok {
+				evaluation, err = aware.EvaluateWithTruncation(ctx, step, confirmed.Output, confirmed.OutputTruncations, append([]string(nil), evidenceIDs...))
+			} else {
+				evaluation, err = e.deps.Evaluator.Evaluate(ctx, step, confirmed.Output, append([]string(nil), evidenceIDs...))
+			}
 			if err != nil {
 				if cancellation(ctx, err) {
 					return StepResult{}, cancellationCause(ctx, err)
@@ -203,7 +227,7 @@ func (e *PlanExecutor) executeStep(ctx context.Context, plan ValidationPlan, ste
 			if evaluation.Status != StepPassed && evaluation.Status != StepFailed && evaluation.Status != StepInconclusive {
 				return StepResult{}, fmt.Errorf("evaluator returned invalid status %s for step %s", evaluation.Status, step.ID)
 			}
-			stepResult := StepResult{StepID: step.ID, Status: evaluation.Status, EvidenceIDs: append([]string(nil), evidenceIDs...), TerminalEvidenceID: record.ID}
+			stepResult := StepResult{StepID: step.ID, Status: evaluation.Status, EvidenceIDs: append([]string(nil), evidenceIDs...), TerminalEvidenceID: record.ID, AssertionResults: cloneAssertionResults(evaluation.Results)}
 			return e.completeStep(ctx, plan, stepResult)
 		}
 		safe := !spec.Effects || spec.Idempotent || call.IdempotencyKey != ""
@@ -224,6 +248,35 @@ func (e *PlanExecutor) executeStep(ctx context.Context, plan ValidationPlan, ste
 		}
 		attempt++
 	}
+}
+
+// planEventTruncations projects treated size metadata into payload-free journal facts.
+func planEventTruncations(input, output []evidence.Truncation) []harness.EventTruncation {
+	result := make([]harness.EventTruncation, 0, len(input)+len(output))
+	for _, item := range input {
+		result = append(result, harness.EventTruncation{Surface: "input", Path: item.Path, Representation: item.Representation, OriginalBytes: item.OriginalBytes, RetainedBytes: item.RetainedBytes})
+	}
+	for _, item := range output {
+		result = append(result, harness.EventTruncation{Surface: "output", Path: item.Path, Representation: item.Representation, OriginalBytes: item.OriginalBytes, RetainedBytes: item.RetainedBytes})
+	}
+	return result
+}
+
+// cloneAssertionResults prevents evaluator-owned result trees from becoming mutable executor state.
+func cloneAssertionResults(results []AssertionResult) []AssertionResult {
+	out := make([]AssertionResult, len(results))
+	for i, result := range results {
+		out[i] = result
+		out[i].Expected.Value = cloneStructuredValue(result.Expected.Value)
+		out[i].Observed.Value = cloneStructuredValue(result.Observed.Value)
+		out[i].EvidenceIDs = append([]string(nil), result.EvidenceIDs...)
+		out[i].Children = cloneAssertionResults(result.Children)
+		if result.Cause != nil {
+			cause := *result.Cause
+			out[i].Cause = &cause
+		}
+	}
+	return out
 }
 
 // completeInconclusive converts an expected unavailable outcome into an auditable terminal step result.

@@ -49,7 +49,7 @@ type fakeEvaluator struct {
 }
 
 // Evaluate derives only the programmed deterministic status for the selected step.
-func (f *fakeEvaluator) Evaluate(ctx context.Context, step PlanStep, _ map[string]any, _ []string) (StepEvaluation, error) {
+func (f *fakeEvaluator) Evaluate(ctx context.Context, step PlanStep, _ any, _ []string) (StepEvaluation, error) {
 	if err := ctx.Err(); err != nil {
 		return StepEvaluation{}, err
 	}
@@ -74,6 +74,16 @@ type executorFixture struct {
 	evaluator *fakeEvaluator
 	waiter    *testWaiter
 	ids       *testIDs
+}
+
+// testEvidenceSanitizer creates explicit bounded evidence treatment for executor tests.
+func testEvidenceSanitizer(t *testing.T) evidence.Sanitizer {
+	t.Helper()
+	configured, err := evidence.NewPolicy(evidence.Config{MaxBodyBytes: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return evidence.NewSanitizer(configured)
 }
 
 // failingPlanJournal confirms events until one configured type and then exposes a stable operational failure.
@@ -114,7 +124,7 @@ func newExecutorFixture(t *testing.T, specs ...harness.ToolSpec) (*PlanExecutor,
 		decisions[spec.Name] = harness.PolicyDecision{Allowed: true, Reason: "allowed"}
 	}
 	fixture := &executorFixture{run: run, registry: registry, policy: &policy.Static{Decisions: decisions}, store: &memoryEvidence{records: map[string]evidence.Record{}}, journal: harness.NewMemoryJournal(), evaluator: &fakeEvaluator{statuses: map[string]StepStatus{}}, waiter: &testWaiter{}, ids: &testIDs{}}
-	executor, err := NewPlanExecutor(ExecutorConfig{Run: run}, ExecutorDependencies{Registry: registry, Policy: fixture.policy, Evidence: fixture.store, Journal: fixture.journal, Clock: &testClock{}, IDs: fixture.ids, Waiter: fixture.waiter, Evaluator: fixture.evaluator})
+	executor, err := NewPlanExecutor(ExecutorConfig{Run: run}, ExecutorDependencies{Registry: registry, Policy: fixture.policy, Evidence: fixture.store, Journal: fixture.journal, Sanitizer: testEvidenceSanitizer(t), Clock: &testClock{}, IDs: fixture.ids, Waiter: fixture.waiter, Evaluator: fixture.evaluator})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +139,7 @@ func stepFor(id, tool string, dependencies ...string) PlanStep {
 // validateForExecution obtains the immutable plan boundary used by every executor test.
 func validateForExecution(t *testing.T, registry harness.Registry, plan ValidationPlan) ValidatedPlan {
 	t.Helper()
-	validator, err := NewValidator(constraintSet{"constraint": true}, registry)
+	validator, err := NewValidator(constraintSet{"constraint": true}, registry, acceptAllAssertions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +221,7 @@ func TestResolveValidatePolicyBudgetToolEvidenceEvaluatorOrder(t *testing.T) {
 type tracingEvaluator struct{ trace *[]string }
 
 // Evaluate appends its boundary marker and returns a deterministic passing outcome.
-func (e *tracingEvaluator) Evaluate(context.Context, PlanStep, map[string]any, []string) (StepEvaluation, error) {
+func (e *tracingEvaluator) Evaluate(context.Context, PlanStep, any, []string) (StepEvaluation, error) {
 	*e.trace = append(*e.trace, "evaluator")
 	return StepEvaluation{Status: StepPassed}, nil
 }
@@ -249,7 +259,7 @@ func TestPlanCancellationPreservesConfirmedWorkAndStopsSelection(t *testing.T) {
 type cancelingEvaluator struct{ cancel context.CancelFunc }
 
 // Evaluate cancels the shared context after deriving the current step's passing result.
-func (e *cancelingEvaluator) Evaluate(context.Context, PlanStep, map[string]any, []string) (StepEvaluation, error) {
+func (e *cancelingEvaluator) Evaluate(context.Context, PlanStep, any, []string) (StepEvaluation, error) {
 	e.cancel()
 	return StepEvaluation{Status: StepPassed}, nil
 }
@@ -374,7 +384,8 @@ func TestJournalFailureAfterEvidenceStopsSelectionAndPreservesEvidence(t *testin
 		t.Fatalf("unexpected post-evidence journal failure: result=%#v err=%v calls=%d evidence=%d", result, err, tool.CallCount(), len(fixture.store.records))
 	}
 	confirmedEvidence, exists := fixture.store.records["ev-1"]
-	if !exists || confirmedEvidence.StepID != "first" || confirmedEvidence.Output["ok"] != true {
+	confirmedOutput, _ := confirmedEvidence.Output.(map[string]any)
+	if !exists || confirmedEvidence.StepID != "first" || confirmedOutput["ok"] != true {
 		t.Fatalf("confirmed evidence was not preserved: %#v", fixture.store.records)
 	}
 	events, eventErr := failing.Events(context.Background(), "run")
@@ -410,7 +421,7 @@ func assertNoLaterSelectionOrCompletion(t *testing.T, events []harness.Event, fo
 type invalidStatusEvaluator struct{}
 
 // Evaluate returns an impossible blocked status to exercise defensive contract validation.
-func (invalidStatusEvaluator) Evaluate(context.Context, PlanStep, map[string]any, []string) (StepEvaluation, error) {
+func (invalidStatusEvaluator) Evaluate(context.Context, PlanStep, any, []string) (StepEvaluation, error) {
 	return StepEvaluation{Status: StepBlocked}, nil
 }
 
@@ -437,11 +448,11 @@ func TestToolRemovedAfterValidationBecomesInconclusive(t *testing.T) {
 	registry := &volatileRegistry{spec: harness.ToolSpec{Name: "tool", Validate: func(map[string]any) error { return nil }, Tool: tool}}
 	run, _ := harness.NewRun("run", "objective", "constraint", harness.Limits{MaxToolCalls: 1})
 	journal := harness.NewMemoryJournal()
-	executor, err := NewPlanExecutor(ExecutorConfig{Run: run}, ExecutorDependencies{Registry: registry, Policy: &policy.Static{}, Evidence: &memoryEvidence{}, Journal: journal, Clock: &testClock{}, IDs: &testIDs{}, Waiter: &testWaiter{}, Evaluator: &fakeEvaluator{}})
+	executor, err := NewPlanExecutor(ExecutorConfig{Run: run}, ExecutorDependencies{Registry: registry, Policy: &policy.Static{}, Evidence: &memoryEvidence{}, Journal: journal, Sanitizer: testEvidenceSanitizer(t), Clock: &testClock{}, IDs: &testIDs{}, Waiter: &testWaiter{}, Evaluator: &fakeEvaluator{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	validator, _ := NewValidator(constraintSet{"constraint": true}, registry)
+	validator, _ := NewValidator(constraintSet{"constraint": true}, registry, acceptAllAssertions{})
 	validated, err := validator.Validate(ValidationPlan{ID: "plan", ConstraintID: "constraint", Steps: []PlanStep{stepFor("one", "tool")}})
 	if err != nil {
 		t.Fatal(err)

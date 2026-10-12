@@ -18,9 +18,15 @@ type Dependencies struct {
 	Evidence  evidence.Store
 	Journal   Journal
 	Sanitizer evidence.Sanitizer
+	Projector EvidenceProjector
 	Clock     Clock
 	IDs       IDGenerator
 	Waiter    Waiter
+}
+
+// EvidenceProjector derives the model-facing observation solely from confirmed treated evidence.
+type EvidenceProjector interface {
+	Project(context.Context, evidence.Record) (any, error)
 }
 
 // Config defines the identity, objective, budgets, and retry timing for one run.
@@ -43,6 +49,12 @@ func New(cfg Config, deps Dependencies) (*Harness, error) {
 	}
 	if deps.Model == nil || deps.Registry == nil || deps.Policy == nil || deps.Evidence == nil || deps.Journal == nil || deps.Clock == nil || deps.IDs == nil || deps.Waiter == nil {
 		return nil, fmt.Errorf("all harness dependencies are required")
+	}
+	if !deps.Sanitizer.Configured() {
+		return nil, fmt.Errorf("validated evidence sanitizer is required")
+	}
+	if deps.Sanitizer.RequiresProjector() && deps.Projector == nil {
+		return nil, fmt.Errorf("model evidence projector is required by redaction policy")
 	}
 	return &Harness{deps: deps, cfg: cfg}, nil
 }
@@ -239,7 +251,18 @@ func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 			if isCancellation(ctx, executeErr) {
 				return run, end(StatusCancelled, "", cancellationError(ctx, executeErr))
 			}
-			record := evidence.Record{ID: h.deps.IDs.Next(), RunID: run.ID, Step: run.Consumed.Steps, ToolCallID: call.ID, Attempt: attempt, ToolName: call.Tool, StartedAt: started, Duration: duration, Input: h.deps.Sanitizer.Map(call.Input), Output: h.deps.Sanitizer.Map(result.Output), ErrorClass: string(result.ErrorClass)}
+			sanitizedInput, sanitizeErr := h.deps.Sanitizer.Sanitize(ctx, call.Input)
+			if sanitizeErr != nil {
+				return run, end(StatusFailed, "", fmt.Errorf("sanitize tool input: %w", sanitizeErr))
+			}
+			sanitizedOutput, sanitizeErr := h.deps.Sanitizer.Sanitize(ctx, result.Output)
+			if sanitizeErr != nil {
+				return run, end(StatusFailed, "", fmt.Errorf("sanitize tool output: %w", sanitizeErr))
+			}
+			record, recordErr := evidence.NewRecord(evidence.Record{ID: h.deps.IDs.Next(), RunID: run.ID, Step: run.Consumed.Steps, ToolCallID: call.ID, Attempt: attempt, ToolName: call.Tool, StartedAt: started, Duration: duration, ErrorClass: string(result.ErrorClass)}, sanitizedInput, sanitizedOutput)
+			if recordErr != nil {
+				return run, end(StatusFailed, "", fmt.Errorf("seal evidence: %w", recordErr))
+			}
 			if saveErr := h.deps.Evidence.Save(ctx, record); saveErr != nil {
 				if isCancellation(ctx, saveErr) {
 					return run, end(StatusCancelled, "", cancellationError(ctx, saveErr))
@@ -248,8 +271,19 @@ func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 				return run, end(StatusFailed, "", fmt.Errorf("persist evidence: %w", saveErr))
 			}
 			run.EvidenceIDs = append(run.EvidenceIDs, record.ID)
-			observations = append(observations, Observation{EvidenceID: record.ID, Output: record.Output, ErrorClass: result.ErrorClass})
-			if err = audit(Event{Type: EventEvidencePersisted, Step: run.Consumed.Steps, ToolCallID: call.ID}); err != nil {
+			var modelOutput any = record.Output
+			if h.deps.Projector != nil {
+				confirmed, projectErr := h.deps.Evidence.Get(ctx, record.ID)
+				if projectErr != nil {
+					return run, end(StatusFailed, "", fmt.Errorf("recover evidence for model projection: %w", projectErr))
+				}
+				modelOutput, projectErr = h.deps.Projector.Project(ctx, confirmed)
+				if projectErr != nil {
+					return run, end(StatusFailed, "", fmt.Errorf("project evidence for model: %w", projectErr))
+				}
+			}
+			observations = append(observations, Observation{EvidenceID: record.ID, Output: modelOutput, ErrorClass: result.ErrorClass})
+			if err = audit(Event{Type: EventEvidencePersisted, Step: run.Consumed.Steps, ToolCallID: call.ID, Truncations: eventTruncations(sanitizedInput.Truncations(), sanitizedOutput.Truncations())}); err != nil {
 				return run, end(StatusFailed, "", err)
 			}
 			if result.ErrorClass != ErrorTransient {
@@ -286,6 +320,18 @@ func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 			}
 		}
 	}
+}
+
+// eventTruncations converts evidence metadata to the payload-free journal representation.
+func eventTruncations(input, output []evidence.Truncation) []EventTruncation {
+	result := make([]EventTruncation, 0, len(input)+len(output))
+	for _, item := range input {
+		result = append(result, EventTruncation{Surface: "input", Path: item.Path, Representation: item.Representation, OriginalBytes: item.OriginalBytes, RetainedBytes: item.RetainedBytes})
+	}
+	for _, item := range output {
+		result = append(result, EventTruncation{Surface: "output", Path: item.Path, Representation: item.Representation, OriginalBytes: item.OriginalBytes, RetainedBytes: item.RetainedBytes})
+	}
+	return result
 }
 
 // isCancellation normalizes cancellation reported by context or a blocking dependency.
@@ -330,7 +376,8 @@ func (h *Harness) evaluate(ctx context.Context, run *Run, assertion *Assertion, 
 			continue
 		}
 		used = append(used, id)
-		if reflect.DeepEqual(record.Output[assertion.Field], assertion.Expected) {
+		output, ok := record.Output.(map[string]any)
+		if ok && reflect.DeepEqual(output[assertion.Field], assertion.Expected) {
 			return Verdict{Status: VerdictPassed, EvidenceIDs: []string{id}}, nil
 		}
 		return Verdict{Status: VerdictFailed, EvidenceIDs: []string{id}}, nil

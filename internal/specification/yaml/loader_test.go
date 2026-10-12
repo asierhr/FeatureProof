@@ -92,8 +92,8 @@ func TestLoadRejectsUnknownAndDuplicateKeys(t *testing.T) {
 		category error
 		field    string
 	}{
-		{"unknown root", validYAML + "typo: true\n", specification.ErrUnknownField, "typo"},
-		{"unknown nested", strings.Replace(validYAML, "  id: checkout-search", "  id: checkout-search\n  typo: value", 1), specification.ErrUnknownField, "feature.typo"},
+		{"unknown root", validYAML + "typo: true\n", specification.ErrUnknownField, "$mapping.members[5]"},
+		{"unknown nested", strings.Replace(validYAML, "  id: checkout-search", "  id: checkout-search\n  typo: value", 1), specification.ErrUnknownField, "feature.members[1]"},
 		{"duplicate", strings.Replace(validYAML, "version: 1", "version: 1\nversion: 1", 1), specification.ErrSyntax, "version"},
 	}
 	for _, test := range tests {

@@ -57,3 +57,78 @@ Bitácora append-only de features completadas.
   snapshots mutables, cobertura de fallos del journal, diagnóstico de ciclos y
   números no finitos; evidencia en
   `progress/multi-step-validation-plan/review.md`.
+
+## 2026-10-11 — assertion-engine
+
+- Estado final: `done`.
+- Resultado: motor determinista de assertions con paths acotados, igualdad,
+  existencia, ausencia, comparaciones numéricas exactas, grupos `all`/`any`
+  anidados y resultados auditables derivados de evidencia terminal.
+- Spec aprobada por el usuario el `2026-10-11T18:41:50+02:00`.
+- Tasks: T1-T6 completadas.
+- Trazabilidad: R1-R9 verificados mediante tests concretos en
+  `progress/assertion-engine/implementation.md`.
+- Verificación independiente: `gofmt -l .`, `go vet ./...`, compilación,
+  `go test ./...`, `go test -race ./...`, 20 repeticiones race y coverage en
+  pass.
+- Coverage: 90,2 % global; 90,0 % en `internal/assertion` y 90,3 % en
+  `internal/planning`.
+- Review: aprobada tras corregir números con exponentes extremos, cancelación
+  durante compilación y construcción sin evidencia, y recuperar el baseline de
+  coverage; evidencia en `progress/assertion-engine/review.md`.
+
+## 2026-10-11 — http-tool
+
+- Estado final: `done`.
+- Resultado: adapter `http.request` controlado con target y DNS fijados,
+  validación previa a red, redirects revalidados, timeout/cancelación, límites
+  de request/response, output estructurado y headers sensibles excluidos.
+- Spec aprobada por el usuario el `2026-10-11T19:14:19+02:00`.
+- Tasks: T1-T7 completadas.
+- Trazabilidad: R1-R11 verificados mediante tests concretos en
+  `progress/http-tool/implementation.md`.
+- Verificación independiente: formato, vet, compilación, suite completa, race,
+  20 repeticiones race y coverage en pass usando servidores locales.
+- Coverage: 90,3 % global; 90,4 % en `internal/tools/http` y 90,3 % en
+  `internal/planning`.
+- Review: aprobada tras limitar cada ejecución a un único dial y medir todos
+  los headers realmente serializados antes de DNS; evidencia en
+  `progress/http-tool/review.md`.
+
+## 2026-10-11 — evidence-redaction
+
+- Estado final: `done`.
+- Resultado: policy inmutable, redacción recursiva y cancelable, truncación
+  auditable, evidencia sellada fail-closed y proyección del modelo más
+  restrictiva derivada de records confirmados.
+- Spec revisada aprobada por el usuario el `2026-10-11T20:43:32+02:00`.
+- Tasks: T1-T7 completadas.
+- Trazabilidad: R1-R10 verificados mediante tests concretos y secretos canario
+  en `progress/evidence-redaction/implementation.md`.
+- Verificación independiente: formato, vet, compilación, suite, race completa,
+  20 repeticiones race y coverage en pass.
+- Coverage: 90,5 % global; todos los paquetes modificados superan 85 %.
+- Review: aprobada tras fijar `/headers` raíz como ubicación implícita,
+  endurecer sellado/copia de evidencias, detectar ciclos nombrados y preservar
+  números JSON exactos; evidencia en
+  `progress/evidence-redaction/review.md`.
+
+## 2026-10-11 — local-validation-cli
+
+- Estado final: `done`.
+- Resultado: comando `featureproof validate` determinista con specification,
+  plan manifest JSON v1, target explícito, runtime confiable, progreso seguro,
+  códigos 0/1/2/3/130 y bundle terminal publicado atómicamente.
+- Spec aprobada por el usuario el `2026-10-11T21:15:19+02:00`.
+- Tasks: T1-T7 completadas.
+- Trazabilidad: R1-R11 verificados mediante tests concretos, flujos locales y
+  canarios en `progress/local-validation-cli/implementation.md`.
+- Verificación independiente: formato, vet, compilación, suite completa, race
+  fresca, 20 repeticiones race, builds Linux/macOS y coverage en pass.
+- Coverage: 91,0 % global; `cmd/featureproof` 100,0 %,
+  `internal/localvalidation` 92,3 % e `internal/planmanifest` 92,7 %; todos los
+  paquetes modificados superan 85 %.
+- Review: aprobada tras endurecer JSON y diagnósticos, introducir filesystem
+  inyectable con commit no-replace, cubrir cancelación en todas las fronteras
+  y cerrar la convención de comentarios; evidencia en
+  `progress/local-validation-cli/review.md`.

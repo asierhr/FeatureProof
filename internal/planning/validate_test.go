@@ -20,6 +20,12 @@ func (c constraintSet) HasConstraint(id string) bool { return c[id] }
 // registrySet is the read-only capability catalog used by validator tests.
 type registrySet map[string]harness.ToolSpec
 
+// acceptAllAssertions preserves feature-3 fixtures while the assertion package tests the real validator contract.
+type acceptAllAssertions struct{}
+
+// ValidateDefinition accepts legacy opaque declarations used outside assertion-engine integration tests.
+func (acceptAllAssertions) ValidateDefinition(AssertionDeclaration, string) error { return nil }
+
 // Resolve returns only exact tool names and records no execution effects.
 func (r registrySet) Resolve(name string) (harness.ToolSpec, bool) {
 	spec, ok := r[name]
@@ -34,7 +40,7 @@ func TestInvalidPlanNeverReachesPolicyOrTools(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := &policy.Static{Decisions: map[string]harness.PolicyDecision{"tool": {Allowed: true}}}
-	validator, _ := NewValidator(constraintSet{"constraint": true}, registry)
+	validator, _ := NewValidator(constraintSet{"constraint": true}, registry, acceptAllAssertions{})
 	plan := validPlan()
 	plan.Steps[0].DependsOn = []string{"missing"}
 	if _, err := validator.Validate(plan); err == nil {
@@ -55,7 +61,7 @@ func validPlan() ValidationPlan {
 // newTestValidator constructs a validator with the single known constraint and tool used by the base plan.
 func newTestValidator(t *testing.T) *Validator {
 	t.Helper()
-	validator, err := NewValidator(constraintSet{"constraint": true}, registrySet{"tool": {Name: "tool"}})
+	validator, err := NewValidator(constraintSet{"constraint": true}, registrySet{"tool": {Name: "tool"}}, acceptAllAssertions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +177,7 @@ func TestCycleDiagnosticExcludesEarlierDescendantAndIndependentBranch(t *testing
 		t.Fatal(err)
 	}
 	policy := &policy.Static{Decisions: map[string]harness.PolicyDecision{"tool": {Allowed: true}}}
-	validator, _ := NewValidator(constraintSet{"constraint": true}, registry)
+	validator, _ := NewValidator(constraintSet{"constraint": true}, registry, acceptAllAssertions{})
 	descendant := stepFor("descendant", "tool", "cycle-a")
 	independent := stepFor("independent", "tool")
 	cycleA := stepFor("cycle-a", "tool", "cycle-b")
@@ -206,12 +212,12 @@ func TestNonFiniteLiteralsAreRejectedBeforeEffects(t *testing.T) {
 				t.Fatal(err)
 			}
 			policy := &policy.Static{Decisions: map[string]harness.PolicyDecision{"tool": {Allowed: true}}}
-			validator, _ := NewValidator(constraintSet{"constraint": true}, registry)
+			validator, _ := NewValidator(constraintSet{"constraint": true}, registry, acceptAllAssertions{})
 			plan := validPlan()
 			plan.Steps[0].Input["value"] = InputValue{Literal: &LiteralValue{Value: test.value}}
 			_, err = validator.Validate(plan)
 			var planErr *PlanError
-			if !errors.As(err, &planErr) || planErr.Category != ErrorInvalidValue || planErr.Path != "steps[0].input.value" {
+			if !errors.As(err, &planErr) || planErr.Category != ErrorInvalidValue || planErr.Path != "steps[0].input.members[0]" {
 				t.Fatalf("got %#v", err)
 			}
 			if tool.CallCount() != 0 || len(policy.Calls) != 0 {
@@ -328,7 +334,7 @@ func TestNullReferenceTypeIsRejectedBeforeEffects(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy := &policy.Static{Decisions: map[string]harness.PolicyDecision{"tool": {Allowed: true}}}
-	validator, _ := NewValidator(constraintSet{"constraint": true}, registry)
+	validator, _ := NewValidator(constraintSet{"constraint": true}, registry, acceptAllAssertions{})
 	field := "value"
 	plan := validPlan()
 	consumer := plan.Steps[0]
@@ -337,7 +343,7 @@ func TestNullReferenceTypeIsRejectedBeforeEffects(t *testing.T) {
 	plan.Steps = append(plan.Steps, consumer)
 	_, err = validator.Validate(plan)
 	var planErr *PlanError
-	if !errors.As(err, &planErr) || planErr.Category != ErrorInvalidReference || planErr.Path != "steps[1].input.value.reference.value_type" {
+	if !errors.As(err, &planErr) || planErr.Category != ErrorInvalidReference || planErr.Path != "steps[1].input.members[0].reference.value_type" {
 		t.Fatalf("got %#v", err)
 	}
 	if tool.CallCount() != 0 || len(policy.Calls) != 0 {

@@ -63,12 +63,22 @@ type Event struct {
 	Status        string
 	EvidenceIDs   []string
 	BlockingCause []EventBlockingCause
+	Truncations   []EventTruncation
+}
+
+// EventTruncation records only safe size and path facts needed to audit evidence limitation.
+type EventTruncation struct {
+	Surface        string `json:"surface"`
+	Path           string `json:"path"`
+	Representation string `json:"representation"`
+	OriginalBytes  int    `json:"original_bytes"`
+	RetainedBytes  int    `json:"retained_bytes"`
 }
 
 // EventBlockingCause preserves one direct dependency outcome without requiring consumers to parse text.
 type EventBlockingCause struct {
-	StepID string
-	Status string
+	StepID string `json:"step_id"`
+	Status string `json:"status"`
 }
 
 // Journal is the audit port used to confirm and reconstruct run activity.
@@ -116,6 +126,7 @@ func (j *MemoryJournal) Events(ctx context.Context, id string) ([]Event, error) 
 func cloneEvent(event Event) Event {
 	event.EvidenceIDs = append([]string(nil), event.EvidenceIDs...)
 	event.BlockingCause = append([]EventBlockingCause(nil), event.BlockingCause...)
+	event.Truncations = append([]EventTruncation(nil), event.Truncations...)
 	return event
 }
 

@@ -20,7 +20,11 @@ const (
 type Limits struct{ MaxSteps, MaxToolCalls, MaxRetries int }
 
 // Consumption records the budget already reserved by a run.
-type Consumption struct{ Steps, ToolCalls, Retries int }
+type Consumption struct {
+	Steps     int `json:"steps"`
+	ToolCalls int `json:"tool_calls"`
+	Retries   int `json:"retries"`
+}
 
 // Run is the mutable execution aggregate coordinated by one Harness instance.
 type Run struct {

@@ -19,18 +19,31 @@ type ToolRegistry interface {
 	Resolve(string) (harness.ToolSpec, bool)
 }
 
+// AssertionDefinitionValidator validates one opaque declaration at the planning boundary before effects.
+type AssertionDefinitionValidator interface {
+	ValidateDefinition(AssertionDeclaration, string) error
+}
+
+// AssertionValidationError lets a validator preserve its exact field path and translate configuration categories.
+type AssertionValidationError interface {
+	error
+	PlanErrorCategory() ErrorCategory
+	PlanFieldPath() string
+}
+
 // Validator rejects the complete graph before effects and produces its deterministic execution snapshot.
 type Validator struct {
 	constraints ConstraintCatalog
 	registry    ToolRegistry
+	assertions  AssertionDefinitionValidator
 }
 
 // NewValidator wires the read-only catalogs needed to validate constraint and tool references.
-func NewValidator(constraints ConstraintCatalog, registry ToolRegistry) (*Validator, error) {
-	if constraints == nil || registry == nil {
-		return nil, fmt.Errorf("constraint catalog and tool registry are required")
+func NewValidator(constraints ConstraintCatalog, registry ToolRegistry, assertions AssertionDefinitionValidator) (*Validator, error) {
+	if constraints == nil || registry == nil || assertions == nil {
+		return nil, fmt.Errorf("constraint catalog, tool registry, and assertion validator are required")
 	}
-	return &Validator{constraints: constraints, registry: registry}, nil
+	return &Validator{constraints: constraints, registry: registry, assertions: assertions}, nil
 }
 
 // Validate checks all structural and graph invariants before returning an immutable plan snapshot.
@@ -108,6 +121,13 @@ func (v *Validator) validateStep(step PlanStep, position int, index map[string]i
 		if len(assertion.Definition) == 0 {
 			return planError(ErrorRequired, assertionPath+".definition", nil)
 		}
+		if err := v.assertions.ValidateDefinition(assertion, assertionPath+".definition"); err != nil {
+			category, fieldPath := ErrorInvalidValue, assertionPath+".definition"
+			if typed, ok := err.(AssertionValidationError); ok {
+				category, fieldPath = typed.PlanErrorCategory(), typed.PlanFieldPath()
+			}
+			return planError(category, fieldPath, err)
+		}
 	}
 	dependencies := map[string]bool{}
 	for j, dependency := range step.DependsOn {
@@ -133,11 +153,12 @@ func validateInputMap(input map[string]InputValue, path string, stepIndex map[st
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	for _, key := range keys {
+	for keyIndex, key := range keys {
+		memberPath := fmt.Sprintf("%s.members[%d]", path, keyIndex)
 		if key == "" {
-			return planError(ErrorInvalidValue, path, nil)
+			return planError(ErrorInvalidValue, memberPath, nil)
 		}
-		if err := validateInputValue(input[key], path+"."+key, stepIndex); err != nil {
+		if err := validateInputValue(input[key], memberPath, stepIndex); err != nil {
 			return err
 		}
 	}
@@ -305,8 +326,8 @@ func walkInput(input map[string]InputValue, path string, visit func(OutputRefere
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	for _, key := range keys {
-		if err := walkInputValue(input[key], path+"."+key, visit); err != nil {
+	for keyIndex, key := range keys {
+		if err := walkInputValue(input[key], fmt.Sprintf("%s.members[%d]", path, keyIndex), visit); err != nil {
 			return err
 		}
 	}
