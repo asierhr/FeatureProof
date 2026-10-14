@@ -151,3 +151,26 @@ Bitácora append-only de features completadas.
   URIs y paths fuera de ámbito, copias profundas, locations opacas, siblings
   de `$ref` 3.1 y canonicalización determinista de headers; evidencia en
   `progress/openapi-inspector/review.md`.
+
+## 2026-10-14 — model-adapter
+
+- Estado final: `done`.
+- Resultado: runtime de modelo independiente del proveedor con selección
+  explícita de provider, modelo y perfil; presupuestos de llamadas, tokens,
+  duración y replanificaciones; adapter OpenAI Responses API y perfiles Sign
+  in with ChatGPT OAuth confinados a composición.
+- Spec aprobada por el usuario el `2026-10-14T19:28:41+02:00`.
+- Tasks: T1-T8 completadas.
+- Trazabilidad: R1-R12 verificados mediante tests concretos en
+  `progress/model-adapter/implementation.md`.
+- Verificación independiente: formato, vet, compilación, suite fresca, race
+  completa, 20 repeticiones race, coverage, `go mod verify` y builds
+  Windows/Linux/macOS en pass; ningún test ordinario usó red o credenciales.
+- Coverage: 91,1 % global; 97,2 % en `internal/model`, 95,0 % en
+  `internal/model/openai`, 88,4 % en OAuth y 87,3 % en el smoke.
+- Review: aprobada tras preservar categorías de error extremo a extremo,
+  cerrar overflow de tokens, independizar refresh compartido del iniciador y
+  eliminar locks durante I/O del credential store; evidencia en
+  `progress/model-adapter/review.md`.
+- Smoke real: no ejecutado; permanece opt-in, separado de `go test` y requiere
+  una cuenta open source elegible, perfil y modelo seleccionados.

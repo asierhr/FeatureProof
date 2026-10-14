@@ -2,10 +2,138 @@
 
 ## Estado
 
-La feature `openapi-inspector` está en estado `done`. La tercera review
-independiente aprobó R1-R11, T1-T7 y el cierre de REV-1 a REV-7.
+La feature `agent-plan-generation` está en estado `spec_ready`. La
+especificación está completa y espera aprobación humana. No se ha autorizado
+implementación.
 
 ## Última actualización
+
+- Fecha: 2026-10-14
+- Trabajo: spec de `agent-plan-generation` completada y transición de
+  `pending` a `spec_ready` realizada por el leader.
+- Artefactos: `requirements.md`, `design.md` y `tasks.md` bajo
+  `specs/agent-plan-generation/`.
+- Verificación: R1-R12 contienen criterios comprobables; T1-T8 cubren todos
+  los requisitos; las tareas y el bloque de aprobación humana siguen
+  pendientes.
+- Diseño: protocolo PlanningDecision v1 separado del harness incremental,
+  materialización sobre ValidationPlan, procedencia OpenAPI cerrada, catálogo
+  descriptor-only, policy de solo lectura y cero ejecución durante generación.
+- Fuera de alcance: evals (feature 11), aprobación humana (feature 12) y
+  replanificación (feature 13).
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-14
+- Trabajo: preflight de `agent-plan-generation` completado e inicio de la
+  redacción de `specs/agent-plan-generation/{requirements,design,tasks}.md`.
+- Precondiciones: primera feature pendiente, `sdd: true`, features 1-9 `done`
+  y ninguna feature `in_progress`.
+- Contexto clave: restricciones versionadas, contexto OpenAPI reducido,
+  catálogo descriptivo de herramientas, modelo estructurado y validación de
+  planes ya existen como fronteras separadas.
+- Invariante: generar un plan no ejecutará herramientas ni modificará la
+  aplicación, evidencias, veredictos o estado ejecutable del run.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-14
+- Trabajo: segunda review aprobada y transición de `in_progress` a `done`
+  realizada por el leader.
+- Evidencia: R1-R12 y T1-T8 verificados; REV-1 a REV-4 corregidas; formato,
+  vet, compilación, suite fresca, race, race x20, coverage, módulos y builds
+  Windows/Linux/macOS en pass.
+- Coverage: 91,1 % global; 97,2 % `internal/model`, 95,0 %
+  `internal/model/openai`, 88,4 % OAuth y 87,3 % smoke.
+- Prueba real: no ejecutada; permanece opt-in y requiere perfil elegible y
+  modelo seleccionado explícitamente.
+- Resumen añadido a `progress/history.md`.
+
+- Fecha: 2026-10-14
+- Trabajo: segunda review independiente de `model-adapter` aprobada.
+- Correcciones verificadas: REV-1 taxonomía/cancelación exacta; REV-2 overflow
+  de tokens fail-closed; REV-3 refresh compartido independiente del iniciador;
+  REV-4 credential store sin mutex durante I/O y con espera cancelable.
+- Verificación fresca: formato, vet, compilación, suite, race completa, race
+  x20, módulos, builds Windows/Linux/macOS y coverage global 91,1 % en pass.
+- Evidencia: `progress/model-adapter/review.md`; no se ejecutó el smoke real ni
+  se resolvieron credenciales.
+- Estado: `in_progress`; reviewer solicita al leader la transición a `done`.
+
+- Fecha: 2026-10-14
+- Trabajo: primera review de `model-adapter` rechazada; correcciones devueltas
+  al implementer.
+- Hallazgos: REV-1 pierde categorías de auth/cancelación/timeout; REV-2 permite
+  overflow de tokens; REV-3 liga el refresh compartido al primer caller; REV-4
+  mantiene un mutex durante I/O del credential store.
+- Verificación: formato, vet, compilación, suite, race, coverage 91,1 %,
+  módulos y builds Windows/Linux/macOS pasan; la semántica indicada requiere
+  regresiones y corrección.
+- Estado: `in_progress`; no se ejecutó ninguna prueba real.
+
+- Fecha: 2026-10-14
+- Trabajo: T1-T8 de `model-adapter` implementadas y verificadas por el
+  implementer; entrega preparada para primera review independiente.
+- Resultado: runtime neutral, budgets no monetarios, OAuth Sign in with
+  ChatGPT, adapter Responses/SSE, telemetría segura y smoke opt-in.
+- Evidencia: `progress/model-adapter/implementation.md`; coverage reportada
+  91,1 % global y superior al 85 % en todos los paquetes nuevos.
+- Prueba real: no ejecutada; tests ordinarios herméticos.
+
+- Fecha: 2026-10-14
+- Trabajo: aprobación humana registrada y transición de `spec_ready` a
+  `in_progress` realizada por el leader.
+- Aprobación: `approved_by: user`,
+  `approved_at: 2026-10-14T19:28:41+02:00`.
+- Siguiente fase: implementación T1-T8, comentarios funcionales en cada
+  entidad y función, verificación hermética y review independiente.
+- Prueba real: no se ejecutará sin invocación opt-in explícita y un perfil
+  elegible seleccionado.
+
+- Fecha: 2026-10-14
+- Trabajo: spec de `model-adapter` completada y transición de `pending` a
+  `spec_ready` realizada por el leader.
+- Artefactos: `requirements.md`, `design.md` y `tasks.md` bajo
+  `specs/model-adapter/`.
+- Verificación: R1-R12 contienen criterios de aceptación; T1-T8 cubren todos
+  los requisitos; el bloque de aprobación humana permanece vacío.
+- Alcance: runtime neutral, selección explícita, OAuth de ChatGPT en
+  composición, Responses API acotada, presupuestos no monetarios y smoke real
+  opt-in separado.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-14
+- Trabajo: bloqueo de producto resuelto por decisión explícita del usuario;
+  transición de `blocked` a `pending` realizada por el leader y spec reanudada.
+- Contrato: runtime independiente del proveedor; proveedor, modelo y perfil de
+  autenticación explícitos; ningún modelo por defecto; límites del núcleo por
+  llamadas, tokens, duración y replanificaciones, sin precios monetarios.
+- Primer adapter: OpenAI Responses API mediante Sign in with ChatGPT OAuth para
+  aplicaciones open source elegibles; credenciales resueltas únicamente en la
+  composición y ausentes del contrato del harness.
+- Restricciones oficiales incorporadas: OAuth público dinámico con PKCE;
+  catálogo de modelos por cuenta; `POST /v1/responses` con `store: false` y
+  `stream: true`; tokens protegidos fuera de logs, diagnósticos y evidencias.
+- Pruebas reales: opt-in y separadas de `go test`.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-14
+- Trabajo: spec de `model-adapter` bloqueada y transición de `pending` a
+  `blocked` realizada por el leader.
+- Ambigüedad: proveedor/API, modelo, credencial, endpoint, pricing y prueba real
+  no están fijados por el repositorio.
+- Propuesta: OpenAI Responses API, modelo explícito, `OPENAI_API_KEY`, endpoint
+  oficial, pricing aportado por configuración y prueba real opt-in separada.
+- Informe y pregunta: `progress/model-adapter/spec.md`.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-14
+- Trabajo: preflight de `model-adapter` completado e inicio de la redacción de
+  `specs/model-adapter/{requirements,design,tasks}.md`.
+- Precondiciones: primera feature pendiente, `sdd: true`, criterios de
+  aceptación presentes, features 1-8 `done` y ninguna feature `in_progress`.
+- Contexto clave: adapter real detrás de `harness.Model`, respuesta
+  estructurada, clasificación de errores, secretos por entorno, telemetría y
+  presupuestos de tokens/llamadas/coste.
+- Código productivo modificado para esta feature: no.
 
 - Fecha: 2026-10-14
 - Trabajo: tercera review aprobada y transición de `in_progress` a `done`
@@ -796,7 +924,52 @@ independiente aprobó R1-R11, T1-T7 y el cierre de REV-1 a REV-7.
 - Coverage: 90,4 % global, 91,2 % en `internal/tools/http` y 90,3 % en `internal/planning`.
 - Trazabilidad: R1-R11 vinculados a tests reales en `progress/http-tool/implementation.md`.
 - Estado: `in_progress`; el implementer solicita review y no modifica `feature_list.json`.
-# Feature activa: openapi-inspector
+# Feature activa: model-adapter
+
+- Fecha: 2026-10-14
+- Trabajo: correcciones REV-1 a REV-4 implementadas; reverificación canónica en curso.
+- Resultado provisional: categorías tipadas y causas de contexto preservadas en
+  OAuth/HTTP/SSE; overflow de usage y snapshot cierra la sesión de forma
+  saturada; refresh compartido sobrevive a la cancelación del iniciador cuando
+  quedan waiters; LocalStore coordina turnos cancelables sin mutex durante I/O.
+- Regresiones dirigidas: profile inexistente, browser/listener,
+  exchange/refresh, discovery/JWKS, headers, body SSE, `math.MaxInt64`, refresh
+  concurrente y espera del store pasan; race ×20 de paquetes afectados pasa.
+- Prueba real: no ejecutada; no se usaron credenciales.
+
+- Fecha: 2026-10-14
+- Trabajo: correcciones REV-1 a REV-4 reverificadas y preparadas para segunda
+  review independiente.
+- Verificación final: formato, vet, compilación, suite completa, race completa,
+  race ×20, coverage, módulos y builds Windows/Linux/macOS en pass.
+- Coverage: 91,1 % global; 97,2 % model, 95,0 % openai, 88,5 % oauth y
+  87,3 % smoke. Baseline global preservado.
+- Estado: `in_progress`; T1-T8 continúan completas y no se modificaron spec,
+  `feature_list.json` ni `review.md` durante esta corrección.
+- Prueba real: no ejecutada; no se usaron credenciales.
+
+- Fecha: 2026-10-14
+- Trabajo: implementación iniciada por el implementer tras aprobación humana; T1-T2 completadas.
+- Resultado: contratos neutrales, selección explícita, taxonomía segura, sesión aislada, deadlines, presupuestos de llamadas/tokens/duración/replans y observer fail-closed implementados.
+- Verificación incremental: `go test ./internal/model` en pass. La ejecución local de `-race` requiere habilitar CGO y se repetirá en la verificación canónica con el entorno soportado.
+- Siguiente paso: T3-T4, perfiles OAuth, persistencia protegida, sign-in, refresh coalesced y revocación.
+- T3-T4 completadas: puertos OAuth sustituibles, callback loopback exacto, PKCE/state/nonce, issued client, scope/identidad, store local atómico con protección owner-only por SO, refresh coalesced y revocación implementados.
+- Verificación incremental: `go test -count=20 ./internal/model/openai/oauth` en pass, sin red, navegador ni credenciales reales.
+- Siguiente paso: T5-T6, petición Responses, transporte autenticado, SSE y validación estricta de decisión/usage.
+- T5-T6 completadas: endpoint oficial fijo, `store:false`, `stream:true`, bearer solo en transporte, campos preview omitidos, SSE acotado y fragmentable, terminal/usage obligatorios, JSON exacto y clasificación por status/code.
+- Verificación incremental: `go test ./internal/model/openai` en pass; casos de request, cancelación, CRLF/fragmentación, terminales inválidos, límites y canarios cubiertos.
+- Siguiente paso: T7, ejecutable smoke opt-in y composición falsa verificable sin cuenta real.
+- T7 completada: ejecutable independiente `featureproof-model-smoke` con acciones `provision`/`infer`, opt-in previo a toda composición, selección explícita y salida allowlisted.
+- OAuth real compuesto con autorización dinámica, token/refresh/revocación oficiales, JWKS RS256, loopback y navegador del SO; ninguna credencial se acepta por flags o variables.
+- Verificación incremental: tests de proceso para opt-in, argumentos, auth/provider failure, provisioning y éxito en pass. El smoke real no se ejecutó.
+- Siguiente paso: T8, integración hermética completa, análisis estático, race, builds y coverage.
+- T8 completada: integración fake OAuth → session → OpenAI SSE → harness en pass; no se ejecutan herramientas desde el adapter.
+- Verificación canónica final: formato, vet, compilación, suite, race completa, race ×20 de paquetes afectados, coverage, `go mod verify` y builds Windows/Linux/macOS en pass.
+- Coverage final: 91,1 % global; model 96,9 %, openai 94,0 %, oauth 88,8 % y smoke 87,3 %.
+- Smoke real no ejecutado: permanece opt-in y requiere cuenta OSS elegible, perfil y modelo elegidos por una persona.
+- Estado: T1-T8 completas; implementación preparada para review independiente en `progress/model-adapter/implementation.md`.
+
+# Historial inmediato: openapi-inspector
 
 - Fecha: 2026-10-14
 - Trabajo: implementación iniciada por el implementer tras aprobación humana; T1 en curso.
