@@ -2,10 +2,86 @@
 
 ## Estado
 
-La feature `local-validation-cli` está en estado `done`. La tercera review
-independiente aprobó R1-R11, T1-T7 y el cierre de REV-1 a REV-6.
+La feature `openapi-inspector` está en estado `done`. La tercera review
+independiente aprobó R1-R11, T1-T7 y el cierre de REV-1 a REV-7.
 
 ## Última actualización
+
+- Fecha: 2026-10-14
+- Trabajo: tercera review aprobada y transición de `in_progress` a `done`
+  realizada por el leader.
+- Evidencia: R1-R11 y T1-T7 verificados; overlays REV-1 a REV-7, formato, vet,
+  suite, race fresca, race x20, coverage, módulos y builds Linux/macOS en pass.
+- Coverage: 91,1 % global y 91,4 % en `internal/openapi`.
+- Resumen añadido a `progress/history.md`.
+
+- Fecha: 2026-10-14
+- Trabajo: correcciones REV-5 a REV-7 de `openapi-inspector` completadas.
+- Resultado: paths URI raíz denegados antes de filesystem; siblings de `$ref`
+  3.1 preservados mediante composición; headers duplicados por casing
+  rechazados de forma determinista, incluido `Content-Type`.
+- Verificación: formato, vet, suite fresca, race completa, race x20, coverage,
+  `go mod verify`, builds y compilación de tests Linux/macOS en pass.
+- Coverage: 91,1 % global y 91,4 % en `internal/openapi`.
+- Estado: preparada para tercera review; continúa `in_progress`.
+
+- Fecha: 2026-10-14
+- Trabajo: segunda review de `openapi-inspector` rechazada; REV-1 a REV-4
+  confirmadas como corregidas y REV-5 a REV-7 devueltas al implementer.
+- Hallazgos: path URI con raíz cruza filesystem en Windows; OpenAPI 3.1 pierde
+  siblings de `$ref`; headers observados duplicados por casing producen un
+  resultado no determinista.
+- Estado: requiere correcciones multiplataforma, regresiones de catálogo/
+  response/context y tercera review.
+
+- Fecha: 2026-10-14
+- Trabajo: correcciones REV-1 a REV-4 de `openapi-inspector` completadas.
+- Resultado: matriz de campos OpenAPI obligatorios; denegación URI previa a
+  lectura; copia profunda de enums JSON; locations opacas y serialización de
+  errores sin tokens externos.
+- Verificación: formato, vet, suite fresca, race completa, race x20, coverage,
+  `go mod verify` y builds Linux/macOS en pass.
+- Coverage: 91,1 % global y 91,2 % en `internal/openapi`.
+- Estado: preparada para segunda review; continúa `in_progress`.
+
+- Fecha: 2026-10-14
+- Trabajo: primera review de `openapi-inspector` rechazada; REV-1 a REV-4
+  devueltas al implementer.
+- Hallazgos: validación incompleta de campos OpenAPI obligatorios, esquemas URI
+  no locales mal clasificados, copia superficial de `Schema.Enum` y locations
+  que filtran nombres no confiables.
+- Verificación base: formato, vet, suite, race, coverage 91,1 %, cross-builds
+  y `go mod verify` pasan; los cuatro casos adversariales fallan.
+- Estado: `in_progress`; requiere correcciones, regresiones y nueva review.
+
+- Fecha: 2026-10-14
+- Trabajo: aprobación humana registrada y transición de `spec_ready` a
+  `in_progress` realizada por el leader.
+- Aprobación: `approved_by: user`, `approved_at: 2026-10-14T17:46:38+02:00`.
+- Siguiente fase: implementación T1-T7 con TDD, comentarios funcionales,
+  fixtures locales, canarios y verificación canónica.
+
+- Fecha: 2026-10-14
+- Trabajo: spec de `openapi-inspector` completada y transición de `pending` a
+  `spec_ready` realizada por el leader.
+- Artefactos: `requirements.md`, `design.md` y `tasks.md` bajo
+  `specs/openapi-inspector/`.
+- Verificación: R1-R11 contienen criterios observables; T1-T7 cubren todos los
+  requisitos; las tareas siguen pendientes y la aprobación humana está
+  pendiente.
+- Alcance: carga local OpenAPI 3.0/3.1, refs acotadas, catálogo/security,
+  validación determinista de responses y contexto reducido seleccionado.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-14
+- Trabajo: preflight de `openapi-inspector` completado e inicio de la redacción
+  de `specs/openapi-inspector/{requirements,design,tasks}.md`.
+- Precondiciones: primera feature pendiente, `sdd: true`, criterios de
+  aceptación presentes, features 1-7 `done` y ninguna feature `in_progress`.
+- Contexto clave: carga local OpenAPI 3.0/3.1, referencias acotadas,
+  inspección de operaciones, validación determinista de respuestas y contexto
+  reducido para el modelo.
+- Código productivo modificado para esta feature: no.
 
 - Fecha: 2026-10-11
 - Trabajo: tercera review aprobada y transición de `in_progress` a `done`
@@ -720,3 +796,44 @@ independiente aprobó R1-R11, T1-T7 y el cierre de REV-1 a REV-6.
 - Coverage: 90,4 % global, 91,2 % en `internal/tools/http` y 90,3 % en `internal/planning`.
 - Trazabilidad: R1-R11 vinculados a tests reales en `progress/http-tool/implementation.md`.
 - Estado: `in_progress`; el implementer solicita review y no modifica `feature_list.json`.
+# Feature activa: openapi-inspector
+
+- Fecha: 2026-10-14
+- Trabajo: implementación iniciada por el implementer tras aprobación humana; T1 en curso.
+- Alcance: nuevo paquete `internal/openapi`, sin cambios en CLI, specification ni plan manifest.
+- Estrategia: modelos propios y fronteras locales primero; carga/resolución, catálogo, validación y contexto después.
+- T1-T2 completadas: modelos/errores/SourceFS propios, parser JSON/YAML estricto y resolución local acotada con cancelación, containment y presupuestos.
+- Verificación incremental: `go test -v ./internal/openapi` en pass; T3-T6 y endurecimiento de coverage en curso.
+- T3-T6 completadas: catálogo/security estable, schema validation 3.0/3.1 aislada tras puerto propio, responses deterministas, contexto reducido y fixtures herméticos.
+- Coverage incremental de `internal/openapi`: 87,8 %; flujo integral 3.0/3.1, cancelación, scope, canarios e inmutabilidad en pass.
+- Siguiente paso: T7, verificación canónica completa y trazabilidad final.
+- T7 completada: flujo integral load → catalog → response validation → reduced context probado para OpenAPI 3.0/3.1.
+- Verificación final: formato, vet, compilación, suite completa, race completa, race ×20 del paquete afectado, coverage y builds Linux/macOS en pass.
+- Coverage final: 91,2 % en `internal/openapi` y 91,1 % global; implementación preparada para review independiente.
+- Primera review rechazada con REV-1–REV-4: validación estructural incompleta, clasificación URI insuficiente, copia superficial de enums y locations con tokens externos.
+- Correcciones implementadas: matriz estructural 3.0/3.1 previa a `Contract`, parsing URI deny-first, clonado JSON recursivo y diagnósticos/violations con identidades opacas y serialización segura.
+- Tests de regresión añadidos para campos obligatorios, `urn:`/`mailto:`/`file:`/network-path, mutación concurrente de enums y canarios en nombres dinámicos.
+- Estado: reverificación canónica fresca en curso; T1-T7 siguen completas.
+- REV-1–REV-4 reverificadas: suite fresca, race completa, race ×20, coverage,
+  `go mod verify` y builds Linux/macOS en pass.
+- Coverage final tras correcciones: 91,2 % en `internal/openapi` y 91,1 % global.
+- Estado: correcciones preparadas para segunda review independiente; feature continúa `in_progress`.
+- Segunda review rechazada con REV-5–REV-7: path URI con raíz dependiente del
+  SO, pérdida de siblings de `$ref` en Schema Objects 3.1 y headers observados
+  ambiguos por casing.
+- Correcciones implementadas: denegación URI-root previa al filesystem;
+  composición de `$ref` y siblings 3.1 conservada en validación, catálogo y
+  contexto con semántica 3.0 intacta; canonicalización estable de headers con
+  rechazo `invalid_input` de claves equivalentes.
+- Regresiones añadidas para contadores de frontera, semántica 3.0/3.1,
+  `required`/`properties`/`minProperties`, contexto reducido y duplicados de
+  headers con valores iguales o distintos repetidos 1000 veces.
+- Estado: reverificación canónica fresca para tercera review en curso; T1-T7
+  siguen completas.
+- REV-5–REV-7 reverificadas: formato, vet, compilación, suite fresca, race
+  completa, race ×20, coverage, `go mod verify`, builds y compilación de tests
+  de `internal/openapi` para Linux/macOS en pass.
+- Coverage final tras la segunda ronda: 91,4 % en `internal/openapi` y 91,1 %
+  global; baseline preservado.
+- Estado: correcciones preparadas para tercera review independiente; feature
+  continúa `in_progress`.

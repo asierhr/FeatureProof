@@ -131,6 +131,114 @@
           "Los tests cubren argumentos inválidos, ejecución correcta, fallo funcional, resultado inconcluso, cancelación y códigos de salida"
         ],
         "status": "done"
+    },
+    {
+        "id": 8,
+        "name": "openapi-inspector",
+        "title": "Inspector de contratos OpenAPI",
+        "sdd": true,
+        "acceptance": [
+          "FeatureProof puede cargar documentos OpenAPI 3.0 y 3.1 en JSON o YAML desde una fuente local autorizada",
+          "El inspector enumera operaciones con método, path, operationId, parámetros, request body, respuestas y esquemas asociados",
+          "Los requisitos de autenticación se extraen de security schemes y de la seguridad global o específica de cada operación sin leer credenciales reales",
+          "Las referencias locales se resuelven de forma acotada y las referencias remotas o fuera del ámbito permitido se rechazan",
+          "Un documento inválido, una referencia rota o una versión no soportada produce un error que identifica su ubicación y causa",
+          "El inspector puede validar de forma determinista que status, headers declaradas y body de una respuesta cumplen el contrato seleccionado",
+          "El contexto entregado al modelo contiene únicamente las operaciones y fragmentos de esquema relevantes para las restricciones solicitadas",
+          "El contexto generado respeta un límite de tamaño y no incluye ejemplos, extensiones o campos descartados sin indicarlo explícitamente",
+          "Los tests cubren contratos válidos e inválidos, parámetros, schemas, autenticación, referencias, respuestas y reducción de contexto sin utilizar red"
+        ],
+        "status": "done"
+    },
+    {
+        "id": 9,
+        "name": "model-adapter",
+        "title": "Adapter de modelo real",
+        "sdd": true,
+        "acceptance": [
+          "El harness accede al modelo exclusivamente mediante una interfaz propia y no importa tipos del SDK del proveedor",
+          "Existe al menos un adapter capaz de enviar una petición a un modelo real y recibir una respuesta estructurada conforme al contrato interno",
+          "El adapter valida la respuesta estructurada antes de devolverla y distingue respuesta inválida, timeout, cancelación, autenticación, rate limit y error del proveedor",
+          "Todas las operaciones propagan context cancellation y aplican un timeout configurable",
+          "La configuración no secreta se valida al arrancar y las credenciales se leen desde variables de entorno sin persistirse ni enviarse en evidencias",
+          "Cada llamada registra de forma segura proveedor, modelo, duración y uso de tokens cuando el proveedor lo ofrece",
+          "Los límites configurados de tokens, llamadas y coste estimado se comprueban antes de solicitar otra decisión",
+          "El adapter no recibe acceso directo al registry de herramientas ni puede ejecutar herramientas por iniciativa propia",
+          "Los tests ordinarios utilizan un servidor o transporte falso y la prueba contra el proveedor real es opt-in y queda separada de go test"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 10,
+        "name": "agent-plan-generation",
+        "title": "Generación agentica de planes de validación",
+        "sdd": true,
+        "acceptance": [
+          "El agente genera un ValidationPlan estructurado a partir de restricciones, contexto OpenAPI reducido y catálogo de herramientas permitidas",
+          "Cada check del plan referencia exactamente una restricción existente y declara la evidencia necesaria para evaluarla",
+          "Cuando la restricción lo permite, el agente propone escenarios positivos, negativos y de error sin duplicar comprobaciones equivalentes",
+          "Las operaciones HTTP propuestas existen en el contexto OpenAPI recibido y las herramientas propuestas existen en el catálogo autorizado",
+          "El agente no puede introducir URLs absolutas, comandos, herramientas, endpoints o credenciales que no estén presentes en el contexto permitido",
+          "El plan producido pasa por validación de esquema, validación semántica y evaluación de políticas antes de poder ejecutarse",
+          "Cuando falta información necesaria, el agente devuelve un resultado estructurado de contexto insuficiente con las preguntas o evidencias requeridas en lugar de inventarlas",
+          "Generar un plan no ejecuta herramientas ni modifica la aplicación validada",
+          "Los tests cubren generación válida, escenarios negativos, endpoint inexistente, herramienta inventada, contexto insuficiente y respuesta estructurada inválida"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 11,
+        "name": "agent-evaluation-suite",
+        "title": "Suite de evaluación del agente",
+        "sdd": true,
+        "acceptance": [
+          "Existe un conjunto versionado de casos de evaluación con restricciones, contexto disponible y propiedades esperadas del plan",
+          "La suite comprueba que el agente no inventa endpoints, herramientas, identidades, credenciales ni evidencias",
+          "La suite mide cobertura de restricciones, validez del plan, selección de operaciones, reconocimiento de contexto insuficiente y respeto de límites",
+          "Incluye casos donde OpenAPI, logs o respuestas contienen instrucciones maliciosas y verifica que se tratan como datos no confiables",
+          "Cada ejecución registra versión del dataset, prompt, modelo, configuración, resultados por caso y métricas agregadas sin guardar secretos",
+          "Los criterios de aprobación y sus umbrales están versionados y un resultado por debajo del mínimo devuelve un código de salida no exitoso",
+          "Las evaluaciones no ejecutan acciones contra producción ni utilizan las conclusiones textuales del modelo como única métrica",
+          "La suite puede comparar una ejecución candidata con una baseline e identificar regresiones por categoría",
+          "Las evals se ejecutan mediante un comando separado y nunca forman parte implícita de go test"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 12,
+        "name": "plan-approval",
+        "title": "Aprobación humana del plan",
+        "sdd": true,
+        "acceptance": [
+          "Cuando la aprobación está habilitada, un plan validado queda en estado awaiting_approval y ninguna de sus herramientas se ejecuta todavía",
+          "La vista de aprobación muestra restricciones, pasos, identidades, herramientas, operaciones, assertions, efectos esperados y evidencia solicitada sin exponer secretos",
+          "El usuario puede aprobar, rechazar, editar las restricciones de origen o solicitar la generación de un nuevo plan",
+          "Aprobar registra identidad del aprobador, instante, hash del plan y hash del contexto relevante como un evento auditable",
+          "Rechazar registra la decisión y termina o devuelve el run a planificación según la opción elegida sin ejecutar el plan rechazado",
+          "Editar restricciones invalida el plan anterior y obliga a validarlo y evaluarlo de nuevo antes de otra aprobación",
+          "Una aprobación deja de ser válida si cambia el plan, el target, las restricciones o el contexto contractual utilizado para generarlo",
+          "Solo una transición de aprobación válida permite pasar de awaiting_approval a executing",
+          "Los tests cubren aprobación, rechazo, regeneración, edición, aprobación obsoleta, doble decisión y ausencia de ejecución previa"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 13,
+        "name": "bounded-replanning",
+        "title": "Replanificación agentica acotada",
+        "sdd": true,
+        "acceptance": [
+          "Después de ejecutar un plan, el agente recibe únicamente un resumen redactado de resultados, assertions y referencias de evidencia",
+          "El agente puede terminar el análisis, declarar contexto insuficiente o proponer comprobaciones adicionales mediante decisiones estructuradas",
+          "Cada comprobación adicional vuelve a pasar por validación de esquema, registry, política, presupuesto y aprobación cuando esta sea obligatoria",
+          "El run limita el número de replanificaciones, pasos agenticos, llamadas a herramientas, tokens, coste estimado y duración total",
+          "Al agotar cualquier límite no comienza trabajo nuevo, se registra la causa y el resultado pasa a inconclusive si no existe evidencia suficiente",
+          "El agente no puede eliminar, alterar ni convertir en passed una assertion determinista que ya haya fallado",
+          "El harness detecta propuestas equivalentes ya ejecutadas y evita bucles de comprobaciones repetidas sin nueva información",
+          "Cada replanificación conserva relación con la decisión anterior, las evidencias observadas y las nuevas acciones propuestas",
+          "Los tests cubren comprobación adicional permitida, política denegada, aprobación requerida, límite agotado, propuesta repetida y conservación de fallos deterministas"
+        ],
+        "status": "pending"
     }
   ]
 }

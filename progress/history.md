@@ -132,3 +132,22 @@ Bitácora append-only de features completadas.
   inyectable con commit no-replace, cubrir cancelación en todas las fronteras
   y cerrar la convención de comentarios; evidencia en
   `progress/local-validation-cli/review.md`.
+
+## 2026-10-14 — openapi-inspector
+
+- Estado final: `done`.
+- Resultado: inspector local de OpenAPI 3.0/3.1 para JSON/YAML, resolución de
+  referencias acotada, catálogo determinista con seguridad efectiva,
+  validación de responses y contexto reducido con límite y omisiones.
+- Spec aprobada por el usuario el `2026-10-14T17:46:38+02:00`.
+- Tasks: T1-T7 completadas.
+- Trazabilidad: R1-R11 verificados mediante tests concretos y casos
+  adversariales en `progress/openapi-inspector/implementation.md`.
+- Verificación independiente: formato, vet, compilación, suite completa, race
+  fresca, 20 repeticiones race, coverage, `go mod verify`, builds y compilación
+  de tests Linux/macOS en pass.
+- Coverage: 91,1 % global y 91,4 % en `internal/openapi`.
+- Review: aprobada tras cerrar validación estructural OpenAPI, denegación de
+  URIs y paths fuera de ámbito, copias profundas, locations opacas, siblings
+  de `$ref` 3.1 y canonicalización determinista de headers; evidencia en
+  `progress/openapi-inspector/review.md`.
