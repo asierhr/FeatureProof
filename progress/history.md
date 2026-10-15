@@ -174,3 +174,26 @@ Bitácora append-only de features completadas.
   `progress/model-adapter/review.md`.
 - Smoke real: no ejecutado; permanece opt-in, separado de `go test` y requiere
   una cuenta open source elegible, perfil y modelo seleccionados.
+
+## 2026-10-15 — agent-plan-generation
+
+- Estado final: `done`.
+- Resultado: generación agéntica de planes mediante protocolo
+  `PlanningDecision` v1, contexto OpenAPI reducido, catálogo descriptor-only,
+  policy de solo lectura y materialización validada sobre
+  `planning.ValidationPlan`, sin capacidades ejecutables.
+- Spec aprobada por el usuario el `2026-10-15T15:37:20+02:00`.
+- Tasks: T1-T8 completadas.
+- Trazabilidad: R1-R12 verificados mediante tests concretos en
+  `progress/agent-plan-generation/implementation.md`.
+- Verificación independiente: formato, vet, compilación, suite fresca, race
+  completa, 20 repeticiones race, coverage, `go mod verify` y builds
+  Windows/Linux/macOS en pass; tests herméticos sin red ni credenciales.
+- Coverage: 91,1 % global; 91,0 % en `internal/agentplanning`, 96,5 % en model,
+  93,9 % en OpenAI, 91,8 % en OpenAPI y 89,5 % en planning.
+- Review: aprobada tras cerrar filtrado de assertions, trabajo profundo
+  acotado, cancelación completa, causas externas opacas, fingerprint canónico
+  y ciclo de vida síncrono del observer; evidencia en
+  `progress/agent-plan-generation/review.md`.
+- Alcance preservado: generar no ejecuta, persiste, aprueba ni replantea; las
+  features 11, 12 y 13 mantienen esas responsabilidades.

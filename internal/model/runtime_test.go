@@ -36,6 +36,17 @@ type providerFunc struct {
 	infer func(context.Context, string, Request) (Result, error)
 }
 
+// structuredProviderFunc implements both protocols so tests can verify shared session accounting.
+type structuredProviderFunc struct {
+	providerFunc
+	structured func(context.Context, string, StructuredRequest) (StructuredResult, error)
+}
+
+// InferStructured delegates one test JSON attempt without retry or repair.
+func (p structuredProviderFunc) InferStructured(ctx context.Context, modelID string, request StructuredRequest) (StructuredResult, error) {
+	return p.structured(ctx, modelID, request)
+}
+
 // ID returns the explicitly configured fake provider selection.
 func (p providerFunc) ID() string { return p.id }
 
@@ -58,6 +69,54 @@ func validConfig() Config {
 // validResult supplies confirmed usage and a valid terminal harness decision.
 func validResult() Result {
 	return Result{Decision: harness.ModelDecision{Version: 1, Kind: harness.DecisionComplete}, Usage: Usage{InputTokens: 2, OutputTokens: 3, Confirmed: true}}
+}
+
+// TestStructuredCallSharesBudgetsTelemetryAndNeverReservesReplan proves planning uses feature 9 admission unchanged.
+func TestStructuredCallSharesBudgetsTelemetryAndNeverReservesReplan(t *testing.T) {
+	clock := &testClock{now: time.Unix(10, 0)}
+	records := []AttemptRecord{}
+	provider := structuredProviderFunc{providerFunc: providerFunc{id: "openai", infer: func(context.Context, string, Request) (Result, error) { return validResult(), nil }}, structured: func(ctx context.Context, modelID string, request StructuredRequest) (StructuredResult, error) {
+		if modelID != "selected-model" || request.Bounds.MaxOutputBytes != 64 || len(request.Untrusted) == 0 {
+			t.Fatalf("unexpected structured request: %#v", request)
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("structured call has no deadline")
+		}
+		return StructuredResult{Output: []byte(`{"version":1}`), Usage: Usage{InputTokens: 7, OutputTokens: 5, Confirmed: true}}, nil
+	}}
+	session, err := NewSession(validConfig(), provider, clock, observerFunc(func(_ context.Context, record AttemptRecord) error { records = append(records, record); return nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.InferStructured(context.Background(), StructuredRequest{RunID: "run", Instructions: "contract", Untrusted: []byte(`{"label":"untrusted"}`), Bounds: IOBounds{MaxOutputBytes: 64}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(result.Output) != `{"version":1}` {
+		t.Fatalf("output=%s", result.Output)
+	}
+	snapshot := session.Snapshot()
+	if snapshot.Calls != 1 || snapshot.Tokens != 12 || snapshot.Replans != 0 || len(records) != 1 {
+		t.Fatalf("snapshot=%+v records=%#v", snapshot, records)
+	}
+}
+
+// TestStructuredCallRejectsSuccessReturnedAfterContextCancellation proves providers cannot override caller cancellation.
+func TestStructuredCallRejectsSuccessReturnedAfterContextCancellation(t *testing.T) {
+	clock := &testClock{now: time.Unix(11, 0)}
+	provider := structuredProviderFunc{providerFunc: providerFunc{id: "openai", infer: func(context.Context, string, Request) (Result, error) { return validResult(), nil }}, structured: func(ctx context.Context, _ string, _ StructuredRequest) (StructuredResult, error) {
+		<-ctx.Done()
+		return StructuredResult{Output: []byte(`{}`), Usage: Usage{Confirmed: true}}, nil
+	}}
+	cfg := validConfig()
+	cfg.CallTimeout = time.Nanosecond
+	session, err := NewSession(cfg, provider, clock, observerFunc(func(context.Context, AttemptRecord) error { return nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.InferStructured(context.Background(), StructuredRequest{RunID: "run", Instructions: "x", Untrusted: []byte(`{}`)}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("late success accepted: %v", err)
+	}
 }
 
 // TestSessionRequiresExplicitProviderModelProfileTimeoutAndBudgets verifies fail-fast neutral selection.

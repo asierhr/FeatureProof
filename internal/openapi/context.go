@@ -114,7 +114,29 @@ func (c *Contract) BuildContext(ctx context.Context, request ContextRequest) (Re
 	if err := ctx.Err(); err != nil {
 		return ReducedContext{}, cancelledError("context", err)
 	}
-	return ReducedContext{MediaType: "application/vnd.featureproof.openapi-context+json;v=1", Untrusted: true, Bytes: append([]byte(nil), b...), Omissions: omitted}, nil
+	retained := c.retainedIndex(envelope, constraints)
+	return ReducedContext{MediaType: "application/vnd.featureproof.openapi-context+json;v=1", Untrusted: true, Bytes: append([]byte(nil), b...), Omissions: omitted, retained: retained}, nil
+}
+
+// retainedIndex derives provenance from the final serialized envelope so size-omitted operations remain unavailable.
+func (c *Contract) retainedIndex(envelope contextEnvelope, constraints []contextConstraint) []RetainedOperation {
+	included := make(map[OperationKey]bool, len(envelope.Operations))
+	for _, operation := range envelope.Operations {
+		included[operation.Key] = true
+	}
+	out := make([]RetainedOperation, 0)
+	for _, constraint := range constraints {
+		for _, key := range constraint.Operations {
+			if !included[key] {
+				continue
+			}
+			operation, ok := c.findOperation(key)
+			if ok {
+				out = append(out, RetainedOperation{ConstraintID: constraint.ID, Operation: cloneOperation(operation)})
+			}
+		}
+	}
+	return out
 }
 
 // validateSelection rejects duplicate constraint IDs, duplicate keys and unknown operations.

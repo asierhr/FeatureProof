@@ -2,11 +2,141 @@
 
 ## Estado
 
-La feature `agent-plan-generation` está en estado `spec_ready`. La
-especificación está completa y espera aprobación humana. No se ha autorizado
-implementación.
+La feature `agent-plan-generation` está en estado `done`. La implementación y
+la revisión independiente están completas.
 
 ## Última actualización
+
+- Fecha: 2026-10-15
+- Trabajo: tercera review aprobada y transición de `in_progress` a `done`
+  realizada por el leader.
+- Evidencia: R1-R12 y T1-T8 verificados; REV-1 a REV-6 corregidas; formato,
+  vet, compilación, suite fresca, race, race x20, coverage, módulos y builds
+  Windows/Linux/macOS en pass.
+- Coverage: 91,1 % global; 91,0 % `internal/agentplanning`, 96,5 % model,
+  93,9 % OpenAI, 91,8 % OpenAPI y 89,5 % planning.
+- Invariantes finales: una inferencia, cero ejecución/retry/replan, procedencia
+  cerrada, validación all-or-nothing y observer unido al ciclo de vida.
+- Resumen añadido a `progress/history.md`.
+
+- Fecha: 2026-10-15
+- Trabajo: tercera review independiente de `agent-plan-generation` aprobada.
+- Resultado: REV-1 a REV-6 corregidas; R1-R12 y T1-T8 verificados sin hallazgos
+  pendientes. El observer es síncrono, cooperativo, acotado y unido a
+  `Generate`, sin goroutines ni terminales tardíos.
+- Verificación fresca: formato, vet, compilación, suite sin caché, race
+  completa, race ×20, módulos y builds Windows/Linux/macOS en pass.
+- Coverage: 91,1 % global; 91,0 % `internal/agentplanning`, 96,5 % model,
+  93,9 % OpenAI, 91,8 % OpenAPI y 89,5 % planning.
+- Estado: `in_progress`; reviewer solicita al leader transición a `done` y
+  registro en `progress/history.md`.
+
+- Fecha: 2026-10-15
+- Trabajo: REV-6 corregida y preparada para tercera review.
+- Resultado: `observeTerminal` ejecuta `Observer.Observe` síncronamente con un
+  deadline finito; el contrato exige detener todo trabajo propio antes de
+  retornar al vencer `ctx`. No existe goroutine fire-and-forget.
+- Regresión: el test coordinado observa deadline/cancelación, demuestra que
+  `Generate` espera la limpieza del observer y verifica ausencia de trabajo y
+  escrituras terminales posteriores al retorno; observer error sigue
+  fail-closed.
+- Verificación: formato, vet, compilación, suite fresca, race completa, race
+  ×20, módulos y builds Windows/Linux/macOS en pass; coverage global 91,1 %
+  y `internal/agentplanning` 91,0 %.
+- Estado: `in_progress`; `ready_for_review` en
+  `progress/agent-plan-generation/implementation.md`.
+
+- Fecha: 2026-10-15
+- Trabajo: segunda review rechazada por REV-6; corrección del ciclo de vida
+  del observer iniciada.
+- Hallazgo: el timeout asíncrono podía abandonar una goroutine y permitir una
+  confirmación terminal posterior al retorno de `Generate`.
+- Corrección en curso: observer síncrono con contexto de finalización acotado,
+  contrato cooperativo y regresiones de join/orden sin trabajo huérfano.
+- Estado: `in_progress`; pendiente verificación canónica y nueva review.
+
+- Fecha: 2026-10-15
+- Trabajo: segunda review independiente de `agent-plan-generation` rechazada.
+- Resultado: REV-1, REV-2, REV-4 y REV-5 corregidas; REV-3 corregida salvo la
+  estrategia de finalización del observer.
+- Nuevo hallazgo: REV-6 blocker. `observeTerminal` abandona una goroutine cuando
+  el observer ignora contexto; viola el diseño sin goroutines, no garantiza
+  terminación y permite una confirmación terminal posterior al retorno.
+- Verificación fresca: formato, vet, suite sin caché, race completa, race ×20,
+  módulos y builds Windows/Linux/macOS en pass; coverage global 91,1 %.
+- Estado: `in_progress`; requiere corregir REV-6 y repetir review.
+
+- Fecha: 2026-10-15
+- Trabajo: REV-1 a REV-5 corregidas y preparadas para segunda review.
+- Resultado: traversal completo y acotado de datos model-authored; presupuesto
+  overflow-safe; cancelación post-colaborador; observer con deadline; causas
+  externas opacas; fingerprint canónico de grafo y evidence.
+- Regresiones: canarios en assertions, URL con whitespace/userinfo, comandos,
+  credenciales/capabilities, deep/wide, límite exacto, `math.MaxInt`, overflow,
+  cancelación coordinada y permutaciones no semánticas en pass.
+- Verificación: formato, vet, compilación, suite fresca, race completa, race
+  ×20, módulos y builds Windows/Linux/macOS en pass; coverage global 91,1 %
+  y `internal/agentplanning` 91,0 %.
+- Estado: `in_progress`; `ready_for_review` en
+  `progress/agent-plan-generation/implementation.md`.
+
+- Fecha: 2026-10-15
+- Trabajo: corrección de REV-1 a REV-5 iniciada con regresiones adversariales.
+- En curso: recorrido profundo compartido y overflow-safe, cancelación entre
+  unidades y colaboradores, causas externas opacas, observer con finalización
+  acotada y fingerprint canónico independiente de IDs y orden no semántico.
+- Estado: `in_progress`; pendiente completar verificación canónica y devolver
+  a review independiente.
+
+- Fecha: 2026-10-15
+- Trabajo: primera review de `agent-plan-generation` rechazada; correcciones
+  devueltas al implementer.
+- Hallazgos: REV-1 filtra valores prohibidos solo en inputs y no en assertions;
+  REV-2 no contabiliza trabajo profundo; REV-3 deja recorridos, policy y
+  observer fuera de una cancelación acotada; REV-4 expone causas externas;
+  REV-5 no canonicaliza por completo grafo y evidence requirements.
+- Verificación base: formato, vet, suite fresca, race completa, race x20,
+  coverage 91,2 %, módulos y builds Windows/Linux/macOS pasan.
+- Estado: `in_progress`; requiere correcciones y regresiones adversariales.
+
+- Fecha: 2026-10-15
+- Trabajo: T1-T8 de `agent-plan-generation` completadas y preparadas para
+  review independiente.
+- Verificación final: formato, vet, compilación, suite completa, race completa,
+  race ×20 de paquetes afectados, coverage, módulos y builds
+  Windows/Linux/macOS en pass.
+- Coverage: 91,2 % global; 91,9 % `internal/agentplanning`, 96,5 % model,
+  93,9 % OpenAI, 91,8 % OpenAPI y 89,5 % planning. Baseline 91,1 % preservado.
+- Invariantes: una inferencia, cero retry/replan, cero ejecución/persistencia,
+  procedencia solo desde operaciones retenidas y terminales sin payloads.
+- Estado: `in_progress`; el implementer solicita review en
+  `progress/agent-plan-generation/implementation.md` y no modifica
+  `feature_list.json` ni `review.md`.
+
+- Fecha: 2026-10-15
+- Trabajo: T1-T7 de `agent-plan-generation` implementadas y verificadas de
+  forma incremental; T8 y verificación canónica en curso.
+- Resultado: protocolo PlanningDecision v1 estricto, procedencia exacta desde
+  ReducedContext, deduplicación canónica, materialización sobre ValidationPlan,
+  catálogo descriptor-only, policy read-only, sesión estructurada con budgets
+  de feature 9 y Responses/SSE compartido.
+- Seguridad: cero handles ejecutables, persistencia o mutación de run; método y
+  path HTTP se derivan de operaciones retenidas; instrucciones privilegiadas y
+  datos no confiables viajan separados.
+- Verificación incremental: suite completa en pass; cobertura del paquete nuevo
+  `internal/agentplanning` 86,8 %, por encima del mínimo del 85 %.
+- Siguiente paso: endurecimiento final, race/repeticiones, coverage global,
+  builds, trazabilidad R→test y entrega a review independiente.
+
+- Fecha: 2026-10-15
+- Trabajo: aprobación humana registrada y transición de `spec_ready` a
+  `in_progress` realizada por el leader.
+- Aprobación: `approved_by: user`,
+  `approved_at: 2026-10-15T15:37:20+02:00`.
+- Siguiente fase: implementación T1-T8, comentarios funcionales en cada
+  entidad y función, verificación canónica y review independiente.
+- Límite: generación y validación únicamente; sin ejecución, evals,
+  aprobación de plan ni replanificación.
 
 - Fecha: 2026-10-14
 - Trabajo: spec de `agent-plan-generation` completada y transición de

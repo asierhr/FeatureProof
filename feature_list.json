@@ -184,7 +184,7 @@
           "Generar un plan no ejecuta herramientas ni modifica la aplicación validada",
           "Los tests cubren generación válida, escenarios negativos, endpoint inexistente, herramienta inventada, contexto insuficiente y respuesta estructurada inválida"
         ],
-        "status": "spec_ready"
+        "status": "done"
     },
     {
         "id": 11,

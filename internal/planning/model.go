@@ -8,42 +8,44 @@ import (
 
 // ValidationPlan groups the ordered steps that collect evidence for one constraint.
 type ValidationPlan struct {
-	ID           string
-	ConstraintID string
-	Steps        []PlanStep
+	ID           string     `json:"id"`
+	ConstraintID string     `json:"constraint_id"`
+	Steps        []PlanStep `json:"steps"`
 }
 
 // PlanStep declares one registered capability, its structured input, assertions, and explicit predecessors.
 type PlanStep struct {
-	ID         string
-	Tool       string
-	Input      map[string]InputValue
-	Assertions []AssertionDeclaration
-	DependsOn  []string
+	ID         string                 `json:"id"`
+	Tool       string                 `json:"tool"`
+	Input      map[string]InputValue  `json:"input"`
+	Assertions []AssertionDeclaration `json:"assertions"`
+	DependsOn  []string               `json:"depends_on,omitempty"`
 }
 
 // InputValue is one node in an input tree and has exactly one literal, object, array, or reference representation.
 type InputValue struct {
-	Literal   *LiteralValue
-	Object    map[string]InputValue
-	Array     []InputValue
-	Reference *OutputReference
+	Literal   *LiteralValue         `json:"literal,omitempty"`
+	Object    map[string]InputValue `json:"object,omitempty"`
+	Array     []InputValue          `json:"array,omitempty"`
+	Reference *OutputReference      `json:"reference,omitempty"`
 }
 
 // LiteralValue wraps a JSON-compatible scalar, including an explicit null value.
-type LiteralValue struct{ Value any }
+type LiteralValue struct {
+	Value any `json:"value"`
+}
 
 // OutputReference selects a typed value from the persisted terminal evidence of an ancestor step.
 type OutputReference struct {
-	StepID    string
-	Path      []PathSegment
-	ValueType ValueType
+	StepID    string        `json:"step_id"`
+	Path      []PathSegment `json:"path"`
+	ValueType ValueType     `json:"value_type"`
 }
 
 // PathSegment selects exactly one object field or array index from structured evidence.
 type PathSegment struct {
-	Field *string
-	Index *int
+	Field *string `json:"field,omitempty"`
+	Index *int    `json:"index,omitempty"`
 }
 
 // ValueType identifies the JSON-compatible type expected at an output reference.
@@ -64,8 +66,8 @@ const (
 
 // AssertionDeclaration keeps structured assertion configuration opaque to planning while the assertion engine owns its semantics.
 type AssertionDeclaration struct {
-	ID         string
-	Definition map[string]any
+	ID         string         `json:"id"`
+	Definition map[string]any `json:"definition"`
 }
 
 // StepStatus is a functional terminal outcome produced without a model claim.

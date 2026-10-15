@@ -416,6 +416,6 @@ Ninguna para esta entrega.
 ## Aprobación humana
 
 ```yaml
-approved_by:
-approved_at:
+approved_by: user
+approved_at: 2026-10-15T15:37:20+02:00
 ```

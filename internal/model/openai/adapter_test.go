@@ -113,6 +113,31 @@ func TestOpenAIRequestOmitsPreviewUnsupportedFieldsToolsAndSecrets(t *testing.T)
 	}
 }
 
+// TestStructuredPlanningCallSharesResponsesTransportAndSeparatesInstructions proves one request carries untrusted data only in user input.
+func TestStructuredPlanningCallSharesResponsesTransportAndSeparatesInstructions(t *testing.T) {
+	var calls int
+	var captured requestDTO
+	planningJSON := `{"version":1,"kind":"insufficient_context","missing_context":{"items":[{"kind":"question","constraint_ids":["c1"],"request":"expected status?"}]}}`
+	stream := "data: {\"type\":\"response.output_text.delta\",\"delta\":" + string(mustJSON(t, planningJSON)) + "}\n\n" + "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":6}}}\n\n"
+	adapter, _ := New(doerFunc(func(_ context.Context, request *http.Request) (*http.Response, error) {
+		calls++
+		if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+			t.Fatal(err)
+		}
+		return response(http.StatusOK, stream), nil
+	}), adapterConfig())
+	result, err := adapter.InferStructured(context.Background(), "chosen-model", model.StructuredRequest{RunID: "run", Instructions: "PRIVILEGED_CONTRACT", Untrusted: []byte(`{"constraint":"INJECTION_CANARY"}`), Bounds: model.IOBounds{MaxRequestBytes: 8192, MaxStreamBytes: 8192, MaxOutputBytes: 4096}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || string(result.Output) != planningJSON || result.Usage.Total() != 10 {
+		t.Fatalf("calls=%d result=%+v", calls, result)
+	}
+	if captured.Instructions != "PRIVILEGED_CONTRACT" || strings.Contains(captured.Instructions, "INJECTION_CANARY") || len(captured.Input) != 1 || !strings.Contains(captured.Input[0].Content, "INJECTION_CANARY") {
+		t.Fatalf("instruction/data separation failed: %#v", captured)
+	}
+}
+
 // TestOpenAIRequestCancellationBeforeHeadersAndDuringBody verifies context propagation through HTTP and SSE.
 func TestOpenAIRequestCancellationBeforeHeadersAndDuringBody(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

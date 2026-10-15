@@ -19,6 +19,17 @@ type ToolRegistry interface {
 	Resolve(string) (harness.ToolSpec, bool)
 }
 
+// CapabilitySpec contains only the metadata needed to validate a plan without resolving an implementation.
+type CapabilitySpec struct {
+	Name     string
+	Validate func(map[string]any) error
+}
+
+// DescriptorRegistry resolves validation descriptors without exposing executable tool handles.
+type DescriptorRegistry interface {
+	ResolveDescriptor(string) (CapabilitySpec, bool)
+}
+
 // AssertionDefinitionValidator validates one opaque declaration at the planning boundary before effects.
 type AssertionDefinitionValidator interface {
 	ValidateDefinition(AssertionDeclaration, string) error
@@ -34,7 +45,7 @@ type AssertionValidationError interface {
 // Validator rejects the complete graph before effects and produces its deterministic execution snapshot.
 type Validator struct {
 	constraints ConstraintCatalog
-	registry    ToolRegistry
+	resolve     func(string) (CapabilitySpec, bool)
 	assertions  AssertionDefinitionValidator
 }
 
@@ -43,7 +54,18 @@ func NewValidator(constraints ConstraintCatalog, registry ToolRegistry, assertio
 	if constraints == nil || registry == nil || assertions == nil {
 		return nil, fmt.Errorf("constraint catalog, tool registry, and assertion validator are required")
 	}
-	return &Validator{constraints: constraints, registry: registry, assertions: assertions}, nil
+	return &Validator{constraints: constraints, resolve: func(name string) (CapabilitySpec, bool) {
+		spec, ok := registry.Resolve(name)
+		return CapabilitySpec{Name: spec.Name, Validate: spec.Validate}, ok
+	}, assertions: assertions}, nil
+}
+
+// NewDescriptorValidator wires a descriptor-only registry for generation-time graph validation.
+func NewDescriptorValidator(constraints ConstraintCatalog, registry DescriptorRegistry, assertions AssertionDefinitionValidator) (*Validator, error) {
+	if constraints == nil || registry == nil || assertions == nil {
+		return nil, fmt.Errorf("constraint catalog, descriptor registry, and assertion validator are required")
+	}
+	return &Validator{constraints: constraints, resolve: registry.ResolveDescriptor, assertions: assertions}, nil
 }
 
 // Validate checks all structural and graph invariants before returning an immutable plan snapshot.
@@ -96,7 +118,7 @@ func (v *Validator) validateStep(step PlanStep, position int, index map[string]i
 	if step.Tool == "" {
 		return planError(ErrorRequired, path+".tool", nil)
 	}
-	if _, exists := v.registry.Resolve(step.Tool); !exists {
+	if _, exists := v.resolve(step.Tool); !exists {
 		return planError(ErrorUnknownReference, path+".tool", nil)
 	}
 	if step.Input == nil {

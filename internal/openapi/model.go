@@ -200,6 +200,22 @@ type ReducedContext struct {
 	Untrusted bool           `json:"untrusted"`
 	Bytes     []byte         `json:"-"`
 	Omissions OmissionCounts `json:"omissions"`
+	retained  []RetainedOperation
+}
+
+// RetainedOperation ties one caller constraint to an operation actually serialized into reduced context.
+type RetainedOperation struct {
+	ConstraintID string
+	Operation    OperationDescriptor
+}
+
+// RetainedOperations returns an isolated exact provenance index for serialized operations only.
+func (r ReducedContext) RetainedOperations() []RetainedOperation {
+	out := make([]RetainedOperation, len(r.retained))
+	for i, item := range r.retained {
+		out[i] = RetainedOperation{ConstraintID: item.ConstraintID, Operation: cloneOperation(item.Operation)}
+	}
+	return out
 }
 
 // Contract owns a normalized immutable snapshot produced by a successful load.

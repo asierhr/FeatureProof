@@ -127,10 +127,30 @@ type Result struct {
 	RequestID string
 }
 
+// StructuredRequest carries consumer-owned privileged instructions and isolated untrusted JSON through the neutral runtime.
+type StructuredRequest struct {
+	RunID        string
+	Instructions string
+	Untrusted    []byte
+	Bounds       IOBounds
+}
+
+// StructuredResult contains one bounded terminal JSON value and provider-confirmed usage.
+type StructuredResult struct {
+	Output    []byte
+	Usage     Usage
+	RequestID string
+}
+
 // Provider performs exactly one inference without owning budgets or retry policy.
 type Provider interface {
 	ID() string
 	Infer(context.Context, string, Request) (Result, error)
+}
+
+// StructuredProvider extends a provider with protocol-neutral JSON inference over the same transport.
+type StructuredProvider interface {
+	InferStructured(context.Context, string, StructuredRequest) (StructuredResult, error)
 }
 
 // Clock supplies deterministic session time and deadline calculation.
@@ -185,10 +205,64 @@ func NewSession(cfg Config, provider Provider, clock Clock, observer Observer) (
 
 // Decide reserves one call, applies the shortest deadline and publishes only audited decisions.
 func (s *Session) Decide(ctx context.Context, request harness.ModelRequest) (harness.ModelDecision, error) {
+	providerRequest := neutralRequest(request)
+	value, err := s.runAttempt(ctx, request.RunID, func(callCtx context.Context, bounds IOBounds) (attemptValue, error) {
+		providerRequest.Bounds = bounds
+		result, callErr := s.provider.Infer(callCtx, s.cfg.ModelID, providerRequest)
+		return attemptValue{decision: result.Decision, usage: result.Usage}, callErr
+	})
+	if err != nil {
+		return harness.ModelDecision{}, retryClassified(err)
+	}
+	return value.decision, nil
+}
+
+// InferStructured runs one consumer-defined JSON protocol through the same call, token and duration budgets.
+func (s *Session) InferStructured(ctx context.Context, request StructuredRequest) (StructuredResult, error) {
+	provider, ok := s.provider.(StructuredProvider)
+	if !ok {
+		return StructuredResult{}, &Error{Category: CategoryInvalidConfig, Operation: "compose structured provider"}
+	}
+	request.Untrusted = append([]byte(nil), request.Untrusted...)
+	requestedBounds := request.Bounds
+	value, err := s.runAttempt(ctx, request.RunID, func(callCtx context.Context, bounds IOBounds) (attemptValue, error) {
+		request.Bounds = intersectBounds(bounds, requestedBounds)
+		result, callErr := provider.InferStructured(callCtx, s.cfg.ModelID, request)
+		return attemptValue{output: append([]byte(nil), result.Output...), usage: result.Usage, requestID: result.RequestID}, callErr
+	})
+	if err != nil {
+		return StructuredResult{}, err
+	}
+	return StructuredResult{Output: append([]byte(nil), value.output...), Usage: value.usage, RequestID: value.requestID}, nil
+}
+
+// intersectBounds applies optional consumer ceilings without allowing them to widen session limits.
+func intersectBounds(session, requested IOBounds) IOBounds {
+	return IOBounds{MaxRequestBytes: lowerPositive(session.MaxRequestBytes, requested.MaxRequestBytes), MaxStreamBytes: lowerPositive(session.MaxStreamBytes, requested.MaxStreamBytes), MaxOutputBytes: lowerPositive(session.MaxOutputBytes, requested.MaxOutputBytes)}
+}
+
+// lowerPositive returns the smaller positive bound while treating a non-positive request as no narrower ceiling.
+func lowerPositive(session, requested int64) int64 {
+	if requested > 0 && requested < session {
+		return requested
+	}
+	return session
+}
+
+// attemptValue is the protocol-neutral terminal data accounted by one reserved model attempt.
+type attemptValue struct {
+	decision  harness.ModelDecision
+	output    []byte
+	usage     Usage
+	requestID string
+}
+
+// runAttempt shares admission, deadlines, token accounting and observation across structured protocols.
+func (s *Session) runAttempt(ctx context.Context, runID string, infer func(context.Context, IOBounds) (attemptValue, error)) (attemptValue, error) {
 	start := s.clock.Now()
 	attempt, err := s.reserveCall(ctx, start)
 	if err != nil {
-		return harness.ModelDecision{}, err
+		return attemptValue{}, err
 	}
 	remaining := s.remainingDuration(start)
 	timeout := s.cfg.CallTimeout
@@ -197,16 +271,18 @@ func (s *Session) Decide(ctx context.Context, request harness.ModelRequest) (har
 	}
 	callCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	providerRequest := neutralRequest(request)
-	providerRequest.Bounds = IOBounds{MaxRequestBytes: s.cfg.MaxRequestBytes, MaxStreamBytes: s.cfg.MaxStreamBytes, MaxOutputBytes: s.cfg.MaxOutputBytes}
-	result, callErr := s.provider.Infer(callCtx, s.cfg.ModelID, providerRequest)
+	bounds := IOBounds{MaxRequestBytes: s.cfg.MaxRequestBytes, MaxStreamBytes: s.cfg.MaxStreamBytes, MaxOutputBytes: s.cfg.MaxOutputBytes}
+	value, callErr := infer(callCtx, bounds)
+	if callErr == nil && callCtx.Err() != nil {
+		callErr = callCtx.Err()
+	}
 	category := classify(callCtx, callErr)
-	totalTokens, validUsage := result.Usage.validTotal()
-	if callErr == nil && (!result.Usage.Confirmed || !validUsage) {
+	totalTokens, validUsage := value.usage.validTotal()
+	if callErr == nil && (!value.usage.Confirmed || !validUsage) {
 		callErr = &Error{Category: CategoryInvalidResponse, Operation: "account usage"}
 		category = CategoryInvalidResponse
 	}
-	if result.Usage.Confirmed {
+	if value.usage.Confirmed {
 		s.mu.Lock()
 		if !validUsage || s.snapshot.Tokens > math.MaxInt64-totalTokens {
 			s.snapshot.Tokens = math.MaxInt64
@@ -236,18 +312,22 @@ func (s *Session) Decide(ctx context.Context, request harness.ModelRequest) (har
 	if callErr != nil {
 		outcome = "failure"
 	}
-	record := AttemptRecord{RunID: request.RunID, Attempt: attempt, Provider: s.cfg.ProviderID, Model: s.cfg.ModelID, Duration: duration, Outcome: outcome, Category: category, Usage: result.Usage}
-	if observeErr := s.observer.Observe(context.WithoutCancel(ctx), record); observeErr != nil {
-		return harness.ModelDecision{}, &Error{Category: CategoryInternal, Operation: "observe attempt"}
+	if observeErr := s.observer.Observe(context.WithoutCancel(ctx), AttemptRecord{RunID: runID, Attempt: attempt, Provider: s.cfg.ProviderID, Model: s.cfg.ModelID, Duration: duration, Outcome: outcome, Category: category, Usage: value.usage}); observeErr != nil {
+		return attemptValue{}, &Error{Category: CategoryInternal, Operation: "observe attempt"}
 	}
 	if callErr != nil {
-		normalized := normalizeError(callCtx, callErr)
-		if category == CategoryProviderTransient || category == CategoryRateLimit {
-			return harness.ModelDecision{}, &harness.OperationError{Class: harness.ErrorTransient, Err: normalized}
-		}
-		return harness.ModelDecision{}, normalized
+		return attemptValue{}, normalizeError(callCtx, callErr)
 	}
-	return result.Decision, nil
+	return value, nil
+}
+
+// retryClassified preserves the harness retry contract for transient and rate-limit failures only.
+func retryClassified(err error) error {
+	var typed *Error
+	if errors.As(err, &typed) && (typed.Category == CategoryProviderTransient || typed.Category == CategoryRateLimit) {
+		return &harness.OperationError{Class: harness.ErrorTransient, Err: err}
+	}
+	return err
 }
 
 // ReserveReplan atomically reserves one future replan without performing it.
@@ -272,6 +352,9 @@ func (s *Session) Snapshot() Snapshot {
 	copy.Duration = s.elapsedLocked()
 	return copy
 }
+
+// Selection returns non-secret provider and model identifiers already allowed in attempt telemetry.
+func (s *Session) Selection() (string, string) { return s.cfg.ProviderID, s.cfg.ModelID }
 
 // reserveCall atomically admits one attempt before provider or auth work begins.
 func (s *Session) reserveCall(ctx context.Context, now time.Time) (int, error) {
