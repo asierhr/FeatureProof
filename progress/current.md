@@ -2,10 +2,102 @@
 
 ## Estado
 
-La feature `agent-plan-generation` está en estado `done`. La implementación y
+La feature `agent-evaluation-suite` está en estado `done`. La implementación y
 la revisión independiente están completas.
 
 ## Última actualización
+
+- Fecha: 2026-10-15
+- Trabajo: tercera revisión independiente aprobada y transición de
+  `in_progress` a `done` realizada por el leader.
+- Evidencia: R1-R12 y T1-T9 verificados; REV-1 a REV-13 cerradas; formato,
+  vet, compilación, suite fresca, race, race x20, coverage, módulos y builds
+  Windows/Linux/macOS en pass.
+- Coverage: 91,1 % global; 91,3 % `internal/agenteval` y 89,2 %
+  `cmd/featureproof`.
+- Invariantes finales: replay hermético, live opt-in con preflight previo a
+  OAuth, cero ejecución de herramientas/targets, datasets y baselines
+  autenticados, métricas estructurales y bundles sin secretos.
+- Resumen añadido a `progress/history.md`.
+
+- Fecha: 2026-10-15
+- Trabajo: segunda revisión independiente rechazada; REV-1 a REV-9 cerradas
+  y REV-10 a REV-13 devueltas al implementer.
+- Hallazgos pendientes: normalización/unicidad de sets y digest lógico,
+  conversión checked de milisegundos, publicación del timeout por llamada en
+  la configuración segura y recuperación verificable del baseline global de
+  coverage.
+- Estado: `in_progress`; requiere tercera review tras correcciones y
+  reverificación canónica.
+
+- Fecha: 2026-10-15
+- Trabajo: primera revisión independiente de `agent-evaluation-suite`
+  rechazada; correcciones devueltas al implementer.
+- Hallazgos: REV-1 a REV-9 cubren confinamiento/snapshot OpenAPI,
+  expectativas de contexto insuficiente, matching de rechazo, fail-fast,
+  límites, configuración del manifest, autenticidad de baseline, casos por
+  categoría y preflight de baseline antes de live.
+- Estado: `in_progress`; requiere corrección, reverificación completa y nueva
+  review independiente.
+
+- Fecha: 2026-10-15
+- Trabajo: implementación T1-T9 de `agent-evaluation-suite` cerrada y lista
+  para review independiente.
+- Verificación final: formato, vet, compilación, suite fresca, race completa,
+  race ×20, coverage, módulos y builds Windows/Linux/macOS en pass.
+- Coverage: 91,1 % global preservado; 91,2 % `internal/agenteval`.
+- Evidencia: mapa R1-R12, tareas, comandos y riesgos registrado en
+  `progress/agent-evaluation-suite/implementation.md`.
+- Estado: `in_progress`; el implementer solicita review y no cambia el estado
+  de la feature.
+
+- Fecha: 2026-10-15
+- Trabajo: implementación de T1-T8 de `agent-evaluation-suite` completada;
+  cierre de T9 y verificación canónica en curso.
+- Resultado: nuevo paquete `internal/agenteval` con loaders JSON locales
+  estrictos, replay/live sobre el runtime de feature 9, runner secuencial,
+  captura de frontera, oráculo anti-invención, métricas ppm, criterios,
+  bundles con manifest final, baseline y comando `featureproof eval agent`.
+- Dataset: `evals/agentplanning/v1/` cubre plan válido, prompt injection como
+  datos, contexto insuficiente, endpoint inventado y límites; el replay
+  hermético completo produce veredicto `passed`.
+- Seguridad: cero executor/tools/target/evidence store; el modo live exige
+  opt-in, selección y todos los budgets antes de resolver OAuth.
+- Verificación parcial: tests nuevos de `internal/agenteval` y
+  `cmd/featureproof` pasan sin red ni credenciales.
+
+- Fecha: 2026-10-15
+- Trabajo: aprobación humana registrada y transición de `spec_ready` a
+  `in_progress` realizada por el leader.
+- Aprobación: `approved_by: user`,
+  `approved_at: 2026-10-15T16:53:38+02:00`.
+- Siguiente fase: implementación ordenada de T1-T9, verificación canónica y
+  revisión independiente.
+
+- Fecha: 2026-10-15
+- Trabajo: especificación de `agent-evaluation-suite` completada y transición
+  de `pending` a `spec_ready` realizada por el leader.
+- Artefactos: `requirements.md`, `design.md` y `tasks.md` bajo
+  `specs/agent-evaluation-suite/`.
+- Verificación: R1-R12 definen dataset y criterios versionados, oráculo y
+  métricas deterministas, bundles seguros, comparación con baseline y comando
+  separado; T1-T9 referencian todos los requirements y la aprobación humana
+  permanece vacía.
+- Frontera: las evaluaciones no ejecutan herramientas ni acciones contra un
+  target; replay es local y el modo live exige opt-in y selección explícita.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-15
+- Trabajo: preflight de `agent-evaluation-suite` completado e inicio de la
+  redacción de `specs/agent-evaluation-suite/{requirements,design,tasks}.md`.
+- Precondiciones: primera feature pendiente, `sdd: true`, features 1-10 `done`
+  y ninguna feature `in_progress`.
+- Contexto clave: la feature 10 produce PreparedPlan o insufficient_context
+  sin ejecutar; la suite debe medir propiedades deterministas, versionar
+  dataset/umbrales y comparar resultados candidatos con una baseline.
+- Invariante: las evals no ejecutarán herramientas ni acciones contra una
+  aplicación desplegada y vivirán en un comando separado de `go test`.
+- Código productivo modificado para esta feature: no.
 
 - Fecha: 2026-10-15
 - Trabajo: tercera review aprobada y transición de `in_progress` a `done`
@@ -1140,3 +1232,26 @@ la revisión independiente están completas.
   global; baseline preservado.
 - Estado: correcciones preparadas para tercera review independiente; feature
   continúa `in_progress`.
+
+# Feature activa: agent-evaluation-suite
+
+- Fecha: 2026-10-15
+- Trabajo: primera review rechazada; correcciones REV-1–REV-9 implementadas y pruebas dirigidas en pass.
+- Resultado: confinement resuelto para links intermedios y OpenAPI compuesto desde bytes digest-bound; expectations de missing context y rejection path cerradas; fail-fast uniforme; deadline total y cinco dimensiones de budget comprobadas; safe configuration serializada; baselines autenticadas e invariantes; affected cases por categoría; compatibilidad previa a composición live.
+- Evidencia incremental: `go test ./... -count=1`, `go vet ./...`, compilación sin tests y coverage de paquetes afectados en pass. Ninguna eval live, credencial o target real fue utilizado.
+- Estado: T1-T9 permanecen completas; verificación canónica fresca en curso para solicitar segunda review.
+- Fecha: 2026-10-15
+- Trabajo: correcciones REV-1–REV-9 reverificadas y preparadas para segunda review independiente.
+- Verificación final: formato, vet, build, compilación sin tests, suite completa, race completa, race ×20 de paquetes afectados, coverage, módulos, `git diff --check` y builds/test-compile Linux/macOS en pass.
+- Coverage final: 91,1 % global; 91,0 % en `internal/agenteval`; 89,2 % en `cmd/featureproof`. Baseline global preservado.
+- Estado: T1-T9 siguen `[x]`; implementación y trazabilidad actualizadas en `progress/agent-evaluation-suite/implementation.md`. No se ejecutaron evals live, no se usaron credenciales/targets reales y no se modificó el review.
+- Fecha: 2026-10-15
+- Trabajo: segunda review rechazada; correcciones REV-10–REV-13 implementadas y pruebas dirigidas en pass.
+- Resultado: todos los sets de expectations son únicos y se normalizan antes del digest lógico; el SHA wire queda separado como control de integridad. La conversión millis→`time.Duration` es checked en criteria, casos, runner y oracle. `safe_configuration` incorpora `call_timeout_millis` live desde el entrypoint y lo serializa sin profile. Nuevas pruebas de comportamiento recuperan el baseline global.
+- Evidencia incremental: coverage exacto mediante `go test -count=1 -coverprofile=<temp> ./...` + `go tool cover -func=<temp>` da 91,1 % global; `internal/agenteval` 91,3 % y `cmd/featureproof` 89,2 %.
+- Estado: T1-T9 permanecen completas; verificación canónica fresca en curso para tercera review. No se ejecutaron evals live ni se usaron credenciales o targets reales.
+- Fecha: 2026-10-15
+- Trabajo: correcciones REV-10–REV-13 reverificadas y preparadas para tercera review independiente.
+- Verificación final: formato, vet, build, compilación sin tests, suite completa, race completa, race ×20, coverage exacto con profile + `go tool cover`, módulos, `git diff --check` y builds/test-compile Linux/macOS en pass.
+- Coverage reproducible: 91,1 % global, igual al baseline aprobado; 91,3 % en `internal/agenteval` y 89,2 % en `cmd/featureproof`.
+- Estado: T1-T9 siguen `[x]`; REV-1–REV-13 cuentan con pruebas directas y trazabilidad actualizada. No se modificaron `feature_list.json` ni el review, y no se ejecutaron evals live ni se usaron credenciales/targets reales.

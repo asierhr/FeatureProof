@@ -197,3 +197,25 @@ Bitácora append-only de features completadas.
   `progress/agent-plan-generation/review.md`.
 - Alcance preservado: generar no ejecuta, persiste, aprueba ni replantea; las
   features 11, 12 y 13 mantienen esas responsabilidades.
+
+## 2026-10-15 — agent-evaluation-suite
+
+- Estado final: `done`.
+- Resultado: suite versionada para evaluar la generación de planes mediante
+  replay hermético o live opt-in, con oráculo estructural anti-invención,
+  métricas enteras, criterios explícitos, comparación con baseline y bundles
+  autenticados sin secretos ni acciones contra aplicaciones desplegadas.
+- Spec aprobada por el usuario el `2026-10-15T16:53:38+02:00`.
+- Tasks: T1-T9 completadas.
+- Trazabilidad: R1-R12 verificados mediante tests concretos en
+  `progress/agent-evaluation-suite/implementation.md`.
+- Verificación independiente: formato, vet, compilación, suite fresca, race
+  completa, 20 repeticiones race, coverage, `go mod verify` y builds
+  Windows/Linux/macOS en pass; evaluaciones live no ejecutadas.
+- Coverage: 91,1 % global; 91,3 % en `internal/agenteval` y 89,2 % en
+  `cmd/featureproof`.
+- Review: aprobada tras cerrar REV-1 a REV-13 sobre confinement y snapshots,
+  expectativas estructurales, fail-fast y límites, configuración auditable,
+  autenticidad y compatibilidad de baseline, digests lógicos y preflight
+  previo a composición live; evidencia en
+  `progress/agent-evaluation-suite/review.md`.

@@ -202,7 +202,7 @@
           "La suite puede comparar una ejecución candidata con una baseline e identificar regresiones por categoría",
           "Las evals se ejecutan mediante un comando separado y nunca forman parte implícita de go test"
         ],
-        "status": "pending"
+        "status": "done"
     },
     {
         "id": 12,
