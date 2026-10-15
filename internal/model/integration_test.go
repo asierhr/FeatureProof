@@ -167,7 +167,7 @@ func TestOrdinaryModelSuiteUsesOnlyControlledLocalDependencies(t *testing.T) {
 		t.Fatal(err)
 	}
 	run, err := h.Run(context.Background())
-	if err != nil || run.Status != harness.StatusCompleted || httpBoundary.calls != 1 || len(observer.records) != 1 || observer.records[0].Usage.Total() != 3 || !browser.opened {
+	if err != nil || run.Status() != harness.StatusCompleted || httpBoundary.calls != 1 || len(observer.records) != 1 || observer.records[0].Usage.Total() != 3 || !browser.opened {
 		t.Fatalf("run=%+v calls=%d records=%+v opened=%v error=%v", run, httpBoundary.calls, observer.records, browser.opened, err)
 	}
 }

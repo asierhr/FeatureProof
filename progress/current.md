@@ -2,10 +2,143 @@
 
 ## Estado
 
-La feature `agent-evaluation-suite` está en estado `done`. La implementación y
-la revisión independiente están completas.
+La feature `bounded-replanning` está en estado `spec_ready`. La especificación
+está completa y espera aprobación humana. No se ha autorizado implementación.
 
 ## Última actualización
+
+- Fecha: 2026-10-15
+- Trabajo: especificación de `bounded-replanning` completada y transición de
+  `pending` a `spec_ready` realizada por el leader.
+- Artefactos: `requirements.md`, `design.md` y `tasks.md` bajo
+  `specs/bounded-replanning/`.
+- Verificación: R1-R12 cubren resumen saneado, protocolo cerrado, pipeline
+  completo, presupuestos, agotamiento, ledger monotónico, anti-loop, lineage,
+  aprobación, concurrencia y verdict; T1-T9 referencian todos los requirements
+  y la aprobación humana permanece vacía.
+- Frontera: no se introducen costes monetarios; se reutilizan llamadas,
+  tokens, duración y replans de feature 9 junto con steps, tools y trabajo
+  determinista.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-15
+- Trabajo: preflight de `bounded-replanning` completado e inicio de la
+  redacción de `specs/bounded-replanning/{requirements,design,tasks}.md`.
+- Precondiciones: primera feature pendiente, `sdd: true`, features 1-12
+  `done` y ninguna feature `in_progress`.
+- Contexto clave: la replanificación parte únicamente de resultados y
+  evidencias redactadas; cualquier comprobación adicional debe volver a pasar
+  por validación, registry, policy, budgets y aprobación cuando corresponda.
+- Invariante: una replanificación nunca puede borrar o mejorar un fallo
+  determinista ya observado, ni iniciar trabajo al agotarse un límite.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-15
+- Trabajo: quinta revisión independiente aprobada y transición de
+  `in_progress` a `done` realizada por el leader.
+- Evidencia: R1-R12 y T1-T9 verificados; REV-1 a REV-9 cerradas; formato, vet,
+  compilación, suite fresca, race, race x20, coverage, módulos y builds
+  Windows/Linux/macOS en pass.
+- Coverage: 91,1 % global; 91,5 % `internal/planapproval`, 90,8 %
+  `internal/agentplanning`, 88,3 % `internal/harness` y 89,3 %
+  `internal/planning`.
+- Invariantes finales: cero ejecución sin grant vigente, provenance ligada al
+  contexto, consumo único durable, journal estricto y carga local aislada por
+  run sin I/O bajo locks globales.
+- Resumen añadido a `progress/history.md`.
+
+- Fecha: 2026-10-15
+- Trabajo: cuarta revisión independiente rechazada; REV-1 a REV-8 cerradas y
+  REV-9 devuelta al implementer.
+- Hallazgo pendiente: `LocalStore.ensureLoaded` conserva un mutex global por
+  root durante recovery y lectura de disco, bloqueando runs independientes.
+- Estado: `in_progress`; requiere carga coordinada por run, pruebas de
+  bloqueo/cancelación/retry y quinta review.
+
+- Fecha: 2026-10-15
+- Trabajo: tercera revisión independiente rechazada; REV-1 a REV-7 cerradas
+  y REV-8 devuelta al implementer.
+- Hallazgo pendiente: el lifecycle mantiene su mutex durante store,
+  sanitizer, hashing y la ejecución externa de `PlanExecutor`, creando una
+  ruta de bloqueo y reentrada contraria a las convenciones.
+- Estado: `in_progress`; requiere reducir la sección crítica, reverificar y
+  realizar una cuarta review independiente.
+
+- Fecha: 2026-10-15
+- Trabajo: segunda revisión independiente rechazada; REV-2 a REV-4 cerradas,
+  REV-1/REV-5 parciales y REV-6/REV-7 devueltas al implementer.
+- Hallazgos pendientes: propiedad única y race-free del aggregate `Run` unida
+  al CAS autoritativo, y validación estricta de SHA-256/UTC en eventos
+  reconstruidos.
+- Estado: `in_progress`; requiere tercera review tras correcciones y
+  reverificación completa.
+
+- Fecha: 2026-10-15
+- Trabajo: primera revisión independiente de `plan-approval` rechazada;
+  correcciones devueltas al implementer.
+- Hallazgos: REV-1 a REV-5 cubren integración obligatoria en la ruta real de
+  `PlanExecutor`, provenance entre plan y restricciones, recuperación local
+  transaccional, append resistente a escrituras parciales y validación cerrada
+  de eventos auditables.
+- Estado: `in_progress`; requiere corrección, reverificación completa y nueva
+  review independiente.
+
+- Fecha: 2026-10-15
+- Trabajo: T1-T9 de `plan-approval` completadas; implementación preparada para
+  revisión independiente en `progress/plan-approval/implementation.md`.
+- Verificación: formato, vet, compilación, suite completa, race completa, race
+  x20 de paquetes afectados, coverage, módulos, `git diff --check` y builds
+  Linux/macOS en pass.
+- Coverage: 91,4 % global; 94,3 % `internal/planapproval`, 91,0 %
+  `internal/evidence` y 88,0 % `internal/harness`; baseline global preservado.
+- Seguridad: cero red, credenciales, targets reales o ejecución previa a una
+  autorización confirmada y consumida una sola vez.
+- Estado: la feature continúa `in_progress`; se solicita review independiente.
+
+- Fecha: 2026-10-15
+- Trabajo: T1-T7 de `plan-approval` implementadas con workflow, proyección
+  saneada, hashes canónicos, journal/CAS en memoria y local, decisiones e
+  invalidaciones cerradas, grant opaco consumible una vez e integración con
+  la frontera de `planning`.
+- Estado: tests dirigidos en pass y coverage del paquete nuevo en 85,1 %; T8
+  y T9 continúan con race, verificación canónica y trazabilidad final.
+- Seguridad: no se han usado red, credenciales, targets reales ni una CLI
+  interactiva; el executor solo recibe planes después de consumo persistido.
+
+- Fecha: 2026-10-15
+- Trabajo: aprobación humana registrada y transición de `spec_ready` a
+  `in_progress` realizada por el leader.
+- Aprobación: `approved_by: user`,
+  `approved_at: 2026-10-15T18:30:28+02:00`.
+- Siguiente fase: implementación ordenada de T1-T9, verificación canónica y
+  revisión independiente.
+
+- Fecha: 2026-10-15
+- Trabajo: especificación de `plan-approval` completada y transición de
+  `pending` a `spec_ready` realizada por el leader.
+- Artefactos: `requirements.md`, `design.md` y `tasks.md` bajo
+  `specs/plan-approval/`.
+- Verificación: R1-R12 cubren staging sin efectos, vista saneada, decisiones,
+  hashes, invalidación, grant opaco, consumo único, CAS, journal y
+  cancelación; T1-T9 referencian todos los requirements y la aprobación
+  humana permanece vacía.
+- Frontera: la feature no inventa una CLI interactiva; ofrece un workflow de
+  aplicación reutilizable y ninguna herramienta cruza la puerta sin una
+  autorización vigente y consumible una sola vez.
+- Código productivo modificado para esta feature: no.
+
+- Fecha: 2026-10-15
+- Trabajo: preflight de `plan-approval` completado e inicio de la redacción de
+  `specs/plan-approval/{requirements,design,tasks}.md`.
+- Precondiciones: primera feature pendiente, `sdd: true`, features 1-11
+  `done` y ninguna feature `in_progress`.
+- Contexto clave: la feature 10 entrega un plan preparado sin ejecutarlo; esta
+  feature debe introducir una decisión humana auditable, vinculada por hashes
+  al plan, target, restricciones y contexto contractual.
+- Invariante: ninguna herramienta puede ejecutarse mientras el run permanezca
+  en `awaiting_approval` o cuando la aprobación sea inexistente, rechazada,
+  duplicada u obsoleta.
+- Código productivo modificado para esta feature: no.
 
 - Fecha: 2026-10-15
 - Trabajo: tercera revisión independiente aprobada y transición de
@@ -1255,3 +1388,43 @@ la revisión independiente están completas.
 - Verificación final: formato, vet, build, compilación sin tests, suite completa, race completa, race ×20, coverage exacto con profile + `go tool cover`, módulos, `git diff --check` y builds/test-compile Linux/macOS en pass.
 - Coverage reproducible: 91,1 % global, igual al baseline aprobado; 91,3 % en `internal/agenteval` y 89,2 % en `cmd/featureproof`.
 - Estado: T1-T9 siguen `[x]`; REV-1–REV-13 cuentan con pruebas directas y trazabilidad actualizada. No se modificaron `feature_list.json` ni el review, y no se ejecutaron evals live ni se usaron credenciales/targets reales.
+
+- 2026-10-15: La primera revisión de plan-approval fue rechazada. Se corrigen REV-1–REV-5: composición obligatoria, provenance, recuperación transaccional, publicación atómica y schema cerrado de eventos.
+- Fecha: 2026-10-15
+- Trabajo: REV-1–REV-5 de plan-approval corregidas íntegramente.
+- Resultado: composición fija con PlanExecutor real y run transicionado por journal; provenance privada de feature 10; recovery transaccional; publicación atómica con rollback/recovery; schema cerrado completo por evento.
+- Evidencia: suite canónica, race completa, race ×20, coverage, módulos, diff y builds Linux/macOS en pass. Coverage 91,2 % global y 92,8 % en planapproval; baseline global 91,1 % preservado.
+- Estado: T1–T9 continúan completas; implementación preparada para segunda review. No se modificaron feature_list.json ni review.md y no se usaron red, credenciales o targets reales.
+- Fecha: 2026-10-15
+- Trabajo: REV-6 y REV-7 de plan-approval corregidas tras la segunda review.
+- Resultado: propietario único y race-free por run con aggregate no sustituible; comandos sin puntero de run; CAS/proyección/transición serializados; estado privado sincronizado en harness; executor verificado contra el mismo aggregate. Projector exige hashes SHA-256 hex minúsculos exactos y timestamps UTC.
+- Evidencia: approve/approve, approve/reject y reject/regenerate sobre el mismo aggregate, append failure y replay alineados con Project; suite completa, race completa, race ×20, coverage, módulos, diff y builds Linux/macOS en pass. Coverage 91,3 % global y 93,1 % planapproval.
+- Estado: T1–T9 siguen completas y la implementación queda preparada para tercera review. No se modificaron feature_list.json ni review.md.
+- Fecha: 2026-10-15
+- Trabajo: REV-8 de `plan-approval` corregida tras la tercera review.
+- Resultado: el propietario por run usa una reserva tokenizada y mantiene su
+  mutex únicamente durante reserva/verificación/commit; store, hashing,
+  sanitizer y `PlanExecutor` operan sin ese lock. Stage/Decide revalidan el
+  prefijo y proyectan el evento confirmado antes de publicar el estado; el
+  consumo CAS se confirma y libera antes de policy, budgets, tools, waits,
+  evidence o callbacks del executor.
+- Evidencia: regresiones bloqueantes y reentrantes de store, sanitizer y
+  policy/runner terminan sin deadlock; concurrencia, replay y alineación de
+  journal conservan un único consumo y estado coherente. Suite completa, race
+  completa, race ×20, coverage, módulos, diff y builds Linux/macOS en pass.
+- Coverage: 91,1 % global y 91,3 % `internal/planapproval`; baseline global
+  preservado. T1–T9 permanecen completas y se solicita cuarta review.
+- Fecha: 2026-10-15
+- Trabajo: REV-9 de `plan-approval` corregida tras la cuarta review.
+- Resultado: `LocalStore` coordina carga y recovery por run mediante un owner
+  y un canal de finalización cancelable. El mapa compartido se bloquea solo al
+  reclamar o publicar el resultado; recovery, lectura, decode y `Project`
+  ocurren sin ese mutex. Los fallos eliminan el estado in-flight y permiten un
+  retry limpio; el prefijo validado se publica atómicamente.
+- Evidencia: un run bloqueado no impide completar otro del mismo root; dos
+  handles del mismo run comparten una carga; un waiter cancelado no roba el
+  owner; error y cancelación del owner admiten retry sin duplicados ni prefijo
+  parcial. Suite completa, race completa, race ×20, coverage, módulos, diff y
+  builds Linux/macOS en pass.
+- Coverage: 91,1 % global y 91,5 % `internal/planapproval`; baseline global
+  preservado. T1–T9 permanecen completas y se solicita quinta review.

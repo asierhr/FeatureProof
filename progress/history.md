@@ -219,3 +219,25 @@ Bitácora append-only de features completadas.
   autenticidad y compatibilidad de baseline, digests lógicos y preflight
   previo a composición live; evidencia en
   `progress/agent-evaluation-suite/review.md`.
+
+## 2026-10-15 — plan-approval
+
+- Estado final: `done`.
+- Resultado: puerta humana entre planificación y ejecución con estado
+  `awaiting_approval`, vista exhaustiva saneada, fingerprints canónicos,
+  decisiones auditables, invalidación por cambios y autorización opaca de un
+  solo uso antes de `PlanExecutor`.
+- Spec aprobada por el usuario el `2026-10-15T18:30:28+02:00`.
+- Tasks: T1-T9 completadas.
+- Trazabilidad: R1-R12 verificados mediante tests concretos en
+  `progress/plan-approval/implementation.md`.
+- Verificación independiente: formato, vet, compilación, suite fresca, race
+  completa, 20 repeticiones race, coverage, `go mod verify` y builds
+  Windows/Linux/macOS en pass; sin red, credenciales ni targets reales.
+- Coverage: 91,1 % global; 91,5 % en `internal/planapproval`, 90,8 % en
+  `internal/agentplanning`, 88,3 % en `internal/harness` y 89,3 % en
+  `internal/planning`.
+- Review: aprobada tras cerrar REV-1 a REV-9 sobre integración obligatoria,
+  provenance, recuperación/publicación transaccional, schema de eventos,
+  propiedad concurrente del run, locks acotados y carga local aislada por
+  run; evidencia en `progress/plan-approval/review.md`.

@@ -1,19 +1,23 @@
 package harness
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 // Status represents the lifecycle phase owned and mutated exclusively by the harness.
 type Status string
 
 const (
-	StatusCreated      Status = "created"
-	StatusPlanning     Status = "planning"
-	StatusExecuting    Status = "executing"
-	StatusReviewing    Status = "reviewing"
-	StatusCompleted    Status = "completed"
-	StatusFailed       Status = "failed"
-	StatusInconclusive Status = "inconclusive"
-	StatusCancelled    Status = "cancelled"
+	StatusCreated          Status = "created"
+	StatusPlanning         Status = "planning"
+	StatusAwaitingApproval Status = "awaiting_approval"
+	StatusExecuting        Status = "executing"
+	StatusReviewing        Status = "reviewing"
+	StatusCompleted        Status = "completed"
+	StatusFailed           Status = "failed"
+	StatusInconclusive     Status = "inconclusive"
+	StatusCancelled        Status = "cancelled"
 )
 
 // Limits defines the maximum model steps, tool executions, and retries for a run.
@@ -28,8 +32,9 @@ type Consumption struct {
 
 // Run is the mutable execution aggregate coordinated by one Harness instance.
 type Run struct {
+	mu                          sync.RWMutex
 	ID, Objective, ConstraintID string
-	Status                      Status
+	status                      Status
 	Limits                      Limits
 	Consumed                    Consumption
 	EvidenceIDs                 []string
@@ -60,30 +65,47 @@ func NewRun(id, objective, constraintID string, limits Limits) (*Run, error) {
 	if limits.MaxSteps < 0 || limits.MaxToolCalls < 0 || limits.MaxRetries < 0 {
 		return nil, fmt.Errorf("limits must be non-negative")
 	}
-	return &Run{ID: id, Objective: objective, ConstraintID: constraintID, Status: StatusCreated, Limits: limits}, nil
+	return &Run{ID: id, Objective: objective, ConstraintID: constraintID, status: StatusCreated, Limits: limits}, nil
+}
+
+// Status returns the lifecycle phase through the run's synchronized ownership boundary.
+func (r *Run) Status() Status {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.status
 }
 
 // Transition enforces the approved run state machine and prevents terminal mutation.
 func (r *Run) Transition(to Status) error {
-	if r.Terminal() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if terminalStatus(r.status) {
 		return fmt.Errorf("run %s is terminal", r.ID)
 	}
 	valid := map[Status]map[Status]bool{
-		StatusCreated:   {StatusPlanning: true, StatusFailed: true, StatusInconclusive: true, StatusCancelled: true},
-		StatusPlanning:  {StatusExecuting: true, StatusReviewing: true, StatusFailed: true, StatusInconclusive: true, StatusCancelled: true},
-		StatusExecuting: {StatusReviewing: true, StatusFailed: true, StatusInconclusive: true, StatusCancelled: true},
-		StatusReviewing: {StatusPlanning: true, StatusCompleted: true, StatusFailed: true, StatusInconclusive: true, StatusCancelled: true},
+		StatusCreated:          {StatusPlanning: true, StatusFailed: true, StatusInconclusive: true, StatusCancelled: true},
+		StatusPlanning:         {StatusAwaitingApproval: true, StatusExecuting: true, StatusReviewing: true, StatusFailed: true, StatusInconclusive: true, StatusCancelled: true},
+		StatusAwaitingApproval: {StatusExecuting: true, StatusPlanning: true, StatusCancelled: true},
+		StatusExecuting:        {StatusReviewing: true, StatusFailed: true, StatusInconclusive: true, StatusCancelled: true},
+		StatusReviewing:        {StatusPlanning: true, StatusCompleted: true, StatusFailed: true, StatusInconclusive: true, StatusCancelled: true},
 	}
-	if !valid[r.Status][to] {
-		return fmt.Errorf("invalid run transition %s to %s", r.Status, to)
+	if !valid[r.status][to] {
+		return fmt.Errorf("invalid run transition %s to %s", r.status, to)
 	}
-	r.Status = to
+	r.status = to
 	return nil
 }
 
 // Terminal reports whether the run has reached an immutable lifecycle state.
 func (r *Run) Terminal() bool {
-	return r.Status == StatusCompleted || r.Status == StatusFailed || r.Status == StatusInconclusive || r.Status == StatusCancelled
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return terminalStatus(r.status)
+}
+
+// terminalStatus classifies immutable states while the caller owns any required run lock.
+func terminalStatus(status Status) bool {
+	return status == StatusCompleted || status == StatusFailed || status == StatusInconclusive || status == StatusCancelled
 }
 
 // ReserveStep atomically accounts for one model decision within the step budget.

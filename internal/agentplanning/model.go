@@ -265,8 +265,9 @@ func (p PreparedCheck) Evidence() []EvidenceRequirement { return cloneEvidence(p
 
 // PreparedPlan is the all-or-nothing result that passed every generation validation stage.
 type PreparedPlan struct {
-	id     string
-	checks []PreparedCheck
+	id         string
+	checks     []PreparedCheck
+	provenance string
 }
 
 // ID returns the caller-selected plan identifier.
@@ -274,6 +275,19 @@ func (p PreparedPlan) ID() string { return p.id }
 
 // Checks returns isolated prepared entries without granting execution authority.
 func (p PreparedPlan) Checks() []PreparedCheck { return append([]PreparedCheck(nil), p.checks...) }
+
+// ProvenanceInput is the non-executable generation context that an approval boundary may verify against a prepared plan.
+type ProvenanceInput struct {
+	Constraints  []Constraint
+	OpenAPI      openapi.ReducedContext
+	Capabilities []CapabilityDescriptor
+}
+
+// MatchesProvenance proves that this plan was minted from the supplied generation inputs without exposing a forgeable token.
+func (p PreparedPlan) MatchesProvenance(input ProvenanceInput) bool {
+	want, err := generationProvenance(input.Constraints, input.OpenAPI, input.Capabilities)
+	return err == nil && p.provenance != "" && p.provenance == want
+}
 
 // Result contains exactly one successful domain branch.
 type Result struct {

@@ -2,6 +2,7 @@ package harness
 
 import "testing"
 
+// TestRunConfigurationAndTransitions protects the run lifecycle and explicit budget preconditions.
 func TestRunConfigurationAndTransitions(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -27,6 +28,30 @@ func TestRunConfigurationAndTransitions(t *testing.T) {
 	}
 	if err := r.Transition(StatusCompleted); err == nil {
 		t.Fatal("invalid transition accepted")
+	}
+}
+
+// TestApprovalTransitionsPermitOnlyTheApprovedLifecycleEdges keeps execution unreachable except through the approval phase.
+func TestApprovalTransitionsPermitOnlyTheApprovedLifecycleEdges(t *testing.T) {
+	for _, destination := range []Status{StatusExecuting, StatusPlanning, StatusCancelled} {
+		run, _ := NewRun("run", "goal", "constraint", Limits{})
+		if err := run.Transition(StatusPlanning); err != nil {
+			t.Fatal(err)
+		}
+		if err := run.Transition(StatusAwaitingApproval); err != nil {
+			t.Fatal(err)
+		}
+		if err := run.Transition(destination); err != nil {
+			t.Fatalf("destination %s rejected: %v", destination, err)
+		}
+	}
+	for _, destination := range []Status{StatusCreated, StatusReviewing, StatusCompleted, StatusAwaitingApproval, StatusFailed, StatusInconclusive} {
+		run, _ := NewRun("run", "goal", "constraint", Limits{})
+		_ = run.Transition(StatusPlanning)
+		_ = run.Transition(StatusAwaitingApproval)
+		if err := run.Transition(destination); err == nil {
+			t.Fatalf("destination %s accepted", destination)
+		}
 	}
 }
 

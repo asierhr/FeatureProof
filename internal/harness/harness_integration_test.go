@@ -190,7 +190,7 @@ func TestModelProjectionFailurePreventsModelCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	run, err := h.Run(context.Background())
-	if err == nil || run.Status != harness.StatusFailed || len(m.CapturedRequests()) != 1 || tool.CallCount() != 1 {
+	if err == nil || run.Status() != harness.StatusFailed || len(m.CapturedRequests()) != 1 || tool.CallCount() != 1 {
 		t.Fatalf("projection failure crossed model boundary: run=%#v calls=%d err=%v", run, len(m.CapturedRequests()), err)
 	}
 }
@@ -317,7 +317,7 @@ func TestHarnessStopsWhenToolBudgetIsExhausted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Status != harness.StatusInconclusive || f.tool.CallCount() != 0 {
+	if r.Status() != harness.StatusInconclusive || f.tool.CallCount() != 0 {
 		t.Fatalf("run=%+v calls=%d", r, f.tool.CallCount())
 	}
 	events, _ := f.journal.Events(context.Background(), "run-1")
@@ -341,7 +341,7 @@ func TestHarnessStopsWhenRetryBudgetIsExhausted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Status != harness.StatusInconclusive || run.Verdict != nil || run.Consumed.Retries != 0 || run.Consumed.ToolCalls != 1 {
+	if run.Status() != harness.StatusInconclusive || run.Verdict != nil || run.Consumed.Retries != 0 || run.Consumed.ToolCalls != 1 {
 		t.Fatalf("run=%+v", run)
 	}
 	if len(f.model.CapturedRequests()) != 1 || f.tool.CallCount() != 1 {
@@ -358,7 +358,7 @@ func TestHarnessDoesNotPartiallyReserveWhenToolBudgetIsExhaustedBeforeRetry(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Status != harness.StatusInconclusive || run.Verdict != nil || run.Consumed.Retries != 0 || run.Consumed.ToolCalls != 1 {
+	if run.Status() != harness.StatusInconclusive || run.Verdict != nil || run.Consumed.Retries != 0 || run.Consumed.ToolCalls != 1 {
 		t.Fatalf("run=%+v", run)
 	}
 	if len(f.model.CapturedRequests()) != 1 || f.tool.CallCount() != 1 {
@@ -397,7 +397,7 @@ func TestHarnessRetriesTransientModelErrorWithinBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Status != harness.StatusCompleted || r.Consumed.Steps != 2 || r.Consumed.Retries != 1 || f.waiter.calls != 1 {
+	if r.Status() != harness.StatusCompleted || r.Consumed.Steps != 2 || r.Consumed.Retries != 1 || f.waiter.calls != 1 {
 		t.Fatalf("run=%+v waits=%d", r, f.waiter.calls)
 	}
 }
@@ -438,7 +438,7 @@ func TestHarnessFailsWhenEvidenceCannotBePersisted(t *testing.T) {
 		t.Fatal(err)
 	}
 	r, err := h.Run(context.Background())
-	if err == nil || r.Status != harness.StatusFailed || len(f.model.CapturedRequests()) != 1 {
+	if err == nil || r.Status() != harness.StatusFailed || len(f.model.CapturedRequests()) != 1 {
 		t.Fatalf("run=%+v err=%v", r, err)
 	}
 }
@@ -457,7 +457,7 @@ func TestHarnessStopsAtConfiguredStepLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Status != harness.StatusInconclusive || len(f.model.CapturedRequests()) != 1 || len(r.EvidenceIDs) != 1 {
+	if r.Status() != harness.StatusInconclusive || len(f.model.CapturedRequests()) != 1 || len(r.EvidenceIDs) != 1 {
 		t.Fatalf("run=%+v requests=%d", r, len(f.model.CapturedRequests()))
 	}
 }
@@ -506,8 +506,8 @@ func TestHarnessPropagatesCancellationAndPreservesConfirmedRecords(t *testing.T)
 	<-started
 	cancel()
 	r := <-done
-	if r.Status != harness.StatusCancelled {
-		t.Fatalf("status=%s", r.Status)
+	if r.Status() != harness.StatusCancelled {
+		t.Fatalf("status=%s", r.Status())
 	}
 	if len(r.EvidenceIDs) != 1 {
 		t.Fatalf("confirmed evidence lost: %v", r.EvidenceIDs)
@@ -540,7 +540,7 @@ func TestHarnessCancelsDuringEvidencePersistenceAndPreservesConfirmedRecords(t *
 	<-store.started
 	cancel()
 	run := <-done
-	if run.Status != harness.StatusCancelled || len(run.EvidenceIDs) != 1 {
+	if run.Status() != harness.StatusCancelled || len(run.EvidenceIDs) != 1 {
 		t.Fatalf("run=%+v", run)
 	}
 	if _, err := f.store.Get(context.Background(), run.EvidenceIDs[0]); err != nil {
@@ -562,7 +562,7 @@ func TestHarnessCancelsDuringEvidenceRecoveryAndPreservesConfirmedRecords(t *tes
 	<-store.started
 	cancel()
 	run := <-done
-	if run.Status != harness.StatusCancelled || len(run.EvidenceIDs) != 1 {
+	if run.Status() != harness.StatusCancelled || len(run.EvidenceIDs) != 1 {
 		t.Fatalf("run=%+v", run)
 	}
 	if _, err := f.store.Get(context.Background(), run.EvidenceIDs[0]); err != nil {
@@ -585,7 +585,7 @@ func TestHarnessStopsWhenJournalFailsBeforeOrDuringExecution(t *testing.T) {
 				t.Fatal(err)
 			}
 			run, runErr := h.Run(context.Background())
-			if runErr == nil || run.Status != harness.StatusFailed {
+			if runErr == nil || run.Status() != harness.StatusFailed {
 				t.Fatalf("run=%+v err=%v", run, runErr)
 			}
 			if f.tool.CallCount() != 0 {
@@ -604,7 +604,7 @@ func TestHarnessConfirmsTerminalAfterTransientJournalFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	run, runErr := h.Run(context.Background())
-	if runErr == nil || run.Status != harness.StatusCompleted {
+	if runErr == nil || run.Status() != harness.StatusCompleted {
 		t.Fatalf("run=%+v err=%v", run, runErr)
 	}
 	assertSingleTerminal(t, journal, run.ID, harness.EventRunCompleted)
@@ -644,7 +644,7 @@ func TestHarnessPropagatesMandatoryJournalFailures(t *testing.T) {
 				t.Fatal(err)
 			}
 			run, runErr := h.Run(context.Background())
-			if runErr == nil || run.Status != harness.StatusFailed {
+			if runErr == nil || run.Status() != harness.StatusFailed {
 				t.Fatalf("run=%+v err=%v", run, runErr)
 			}
 			assertSingleTerminal(t, journal, run.ID, harness.EventRunFailed)
@@ -757,7 +757,7 @@ func TestHarnessClassifiesPermanentModelAndPolicyErrors(t *testing.T) {
 		f := fixtureFor(t, []harness.ModelDecision{complete("")}, nil, harness.Limits{MaxSteps: 1})
 		f.model.Errors = []error{errors.New("provider failed")}
 		r, err := f.h.Run(context.Background())
-		if err == nil || r.Status != harness.StatusFailed {
+		if err == nil || r.Status() != harness.StatusFailed {
 			t.Fatalf("run=%+v err=%v", r, err)
 		}
 	})
@@ -768,7 +768,7 @@ func TestHarnessClassifiesPermanentModelAndPolicyErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		r, runErr := h.Run(context.Background())
-		if runErr == nil || r.Status != harness.StatusFailed {
+		if runErr == nil || r.Status() != harness.StatusFailed {
 			t.Fatalf("run=%+v err=%v", r, runErr)
 		}
 	})

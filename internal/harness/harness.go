@@ -74,7 +74,7 @@ func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 				return transitionErr
 			}
 		}
-		typ, typeErr := terminalEvent(run.Status)
+		typ, typeErr := terminalEvent(run.Status())
 		if typeErr != nil {
 			return typeErr
 		}
@@ -107,7 +107,7 @@ func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 		if terminalWritten {
 			return
 		}
-		status := run.Status
+		status := run.Status()
 		if !run.Terminal() {
 			status = StatusFailed
 		}
@@ -228,7 +228,7 @@ func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 		if err = audit(Event{Type: EventBudgetReserved, Step: run.Consumed.Steps, ToolCallID: call.ID}); err != nil {
 			return run, end(StatusFailed, "", err)
 		}
-		if run.Status == StatusPlanning {
+		if run.Status() == StatusPlanning {
 			if err = run.Transition(StatusExecuting); err != nil {
 				return run, end(StatusFailed, "", err)
 			}
@@ -311,7 +311,7 @@ func (h *Harness) Run(ctx context.Context) (run *Run, err error) {
 			}
 			attempt++
 		}
-		if run.Status == StatusExecuting {
+		if run.Status() == StatusExecuting {
 			if err = run.Transition(StatusReviewing); err != nil {
 				return run, end(StatusFailed, "", err)
 			}

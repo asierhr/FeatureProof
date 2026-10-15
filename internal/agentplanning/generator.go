@@ -166,7 +166,12 @@ func (g *Generator) Generate(ctx context.Context, request GenerationRequest) (re
 		record.Category = CategoryPolicyDenial
 		return Result{}, typedError(CategoryPolicyDenial, "policy", field("checks", denied), nil)
 	}
-	value := PreparedPlan{id: snapshot.PlanID, checks: prepared}
+	provenance, provenanceErr := generationProvenance(snapshot.Constraints, snapshot.OpenAPI, snapshot.Capabilities)
+	if provenanceErr != nil {
+		record.Category = CategoryInternal
+		return Result{}, typedError(CategoryInternal, "provenance", "generation_context", nil)
+	}
+	value := PreparedPlan{id: snapshot.PlanID, checks: prepared, provenance: provenance}
 	record.Outcome, record.Category = OutcomePrepared, ""
 	return Result{Prepared: &value}, nil
 }

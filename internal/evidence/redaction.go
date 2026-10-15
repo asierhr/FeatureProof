@@ -189,6 +189,22 @@ func (v SanitizedValue) Truncations() []Truncation {
 	return append([]Truncation(nil), v.truncations...)
 }
 
+// Value returns an isolated treated payload so trusted presentation adapters can reuse the evidence boundary.
+func (v SanitizedValue) Value() any {
+	if !v.complete {
+		return nil
+	}
+	raw, err := json.Marshal(v.value)
+	if err != nil {
+		return nil
+	}
+	var out any
+	if json.Unmarshal(raw, &out) != nil {
+		return nil
+	}
+	return out
+}
+
 // Sanitizer applies one validated policy before evidence crosses a persistence boundary.
 type Sanitizer struct {
 	policy    *Policy

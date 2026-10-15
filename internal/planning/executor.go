@@ -52,6 +52,11 @@ type PlanExecutor struct {
 	deps   ExecutorDependencies
 }
 
+// IsBoundTo verifies composition identity without exposing or replacing the executor's mutable run aggregate.
+func (e *PlanExecutor) IsBoundTo(run *harness.Run) bool {
+	return e != nil && e.config.Run == run
+}
+
 // NewPlanExecutor validates required execution boundaries before any journal or tool effect occurs.
 func NewPlanExecutor(config ExecutorConfig, dependencies ExecutorDependencies) (*PlanExecutor, error) {
 	if config.Run == nil {

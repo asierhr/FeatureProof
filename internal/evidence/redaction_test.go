@@ -16,6 +16,27 @@ type cancelBoundaryContext struct {
 	remaining int
 }
 
+// TestSanitizedValueReturnsIsolatedProjection lets trusted adapters reuse treatment without mutable aliases.
+func TestSanitizedValueReturnsIsolatedProjection(t *testing.T) {
+	if (SanitizedValue{}).Value() != nil {
+		t.Fatal("incomplete treatment exposed")
+	}
+	policy, err := NewPolicy(Config{MaxBodyBytes: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := NewSanitizer(policy).Sanitize(context.Background(), map[string]any{"body": map[string]any{"ok": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := result.Value().(map[string]any)
+	first["mutated"] = true
+	second := result.Value().(map[string]any)
+	if _, exists := second["mutated"]; exists {
+		t.Fatal("treated value aliased caller mutation")
+	}
+}
+
 // namedObject, namedArray, and namedFixed exercise identities that bypass concrete type switches.
 type namedObject map[string]any
 type namedArray []any

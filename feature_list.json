@@ -220,7 +220,7 @@
           "Solo una transición de aprobación válida permite pasar de awaiting_approval a executing",
           "Los tests cubren aprobación, rechazo, regeneración, edición, aprobación obsoleta, doble decisión y ausencia de ejecución previa"
         ],
-        "status": "pending"
+        "status": "done"
     },
     {
         "id": 13,
@@ -237,6 +237,113 @@
           "El harness detecta propuestas equivalentes ya ejecutadas y evita bucles de comprobaciones repetidas sin nueva información",
           "Cada replanificación conserva relación con la decisión anterior, las evidencias observadas y las nuevas acciones propuestas",
           "Los tests cubren comprobación adicional permitida, política denegada, aprobación requerida, límite agotado, propuesta repetida y conservación de fallos deterministas"
+        ],
+      "status": "spec_ready"
+    },
+    {
+        "id": 14,
+        "name": "revision-bound-validation",
+        "title": "Validación vinculada a una revisión",
+        "sdd": true,
+        "acceptance": [
+          "Cada run se vincula antes de ejecutar a una identidad canónica de repositorio, un commit completo e inmutable, una configuración de validación y un entorno identificado",
+          "La vinculación registra hashes estables de las restricciones, el plan aprobado, el contrato relevante y la configuración no secreta utilizada",
+          "Un commit inexistente, ambiguo o distinto del desplegado se rechaza o deja el run inconclusive antes de publicar una conclusión funcional",
+          "Los cambios locales no comprometidos nunca se atribuyen silenciosamente al commit y su presencia se rechaza o se representa explícitamente en la identidad de la revisión",
+          "Run, eventos, evidencias e informe conservan la misma vinculación y permiten comprobar que pertenecen a la revisión declarada",
+          "Las credenciales, tokens y valores sensibles no forman parte de la identidad, los hashes publicados ni los metadatos de revisión",
+          "Validar una corrección crea un nuevo run vinculado al nuevo commit y nunca modifica retroactivamente la revisión de un run anterior",
+          "Los tests cubren revisión válida, commit inexistente, working tree modificado, discrepancia de entorno, cambio de configuración e invariancia de hashes"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 15,
+        "name": "evidence-package",
+        "title": "Paquete de evidencias interoperable",
+        "sdd": true,
+        "acceptance": [
+          "FeatureProof produce un paquete versionado y legible por máquinas que contiene manifest, resultado por restricción, fallos, hechos observados, referencias de evidencia e instrucciones de reproducción",
+          "El paquete identifica de forma inmutable el run y la revisión definidos por revision-bound-validation",
+          "Los hechos deterministas se representan por separado de los diagnósticos o hipótesis generados por el agente",
+          "Cada fallo referencia la restricción, escenario, paso, assertion, valores esperado y observado y evidencias que lo justifican",
+          "El manifest incluye tamaño y digest de cada artefacto y el consumidor detecta archivos ausentes, modificados o no declarados",
+          "La publicación es atómica y un paquete incompleto nunca se presenta como resultado final válido",
+          "La redacción y los límites de evidencia se aplican antes de empaquetar y ningún secreto necesario para reproducir una ejecución se incluye en texto claro",
+          "Un lector puede validar la versión, integridad y referencias internas del paquete sin ejecutar herramientas ni confiar en texto producido por el modelo",
+          "Los tests cubren paquete válido, fallo funcional, resultado inconclusive, manipulación, referencias rotas, publicación interrumpida y secretos canario"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 16,
+        "name": "external-agent-interface",
+        "title": "Interfaz para agentes externos",
+        "sdd": true,
+        "acceptance": [
+          "Un agente externo puede solicitar una validación, consultar su estado y obtener su resultado mediante una interfaz estable sin acceder a componentes internos del harness",
+          "La CLI y el servidor MCP reutilizan los mismos casos de uso y producen contratos equivalentes para una misma operación",
+          "La interfaz permite consultar restricciones fallidas, hechos observados, referencias de evidencia y datos de reproducción del paquete sin entregar secretos ni rutas arbitrarias del host",
+          "Las operaciones potencialmente mutables requieren identidad, autorización y una clave de idempotencia y no pueden evitar políticas, presupuestos o aprobaciones",
+          "El agente externo solo puede utilizar identificadores opacos de runs y evidencias pertenecientes a su ámbito autorizado",
+          "Las respuestas distinguen de forma estructurada petición inválida, no autorizado, no encontrado, conflicto, ejecución en curso, fallo funcional e inconclusive",
+          "La cancelación y los timeouts se propagan sin abandonar ejecuciones o publicaciones huérfanas",
+          "La interfaz publica sus capacidades y versión para que un agente pueda detectar operaciones soportadas sin inventarlas",
+          "Los tests contractuales ejecutan los mismos casos contra CLI y MCP con adapters falsos y verifican idempotencia, aislamiento, errores y ausencia de secretos"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 17,
+        "name": "correction-loop",
+        "title": "Bucle verificable de corrección",
+        "sdd": true,
+        "acceptance": [
+          "Un agente externo puede presentar una nueva revisión como corrección de un run fallido sin modificar el run ni las evidencias originales",
+          "La corrección crea un run hijo vinculado al run anterior, al nuevo commit y a las restricciones que motivaron la revalidación",
+          "La nueva revisión debe ser distinta, resoluble y compatible con el repositorio y entorno autorizados antes de ejecutar comprobaciones",
+          "FeatureProof ejecuta primero los escenarios previamente fallidos cuando siguen siendo aplicables y después ejecuta la regresión completa requerida",
+          "Ningún resultado passed del run anterior se hereda como evidencia de la nueva revisión sin volver a comprobarse cuando la política exige regresión",
+          "El informe compara ambos runs y distingue fallos corregidos, persistentes, nuevos, no aplicables e inconclusive",
+          "El bucle limita intentos, duración y consumo del modelo y puede exigir aprobación humana antes de continuar",
+          "Un fallo de infraestructura o una revisión no desplegada detiene la iteración sin atribuir un fallo funcional al código",
+          "Los tests cubren corrección exitosa, fallo persistente, regresión nueva, mismo commit, límite agotado, escenario obsoleto y error de infraestructura"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 18,
+        "name": "github-pr-integration",
+        "title": "Integración con pull requests de GitHub",
+        "sdd": true,
+        "acceptance": [
+          "FeatureProof puede iniciar o asociar una validación a una pull request autorizada y vincularla exactamente a su head commit",
+          "El resultado se publica como check de GitHub con estados diferenciados para en curso, passed, failed, inconclusive y error operativo",
+          "El check resume restricciones, fallos y elementos no verificados y enlaza las evidencias sin incluir secretos ni contenido no redactado",
+          "La integración puede publicar o actualizar un único comentario resumen identificable sin crear duplicados en cada evento o reintento",
+          "Si cambia el head commit, el resultado anterior queda asociado a la revisión antigua y una nueva validación no reutiliza su aprobación ni sus evidencias",
+          "Los eventos entrantes se autentican, se procesan de forma idempotente y se rechazan cuando repositorio, instalación o pull request no están autorizados",
+          "Las pull requests procedentes de forks no reciben secretos ni credenciales salvo que una política explícita y segura autorice la ejecución",
+          "La integración utiliza permisos mínimos y no modifica código, ramas, revisiones ni otros checks de la pull request",
+          "Los tests usan un GitHub falso y cubren publicación, actualización idempotente, nuevo commit, webhook inválido, fork no confiable, rate limit y errores transitorios"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 19,
+        "name": "preview-environment-adapter",
+        "title": "Adapter de entornos preview existentes",
+        "sdd": true,
+        "acceptance": [
+          "FeatureProof puede conectarse mediante una interfaz propia a un entorno preview existente seleccionado explícitamente para un run",
+          "El adapter devuelve una identidad estable del entorno, target autorizado, estado de disponibilidad y metadatos de revisión sin exponer credenciales",
+          "Antes de validar la feature se comprueba mediante una atestación o mecanismo configurado que el entorno corresponde al commit vinculado al run",
+          "El target, esquema, host y puerto obtenidos del adapter vuelven a pasar por las políticas de red y no pueden ser sustituidos por el modelo",
+          "Las credenciales y secretos necesarios se resuelven durante la composición y solo se entregan al ejecutor autorizado que los necesita",
+          "El adapter aplica timeout y context cancellation a descubrimiento, readiness y liberación de la reserva del entorno",
+          "Un entorno no disponible, no saludable o asociado a otra revisión produce un error operativo o inconclusive y nunca un incumplimiento funcional",
+          "Esta primera versión no crea, modifica ni destruye infraestructura y deja explícitamente fuera de alcance el aprovisionamiento de previews",
+          "Los tests usan un provider falso y cubren conexión, readiness, revisión incorrecta, target denegado, timeout, cancelación, liberación y ausencia de secretos"
         ],
         "status": "pending"
     }
