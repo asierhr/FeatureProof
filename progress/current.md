@@ -1,5 +1,53 @@
 # Trabajo actual
 
+## 2026-10-16 — Cierre de external-agent-interface
+
+- Feature 16 `done` tras tercera review independiente aprobada; T1–T8 y
+  R1–R10 verificados.
+- REV-1 a REV-5 cerradas: journal append-only, schemas satisfacibles, join
+  real, contrato común CLI/MCP y finalización acotada ante fallos de
+  publicación.
+- Suite dirigida, race global comparable, race ×20, vet, módulos, diff y
+  builds Windows/Linux/macOS pasan. Coverage: 88,9 % `internal/externalagent`
+  y 88,7 % global comparable.
+- El único fallo literal global es el test de symlink preexistente de feature
+  15 en Windows; fue reproducido como limitación de privilegios y el mismo
+  subtest pasó bajo WSL2 sin modificarlo.
+- Informes finales en `progress/external-agent-interface/`; resumen añadido a
+  `progress/history.md`.
+
+## 2026-10-16 — Segunda review de external-agent-interface rechazada
+
+- REV-1 a REV-3 cerradas; REV-4 sigue parcial y REV-5 fue devuelta al
+  implementer.
+- Pendiente: añadir a la tabla contractual común `invalid_request`,
+  `unauthorized` y replay/conflict de cancelación; acotar con deadline y tratar
+  errores al persistir `publication_failed` antes de la transición terminal.
+- Estado: `in_progress`; requiere corrección, reverificación y tercera review.
+
+## 2026-10-16 — Primera review de external-agent-interface rechazada
+
+- REV-1 a REV-4 devueltas al implementer: journal append-only del registro,
+  schemas de salida completos y satisfacibles, join real del supervisor tras
+  cleanup y suite contractual común CLI/MCP para todos los escenarios R10.
+- La review confirmó que el fallo de symlink pertenece a feature 15 y es
+  ambiental en Windows; el mismo subtest pasó bajo WSL2. No se considera un
+  defecto de feature 16.
+- Estado: `in_progress`; requiere correcciones, verificación completa y nueva
+  review independiente.
+
+## 2026-10-16 — Inicio de implementación de external-agent-interface
+
+- El usuario aprobó la spec de feature 16 con la instrucción explícita de
+  continuar la implementación, registrada el
+  `2026-10-16T15:56:50+02:00`.
+- El leader cambió `external-agent-interface` de `spec_ready` a
+  `in_progress`.
+- Alcance: T1–T8 y R1–R10, con caso de uso compartido, adaptadores CLI/MCP,
+  identidad confiable, registro durable, idempotencia, supervisión cancelable
+  y proyección segura de paquetes; features 17–19 quedan fuera.
+- Siguiente fase: implementer, verificación canónica y review independiente.
+
 ## 2026-10-16 — Spec de external-agent-interface completada
 
 - Feature 16 pasó de `pending` a `spec_ready` tras verificar los tres
@@ -1595,3 +1643,19 @@ aprobadas. No hay feature `in_progress`.
 - evidence-package: events.jsonl verifica IDs de plan, constraint, step y tool call contra topología y registros de evidencia; manipulación de cada ID con manifest rehasheado rechazada. Tests dirigidos pasan; suite y race dirigida posteriores en curso.
 - evidence-package: tras correcciones de review pasan suite completa, vet, test sin caché de localvalidation, race dirigida de localvalidation y race fresca de las seis regresiones. Formato dirigido y diff check pasan. Race global/builds offline pertenecen al snapshot previo; reviewer repetirá el gate final.
 - evidence-package: la coherencia del árbol también verifica grupos `all`/`any` ternarios. Cobertura final de localvalidation 85,2 %, suite completa, vet y race fresca de regresiones en pass sobre el snapshot final. Ready for review; reviewer repetirá race global y builds offline.
+
+# Feature activa: external-agent-interface
+
+- 2026-10-16: implementación iniciada tras aprobación humana. Precondiciones verificadas: feature 16 en `in_progress`, spec completa y T1–T8 pendientes. T1 en curso: contrato de aplicación v1, estados y errores cerrados compartidos por CLI/MCP.
+- T1–T2 completadas: contrato v1 estricto, categorías/estados cerrados, descubrimiento con schemas y autoridad proveniente exclusivamente de identidad local más catálogo protegido. JSON duplicado, desconocido, profundo o sobredimensionado se rechaza sin valores.
+- T3 completada: registro JSON privado con publicación atómica, fsync, lock entre procesos, CAS de fases, hashes de idempotencia y lease OS por run. Concurrencia, reinicio y dos procesos conservan una sola reserva.
+- T4 completada: supervisor propietario propaga timeout/cancelación, espera workers, recupera owners perdidos sin rerun y no confunde un lease vivo con crash. La composición productiva permanece fail-closed mediante `FailClosedExecutor`; los positivos usan fakes que representan las puertas aprobadas.
+- T5 completada: `VerifiedPackageReader` delega exclusivamente en `localvalidation.ReadPackage`; la proyección revalida run/status/referencias, emite handles opacos, restringe vocabularios y elimina paths y texto libre.
+- T6–T7 completadas: CLI JSON y MCP stdio `2026-07-28` llaman a `Service.Invoke`. MCP es stateless, reautoriza cada petición, soporta `server/discover`, `tools/list` y `tools/call`, rechaza `initialize`, y separa protocolo de error de aplicación.
+- T8 en curso: tests dirigidos y contract suite común pasan. La primera suite global solo falla en el test preexistente de symlink de `internal/localvalidation` porque Windows devuelve `A required privilege is not held by the client`; no es un fallo del diff. Resto de paquetes, incluido `externalagent`, en pass. Pendientes vet/race/coverage/builds y documentación final.
+- T8 completada: suite contractual CLI/MCP, idempotencia multiproceso, cancelación cruzada entre procesos, aislamiento, recovery y proyección segura pasan. `go vet`, compilación, módulos, diff, formato dirigido, builds Windows/Linux/macOS, race global con exclusión ambiental y race ×20 de paquetes afectados pasan. Coverage `internal/externalagent` 88,9 % y global comparable 88,8 % al excluir únicamente el test preexistente de symlink que este Windows no puede crear. El `go test ./...` literal sigue bloqueado solo por ese `Skipf` preexistente ejecutado sobre el test padre; el código de feature 16 no interviene. Informe en `progress/external-agent-interface/implementation.md`; listo para review independiente.
+- Primera review de `external-agent-interface` rechazada con REV-1–REV-4. Se añadió un journal durable con prefijo ordenado para reserva, inicio, cancelación, terminal, recovery y fallo de publicación, incluida causa cerrada `interrupted`; snapshot y evento se publican en una única transacción. Los schemas de salida ahora describen el envelope y todos los DTO anidados con versiones y enums cerrados. El supervisor cierra `done` después de retirar el worker y liberar la lease. Una tabla contractual única ejecuta por CLI y MCP submit, replay/conflicto idempotente, cancelación, resultado saneado, corrupción, principal ajeno, `in_progress` y cada terminal, valida cada respuesta contra discovery y compara el envelope semántico.
+- Reverificación tras REV-1–REV-4: tests dirigidos y 20 repeticiones, suite global comparable, compilación, vet, módulos, diff, formato dirigido, race global comparable, race ×20 y builds Windows/Linux/macOS pasan. Coverage `internal/externalagent` 88,8 % y global comparable 88,7 %. El gate literal conserva únicamente el fallo ambiental/preexistente del symlink de feature 15 en Windows; la review anterior confirmó el mismo subtest en WSL2. No se modificó feature 15. Estado `in_progress`; preparado para segunda review independiente.
+- Segunda review de `external-agent-interface`: REV-1–REV-3 cerradas; REV-4 incompleta y nueva REV-5. La tabla contractual común ahora añade `invalid_request` representable en ambas superficies, revocación de scope tras discovery, replay de cancelación y conflicto al reutilizar la misma clave con otro handle. Cada respuesta real continúa validándose contra el schema descubierto por su propio transporte antes de comparar envelopes.
+- Corrección REV-5: el supervisor crea un contexto de finalización independiente con deadline antes de registrar `publication_failed` y lo reutiliza para las transiciones finalizing/terminal. Un registro bloqueado respeta el plazo y deja el run recuperable tras liberar worker/lease; un fallo inmediato continúa a terminal `error`. `TestPublicationFailureFinalizationIsBoundedAndRecoverable` prueba ambas rutas mediante `Wait`, `Cancel` y `Close`, sin callback ni worker huérfanos.
+- Reverificación tras segunda review: suite dirigida y ×20, suite global comparable, compile-only, vet, módulos, race global comparable, race ×20 y builds Windows/Linux/macOS pasan. Coverage `internal/externalagent` 88,9 % y global comparable 88,7 %. El único bloqueo literal sigue siendo el symlink preexistente de feature 15 ya confirmado bajo WSL2; no se modificaron feature 15, `feature_list.json` ni `review.md`. Preparado para tercera review independiente.

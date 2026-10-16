@@ -304,3 +304,25 @@ Bitácora append-only de features completadas.
   detecta alteraciones respecto a los bytes recibidos, pero no firma el
   origen; las instrucciones de reproducción son declarativas y no incluyen
   credenciales ni comandos ejecutables.
+
+## 2026-10-16 — external-agent-interface
+
+- Estado final: `done`.
+- Resultado: contrato de aplicación v1 compartido por CLI JSON y MCP stdio
+  `2026-07-28`, con identidad y ámbitos confiables, aliases autorizados,
+  handles opacos reautorizados, idempotencia durable, supervisor cancelable y
+  resultados proyectados exclusivamente desde paquetes verificados.
+- Spec aprobada por el usuario el `2026-10-16T15:56:50+02:00`.
+- Tasks: T1–T8 completadas; R1–R10 trazados a tests concretos en
+  `progress/external-agent-interface/implementation.md`.
+- Verificación independiente: suite dirigida, race global comparable, 20
+  repeticiones race, coverage, `go vet`, `go mod verify`, diff y builds
+  Windows/Linux/macOS en pass; sin red, modelo ni credenciales reales.
+- Coverage: 88,9 % en `internal/externalagent` y 88,7 % global comparable.
+- Review aprobada tras cerrar REV-1 a REV-5 sobre journal append-only,
+  schemas anunciados, join del supervisor, paridad contractual CLI/MCP y
+  finalización acotada; evidencia en
+  `progress/external-agent-interface/review.md`.
+- Limitación del host: el test de symlink de feature 15 falla en Windows por
+  privilegios y un `Skipf` heredado ligado al `testing.T` padre; el mismo
+  subtest pasó bajo WSL2 sin cambios.

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agenteval"
+	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/model"
 )
 
@@ -100,5 +101,52 @@ func TestMainPropagatesTheCommandExitCode(t *testing.T) {
 	main()
 	if code != 3 {
 		t.Fatalf("code=%d", code)
+	}
+}
+
+// TestProductionExternalAgentCompositionFailsClosed covers trusted OS composition without preview execution.
+func TestProductionExternalAgentCompositionFailsClosed(t *testing.T) {
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(original)
+	service, err := composeExternalAgentService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close(context.Background())
+	capabilities, err := service.Capabilities(context.Background())
+	if err != nil || len(capabilities.Operations) != 1 || capabilities.Operations[0].Name != "capabilities" {
+		t.Fatalf("capabilities=%#v err=%v", capabilities, err)
+	}
+	if _, err := service.Submit(context.Background(), externalagent.SubmitInput{SelectionAlias: "safe", IdempotencyKey: "production-key01"}); err == nil {
+		t.Fatal("preview composition admitted a run")
+	}
+	if !isExternalAgentCommand([]string{"run"}) || isExternalAgentCommand([]string{"validate"}) || isExternalAgentCommand(nil) {
+		t.Fatal("external dispatch classification changed")
+	}
+	var output bytes.Buffer
+	if code := writeExternalCompositionError(&output); code != 3 || !strings.Contains(output.String(), string(externalagent.CodeInternal)) {
+		t.Fatalf("code=%d body=%s", code, output.String())
+	}
+}
+
+// TestRunDispatchesExternalCapabilities covers the executable JSON adapter without credentials.
+func TestRunDispatchesExternalCapabilities(t *testing.T) {
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(original)
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"capabilities", "--json"}, strings.NewReader(""), &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), `"contract_version":1`) {
+		t.Fatalf("code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 }

@@ -291,7 +291,7 @@
           "La interfaz publica sus capacidades y versión para que un agente pueda detectar operaciones soportadas sin inventarlas",
           "Los tests contractuales ejecutan los mismos casos contra CLI y MCP con adapters falsos y verifican idempotencia, aislamiento, errores y ausencia de secretos"
         ],
-        "status": "spec_ready"
+      "status": "done"
     },
     {
         "id": 17,

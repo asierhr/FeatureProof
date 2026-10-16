@@ -8,10 +8,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"os/user"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agenteval"
+	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/model"
 	"github.com/asierhr/featureProof/internal/model/openai"
@@ -90,7 +93,63 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) >= 2 && args[0] == "eval" && args[1] == "agent" {
 		return agenteval.RunCommand(ctx, args[2:], stdout, stderr, productionEvalComposer{})
 	}
+	if isExternalAgentCommand(args) {
+		service, err := composeExternalAgentService()
+		if err != nil {
+			return writeExternalCompositionError(stdout)
+		}
+		defer service.Close(context.WithoutCancel(ctx))
+		if len(args) == 2 && args[0] == "mcp" && args[1] == "serve" {
+			server, err := externalagent.NewMCPServer(service)
+			if err != nil || server.Serve(ctx, stdin, stdout) != nil {
+				return 3
+			}
+			return 0
+		}
+		return externalagent.RunCLI(ctx, args, stdout, service)
+	}
 	return localvalidation.RunCommand(localvalidation.TerminalSignalContext(ctx), args, stdin, stdout, stderr)
+}
+
+// isExternalAgentCommand keeps the existing validate/eval dispatch stable.
+func isExternalAgentCommand(args []string) bool {
+	return len(args) > 0 && (args[0] == "capabilities" || args[0] == "run" || args[0] == "mcp")
+}
+
+// composeExternalAgentService resolves OS identity but grants no preview execution scopes.
+func composeExternalAgentService() (*externalagent.Service, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	current, err := user.Current()
+	if err != nil || current.Uid == "" {
+		return nil, errors.New("local identity unavailable")
+	}
+	identity, err := externalagent.NewLocalIdentity(externalagent.Principal{ID: current.Uid, Scopes: map[string]bool{}})
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := externalagent.NewAliasCatalog(map[string]map[string]externalagent.Selection{current.Uid: {}})
+	if err != nil {
+		return nil, err
+	}
+	registry, err := externalagent.NewLocalRegistry(filepath.Join(root, ".featureproof", "external-agent"))
+	if err != nil {
+		return nil, err
+	}
+	owner, err := (externalagent.RandomIDs{}).Next()
+	if err != nil {
+		return nil, err
+	}
+	return externalagent.NewService(externalagent.ServiceDependencies{Identity: identity, Catalog: catalog, Registry: registry, Executor: externalagent.FailClosedExecutor{}, Packages: externalagent.VerifiedPackageReader{}, Clock: externalagent.WallClock{}, IDs: externalagent.RandomIDs{}, Owner: owner, Retention: 24 * time.Hour, RunTimeout: 30 * time.Minute})
+}
+
+// writeExternalCompositionError emits the same closed envelope if composition itself fails.
+func writeExternalCompositionError(output io.Writer) int {
+	raw, _ := externalagent.CanonicalJSON(externalagent.Envelope{ContractVersion: externalagent.ContractVersion, Error: &externalagent.AppError{Code: externalagent.CodeInternal}})
+	_, _ = output.Write(append(raw, '\n'))
+	return 3
 }
 
 // main delegates process termination to the stable command exit code.

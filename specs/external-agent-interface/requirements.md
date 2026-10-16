@@ -96,6 +96,6 @@ Ninguna para el alcance local. La política de identidades entre usuarios del mi
 ## Aprobación humana
 
 ```yaml
-approved_by:
-approved_at:
+approved_by: user
+approved_at: 2026-10-16T15:56:50+02:00
 ```
