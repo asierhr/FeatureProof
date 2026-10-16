@@ -15,9 +15,10 @@ const maxModelValueDepth = 128
 
 // validationWork accounts for every deterministic visit under one shared, overflow-safe budget.
 type validationWork struct {
-	ctx  context.Context
-	max  int
-	used int
+	ctx     context.Context
+	max     int
+	used    int
+	reserve func(int) error
 }
 
 // newValidationWork starts a candidate-wide validation budget.
@@ -32,6 +33,11 @@ func (w *validationWork) visit(count int, stage string) error {
 	}
 	if count < 0 || w.used > w.max || count > w.max-w.used {
 		return typedError(CategoryLimitExceeded, stage, "work", nil)
+	}
+	if w.reserve != nil && count > 0 {
+		if err := w.reserve(count); err != nil {
+			return err
+		}
 	}
 	w.used += count
 	return nil

@@ -1,9 +1,59 @@
 # Trabajo actual
 
+## 2026-10-16 — Cierre de revision-bound-validation
+
+- Feature 14 `done` tras review independiente aprobada; T1–T8 y R1–R8
+  verificados. Informes en `progress/revision-bound-validation/` y resumen
+  añadido a `progress/history.md`.
+- Suite, vet, race completa, race ×20 de `localvalidation` y builds
+  Windows/Linux/macOS en pass. Cobertura global 89,2 %; el reviewer aprobó
+  expresamente la justificación de la caída de 0,4 puntos.
+- El gate global `gofmt -l .` conserva 135 archivos anteriores fuera del cambio;
+  los 48 Go nuevos o modificados por esta feature están formateados.
+- No queda ninguna feature `in_progress`; la siguiente pendiente es
+  `evidence-package` (feature 15).
+
+## 2026-10-16 — Inicio de implementación de revision-bound-validation
+
+- El usuario aprobó la spec de feature 14 con la instrucción explícita de continuar la implementación, registrada el 2026-10-16T10:22:13+02:00.
+- El leader cambió `revision-bound-validation` de `spec_ready` a `in_progress`.
+- Alcance: implementar T1-T8 y verificar R1-R8 de feature 14; la feature 13 permanece `done` y sus cambios locales se preservan.
+- Siguiente fase: implementer, verificación y review independiente.
+
+## 2026-10-16 — Spec de revision-bound-validation completada
+
+- Feature 14 pasó de `pending` a `spec_ready` tras comprobar los tres artefactos SDD.
+- `specs/revision-bound-validation/{requirements,design,tasks}.md` contiene R1-R8, mapa de trazabilidad y T1-T8 sin marcar.
+- La aprobación humana en `requirements.md` permanece vacía. No se ha implementado código de feature 14.
+- Alcance decidido en la spec: working tree sucio se rechaza; la revisión desplegada debe acreditarse por una fuente confiable. El adapter preview concreto pertenece a feature 19.
+- Siguiente puerta: lectura y aprobación explícita del usuario antes de `in_progress`.
+
+## 2026-10-16 — Preflight de revision-bound-validation
+
+- Feature 14 seleccionada: `pending`, `sdd: true`; ninguna feature está `in_progress`.
+- Acceptance criteria disponibles en `feature_list.json`; features 1-13 cerradas, con cambios locales no comprometidos de feature 13 que se preservan.
+- Alcance de esta sesión: redactar exclusivamente `requirements.md`, `design.md` y `tasks.md` de feature 14. No se implementa código ni se presume aprobación humana.
+- Siguiente fase: spec author, verificación de artefactos y transición del leader a `spec_ready`.
+
+## 2026-10-16 — Cierre de bounded-replanning
+
+- Estado final: `done`; quinta revisión independiente aprobada.
+- T1-T9 completas; R1-R12 trazados a tests y REV-1 a REV-9 cerradas.
+- Pasan suite, vet, compilación, race completa y repetida, módulos, diff y builds Windows/Linux/macOS.
+- Cobertura: 89,6 % global; `internal/replanning` 85,2 % y demás paquetes modificados al menos 85 %.
+- `gofmt -l` de los Go modificados o nuevos no emite rutas. El comando global `gofmt -l .` sigue enumerando 146 archivos anteriores fuera del diff.
+- Evidencia: `progress/bounded-replanning/{implementation,review}.md` y `progress/history.md`.
+
+## 2026-10-16 — Inicio de bounded-replanning
+
+- El usuario aprobó explícitamente `specs/bounded-replanning/` el 2026-10-16T08:27:07+02:00.
+- El leader registró la aprobación y pasó la feature 13 a `in_progress`.
+- Alcance: solo implementación y verificación de `bounded-replanning`; features 1-12 cerradas.
+
 ## Estado
 
-La feature `bounded-replanning` está en estado `spec_ready`. La especificación
-está completa y espera aprobación humana. No se ha autorizado implementación.
+La feature `revision-bound-validation` está en estado `done`, con spec y review
+aprobadas. No hay feature `in_progress`.
 
 ## Última actualización
 
@@ -1428,3 +1478,41 @@ está completa y espera aprobación humana. No se ha autorizado implementación.
   builds Linux/macOS en pass.
 - Coverage: 91,1 % global y 91,5 % `internal/planapproval`; baseline global
   preservado. T1–T9 permanecen completas y se solicita quinta review.
+# Feature activa: bounded-replanning
+
+- Fecha: 2026-10-16.
+- Spec aprobada por el usuario; estado `in_progress` fijado por el leader.
+- T1 completada: paquete `internal/replanning`, unión JSON v1 estricta, límites no monetarios y reservas deterministas atómicas. Tests herméticos de ramas, malformed/mixed JSON y concurrencia pasan.
+- Siguiente paso: T2, resumen redactado y digest estable.
+- T2 completada: summary v1 con orden canónico, SHA-256, pertenencia al run de cada evidence ID, sanitizer en expected/observed, contexto contractual dentro de JSON no confiable y límites de tamaño/nodos. Tests de canario, estabilidad y error operativo pasan.
+- T3 en curso: journal CAS/projector, ledger append-only y fingerprint semántico implementados; endurecimiento de schema y tests adversariales pendiente.
+- T3 completada: projector valida schema, secuencia, ciclo, decisión, fingerprint, batch y revisión; CAS/idempotencia por run, ledger monotónico y fingerprint de DAG completo. Tests de corrupción, replay conflictivo, carrera CAS y renombrado semánticamente equivalente pasan.
+- T4 en curso: preparación de lote mediante `agentplanning.PrepareAdditional` y nueva revisión de `planapproval` tras consumo de grant; faltan pruebas específicas de aprobación fresca.
+- T4 completada: check adicional validado por operación retenida, registry, assertions, policy de generación, plan y provenance; un check inválido rechaza lote entero. `ReopenForReplan` permite nueva revisión tras consumir la anterior y el test demuestra que el grant inicial no se reutiliza. Adaptaciones de planapproval limitadas a modelo de evento, projector y workflow.
+- T5 en curso: admisión previa de pasos, replans, modelo, validación y tools; faltan pruebas exhaustivas de todas las dimensiones.
+- T5 completada: reservas checked de agent steps/tools/validation work; feature-9 Session conserva model calls/tokens/duration/replans; pruebas de cada dimensión, último replan concurrente y agotamiento sin inferencia pasan.
+- T6 completada: ledger inmutable por identidad completa, replay idempotente, conflicto fail-closed y agregación `failed > inconclusive > passed` solo con declaraciones requeridas y evidencia confirmada.
+- T7 en curso: coordinador secuencial y end-to-end fake funcionan; faltan casos de aprobación requerida, repetición y cancelación por frontera.
+- T7 completada: coordinador secuencial une resumen, admisión, decisión, preparación, aprobación, ejecución, ledger y terminal CAS. Tests end-to-end cubren lote permitido, denegación, aprobación nueva, regeneración, repetición y cancelación en modelo/aprobación/persistencia.
+- T8 completada: suite adversarial hermética cubre JSON hostil, contexto redactado, lineage corrupto, replays, límite concurrente y CAS ambiguo cancelado; no hay red ni provider real en tests.
+- T9 en curso: suite completa, vet y mod verify en pass; coverage de paquetes modificados supera 85%; faltan gates race/builds y documentación final.
+- T9 completada: suite completa, compilación, vet, race completa, race ×20 en cuatro paquetes afectados, coverage global 90,2 %, coverage por paquete >=85 %, mod verify, diff y builds Windows/Linux/macOS en pass. Se añadió redacción model-only de assertions y lineage de llamadas reales desde evidencia persistida. Informe en `progress/bounded-replanning/implementation.md`; pendiente de review independiente.
+- Primera review independiente de `bounded-replanning` rechazada con REV-1 a REV-4. Se corrigió la agregación de grupos `any` desde sus raíces, la reserva de `validation_work` antes del fingerprint, la reanudación de prefijos confirmados mediante checkpoints tipados y el journal durable con identidades y resultados reales de assertions. Las regresiones prueban recuperación entre coordinadores y handles sin repetir inferencia ni tools, corrupción del lineage y preservación de presupuestos.
+- Reverificación posterior: suite, compilación, vet, módulos, diff y builds Windows/Linux/macOS en pass; cobertura global 89,8 % y paquetes afectados `replanning` 85,3 %, `agentplanning` 88,0 %, `planapproval` 89,1 %, `evidence` 89,8 %. Race completa y race ×20 de paquetes afectados en pass. `gofmt -l .` conserva archivos preexistentes fuera del diff, mientras todos los Go nuevos/modificados están formateados. Estado `in_progress`; pendiente de nueva review independiente.
+- Segunda review independiente de `bounded-replanning` rechazada: REV-1–4 cerradas; REV-5–7 corregidas. `Restore` reconcilia sesión modelo reutilizada sin perder contadores deterministas; la reanudación de `approval_resolved` reconstruye un grant vigente sin consultar otra vez al humano; `LocalJournal` reserva la transacción por run sin retener el mutex durante I/O. Regresiones con sesión consumida, workflow real y waiter prohibido, y load/publish bloqueados pasan.
+- Reverificación actual: suite, vet, módulos, diff, builds Windows/Linux/macOS, race completa y race ×20 en paquetes afectados pasan. Cobertura global 89,6 %; `replanning` 85,2 %, `agentplanning` 88,0 %, `planapproval` 86,8 %, `evidence` 89,8 %. Formato de todos los Go nuevos/modificados en pass; el gate literal `gofmt -l .` conserva baseline ajeno. Estado `in_progress`; pendiente de tercera review independiente.
+- Tercera review independiente de `bounded-replanning` rechazada solo por REV-8: `Restore` llamaba a `ModelBudget.Snapshot` bajo `b.mu`. Se corrigió con reserva `restoring` bajo mutex breve, callback externo sin lock y reconciliación final atómica. La regresión bloquea el callback y demuestra que otra reserva y otra restauración responden sin esperar ni consumir trabajo, y que el checkpoint queda completo al terminar.
+- Reverificación posterior a REV-8: suite, compilación, vet, módulos, diff, builds Windows/Linux/macOS, race completa y race ×20 de paquetes afectados pasan. Cobertura global 89,6 %; `replanning` 85,2 %, `agentplanning` 88,0 %, `planapproval` 86,8 %, `evidence` 89,8 %. El formato de Go cambiado pasa; el gate literal de repositorio conserva archivos preexistentes fuera del diff. Feature `in_progress`, pendiente de cuarta review independiente.
+- Cuarta review independiente de `bounded-replanning` rechazó solo REV-9 documental. Se añadieron comentarios de responsabilidad sistémica a cinco símbolos introducidos en las correcciones; el barrido de todas las declaraciones top-level `type`/`func` de los Go nuevos o modificados no encontró otras omisiones. Sin cambios de comportamiento.
+- Verificación posterior a REV-9: formato dirigido, suite completa, vet, módulos, diff y race de `internal/replanning` en pass; la race completa/repetida, cobertura y builds de la cuarta review continúan vigentes. Estado `in_progress`; pendiente de quinta review independiente.
+
+# Feature activa: revision-bound-validation
+
+- Fecha: 2026-10-16. Spec aprobada por el usuario y feature en `in_progress`.
+- T1-T2 en curso: se ha creado el modelo versionado e inmutable de binding, las fronteras inyectables de Git/attestation y el resolvedor Git local de solo lectura. Se está verificando con repositorios temporales.
+- T3-T4 en curso: admisión fail-closed exige atestación verificada, vigente y coincidente; proyecciones tipadas obligan a declarar material público o referencia opaca de credencial antes del hash.
+- T1-T7 completadas: Git local rechaza OID parciales, ref ambiguo y worktree sucio; admisión exige atestación confiable y vigente. Hashes safe separados se revalidan antes de lotes y publicación. El coordinador de replanificación exige binding base y guard, confirma lote inicial y cada digest adicional en su journal. Harness, evidencia sellada y publisher llevan/rechazan referencias de binding inconsistentes.
+- Evidencia incremental: `go test ./... -count=1`, `go vet ./...`, `go test -race ./...` en pass. Cobertura dirigida `internal/revisionbinding` 86,8 % y `internal/replanning` 85,0 %; race repetida, builds y cobertura global en curso.
+- Producción falla cerrada mientras no exista el atestador concreto y clasificador seguro configurados; el adapter preview pertenece a feature 19.
+- T8 completada: tests de flujo con Git temporal, atestador fake, worktree dirty, revisión inexistente, drift de revisión/configuración, PlanBinding previo a eventos funcionales y grant obsoleto pasan. Suite, vet, race completa, race ×20 en paquetes afectados, módulos, diff, compilación y builds Windows/Linux/macOS pasan. Cobertura global 89,2 % (baseline 89,6 %); todos los paquetes afectados superan 85 %. Informe de implementación en `progress/revision-bound-validation/implementation.md`; pendiente de review independiente y evaluación de la justificación de cobertura. El gate literal `gofmt -l .` conserva 135 archivos preexistentes fuera del cambio.
+- Correcciones de primera review: GitResolver aísla `GIT_*` heredado; Publisher valida evidencia en todo el árbol de report, exige terminal único congruente y falla cerrado si se cancela staging; Runner clasifica cancelación posterior al último plan antes de publicar. Tests adversariales dirigidos, suite/race completa y race ×20 de `localvalidation` posteriores pasan. Cobertura nueva: global 89,2 %, `revisionbinding` 88,9 %, `localvalidation` 86,6 %. Pendiente del veredicto independiente.

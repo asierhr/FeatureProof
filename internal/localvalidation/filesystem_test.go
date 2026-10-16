@@ -1,15 +1,84 @@
 package localvalidation
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/asierhr/featureProof/internal/planmanifest"
 )
+
+// cancelFileSystem injects cancellation after an artifact rename or the final
+// directory sync, exposing both checkpoints in Publisher.Publish.
+type cancelFileSystem struct {
+	FileSystem
+	cancel context.CancelFunc
+	phase  string
+}
+
+// CommitNoReplace cancels after the first visible staging artifact in one case.
+func (f cancelFileSystem) CommitNoReplace(source, target string) error {
+	if err := f.FileSystem.CommitNoReplace(source, target); err != nil {
+		return err
+	}
+	if f.phase == "artifact" && !strings.HasSuffix(source, ".incomplete") {
+		f.cancel()
+	}
+	return nil
+}
+
+// Open wraps the staging directory sync to cancel immediately before final commit.
+func (f cancelFileSystem) Open(path string) (SyncFile, error) {
+	file, err := f.FileSystem.Open(path)
+	if err != nil || f.phase != "directory" {
+		return file, err
+	}
+	return cancelSyncFile{SyncFile: file, cancel: f.cancel}, nil
+}
+
+// cancelSyncFile cancels after the durability sync, before final visibility.
+type cancelSyncFile struct {
+	SyncFile
+	cancel context.CancelFunc
+}
+
+// Sync delegates durability then signals cancellation.
+func (f cancelSyncFile) Sync() error {
+	if err := f.SyncFile.Sync(); err != nil && runtime.GOOS != "windows" {
+		return err
+	}
+	f.cancel()
+	return nil
+}
+
+// TestPublisherCancellationDuringStagingNeverCommits verifies cancellation at
+// artifact and final-rename boundaries leaves only an incomplete directory.
+func TestPublisherCancellationDuringStagingNeverCommits(t *testing.T) {
+	for _, phase := range []string{"artifact", "directory"} {
+		t.Run(phase, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			root := t.TempDir()
+			fs := cancelFileSystem{FileSystem: OSFileSystem{}, cancel: cancel, phase: phase}
+			publisher, err := NewPublisherWithFilesystem(root, "run", fs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = publishFixture(t, publisher, ctx, RunSnapshot{ID: "run", Status: ResultPassed}, planmanifest.Manifest{}, nil)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancellation ignored: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(root, ".featureproof", "runs", "run")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("final bundle exposed: %v", err)
+			}
+		})
+	}
+}
 
 // faultFile injects durable-file failures without changing the underlying temporary layout.
 type faultFile struct {
@@ -117,7 +186,7 @@ func TestPublisherFailureMatrixNeverExposesFinalBundle(t *testing.T) {
 				t.Fatal(err)
 			}
 			snapshot := RunSnapshot{ID: "run", Status: ResultPassed}
-			if err = publisher.Publish(t.Context(), snapshot, nil, planmanifest.Manifest{}, nil); err == nil {
+			if err = publishFixture(t, publisher, t.Context(), snapshot, planmanifest.Manifest{}, nil); err == nil {
 				t.Fatal("publication failure ignored")
 			}
 			if _, statErr := os.Stat(filepath.Join(root, ".featureproof", "runs", "run")); !os.IsNotExist(statErr) {
@@ -149,7 +218,7 @@ func TestCommitNoReplaceAllowsOneConcurrentPublisher(t *testing.T) {
 	publish := func(p *Publisher, id string) {
 		defer group.Done()
 		<-start
-		results <- p.Publish(t.Context(), RunSnapshot{ID: id, Status: ResultPassed}, nil, planmanifest.Manifest{}, nil)
+		results <- publishFixture(t, p, t.Context(), RunSnapshot{ID: id, Status: ResultPassed}, planmanifest.Manifest{}, nil)
 	}
 	go publish(first, "first")
 	go publish(second, "second")

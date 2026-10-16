@@ -31,6 +31,7 @@ const (
 	EventRejected          EventType = "plan_rejected"
 	EventInvalidated       EventType = "plan_invalidated"
 	EventGrantConsumed     EventType = "approval_authorization_consumed"
+	EventReplanReady       EventType = "plan_replan_ready"
 )
 
 // InvalidationReason classifies why a staged approval can no longer authorize execution.

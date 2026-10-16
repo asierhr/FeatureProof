@@ -20,6 +20,7 @@ import (
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/revisionbinding"
 )
 
 // testClock supplies deterministic timestamps to complete runner tests.
@@ -65,11 +66,15 @@ func runnerFor(t *testing.T, target string, expected, maxCalls int) (*Runner, st
 	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 	clock := &testClock{next: time.Unix(100, 0).UTC()}
 	deps := DefaultDependencies(root, stdout, stderr)
+	commit := strings.Repeat("a", 40)
+	deps.RevisionResolver = fakeRevision{revisionbinding.Revision{RepositoryID: "repo", CommitOID: commit}}
+	deps.EnvironmentAttestor = fakeAttestation{revisionbinding.Attestation{EnvironmentID: "preview", RepositoryID: "repo", CommitOID: commit, Reference: "proof-1", ValidUntil: time.Unix(10000, 0), Verified: true}}
+	deps.SafeProjector = legacyFixtureProjector{}
 	deps.Clock = clock
 	deps.IDs = &testIDs{}
 	deps.Waiter = testWaiter{}
-	deps.FinalizeTimeout = time.Second
-	runner, err := NewRunner(context.Background(), Request{SpecPath: spec, PlanPath: plan, Target: target}, deps)
+	deps.FinalizeTimeout = 10 * time.Second
+	runner, err := NewRunner(context.Background(), Request{SpecPath: spec, PlanPath: plan, Target: target, RepositoryID: "repo", Revision: "main", EnvironmentID: "preview"}, deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +282,7 @@ func TestPublisherFailureLeavesOnlyIncompleteDiagnosticDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot := RunSnapshot{ID: "failure", Status: ResultPassed, StartedAt: time.Unix(1, 0), FinishedAt: time.Unix(2, 0)}
-	if err := publisher.Publish(context.Background(), snapshot, nil, planmanifest.Manifest{}, nil); err == nil {
+	if err := publishFixture(t, publisher, context.Background(), snapshot, planmanifest.Manifest{}, nil); err == nil {
 		t.Fatal("injected failure ignored")
 	}
 	if _, err := os.Stat(filepath.Join(root, ".featureproof", "runs", "failure")); !os.IsNotExist(err) {
@@ -320,7 +325,7 @@ func TestPublisherValidatesEvidenceLinksBeforeArtifactWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot := RunSnapshot{ID: "run", Constraints: []ConstraintResult{{ConstraintID: "c", EvidenceIDs: []string{"ev"}}}}
-	if err = publisher.Publish(context.Background(), snapshot, nil, planmanifest.Manifest{}, store); err == nil {
+	if err = publishFixture(t, publisher, context.Background(), snapshot, planmanifest.Manifest{}, store); err == nil {
 		t.Fatal("foreign evidence accepted")
 	}
 	second, err := NewPublisher(root, "duplicate")
@@ -328,7 +333,7 @@ func TestPublisherValidatesEvidenceLinksBeforeArtifactWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	duplicate := RunSnapshot{ID: "duplicate", Constraints: []ConstraintResult{{EvidenceIDs: []string{"ev", "ev"}}}}
-	if err = second.Publish(context.Background(), duplicate, nil, planmanifest.Manifest{}, nil); err == nil {
+	if err = publishFixture(t, second, context.Background(), duplicate, planmanifest.Manifest{}, nil); err == nil {
 		t.Fatal("duplicate evidence accepted")
 	}
 	third, err := NewPublisher(root, "missing-store")
@@ -336,7 +341,7 @@ func TestPublisherValidatesEvidenceLinksBeforeArtifactWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	missing := RunSnapshot{ID: "missing-store", Constraints: []ConstraintResult{{EvidenceIDs: []string{"ev"}}}}
-	if err = third.Publish(context.Background(), missing, nil, planmanifest.Manifest{}, nil); err == nil {
+	if err = publishFixture(t, third, context.Background(), missing, planmanifest.Manifest{}, nil); err == nil {
 		t.Fatal("missing evidence store accepted")
 	}
 }
@@ -498,18 +503,18 @@ func TestPlanSnapshotPreservesSafeStructureWithoutLiteralValues(t *testing.T) {
 	}
 }
 
-// TestSignalCancellationStopsWorkAndPublishesCancelledBundle traces R10 and its dedicated exit code.
-func TestSignalCancellationStopsWorkAndPublishesCancelledBundle(t *testing.T) {
+// TestSignalCancellationBeforeAdmissionStartsNoRun traces the dedicated exit code and no-work preflight.
+func TestSignalCancellationBeforeAdmissionStartsNoRun(t *testing.T) {
 	runner, root, stdout, _ := runnerFor(t, "http://127.0.0.1:1", 200, 1)
 	ctx, cancel := context.WithCancelCause(context.Background())
 	cancel(ErrTerminalSignal)
 	if code := runner.Run(ctx); code != 130 {
 		t.Fatalf("code=%d", code)
 	}
-	if _, err := os.Stat(filepath.Join(root, ".featureproof", "runs", "id-1", "run.json")); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(root, ".featureproof", "runs")); !os.IsNotExist(err) {
+		t.Fatalf("run created after pre-admission cancellation: %v", err)
 	}
-	if !strings.HasSuffix(stdout.String(), "result=cancelled\n") {
+	if stdout.Len() != 0 {
 		t.Fatalf("stdout=%q", stdout.String())
 	}
 }
@@ -536,13 +541,19 @@ func TestSignalCancellationDuringHTTPPropagatesAndPublishesConfirmedPrefix(t *te
 
 // TestCancellationFinalizationFailureDoesNotPublishPartialRun traces R10's failure path and retained diagnostics.
 func TestCancellationFinalizationFailureDoesNotPublishPartialRun(t *testing.T) {
-	runner, root, _, _ := runnerFor(t, "http://127.0.0.1:1", 200, 1)
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { close(started); <-r.Context().Done() }))
+	defer server.Close()
+	runner, root, _, _ := runnerFor(t, server.URL, 200, 1)
 	runner.deps.PublisherFactory = func(root, id string) (*Publisher, error) {
 		return NewPublisherWithFilesystem(root, id, &faultFileSystem{base: OSFileSystem{}, fail: "write"})
 	}
 	ctx, cancel := context.WithCancelCause(context.Background())
+	result := make(chan int, 1)
+	go func() { result <- runner.Run(ctx) }()
+	<-started
 	cancel(ErrTerminalSignal)
-	if code := runner.Run(ctx); code != 130 {
+	if code := <-result; code != 130 {
 		t.Fatalf("code=%d", code)
 	}
 	if _, err := os.Stat(filepath.Join(root, ".featureproof", "runs", "id-1")); !os.IsNotExist(err) {

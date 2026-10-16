@@ -2,6 +2,7 @@ package planapproval
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,53 @@ type integrationTool struct{ calls atomic.Int32 }
 func (t *integrationTool) Execute(context.Context, harness.ToolCall) (harness.ToolResult, error) {
 	t.calls.Add(1)
 	return harness.ToolResult{Output: map[string]any{"ok": true}}, nil
+}
+
+// TestExecuteBoundRejectsStaleGrantBeforeAuditAndTools covers feature-14 approval ordering.
+func TestExecuteBoundRejectsStaleGrantBeforeAuditAndTools(t *testing.T) {
+	plan, snapshot := singleApprovalFixture(t)
+	run := approvalRun("run-1", harness.StatusPlanning)
+	policy, tool, journal := &integrationPolicy{}, &integrationTool{}, harness.NewMemoryJournal()
+	executor := newIntegrationExecutor(t, run, policy, tool, journal)
+	store := NewMemoryStore()
+	workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := NewExecutionGate(store, fixedClock{value: time.Unix(3, 0)}, testLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	composition, err := NewExecutionComposition(ApprovalRequired, workflow, gate, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workflow.Stage(context.Background(), StageCommand{Plan: plan, Context: snapshot}); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := workflow.Decide(context.Background(), DecisionCommand{PlanID: plan.ID(), DecisionID: "decision", ExpectedRevision: 1, Actor: Actor{Subject: "user", Source: "test"}, Action: ActionApprove, CurrentPlan: plan, CurrentContext: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callbackCalls := 0
+	stale := snapshot
+	stale.Runtime.PolicyVersion = "v2"
+	if _, err := composition.ExecuteBound(context.Background(), decision.Authorization, plan, stale, func() error { callbackCalls++; return nil }); err == nil {
+		t.Fatal("stale grant accepted")
+	}
+	if callbackCalls != 0 || policy.calls.Load() != 0 || tool.calls.Load() != 0 {
+		t.Fatal("audit or tools started before grant validation")
+	}
+	auditErr := errors.New("audit unavailable")
+	if _, err := composition.ExecuteBound(context.Background(), decision.Authorization, plan, snapshot, func() error { callbackCalls++; return auditErr }); !errors.Is(err, auditErr) {
+		t.Fatalf("callback failure lost: %v", err)
+	}
+	if callbackCalls != 1 || policy.calls.Load() != 0 || tool.calls.Load() != 0 {
+		t.Fatal("callback failure reached tools")
+	}
+	if _, err := composition.ExecuteBound(context.Background(), decision.Authorization, plan, snapshot, func() error { callbackCalls++; return nil }); err == nil || callbackCalls != 1 {
+		t.Fatal("consumed grant was reused")
+	}
 }
 
 // integrationRegistry exposes exactly one local capability to the real PlanExecutor.

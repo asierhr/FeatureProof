@@ -10,7 +10,8 @@ func (e *ArgumentError) Error() string {
 	return fmt.Sprintf("invalid argument: %s at %s", e.Category, e.Field)
 }
 
-// ParseRequest accepts exactly one value for each v1 flag and performs no I/O.
+// ParseRequest accepts one value per recognized flag; admission checks that
+// source and environment selections are complete before functional work.
 func ParseRequest(args []string) (Request, error) {
 	if len(args) == 0 || args[0] != "validate" {
 		return Request{}, &ArgumentError{Field: "subcommand", Category: "required"}
@@ -18,7 +19,7 @@ func ParseRequest(args []string) (Request, error) {
 	values := map[string]string{}
 	for n := 1; n < len(args); n++ {
 		flag := args[n]
-		if flag != "--spec" && flag != "--plan" && flag != "--target" {
+		if flag != "--spec" && flag != "--plan" && flag != "--target" && flag != "--repository" && flag != "--revision" && flag != "--environment" {
 			return Request{}, &ArgumentError{Field: "arguments", Category: "unknown"}
 		}
 		if _, exists := values[flag]; exists {
@@ -35,5 +36,5 @@ func ParseRequest(args []string) (Request, error) {
 			return Request{}, &ArgumentError{Field: flag, Category: "required"}
 		}
 	}
-	return Request{SpecPath: values["--spec"], PlanPath: values["--plan"], Target: values["--target"]}, nil
+	return Request{SpecPath: values["--spec"], PlanPath: values["--plan"], Target: values["--target"], RepositoryID: values["--repository"], Revision: values["--revision"], EnvironmentID: values["--environment"]}, nil
 }

@@ -26,6 +26,7 @@ var ErrUntreated = errors.New("evidence was not fully sanitized")
 // Record is the immutable, fully sanitized fact produced by one tool execution attempt.
 type Record struct {
 	ID, RunID, PlanID, StepID, ToolCallID, ToolName string
+	BindingSHA256                                   string
 	Step, Attempt                                   int
 	StartedAt                                       time.Time
 	Duration                                        time.Duration
@@ -35,6 +36,28 @@ type Record struct {
 	IntegrityHash                                   string
 	treated                                         bool
 	seal                                            string
+}
+
+// BindRecord attaches the confirmed run binding before persistence and reseals the
+// already sanitized record. It never changes the treated input or output.
+func BindRecord(record Record, runID, bindingSHA256 string) (Record, error) {
+	if !record.validTreatment() || runID == "" || record.RunID != runID || len(bindingSHA256) != 64 || record.BindingSHA256 != "" {
+		return Record{}, ErrIntegrity
+	}
+	for _, c := range bindingSHA256 {
+		if c < '0' || c > '9' {
+			if c < 'a' || c > 'f' {
+				return Record{}, ErrIntegrity
+			}
+		}
+	}
+	record.BindingSHA256 = bindingSHA256
+	seal, err := recordSeal(record)
+	if err != nil {
+		return Record{}, ErrIntegrity
+	}
+	record.seal = seal
+	return record, nil
 }
 
 // NewRecord seals fully transformed roots and metadata into a record eligible for persistence.

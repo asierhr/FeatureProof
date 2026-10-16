@@ -238,7 +238,7 @@
           "Cada replanificación conserva relación con la decisión anterior, las evidencias observadas y las nuevas acciones propuestas",
           "Los tests cubren comprobación adicional permitida, política denegada, aprobación requerida, límite agotado, propuesta repetida y conservación de fallos deterministas"
         ],
-      "status": "spec_ready"
+      "status": "done"
     },
     {
         "id": 14,
@@ -255,7 +255,7 @@
           "Validar una corrección crea un nuevo run vinculado al nuevo commit y nunca modifica retroactivamente la revisión de un run anterior",
           "Los tests cubren revisión válida, commit inexistente, working tree modificado, discrepancia de entorno, cambio de configuración e invariancia de hashes"
         ],
-        "status": "pending"
+        "status": "done"
     },
     {
         "id": 15,

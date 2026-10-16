@@ -34,6 +34,14 @@ func NewExecutionComposition(mode ApprovalMode, workflow *ApprovalWorkflow, gate
 
 // Execute crosses the fixed approval boundary once and then retains every policy, budget and tool check in PlanExecutor.
 func (c *ExecutionComposition) Execute(ctx context.Context, authorization *ExecutionAuthorization, prepared agentplanning.PreparedPlan, current ContractSnapshot) ([]planning.PlanResult, error) {
+	return c.ExecuteBound(ctx, authorization, prepared, current, func() error { return nil })
+}
+
+// ExecuteBound confirms durable grant consumption, invokes an audit callback, then starts tool work.
+func (c *ExecutionComposition) ExecuteBound(ctx context.Context, authorization *ExecutionAuthorization, prepared agentplanning.PreparedPlan, current ContractSnapshot, onAuthorized func() error) ([]planning.PlanResult, error) {
+	if onAuthorized == nil {
+		return nil, typedError(CategoryInvalidInput, "execute_bound", "callback", nil)
+	}
 	run := c.lifecycle.run
 	if c.mode == ApprovalRequired {
 		token, err := c.lifecycle.reserveLifecycle(harness.StatusExecuting)
@@ -48,6 +56,9 @@ func (c *ExecutionComposition) Execute(ctx context.Context, authorization *Execu
 		if err := c.lifecycle.commitLifecycle(token, harness.StatusExecuting); err != nil {
 			return nil, err
 		}
+		if err := onAuthorized(); err != nil {
+			return nil, err
+		}
 		return executePlans(ctx, plans, c.executor)
 	}
 	token, err := c.lifecycle.reserveLifecycle(harness.StatusPlanning)
@@ -56,6 +67,9 @@ func (c *ExecutionComposition) Execute(ctx context.Context, authorization *Execu
 	}
 	defer c.lifecycle.releaseLifecycle(token)
 	if err := c.lifecycle.commitLifecycle(token, harness.StatusExecuting); err != nil {
+		return nil, err
+	}
+	if err := onAuthorized(); err != nil {
 		return nil, err
 	}
 	return executePrepared(ctx, prepared, c.executor)

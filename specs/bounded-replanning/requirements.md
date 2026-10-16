@@ -372,6 +372,6 @@ frontera de aprobación existente.
 ## Aprobación humana
 
 ```yaml
-approved_by:
-approved_at:
+approved_by: user
+approved_at: 2026-10-16T08:27:07+02:00
 ```

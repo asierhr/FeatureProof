@@ -31,6 +31,60 @@ func NewWorkflow(store ApprovalStore, sanitizer Sanitizer, clock Clock, limits L
 	return &ApprovalWorkflow{store: store, lifecycle: lifecycle, sanitizer: sanitizer, clock: clock, limits: limits}, nil
 }
 
+// ReopenForReplan records that a consumed approved batch finished review and permits a fresh approval revision.
+func (w *ApprovalWorkflow) ReopenForReplan(ctx context.Context, commandID string) error {
+	if commandID == "" {
+		return typedError(CategoryInvalidInput, "reopen", "command_id", nil)
+	}
+	run := w.lifecycle.run
+	if err := ctx.Err(); err != nil {
+		return contextFailure("reopen", err)
+	}
+	events, err := w.store.Events(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	projection, err := Project(ctx, events, w.limits.MaxEvents)
+	if err != nil {
+		return err
+	}
+	if projection.State == harness.StatusPlanning && run.Status() == harness.StatusPlanning {
+		return nil
+	}
+	if projection.State != harness.StatusExecuting || !projection.Consumed || run.Status() != harness.StatusReviewing {
+		return typedError(CategoryInvalidState, "reopen", "state", nil)
+	}
+	token, err := w.lifecycle.reserveLifecycle(harness.StatusReviewing)
+	if err != nil {
+		return err
+	}
+	defer w.lifecycle.releaseLifecycle(token)
+	confirmed, err := w.store.Events(ctx, run.ID)
+	if err != nil {
+		return err
+	}
+	latest, err := Project(ctx, confirmed, w.limits.MaxEvents)
+	if err != nil {
+		return err
+	}
+	if !sameProjectionVersion(projection, latest) {
+		return typedError(CategoryRevisionConflict, "reopen", "projection", nil)
+	}
+	event := ApprovalEvent{Version: 1, Revision: projection.Revision, EventID: eventID(run.ID, projection.Revision, EventReplanReady), DecisionID: commandID, Type: EventReplanReady, RunID: run.ID, PlanID: projection.PlanID, PlanHash: projection.PlanHash, ContextHash: projection.ContextHash, ViewHash: projection.ViewHash, OccurredAt: utc(w.clock.Now()), CommandFingerprint: projection.PlanHash + ":" + projection.ContextHash}
+	appended, _, err := w.store.CompareAndAppend(ctx, run.ID, projection.Sequence, commandID, event)
+	if err != nil {
+		return err
+	}
+	projected, err := w.projectConfirmed(ctx, run.ID, confirmed, appended)
+	if err != nil {
+		return err
+	}
+	if projected.State != harness.StatusPlanning {
+		return typedError(CategoryIntegrityFailure, "reopen", "projection", nil)
+	}
+	return w.lifecycle.commitLifecycle(token, projected.State)
+}
+
 // validLimits ensures every traversed approval dimension has an explicit positive bound.
 func validLimits(limits Limits) bool {
 	return limits.MaxBytes > 0 && limits.MaxDepth > 0 && limits.MaxEvents > 0 && limits.MaxConstraints > 0 && limits.MaxChecks > 0 && limits.MaxSteps > 0 && limits.MaxAssertions > 0 && limits.MaxEvidence > 0
@@ -138,6 +192,68 @@ func (w *ApprovalWorkflow) View(ctx context.Context, runID string) (ApprovalView
 		return ApprovalView{}, err
 	}
 	return cloneView(request.view), nil
+}
+
+// ViewRevision reconstructs a validated safe view for an already requested or approved revision during replan recovery.
+func (w *ApprovalWorkflow) ViewRevision(ctx context.Context, runID string, revision uint64) (ApprovalView, error) {
+	events, err := w.store.Events(ctx, runID)
+	if err != nil {
+		return ApprovalView{}, err
+	}
+	projection, err := Project(ctx, events, w.limits.MaxEvents)
+	if err != nil {
+		return ApprovalView{}, err
+	}
+	if projection.Revision != revision || projection.State != harness.StatusAwaitingApproval && projection.State != harness.StatusExecuting {
+		return ApprovalView{}, typedError(CategoryInvalidState, "view_revision", "state", nil)
+	}
+	request, err := w.store.Request(ctx, runID, revision)
+	if err != nil {
+		return ApprovalView{}, err
+	}
+	if err := w.validateRequest(ctx, projection, request); err != nil {
+		return ApprovalView{}, err
+	}
+	return cloneView(request.view), nil
+}
+
+// RecoverAuthorization reconstructs an unconsumed approved grant from confirmed events without a new human decision.
+func (w *ApprovalWorkflow) RecoverAuthorization(ctx context.Context, runID string, revision uint64, prepared agentplanning.PreparedPlan, current ContractSnapshot) (*ExecutionAuthorization, error) {
+	events, err := w.store.Events(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	projection, err := Project(ctx, events, w.limits.MaxEvents)
+	if err != nil {
+		return nil, err
+	}
+	if projection.Revision != revision || projection.State != harness.StatusExecuting || projection.Consumed || projection.PlanID != prepared.ID() || w.lifecycle.run.ID != runID {
+		return nil, typedError(CategoryInvalidState, "recover_authorization", "revision", nil)
+	}
+	request, err := w.store.Request(ctx, runID, revision)
+	if err != nil {
+		return nil, err
+	}
+	if err := w.validateRequest(ctx, projection, request); err != nil {
+		return nil, err
+	}
+	planHash, err := fingerprintPlan(ctx, prepared, w.limits)
+	if err != nil {
+		return nil, err
+	}
+	contextHashes, err := fingerprintContext(ctx, current, w.limits)
+	if err != nil {
+		return nil, err
+	}
+	if planHash != request.planHash || contextHashes.All != request.contextHashes.All {
+		return nil, typedError(CategoryStaleApproval, "recover_authorization", "snapshot", nil)
+	}
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Revision == revision && events[i].Type == EventApproved && events[i].DecisionID == projection.DecisionID {
+			return newAuthorization(request, events[i].DecisionID, prepared, current), nil
+		}
+	}
+	return nil, typedError(CategoryIntegrityFailure, "recover_authorization", "approval", nil)
 }
 
 // Decide applies one authenticated closed action with CAS and returns a grant only for a confirmed current approval.

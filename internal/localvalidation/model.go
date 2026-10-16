@@ -9,6 +9,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/revisionbinding"
 	"github.com/asierhr/featureProof/internal/specification"
 )
 
@@ -54,17 +55,19 @@ type ConstraintResult struct {
 
 // RunSnapshot is the terminal machine-readable state shared by run.json and reporting.
 type RunSnapshot struct {
-	ID          string               `json:"id"`
-	FeatureID   string               `json:"feature_id"`
-	TargetID    string               `json:"target_id"`
-	TargetURL   string               `json:"target_url"`
-	Status      ResultStatus         `json:"status"`
-	StartedAt   time.Time            `json:"started_at"`
-	FinishedAt  time.Time            `json:"finished_at"`
-	DurationMS  int64                `json:"duration_ms"`
-	Limits      specification.Limits `json:"limits"`
-	Consumed    harness.Consumption  `json:"consumed"`
-	Constraints []ConstraintResult   `json:"constraints"`
+	ID           string                        `json:"id"`
+	Binding      *revisionbinding.Binding      `json:"binding,omitempty"`
+	PlanBindings []revisionbinding.PlanBinding `json:"plan_bindings,omitempty"`
+	FeatureID    string                        `json:"feature_id"`
+	TargetID     string                        `json:"target_id"`
+	TargetURL    string                        `json:"target_url"`
+	Status       ResultStatus                  `json:"status"`
+	StartedAt    time.Time                     `json:"started_at"`
+	FinishedAt   time.Time                     `json:"finished_at"`
+	DurationMS   int64                         `json:"duration_ms"`
+	Limits       specification.Limits          `json:"limits"`
+	Consumed     harness.Consumption           `json:"consumed"`
+	Constraints  []ConstraintResult            `json:"constraints"`
 }
 
 // ExitCode maps terminal outcomes to the public command contract.

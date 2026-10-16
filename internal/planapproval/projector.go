@@ -36,6 +36,7 @@ func Project(ctx context.Context, events []ApprovalEvent, maxEvents int) (Projec
 				return Projection{}, typedError(CategoryIntegrityFailure, "project", "request", nil)
 			}
 			projection.State = harness.StatusAwaitingApproval
+			projection.Consumed = false
 			projection.Revision, projection.RunID, projection.PlanID = event.Revision, event.RunID, event.PlanID
 			projection.PlanHash, projection.ContextHash, projection.ViewHash = event.PlanHash, event.ContextHash, event.ViewHash
 		case EventApproved:
@@ -65,6 +66,11 @@ func Project(ctx context.Context, events []ApprovalEvent, maxEvents int) (Projec
 				return Projection{}, typedError(CategoryIntegrityFailure, "project", "consumption", nil)
 			}
 			projection.Consumed = true
+		case EventReplanReady:
+			if projection.State != harness.StatusExecuting || !projection.Consumed || event.Revision != projection.Revision || event.PlanHash != projection.PlanHash || event.ContextHash != projection.ContextHash || event.ViewHash != projection.ViewHash {
+				return Projection{}, typedError(CategoryIntegrityFailure, "project", "replan", nil)
+			}
+			projection.State = harness.StatusPlanning
 		default:
 			return Projection{}, typedError(CategoryIntegrityFailure, "project", "type", nil)
 		}
@@ -111,6 +117,10 @@ func validateEventSchema(event ApprovalEvent) error {
 	case EventGrantConsumed:
 		if event.DecisionID == "" || event.Actor != nil || event.CommandFingerprint == "" || event.Disposition != "" || event.InvalidationReason != "" {
 			return typedError(CategoryIntegrityFailure, "project", "consumption_schema", nil)
+		}
+	case EventReplanReady:
+		if event.DecisionID == "" || event.Actor != nil || event.CommandFingerprint == "" || event.Disposition != "" || event.InvalidationReason != "" {
+			return typedError(CategoryIntegrityFailure, "project", "replan_schema", nil)
 		}
 	default:
 		return typedError(CategoryIntegrityFailure, "project", "type", nil)

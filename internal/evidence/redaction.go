@@ -235,6 +235,16 @@ func (s Sanitizer) Sanitize(ctx context.Context, input any) (SanitizedValue, err
 	return SanitizedValue{value: value, truncations: append([]Truncation(nil), metadata...), complete: true}, nil
 }
 
+// SanitizeModel applies persisted and model-only paths to arbitrary assertion values before model exposure.
+func (s Sanitizer) SanitizeModel(ctx context.Context, input any) (SanitizedValue, error) {
+	if s.policy == nil {
+		return SanitizedValue{}, &ConfigError{Category: "redaction_failed", Path: "policy"}
+	}
+	copyPolicy := *s.policy
+	copyPolicy.persisted = append(append([]compiledPath(nil), s.policy.persisted...), s.policy.modelOnly...)
+	return NewSanitizer(&copyPolicy).Sanitize(ctx, input)
+}
+
 // Map preserves the feature-one API while new execution paths use the fallible Sanitize method.
 func (s Sanitizer) Map(input map[string]any) map[string]any {
 	if s.policy == nil {

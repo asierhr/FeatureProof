@@ -15,6 +15,7 @@ import (
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/revisionbinding"
 	"github.com/asierhr/featureProof/internal/specification"
 )
 
@@ -63,7 +64,22 @@ func (p *Publisher) Publish(ctx context.Context, snapshot RunSnapshot, events []
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if snapshot.Binding == nil || snapshot.ID != snapshot.Binding.RunID || snapshot.ID != p.runID {
+		return &revisionbinding.Error{Category: revisionbinding.BindingIntegrity, Phase: "publication"}
+	}
+	if err := verifyBoundSequence(ctx, *snapshot.Binding, snapshot.PlanBindings, events, snapshot.Status); err != nil {
+		return err
+	}
 	seenEvidence := map[string]bool{}
+	var addAssertions func([]planning.AssertionResult)
+	addAssertions = func(assertions []planning.AssertionResult) {
+		for _, assertion := range assertions {
+			for _, id := range assertion.EvidenceIDs {
+				seenEvidence[id] = true
+			}
+			addAssertions(assertion.Children)
+		}
+	}
 	for _, constraint := range snapshot.Constraints {
 		for _, id := range constraint.EvidenceIDs {
 			if seenEvidence[id] {
@@ -71,38 +87,80 @@ func (p *Publisher) Publish(ctx context.Context, snapshot RunSnapshot, events []
 			}
 			seenEvidence[id] = true
 		}
+		for _, step := range constraint.Steps {
+			for _, id := range step.EvidenceIDs {
+				seenEvidence[id] = true
+			}
+			if step.TerminalEvidenceID != "" {
+				seenEvidence[step.TerminalEvidenceID] = true
+			}
+			addAssertions(step.AssertionResults)
+		}
+	}
+	for _, event := range events {
+		for _, id := range event.EvidenceIDs {
+			seenEvidence[id] = true
+		}
 	}
 	if len(seenEvidence) > 0 && store == nil {
 		return fmt.Errorf("evidence store is required")
 	}
-	for _, constraint := range snapshot.Constraints {
-		for _, id := range constraint.EvidenceIDs {
-			record, err := store.Get(ctx, id)
-			if err != nil {
-				return fmt.Errorf("verify evidence reference: %w", err)
+	for id := range seenEvidence {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		record, err := store.Get(ctx, id)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
-			if record.RunID != snapshot.ID {
-				return fmt.Errorf("evidence origin mismatch")
-			}
+			return &revisionbinding.Error{Category: revisionbinding.BindingIntegrity, Phase: "evidence"}
+		}
+		if record.ID != id || record.RunID != snapshot.ID {
+			return &revisionbinding.Error{Category: revisionbinding.BindingIntegrity, Phase: "evidence"}
+		}
+		if record.BindingSHA256 != snapshot.Binding.BindingSHA256 {
+			return &revisionbinding.Error{Category: revisionbinding.BindingIntegrity, Phase: "evidence"}
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := p.writeJSON("run.json", buildRunArtifact(snapshot)); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := p.writeEvents(events); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := p.writeJSON("plan.json", safeManifest(manifest)); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := p.writeJSON("report.json", buildReport(snapshot)); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := p.writeFile("report.md", []byte(renderMarkdown(snapshot))); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := syncDirectory(p.fs, p.staging); err != nil {
 		return fmt.Errorf("sync staging bundle: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := p.fs.CommitNoReplace(p.staging, p.final); err != nil {
 		return fmt.Errorf("publish run bundle: %w", err)
@@ -152,7 +210,7 @@ func (p *Publisher) writeEvents(events []harness.Event) error {
 	writer := bufio.NewWriter(&b)
 	encoder := json.NewEncoder(writer)
 	for _, event := range events {
-		encoded := eventArtifact{Sequence: event.Sequence, Type: string(event.Type), RunID: event.RunID, PlanID: event.PlanID, StepID: event.StepID, ConstraintID: event.ConstraintID, Step: event.Step, ToolCallID: event.ToolCallID, Reason: string(event.Reason), Detail: event.Detail, Status: event.Status, EvidenceIDs: event.EvidenceIDs, BlockingCauses: event.BlockingCause, Truncations: event.Truncations}
+		encoded := eventArtifact{Sequence: event.Sequence, Type: string(event.Type), RunID: event.RunID, BindingSHA256: event.BindingSHA256, PlanSHA256: event.PlanSHA256, PlanID: event.PlanID, StepID: event.StepID, ConstraintID: event.ConstraintID, Step: event.Step, ToolCallID: event.ToolCallID, Reason: string(event.Reason), Detail: event.Detail, Status: event.Status, EvidenceIDs: event.EvidenceIDs, BlockingCauses: event.BlockingCause, Truncations: event.Truncations}
 		if err := encoder.Encode(encoded); err != nil {
 			return err
 		}
@@ -168,6 +226,8 @@ type eventArtifact struct {
 	Sequence       int                          `json:"sequence"`
 	Type           string                       `json:"type"`
 	RunID          string                       `json:"run_id"`
+	BindingSHA256  string                       `json:"binding_sha256,omitempty"`
+	PlanSHA256     string                       `json:"plan_sha256,omitempty"`
 	PlanID         string                       `json:"plan_id,omitempty"`
 	StepID         string                       `json:"step_id,omitempty"`
 	ConstraintID   string                       `json:"constraint_id,omitempty"`
@@ -183,17 +243,18 @@ type eventArtifact struct {
 
 // runArtifact is the compact terminal metadata document and excludes detailed assertion payloads.
 type runArtifact struct {
-	ID          string                  `json:"id"`
-	FeatureID   string                  `json:"feature_id"`
-	TargetID    string                  `json:"target_id"`
-	TargetURL   string                  `json:"target_url"`
-	Status      ResultStatus            `json:"status"`
-	StartedAt   time.Time               `json:"started_at"`
-	FinishedAt  time.Time               `json:"finished_at"`
-	DurationMS  int64                   `json:"duration_ms"`
-	Limits      specification.Limits    `json:"limits"`
-	Consumed    harness.Consumption     `json:"consumed"`
-	Constraints []runConstraintArtifact `json:"constraints"`
+	ID           string                        `json:"id"`
+	Binding      *revisionbinding.Binding      `json:"binding,omitempty"`
+	PlanBindings []revisionbinding.PlanBinding `json:"plan_bindings,omitempty"`
+	FeatureID    string                        `json:"feature_id"`
+	TargetID     string                        `json:"target_id"`
+	Status       ResultStatus                  `json:"status"`
+	StartedAt    time.Time                     `json:"started_at"`
+	FinishedAt   time.Time                     `json:"finished_at"`
+	DurationMS   int64                         `json:"duration_ms"`
+	Limits       specification.Limits          `json:"limits"`
+	Consumed     harness.Consumption           `json:"consumed"`
+	Constraints  []runConstraintArtifact       `json:"constraints"`
 }
 
 // runConstraintArtifact keeps only terminal identity, status, and verified evidence links.
@@ -205,7 +266,7 @@ type runConstraintArtifact struct {
 
 // buildRunArtifact removes detailed step trees from operational run metadata.
 func buildRunArtifact(snapshot RunSnapshot) runArtifact {
-	out := runArtifact{ID: snapshot.ID, FeatureID: snapshot.FeatureID, TargetID: snapshot.TargetID, TargetURL: snapshot.TargetURL, Status: snapshot.Status, StartedAt: snapshot.StartedAt.UTC(), FinishedAt: snapshot.FinishedAt.UTC(), DurationMS: snapshot.DurationMS, Limits: snapshot.Limits, Consumed: snapshot.Consumed, Constraints: make([]runConstraintArtifact, len(snapshot.Constraints))}
+	out := runArtifact{ID: snapshot.ID, Binding: snapshot.Binding, PlanBindings: append([]revisionbinding.PlanBinding(nil), snapshot.PlanBindings...), FeatureID: snapshot.FeatureID, TargetID: snapshot.TargetID, Status: snapshot.Status, StartedAt: snapshot.StartedAt.UTC(), FinishedAt: snapshot.FinishedAt.UTC(), DurationMS: snapshot.DurationMS, Limits: snapshot.Limits, Consumed: snapshot.Consumed, Constraints: make([]runConstraintArtifact, len(snapshot.Constraints))}
 	for n, constraint := range snapshot.Constraints {
 		out.Constraints[n] = runConstraintArtifact{ConstraintID: constraint.ConstraintID, Status: constraint.Status, EvidenceIDs: append([]string(nil), constraint.EvidenceIDs...)}
 	}
@@ -214,9 +275,11 @@ func buildRunArtifact(snapshot RunSnapshot) runArtifact {
 
 // reportArtifact is the payload-free machine report whose shape mirrors report.md.
 type reportArtifact struct {
-	RunID       string             `json:"run_id"`
-	Status      ResultStatus       `json:"status"`
-	Constraints []reportConstraint `json:"constraints"`
+	RunID        string                        `json:"run_id"`
+	Binding      *revisionbinding.Binding      `json:"binding,omitempty"`
+	PlanBindings []revisionbinding.PlanBinding `json:"plan_bindings,omitempty"`
+	Status       ResultStatus                  `json:"status"`
+	Constraints  []reportConstraint            `json:"constraints"`
 }
 
 // reportConstraint records one ordered constraint with its complete safe step outcomes.
@@ -252,7 +315,7 @@ type reportAssertion struct {
 
 // buildReport translates domain results to a stable payload-free artifact schema.
 func buildReport(snapshot RunSnapshot) reportArtifact {
-	out := reportArtifact{RunID: snapshot.ID, Status: snapshot.Status, Constraints: make([]reportConstraint, len(snapshot.Constraints))}
+	out := reportArtifact{RunID: snapshot.ID, Binding: snapshot.Binding, PlanBindings: append([]revisionbinding.PlanBinding(nil), snapshot.PlanBindings...), Status: snapshot.Status, Constraints: make([]reportConstraint, len(snapshot.Constraints))}
 	for n, constraint := range snapshot.Constraints {
 		current := reportConstraint{ConstraintID: constraint.ConstraintID, Status: constraint.Status, EvidenceIDs: append([]string(nil), constraint.EvidenceIDs...), Steps: make([]reportStep, len(constraint.Steps))}
 		for i, step := range constraint.Steps {
@@ -396,6 +459,19 @@ func syncDirectory(fs FileSystem, path string) error {
 func renderMarkdown(snapshot RunSnapshot) string {
 	var b strings.Builder
 	b.WriteString("# FeatureProof validation\n\n")
+	if snapshot.Binding != nil {
+		b.WriteString("Revision binding: `" + escapeMarkdown(snapshot.Binding.BindingSHA256) + "`\n\n")
+		b.WriteString("Repository: `" + escapeMarkdown(snapshot.Binding.RepositoryID) + "`\n\n")
+		b.WriteString("Commit: `" + escapeMarkdown(snapshot.Binding.CommitOID) + "`\n\n")
+		b.WriteString("Environment: `" + escapeMarkdown(snapshot.Binding.EnvironmentID) + "`\n\n")
+		b.WriteString("Attestation: `" + escapeMarkdown(snapshot.Binding.AttestationRef) + "`\n\n")
+		b.WriteString("Constraints SHA-256: `" + escapeMarkdown(snapshot.Binding.ConstraintsSHA256) + "`\n\n")
+		b.WriteString("Contract SHA-256: `" + escapeMarkdown(snapshot.Binding.ContractSHA256) + "`\n\n")
+		b.WriteString("Configuration SHA-256: `" + escapeMarkdown(snapshot.Binding.ConfigurationSHA256) + "`\n\n")
+		for _, plan := range snapshot.PlanBindings {
+			fmt.Fprintf(&b, "Plan batch %d: `%s` (%s)\n\n", plan.Batch, escapeMarkdown(plan.PlanSHA256), escapeMarkdown(plan.Mode))
+		}
+	}
 	b.WriteString("Status: `" + escapeMarkdown(string(snapshot.Status)) + "`\n\n| Constraint | Status | Evidence |\n|---|---|---|\n")
 	for _, result := range snapshot.Constraints {
 		ids := append([]string(nil), result.EvidenceIDs...)

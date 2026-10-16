@@ -241,3 +241,44 @@ Bitácora append-only de features completadas.
   provenance, recuperación/publicación transaccional, schema de eventos,
   propiedad concurrente del run, locks acotados y carga local aislada por
   run; evidencia en `progress/plan-approval/review.md`.
+
+## 2026-10-16 — bounded-replanning
+
+- Estado final: `done`.
+- Resultado: coordinador secuencial de replanificación que entrega al modelo un
+  resumen redactado, acepta decisiones estructuradas, admite checks adicionales
+  por las fronteras existentes y preserva presupuestos, aprobación, assertions
+  deterministas y lineage auditable.
+- Spec aprobada por el usuario el `2026-10-16T08:27:07+02:00`.
+- Tasks: T1-T9 completadas. Trazabilidad R1-R12 en
+  `progress/bounded-replanning/implementation.md`.
+- Verificación independiente: suite completa, vet, compilación, race completa y
+  repetida, módulos, diff y builds Windows/Linux/macOS en pass. Cobertura global
+  89,6 %; `internal/replanning` 85,2 % y todos los paquetes modificados al menos
+  85 %.
+- Review: aprobada en la quinta revisión tras cerrar REV-1 a REV-9; evidencia
+  en `progress/bounded-replanning/review.md`.
+- El formato de los archivos Go nuevos y modificados pasa. El gate global
+  `gofmt -l .` conserva 146 archivos previos fuera del diff; se mantiene
+  documentado como límite del checkout.
+
+## 2026-10-16 — revision-bound-validation
+
+- Estado final: `done`.
+- Resultado: cada run admitido queda vinculado a un commit Git completo y limpio,
+  una atestación de entorno y hashes públicos seguros de constraints, plan,
+  contrato y configuración. Journal, evidencia y reportes comprueban el mismo
+  binding; cada replan conserva la revisión y registra su propio digest.
+- Spec aprobada por el usuario el `2026-10-16T10:22:13+02:00`.
+- Tasks T1–T8 completas; R1–R8 trazados a tests en
+  `progress/revision-bound-validation/implementation.md`.
+- Verificación: suite, vet, compilación, race completa y race ×20 de
+  `localvalidation`, módulos, diff y builds Windows/Linux/macOS en pass.
+  Cobertura global 89,2 %; todos los paquetes modificados al menos 85,2 %.
+- Review independiente aprobada tras cerrar REV-1 a REV-4; el reviewer aprobó
+  expresamente la justificación del descenso global de 0,4 puntos. Evidencia
+  en `progress/revision-bound-validation/review.md`.
+- Los 48 Go nuevos o modificados pasan formato; `gofmt -l .` aún lista 135
+  archivos preexistentes fuera del cambio. La CLI falla cerrada hasta que se
+  configure una fuente preview y proyección segura de producción; la spec
+  reserva el adapter preview para la feature 19.

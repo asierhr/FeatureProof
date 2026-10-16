@@ -10,30 +10,32 @@ import (
 type EventType string
 
 const (
-	EventRunCreated         EventType = "run_created"
-	EventPlanningStarted    EventType = "planning_started"
-	EventDecisionReceived   EventType = "model_decision_received"
-	EventCallValidated      EventType = "tool_call_validated"
-	EventPolicyEvaluated    EventType = "policy_evaluated"
-	EventBudgetReserved     EventType = "budget_reserved"
-	EventExecutionStarted   EventType = "tool_execution_started"
-	EventExecutionFinished  EventType = "tool_execution_finished"
-	EventEvidencePersisted  EventType = "evidence_persisted"
-	EventCallRejected       EventType = "tool_call_rejected"
-	EventRetryScheduled     EventType = "retry_scheduled"
-	EventAssertionEvaluated EventType = "assertion_evaluated"
-	EventVerdictCalculated  EventType = "verdict_calculated"
-	EventRunCompleted       EventType = "run_completed"
-	EventRunInconclusive    EventType = "run_inconclusive"
-	EventRunFailed          EventType = "run_failed"
-	EventRunCancelled       EventType = "run_cancelled"
-	EventPlanValidated      EventType = "plan_validated"
-	EventPlanExecutionStart EventType = "plan_execution_started"
-	EventPlanCompleted      EventType = "plan_completed"
-	EventPlanStepStarted    EventType = "plan_step_started"
-	EventPlanInputResolved  EventType = "plan_step_input_resolved"
-	EventPlanStepCompleted  EventType = "plan_step_completed"
-	EventPlanStepBlocked    EventType = "plan_step_blocked"
+	EventRunCreated           EventType = "run_created"
+	EventPlanningStarted      EventType = "planning_started"
+	EventDecisionReceived     EventType = "model_decision_received"
+	EventCallValidated        EventType = "tool_call_validated"
+	EventPolicyEvaluated      EventType = "policy_evaluated"
+	EventBudgetReserved       EventType = "budget_reserved"
+	EventExecutionStarted     EventType = "tool_execution_started"
+	EventExecutionFinished    EventType = "tool_execution_finished"
+	EventEvidencePersisted    EventType = "evidence_persisted"
+	EventCallRejected         EventType = "tool_call_rejected"
+	EventRetryScheduled       EventType = "retry_scheduled"
+	EventAssertionEvaluated   EventType = "assertion_evaluated"
+	EventVerdictCalculated    EventType = "verdict_calculated"
+	EventRunCompleted         EventType = "run_completed"
+	EventRunInconclusive      EventType = "run_inconclusive"
+	EventRunFailed            EventType = "run_failed"
+	EventRunCancelled         EventType = "run_cancelled"
+	EventPlanValidated        EventType = "plan_validated"
+	EventPlanExecutionStart   EventType = "plan_execution_started"
+	EventPlanCompleted        EventType = "plan_completed"
+	EventPlanStepStarted      EventType = "plan_step_started"
+	EventPlanInputResolved    EventType = "plan_step_input_resolved"
+	EventPlanStepCompleted    EventType = "plan_step_completed"
+	EventPlanStepBlocked      EventType = "plan_step_blocked"
+	EventBindingConfirmed     EventType = "binding_confirmed"
+	EventPlanBindingConfirmed EventType = "plan_binding_confirmed"
 )
 
 // RejectReason is the stable machine-readable cause for refusing model-proposed work.
@@ -53,6 +55,8 @@ type Event struct {
 	Sequence      int
 	Type          EventType
 	RunID         string
+	BindingSHA256 string
+	PlanSHA256    string
 	PlanID        string
 	StepID        string
 	ConstraintID  string

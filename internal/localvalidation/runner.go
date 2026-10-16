@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,41 +19,107 @@ import (
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/policy"
+	"github.com/asierhr/featureProof/internal/revisionbinding"
 	"github.com/asierhr/featureProof/internal/specification"
 	specyaml "github.com/asierhr/featureProof/internal/specification/yaml"
 	"github.com/asierhr/featureProof/internal/tools"
 	httptool "github.com/asierhr/featureProof/internal/tools/http"
 )
 
-// Request contains the three explicit inputs accepted by the validate subcommand.
-type Request struct{ SpecPath, PlanPath, Target string }
+// Request contains the explicit source, deployment, and validation selections.
+type Request struct {
+	SpecPath, PlanPath, Target            string
+	RepositoryID, Revision, EnvironmentID string
+}
+
+// prepareBinding rechecks source/deployment and hashes a complete trusted safe
+// projection before new work is authorized. It returns digest fields without
+// assigning a run ID; the caller seals them once that ID is generated.
+func (r *Runner) prepareBinding(ctx context.Context) ([]string, *revisionbinding.Binding, error) {
+	revision, attestation, err := revisionbinding.Admit(ctx, r.selection, r.deps.RevisionResolver, r.deps.EnvironmentAttestor, r.deps.Clock.Now())
+	if err != nil {
+		return nil, nil, err
+	}
+	if revision != r.revision || attestation.EnvironmentID != r.attestation.EnvironmentID || attestation.RepositoryID != r.attestation.RepositoryID || attestation.CommitOID != r.attestation.CommitOID || attestation.Reference != r.attestation.Reference {
+		return nil, nil, &revisionbinding.Error{Category: revisionbinding.RevisionMismatch, Phase: "recheck"}
+	}
+	projection, err := r.deps.SafeProjector.Project(ctx, r.spec, r.manifest, r.validated)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, nil, &revisionbinding.Error{Category: revisionbinding.Cancelled, Phase: "projection"}
+		}
+		return nil, nil, &revisionbinding.Error{Category: revisionbinding.BindingIntegrity, Phase: "projection"}
+	}
+	if len(projection.Plans) != len(r.validated) {
+		return nil, nil, &revisionbinding.Error{Category: revisionbinding.BindingIntegrity, Phase: "projection"}
+	}
+	constraints, err := revisionbinding.HashSafe(ctx, "constraints", projection.Constraints)
+	if err != nil {
+		return nil, nil, err
+	}
+	contract, err := revisionbinding.HashSafe(ctx, "contract", projection.Contract)
+	if err != nil {
+		return nil, nil, err
+	}
+	configuration, err := revisionbinding.HashSafe(ctx, "configuration", projection.Configuration)
+	if err != nil {
+		return nil, nil, err
+	}
+	plans := make([]string, len(projection.Plans))
+	for n, plan := range projection.Plans {
+		plans[n], err = revisionbinding.HashSafe(ctx, "plan", plan)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return plans, &revisionbinding.Binding{ConstraintsSHA256: constraints, ContractSHA256: contract, ConfigurationSHA256: configuration}, nil
+}
+
+// SafeProjections is a complete classified snapshot of executable semantics.
+// The trusted builder must reject every value it cannot represent without
+// hashing secret bytes. Plan order matches the validated constraint order.
+type SafeProjections struct {
+	Constraints, Contract, Configuration revisionbinding.SafeValue
+	Plans                                []revisionbinding.SafeValue
+}
+
+// SafeProjectionBuilder classifies full validated inputs, not display-only views.
+type SafeProjectionBuilder interface {
+	Project(context.Context, specification.Specification, planmanifest.Manifest, []planning.ValidatedPlan) (SafeProjections, error)
+}
 
 // RuntimeDependencies isolates time, identity, network, filesystem and output for hermetic runs.
 type RuntimeDependencies struct {
-	Root             string
-	Clock            harness.Clock
-	IDs              harness.IDGenerator
-	Waiter           harness.Waiter
-	Resolver         httptool.Resolver
-	Dialer           httptool.Dialer
-	WithTimeout      httptool.TimeoutFactory
-	FinalizeTimeout  time.Duration
-	PublisherFactory func(string, string) (*Publisher, error)
-	PolicyFactory    func() harness.Policy
-	EvidenceFactory  func(*Publisher) (evidence.Store, error)
-	Evaluator        planning.StepAssertionEvaluator
-	Stdout, Stderr   io.Writer
+	Root                string
+	Clock               harness.Clock
+	IDs                 harness.IDGenerator
+	Waiter              harness.Waiter
+	Resolver            httptool.Resolver
+	Dialer              httptool.Dialer
+	WithTimeout         httptool.TimeoutFactory
+	FinalizeTimeout     time.Duration
+	PublisherFactory    func(string, string) (*Publisher, error)
+	PolicyFactory       func() harness.Policy
+	EvidenceFactory     func(*Publisher) (evidence.Store, error)
+	Evaluator           planning.StepAssertionEvaluator
+	RevisionResolver    revisionbinding.RevisionResolver
+	EnvironmentAttestor revisionbinding.EnvironmentAttestor
+	SafeProjector       SafeProjectionBuilder
+	Stdout, Stderr      io.Writer
 }
 
 // Runner owns one prevalidated deterministic invocation and its replaceable runtime boundaries.
 type Runner struct {
-	spec      specification.Specification
-	manifest  planmanifest.Manifest
-	validated []planning.ValidatedPlan
-	registry  *tools.Registry
-	policy    harness.Policy
-	sanitizer evidence.Sanitizer
-	deps      RuntimeDependencies
+	spec        specification.Specification
+	manifest    planmanifest.Manifest
+	validated   []planning.ValidatedPlan
+	registry    *tools.Registry
+	policy      harness.Policy
+	sanitizer   evidence.Sanitizer
+	deps        RuntimeDependencies
+	selection   revisionbinding.Selection
+	revision    revisionbinding.Revision
+	attestation revisionbinding.Attestation
 }
 
 // constraintCatalog exposes the specification constraint namespace to deterministic plan validation.
@@ -79,6 +146,18 @@ func NewRunner(ctx context.Context, request Request, deps RuntimeDependencies) (
 	if deps.Clock == nil || deps.IDs == nil || deps.Waiter == nil || deps.Resolver == nil || deps.Dialer == nil || deps.WithTimeout == nil || deps.PublisherFactory == nil || deps.PolicyFactory == nil || deps.EvidenceFactory == nil || deps.Evaluator == nil || deps.Stdout == nil || deps.Stderr == nil || deps.Root == "" || deps.FinalizeTimeout <= 0 {
 		return nil, fmt.Errorf("runtime dependencies are required")
 	}
+	selection := revisionbinding.Selection{RepositoryID: request.RepositoryID, Ref: request.Revision, EnvironmentID: request.EnvironmentID}
+	var revision revisionbinding.Revision
+	var attestation revisionbinding.Attestation
+	if request.RepositoryID != "" || request.Revision != "" || request.EnvironmentID != "" {
+		if deps.RevisionResolver == nil || deps.EnvironmentAttestor == nil || deps.SafeProjector == nil {
+			return nil, &revisionbinding.Error{Category: revisionbinding.UnverifiedEnvironment, Phase: "composition"}
+		}
+		revision, attestation, err = revisionbinding.Admit(ctx, selection, deps.RevisionResolver, deps.EnvironmentAttestor, deps.Clock.Now())
+		if err != nil {
+			return nil, err
+		}
+	}
 	h := manifest.HTTP
 	httpTool, err := httptool.New(httptool.Config{Target: spec.Target, AllowedMethods: h.AllowedMethods, AllowedRequestHeaders: h.AllowedRequestHeaders, AllowedResponseHeaders: h.AllowedResponseHeaders, FollowRedirectsForMethods: h.FollowRedirectsForMethods, MaxRedirects: h.MaxRedirects, Timeout: h.Timeout(), MaxURLBytes: h.MaxURLBytes, MaxRequestHeaderBytes: h.MaxRequestHeaderBytes, MaxRequestBodyBytes: h.MaxRequestBodyBytes, MaxResponseHeaderBytes: h.MaxResponseHeaderBytes, MaxResponseBodyBytes: h.MaxResponseBodyBytes, Resolver: deps.Resolver, Dialer: deps.Dialer, Clock: deps.Clock, WithTimeout: deps.WithTimeout})
 	if err != nil {
@@ -103,21 +182,45 @@ func NewRunner(ctx context.Context, request Request, deps RuntimeDependencies) (
 			return nil, safeError("validate plan", err)
 		}
 	}
+	if selection.RepositoryID == "" && selection.Ref == "" && selection.EnvironmentID == "" {
+		return nil, &revisionbinding.Error{Category: revisionbinding.InvalidRevision, Phase: "selection"}
+	}
 	runPolicy := deps.PolicyFactory()
 	if runPolicy == nil {
 		return nil, fmt.Errorf("policy factory returned nil")
 	}
-	return &Runner{spec: spec, manifest: manifest, validated: validated, registry: registry, policy: runPolicy, sanitizer: evidence.NewSanitizer(redactionPolicy), deps: deps}, nil
+	return &Runner{spec: spec, manifest: manifest, validated: validated, registry: registry, policy: runPolicy, sanitizer: evidence.NewSanitizer(redactionPolicy), deps: deps, selection: selection, revision: revision, attestation: attestation}, nil
 }
 
 // Run executes constraints sequentially, publishes a terminal bundle when possible, and returns the public exit code.
 func (r *Runner) Run(ctx context.Context) int {
+	if err := ctx.Err(); err != nil {
+		if terminalCancellation(ctx) {
+			return 130
+		}
+		fmt.Fprintln(r.deps.Stderr, "featureproof_error=cancelled")
+		return 3
+	}
+	planDigests, preflight, err := r.prepareBinding(ctx)
+	if err != nil {
+		if terminalCancellation(ctx) && ctx.Err() != nil {
+			return 130
+		}
+		fmt.Fprintln(r.deps.Stderr, "featureproof_error=revision_binding")
+		return 3
+	}
 	runID := r.deps.IDs.Next()
 	if runID == "" {
 		fmt.Fprintln(r.deps.Stderr, "featureproof_error=id_generation")
 		return 3
 	}
 	started := r.deps.Clock.Now()
+	sealed, err := revisionbinding.NewBinding(ctx, runID, r.revision, r.attestation, preflight.ConstraintsSHA256, preflight.ContractSHA256, preflight.ConfigurationSHA256)
+	if err != nil {
+		fmt.Fprintln(r.deps.Stderr, "featureproof_error=revision_binding")
+		return 3
+	}
+	binding := &sealed
 	fmt.Fprintf(r.deps.Stdout, "run_id=%s\n", runID)
 	publisher, err := r.deps.PublisherFactory(r.deps.Root, runID)
 	if err != nil {
@@ -129,8 +232,16 @@ func (r *Runner) Run(ctx context.Context) int {
 		fmt.Fprintln(r.deps.Stderr, "featureproof_error=evidence_setup")
 		return 3
 	}
-	journal := harness.NewMemoryJournal()
-	_ = journal.Append(ctx, harness.Event{Type: harness.EventRunCreated, RunID: runID})
+	var journal harness.Journal = boundJournal{inner: harness.NewMemoryJournal(), runID: runID, digest: binding.BindingSHA256}
+	store = boundEvidence{inner: store, runID: runID, digest: binding.BindingSHA256}
+	if err := journal.Append(ctx, harness.Event{Type: harness.EventRunCreated, RunID: runID}); err != nil {
+		fmt.Fprintln(r.deps.Stderr, "featureproof_error=journal")
+		return 3
+	}
+	if err := journal.Append(ctx, harness.Event{Type: harness.EventBindingConfirmed, RunID: runID}); err != nil {
+		fmt.Fprintln(r.deps.Stderr, "featureproof_error=journal")
+		return 3
+	}
 	limits := harness.Limits{MaxSteps: r.spec.Limits.MaxSteps, MaxToolCalls: r.spec.Limits.MaxToolCalls, MaxRetries: r.spec.Limits.MaxRetries}
 	shared, err := harness.NewRun(runID, r.spec.Feature.ID, r.spec.Constraints[0].ID, limits)
 	if err != nil {
@@ -139,6 +250,7 @@ func (r *Runner) Run(ctx context.Context) int {
 	}
 	fmt.Fprintln(r.deps.Stdout, "phase=executing")
 	results := []ConstraintResult{}
+	planBindings := []revisionbinding.PlanBinding{}
 	status := ResultPassed
 	operational := error(nil)
 	for n, constraint := range r.spec.Constraints {
@@ -152,6 +264,23 @@ func (r *Runner) Run(ctx context.Context) int {
 			break
 		}
 		shared.ConstraintID = constraint.ID
+		currentDigests, currentBase, verifyErr := r.prepareBinding(ctx)
+		if verifyErr != nil || !slices.Equal(currentDigests, planDigests) || currentBase.ConstraintsSHA256 != binding.ConstraintsSHA256 || currentBase.ContractSHA256 != binding.ContractSHA256 || currentBase.ConfigurationSHA256 != binding.ConfigurationSHA256 {
+			status = ResultInconclusive
+			break
+		}
+		planBinding, bindErr := revisionbinding.NewPlanBinding(ctx, *binding, n+1, planDigests[n], "approval_not_required", true)
+		if bindErr != nil {
+			status = ResultError
+			operational = bindErr
+			break
+		}
+		if bindErr = journal.Append(ctx, harness.Event{Type: harness.EventPlanBindingConfirmed, RunID: runID, PlanSHA256: planBinding.PlanSHA256}); bindErr != nil {
+			status = ResultError
+			operational = bindErr
+			break
+		}
+		planBindings = append(planBindings, planBinding)
 		executor, buildErr := planning.NewPlanExecutor(planning.ExecutorConfig{Run: shared}, planning.ExecutorDependencies{Registry: r.registry, Policy: r.policy, Evidence: store, Journal: journal, Sanitizer: r.sanitizer, Clock: r.deps.Clock, IDs: r.deps.IDs, Waiter: r.deps.Waiter, Evaluator: r.deps.Evaluator})
 		if buildErr != nil {
 			operational = buildErr
@@ -181,10 +310,28 @@ func (r *Runner) Run(ctx context.Context) int {
 	if status == ResultPassed {
 		status = aggregateStatus(results)
 	}
+	if ctx.Err() == nil {
+		currentDigests, currentBase, verifyErr := r.prepareBinding(ctx)
+		if ctx.Err() == nil && (verifyErr != nil || !slices.Equal(currentDigests, planDigests) || currentBase.ConstraintsSHA256 != binding.ConstraintsSHA256 || currentBase.ContractSHA256 != binding.ContractSHA256 || currentBase.ConfigurationSHA256 != binding.ConfigurationSHA256) {
+			status = ResultInconclusive
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		if terminalCancellation(ctx) {
+			status = ResultCancelled
+		} else {
+			status = ResultError
+			operational = err
+		}
+	}
 	if status == ResultError {
 		fmt.Fprintln(r.deps.Stderr, "featureproof_error=execution")
 	}
-	finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.deps.FinalizeTimeout)
+	finalBase := ctx
+	if status == ResultCancelled || (status == ResultError && ctx.Err() != nil) {
+		finalBase = context.WithoutCancel(ctx)
+	}
+	finalCtx, cancel := context.WithTimeout(finalBase, r.deps.FinalizeTimeout)
 	defer cancel()
 	terminalType := harness.EventRunCompleted
 	if status == ResultCancelled {
@@ -196,14 +343,16 @@ func (r *Runner) Run(ctx context.Context) int {
 	}
 	_ = journal.Append(finalCtx, harness.Event{Type: terminalType, RunID: runID, Status: string(status)})
 	finished := r.deps.Clock.Now()
-	snapshot := RunSnapshot{ID: runID, FeatureID: r.spec.Feature.ID, TargetID: r.spec.Target.ID, TargetURL: r.spec.Target.BaseURL, Status: status, StartedAt: started, FinishedAt: finished, DurationMS: durationMillis(started, finished), Limits: r.spec.Limits, Consumed: shared.Consumed, Constraints: results}
+	snapshot := RunSnapshot{ID: runID, Binding: binding, PlanBindings: planBindings, FeatureID: r.spec.Feature.ID, TargetID: r.spec.Target.ID, TargetURL: r.spec.Target.BaseURL, Status: status, StartedAt: started, FinishedAt: finished, DurationMS: durationMillis(started, finished), Limits: r.spec.Limits, Consumed: shared.Consumed, Constraints: results}
 	events, eventErr := journal.Events(finalCtx, runID)
 	if eventErr == nil {
 		fmt.Fprintln(r.deps.Stdout, "phase=reporting")
 		eventErr = publisher.Publish(finalCtx, snapshot, events, r.manifest, store)
 	}
 	if eventErr != nil {
-		if status != ResultCancelled {
+		if terminalCancellation(ctx) && ctx.Err() != nil {
+			status = ResultCancelled
+		} else if status != ResultCancelled {
 			fmt.Fprintln(r.deps.Stderr, "featureproof_error=publication")
 			status = ResultError
 		}
@@ -271,7 +420,7 @@ func DefaultDependencies(root string, stdout, stderr io.Writer) RuntimeDependenc
 func RunCommand(ctx context.Context, args []string, _ io.Reader, stdout, stderr io.Writer) int {
 	request, err := ParseRequest(args)
 	if err != nil {
-		fmt.Fprintln(stderr, "usage: featureproof validate --spec PATH --plan PATH --target URL")
+		fmt.Fprintln(stderr, "usage: featureproof validate --spec PATH --plan PATH --target URL --repository ID --revision REF --environment ID")
 		var argument *ArgumentError
 		if errors.As(err, &argument) {
 			fmt.Fprintf(stderr, "featureproof_error=arguments field=%s category=%s\n", argument.Field, argument.Category)
@@ -300,6 +449,10 @@ func RunCommand(ctx context.Context, args []string, _ io.Reader, stdout, stderr 
 
 // validationDiagnostic projects known typed failures into value-free operator guidance.
 func validationDiagnostic(err error) (string, string) {
+	var revisionError *revisionbinding.Error
+	if errors.As(err, &revisionError) {
+		return string(revisionError.Category), "revision"
+	}
 	var manifestError *planmanifest.Error
 	if errors.As(err, &manifestError) {
 		return manifestError.Category, safeField(manifestError.Field)

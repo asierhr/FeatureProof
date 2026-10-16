@@ -30,8 +30,8 @@ func TestValidateCommandRequiresExactFlagsBeforeEffects(t *testing.T) {
 	}
 }
 
-// TestRunCommandCompletesWithProductionBoundaries traces R1, R9, and R11 through the real entrypoint composition.
-func TestRunCommandCompletesWithProductionBoundaries(t *testing.T) {
+// TestRunCommandRejectsUnattestedProductionBoundary keeps the public command fail-closed.
+func TestRunCommandRejectsUnattestedProductionBoundary(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
@@ -49,12 +49,22 @@ func TestRunCommandCompletesWithProductionBoundaries(t *testing.T) {
 	defer os.Chdir(previous)
 	var stdout, stderr bytes.Buffer
 	code := RunCommand(context.Background(), []string{"validate", "--spec", spec, "--plan", plan, "--target", server.URL}, strings.NewReader(""), &stdout, &stderr)
-	if code != 0 {
+	if code != 3 || !strings.Contains(stderr.String(), "category=invalid_revision") {
 		t.Fatalf("code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
-	entries, err := os.ReadDir(filepath.Join(root, ".featureproof", "runs"))
-	if err != nil || len(entries) != 1 || strings.HasSuffix(entries[0].Name(), ".incomplete") {
-		t.Fatalf("bundle=%v err=%v", entries, err)
+	if _, err := os.Stat(filepath.Join(root, ".featureproof", "runs")); !os.IsNotExist(err) {
+		t.Fatalf("unattested run directory created: %v", err)
+	}
+}
+
+// TestCommandCannotTreatSelectedRevisionAsDeploymentProof ensures user flags
+// cannot substitute for a configured trusted attestation source.
+func TestCommandCannotTreatSelectedRevisionAsDeploymentProof(t *testing.T) {
+	spec, plan := writeInputs(t, 200, 1)
+	var stdout, stderr bytes.Buffer
+	code := RunCommand(context.Background(), []string{"validate", "--spec", spec, "--plan", plan, "--target", "http://127.0.0.1:1", "--repository", "repo", "--revision", "main", "--environment", "preview"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 3 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "category=unverified_environment") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 }
 
