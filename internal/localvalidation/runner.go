@@ -110,16 +110,17 @@ type RuntimeDependencies struct {
 
 // Runner owns one prevalidated deterministic invocation and its replaceable runtime boundaries.
 type Runner struct {
-	spec        specification.Specification
-	manifest    planmanifest.Manifest
-	validated   []planning.ValidatedPlan
-	registry    *tools.Registry
-	policy      harness.Policy
-	sanitizer   evidence.Sanitizer
-	deps        RuntimeDependencies
-	selection   revisionbinding.Selection
-	revision    revisionbinding.Revision
-	attestation revisionbinding.Attestation
+	spec            specification.Specification
+	manifest        planmanifest.Manifest
+	validated       []planning.ValidatedPlan
+	registry        *tools.Registry
+	policy          harness.Policy
+	sanitizer       evidence.Sanitizer
+	redactionPolicy *evidence.Policy
+	deps            RuntimeDependencies
+	selection       revisionbinding.Selection
+	revision        revisionbinding.Revision
+	attestation     revisionbinding.Attestation
 }
 
 // constraintCatalog exposes the specification constraint namespace to deterministic plan validation.
@@ -189,7 +190,7 @@ func NewRunner(ctx context.Context, request Request, deps RuntimeDependencies) (
 	if runPolicy == nil {
 		return nil, fmt.Errorf("policy factory returned nil")
 	}
-	return &Runner{spec: spec, manifest: manifest, validated: validated, registry: registry, policy: runPolicy, sanitizer: evidence.NewSanitizer(redactionPolicy), deps: deps, selection: selection, revision: revision, attestation: attestation}, nil
+	return &Runner{spec: spec, manifest: manifest, validated: validated, registry: registry, policy: runPolicy, sanitizer: evidence.NewSanitizer(redactionPolicy), redactionPolicy: redactionPolicy, deps: deps, selection: selection, revision: revision, attestation: attestation}, nil
 }
 
 // Run executes constraints sequentially, publishes a terminal bundle when possible, and returns the public exit code.
@@ -302,7 +303,17 @@ func (r *Runner) Run(ctx context.Context) int {
 			}
 			break
 		}
+		failures, projectionErr := captureFailures(ctx, constraint.ID, planResult, r.redactionPolicy, store)
+		if projectionErr != nil {
+			status = ResultError
+			operational = projectionErr
+			break
+		}
+		for i := range failures {
+			failures[i].BatchID = fmt.Sprint(n + 1)
+		}
 		result := constraintResult(constraint.ID, planResult)
+		result.packageFailures = failures
 		results = append(results, result)
 		ids, _ := jsonIDs(result.EvidenceIDs)
 		fmt.Fprintf(r.deps.Stdout, "constraint_id=%s status=%s evidence_ids=%s\n", constraint.ID, result.Status, ids)

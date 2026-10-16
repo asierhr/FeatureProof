@@ -47,10 +47,11 @@ const (
 
 // ConstraintResult is the payload-free terminal view of one constraint and its evidence links.
 type ConstraintResult struct {
-	ConstraintID string                `json:"constraint_id"`
-	Status       ResultStatus          `json:"status"`
-	EvidenceIDs  []string              `json:"evidence_ids"`
-	Steps        []planning.StepResult `json:"steps,omitempty"`
+	ConstraintID    string                `json:"constraint_id"`
+	Status          ResultStatus          `json:"status"`
+	EvidenceIDs     []string              `json:"evidence_ids"`
+	Steps           []planning.StepResult `json:"steps,omitempty"`
+	packageFailures []PackageFailure
 }
 
 // RunSnapshot is the terminal machine-readable state shared by run.json and reporting.

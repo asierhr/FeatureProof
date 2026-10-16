@@ -282,3 +282,25 @@ Bitácora append-only de features completadas.
   archivos preexistentes fuera del cambio. La CLI falla cerrada hasta que se
   configure una fuente preview y proyección segura de producción; la spec
   reserva el adapter preview para la feature 19.
+
+## 2026-10-16 — evidence-package
+
+- Estado final: `done`.
+- Resultado: paquete local v1 con índice semántico y manifest de tamaño y
+  SHA-256 para cada artefacto; lector offline que verifica inventario cerrado,
+  binding, evidencias, referencias y coherencia de estados antes de entregar
+  una vista confiable. El publicador valida staging antes del commit atómico.
+- Spec aprobada por el usuario el `2026-10-16T12:02:02+02:00`. T1–T8
+  completas; R1–R10 trazados a tests en
+  `progress/evidence-package/implementation.md`.
+- Verificación independiente: suite fresca, vet, race completa, builds offline
+  Windows/Linux/macOS, formato dirigido y diff en pass. Cobertura global
+  88,9 % y `internal/localvalidation` 85,2 %.
+- Review aprobada tras corregir procedencia de facts, lote y eventos,
+  coherencia de assertions y comprobación de los bytes leídos contra el
+  manifest. El reviewer aprobó expresamente la justificación del descenso
+  global de 0,3 puntos; evidencia en `progress/evidence-package/review.md`.
+- `gofmt -l .` conserva 135 Go anteriores fuera del cambio. El manifest
+  detecta alteraciones respecto a los bytes recibidos, pero no firma el
+  origen; las instrucciones de reproducción son declarativas y no incluyen
+  credenciales ni comandos ejecutables.

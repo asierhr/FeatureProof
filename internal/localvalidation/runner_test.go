@@ -537,6 +537,10 @@ func TestSignalCancellationDuringHTTPPropagatesAndPublishesConfirmedPrefix(t *te
 	if err != nil || !strings.Contains(string(raw), `"status": "cancelled"`) {
 		t.Fatalf("cancelled bundle=%s err=%v", raw, err)
 	}
+	index, err := ReadPackage(context.Background(), filepath.Join(root, ".featureproof", "runs", "id-1"))
+	if err != nil || index.Status != ResultCancelled || len(index.Failures) != 0 {
+		t.Fatalf("cancelled package=%+v err=%v", index, err)
+	}
 }
 
 // TestCancellationFinalizationFailureDoesNotPublishPartialRun traces R10's failure path and retained diagnostics.

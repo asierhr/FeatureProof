@@ -1,5 +1,71 @@
 # Trabajo actual
 
+## 2026-10-16 — Spec de external-agent-interface completada
+
+- Feature 16 pasó de `pending` a `spec_ready` tras verificar los tres
+  artefactos SDD en `specs/external-agent-interface/`.
+- R1–R10 cubren ciclo durable de runs, paridad CLI/MCP, resultado seguro,
+  identidad y ámbitos, aislamiento de handles, errores, idempotencia,
+  cancelación, descubrimiento y tests contractuales. T1–T8 enlazan todos los
+  requirements con pruebas previstas.
+- Se fijó MCP `2026-07-28` por stdio y un caso de uso compartido; la identidad
+  no procede de `clientInfo` y la admisión productiva mantiene fallo cerrado
+  hasta disponer de proveedor preview confiable.
+- Aprobación humana pendiente en `requirements.md`. No se modificó código ni
+  tests de feature 16; la implementación espera esa puerta.
+
+## 2026-10-16 — Preflight de external-agent-interface
+
+- Feature 16 seleccionada: `pending`, `sdd: true`, con criterios de aceptación
+  en `feature_list.json`. Features 1–15 `done`; ninguna `in_progress`.
+- El working tree conserva cambios locales de feature 15 ya revisada; se
+  preservan. Alcance de esta sesión: solo definir la spec de feature 16,
+  sin código ni tests antes de la puerta de aprobación humana.
+- Contexto externo consultado: especificación MCP oficial 2026-07-28 para
+  capacidades, tools y contrato de transporte. Siguiente fase: spec author.
+
+## 2026-10-16 — Cierre de evidence-package
+
+- Feature 15 `done` tras review independiente aprobada; T1–T8 y R1–R10
+  verificados. Informes en `progress/evidence-package/` y resumen en
+  `progress/history.md`.
+- Suite, vet, race completa y builds offline Windows/Linux/macOS pasan.
+  Cobertura global 88,9 %; `internal/localvalidation` 85,2 % y justificación
+  del descenso global aprobada por el reviewer.
+- Los Go tocados están formateados; `gofmt -l .` conserva 135 archivos
+  preexistentes fuera del cambio. No hay feature `in_progress`; la siguiente
+  pendiente es `external-agent-interface` (feature 16).
+
+## 2026-10-16 — Inicio de implementación de evidence-package
+
+- El usuario aprobó la spec de feature 15 con la instrucción explícita de
+  continuar la implementación, registrada el 2026-10-16T12:02:02+02:00.
+- El leader cambió `evidence-package` de `spec_ready` a `in_progress`.
+- Alcance: T1–T8 y R1–R10, con paquete v1 verificable offline y publicación
+  atómica; las features 16–19 quedan fuera. Siguiente fase: implementer,
+  verificación y review independiente.
+
+## 2026-10-16 — Spec de evidence-package completada
+
+- Feature 15 pasó de `pending` a `spec_ready` tras verificar los tres
+  artefactos SDD en `specs/evidence-package/`.
+- R1–R10 cubren formato e identidad del paquete, separación de hechos,
+  fallos trazables, inventario íntegro, publicación atómica, redacción,
+  lector offline, reproducción segura y cancelación. T1–T8 referencian
+  los requirements y prevén pruebas concretas.
+- La aprobación humana de `requirements.md` está pendiente. No se ha
+  modificado código ni tests de la feature; siguiente fase: revisión de la
+  spec antes de `in_progress`.
+
+## 2026-10-16 — Preflight de evidence-package
+
+- Feature 15 seleccionada: `pending`, `sdd: true`, con criterios de aceptación
+  en `feature_list.json`. Features 1–14 `done`; ninguna `in_progress`.
+- Working tree limpio al iniciar. Alcance actual: redactar la spec de
+  `evidence-package`; el código y los tests esperan aprobación humana.
+- Siguiente fase: spec author y comprobación de `requirements.md`, `design.md`
+  y `tasks.md` antes de pasar a `spec_ready`.
+
 ## 2026-10-16 — Cierre de revision-bound-validation
 
 - Feature 14 `done` tras review independiente aprobada; T1–T8 y R1–R8
@@ -52,7 +118,7 @@
 
 ## Estado
 
-La feature `revision-bound-validation` está en estado `done`, con spec y review
+La feature `evidence-package` está en estado `done`, con spec y review
 aprobadas. No hay feature `in_progress`.
 
 ## Última actualización
@@ -1516,3 +1582,16 @@ aprobadas. No hay feature `in_progress`.
 - Producción falla cerrada mientras no exista el atestador concreto y clasificador seguro configurados; el adapter preview pertenece a feature 19.
 - T8 completada: tests de flujo con Git temporal, atestador fake, worktree dirty, revisión inexistente, drift de revisión/configuración, PlanBinding previo a eventos funcionales y grant obsoleto pasan. Suite, vet, race completa, race ×20 en paquetes afectados, módulos, diff, compilación y builds Windows/Linux/macOS pasan. Cobertura global 89,2 % (baseline 89,6 %); todos los paquetes afectados superan 85 %. Informe de implementación en `progress/revision-bound-validation/implementation.md`; pendiente de review independiente y evaluación de la justificación de cobertura. El gate literal `gofmt -l .` conserva 135 archivos preexistentes fuera del cambio.
 - Correcciones de primera review: GitResolver aísla `GIT_*` heredado; Publisher valida evidencia en todo el árbol de report, exige terminal único congruente y falla cerrado si se cancela staging; Runner clasifica cancelación posterior al último plan antes de publicar. Tests adversariales dirigidos, suite/race completa y race ×20 de `localvalidation` posteriores pasan. Cobertura nueva: global 89,2 %, `revisionbinding` 88,9 %, `localvalidation` 86,6 %. Pendiente del veredicto independiente.
+- 2026-10-16: evidence-package T1 completo: esquema v1, límites, error tipado y rechazo de JSON ambiguo/versiones desconocidas; tests dirigidos en pass.
+- evidence-package T2: proyección determinista de outcomes ligada a Binding.Verify y VerifyPlanChain; variantes passed/failed/inconclusive y manipulación de identidad/status comprobadas.
+- evidence-package T3: fallos hoja/grupo capturados antes de safeAssertions; valores absent/present/redacted/truncated y fallo cerrado ante tipos no clasificables comprobados.
+- evidence-package T4: tabla ID→archivo y hechos de herramienta desde Store.Get, con rechazo de ID/ruta/identidad ajenos y preservación del registro truncado.
+- evidence-package T5: reproducción declarativa con commit/entorno/digests/selectores y marcador de credencial; sin target ni comandos, test canario en pass.
+- evidence-package T6: lector offline con os.Root, inventario SHA-256, límites, rutas canónicas, no-follow, hard links y referencias cruzadas; mutaciones, symlink y cancelación en tests.
+- evidence-package T7: Publisher escribe índice e inventario en staging, ejecuta ReadPackage y solo entonces CommitNoReplace; tests de éxito, cancelación y fallos de filesystem en pass.
+- evidence-package T8: integración failed/inconclusive/cancelled releída offline y mutaciones adversarias en pass; suite, vet, race completa, builds offline y formato dirigido pasan; cobertura localvalidation 85,0 %, global 88,9 % frente a 89,2 % previa (justificación en implementation.md). Review independiente pendiente.
+- evidence-package: endurecimiento final del lector para manifest re-leído y referencias batch/check/escenario/status; suite y race frescas de localvalidation en pass. Race completa anterior al ajuste también en pass; reviewer repetirá gates completos del snapshot final.
+- evidence-package: review adicional corrigió referencias de evidencia de steps, BatchID contra topología, procedencia PlanID de hechos de herramienta, coherencia de assertions raíz y SHA/tamaño en cada lectura semántica. Regresiones con dos batches, IDs de step repetidos, manifest rehasheado y cambio entre scans pasan; gates completos en curso.
+- evidence-package: events.jsonl verifica IDs de plan, constraint, step y tool call contra topología y registros de evidencia; manipulación de cada ID con manifest rehasheado rechazada. Tests dirigidos pasan; suite y race dirigida posteriores en curso.
+- evidence-package: tras correcciones de review pasan suite completa, vet, test sin caché de localvalidation, race dirigida de localvalidation y race fresca de las seis regresiones. Formato dirigido y diff check pasan. Race global/builds offline pertenecen al snapshot previo; reviewer repetirá el gate final.
+- evidence-package: la coherencia del árbol también verifica grupos `all`/`any` ternarios. Cobertura final de localvalidation 85,2 %, suite completa, vet y race fresca de regresiones en pass sobre el snapshot final. Ready for review; reviewer repetirá race global y builds offline.

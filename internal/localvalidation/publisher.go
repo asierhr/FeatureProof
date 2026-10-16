@@ -109,6 +109,9 @@ func (p *Publisher) Publish(ctx context.Context, snapshot RunSnapshot, events []
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if !safePackageID.MatchString(id) {
+			return &PackageError{Category: "invalid_path", Path: "package.json"}
+		}
 		record, err := store.Get(ctx, id)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -124,6 +127,20 @@ func (p *Publisher) Publish(ctx context.Context, snapshot RunSnapshot, events []
 		}
 	}
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	index, err := buildPackageIndex(ctx, snapshot)
+	if err != nil {
+		return err
+	}
+	evidenceEntries, toolFacts, err := collectPackageEvidence(ctx, p.staging, snapshot.ID, snapshot.Binding.BindingSHA256, seenEvidence, store)
+	if err != nil {
+		return err
+	}
+	index.Evidence = evidenceEntries
+	index.Facts = append(index.Facts, toolFacts...)
+	index.Reproduction, err = buildReproduction(ctx, snapshot)
+	if err != nil {
 		return err
 	}
 	if err := p.writeJSON("run.json", buildRunArtifact(snapshot)); err != nil {
@@ -151,6 +168,22 @@ func (p *Publisher) Publish(ctx context.Context, snapshot RunSnapshot, events []
 		return err
 	}
 	if err := p.writeFile("report.md", []byte(renderMarkdown(snapshot))); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := p.writeJSON("package.json", index); err != nil {
+		return err
+	}
+	artifacts, err := inventoryPackage(ctx, p.staging)
+	if err != nil {
+		return err
+	}
+	if err := p.writeJSON("manifest.json", PackageManifest{Version: PackageVersion, RunID: snapshot.ID, BindingSHA256: snapshot.Binding.BindingSHA256, Artifacts: artifacts}); err != nil {
+		return err
+	}
+	if _, err := ReadPackage(ctx, p.staging); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
