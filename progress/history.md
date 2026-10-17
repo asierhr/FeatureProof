@@ -326,3 +326,54 @@ Bitácora append-only de features completadas.
 - Limitación del host: el test de symlink de feature 15 falla en Windows por
   privilegios y un `Skipf` heredado ligado al `testing.T` padre; el mismo
   subtest pasó bajo WSL2 sin cambios.
+
+## 2026-10-16 — correction-loop
+
+- Estado final: `done`.
+- Resultado: bucle de corrección verificable con cadenas lineales de runs
+  padre/hijo, nueva revisión atestada, fase `failed_first`, regresión completa,
+  comparación determinista y veredicto derivado únicamente de evidencia del
+  hijo.
+- Spec aprobada por el usuario el `2026-10-16T17:25:00+02:00`.
+- Tasks: T1–T8 completadas; R1–R12 trazados a tests concretos en
+  `progress/correction-loop/implementation.md`.
+- Persistencia: journal estricto append-only, CAS y locks/leases por cadena,
+  idempotencia multiproceso, presupuestos acumulados y recovery sin robar
+  owners vivos ni repetir trabajo confirmado.
+- Publicación: package y comparación usan preparación/intención durable,
+  commit no-replace y reconciliación de respuestas inciertas; conflictos o
+  corrupción terminan una vez como fallo operativo de integridad.
+- Superficies: application contract v2 compartido por CLI y MCP, con scopes,
+  handles opacos, límites allowlisted y compatibilidad de las operaciones v1.
+- Verificación independiente: siete reviews cerraron REV-1–REV-16; suite
+  dirigida, regresiones repetidas, race de paquetes afectados y race global
+  comparable, vet, compile-only, módulos, diff y builds Windows/Linux/macOS
+  pasan. Coverage `internal/correction` 85,4 %.
+- Limitación del host: el gate literal conserva únicamente el subtest de
+  symlink preexistente de feature 15 que Windows no puede crear sin privilegio;
+  la suite y race comparables excluyen solo ese caso y pasan.
+## 2026-10-17 — github-pr-integration
+
+- Estado final: `done`.
+- Resultado: integración GitHub App para iniciar o asociar validaciones a una
+  pull request autorizada y a su head commit exacto, con webhook HMAC,
+  idempotencia durable, checks y comentario resumen propios, política segura
+  para forks y permisos mínimos.
+- Spec aprobada por el usuario el `2026-10-16T21:51:08+02:00`.
+- Tasks T1–T11 completas; R1–R12 trazados a pruebas concretas en
+  `progress/github-pr-integration/implementation.md`.
+- Persistencia y recuperación: journal append-only con CAS, locks y leases
+  multiproceso; receipts, asociaciones e intents se recuperan por lotes
+  reproducibles menores de 1 MiB, con payloads exactos y ownership verificado.
+- Composición: `featureproof github serve` conecta webhook, adapter REST,
+  retries, publisher y coordinator; las credenciales se resuelven solo en la
+  composición y la selección de preview permanece fail-closed hasta la
+  feature 19.
+- Verificación independiente aprobada en la novena revisión tras cerrar
+  REV-1–REV-23. Pasan paquete ×20, escenario de concurrencia ×500, race del
+  paquete ×3, race global comparable, vet, compile-only, módulos, diff y
+  builds Windows/Linux/macOS. Coverage `internal/githubpr`: 85,6 %.
+- Limitación del host: `go test ./...` conserva únicamente el subtest
+  preexistente de symlink de feature 15, que Windows no puede crear sin el
+  privilegio correspondiente; la suite comparable excluye solo ese caso y
+  pasa.

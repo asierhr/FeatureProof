@@ -152,6 +152,14 @@ func toolOperation(name string) (string, bool) {
 		return "result", true
 	case "featureproof.cancel":
 		return "cancel", true
+	case "featureproof.correction_submit":
+		return "correction_submit", true
+	case "featureproof.correction_status":
+		return "correction_status", true
+	case "featureproof.correction_result":
+		return "correction_result", true
+	case "featureproof.correction_cancel":
+		return "correction_cancel", true
 	default:
 		return "", false
 	}

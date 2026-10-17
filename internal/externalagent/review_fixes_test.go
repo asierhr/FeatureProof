@@ -175,18 +175,18 @@ func TestAdvertisedOutputSchemasValidateRealEnvelopes(t *testing.T) {
 	principal := Principal{ID: "alice", Scopes: allScopes()}
 	operations := operationsFor(principal)
 	examples := map[string]Envelope{
-		"capabilities": {ContractVersion: 1, Data: CapabilitiesResult{ContractVersion: 1, ResultSchemaVersion: 1, RetentionSeconds: 60, Operations: operations}},
-		"submit":       {ContractVersion: 1, Data: RunView{RunHandle: "opaque_schema_handle_000000001", Phase: PhaseQueued, UpdatedAt: time.Unix(1, 0).UTC()}},
-		"status":       {ContractVersion: 1, Data: RunView{RunHandle: "opaque_schema_handle_000000001", Phase: PhaseTerminal, Status: OutcomeFailed, UpdatedAt: time.Unix(1, 0).UTC()}},
-		"cancel":       {ContractVersion: 1, Data: RunView{RunHandle: "opaque_schema_handle_000000001", Phase: PhaseTerminal, Status: OutcomeCancelled, UpdatedAt: time.Unix(1, 0).UTC()}},
-		"result":       {ContractVersion: 1, Data: ResultView{RunHandle: "opaque_schema_handle_000000001", Phase: PhaseTerminal, Status: OutcomeFailed, Constraints: []ConstraintView{}, Failures: []FailureView{}, Facts: []FactView{}, Evidence: []EvidenceView{}, Reproduction: []ReproductionView{}}},
+		"capabilities": {ContractVersion: ContractVersion, Data: CapabilitiesResult{ContractVersion: ContractVersion, ResultSchemaVersion: 1, RetentionSeconds: 60, Operations: operations}},
+		"submit":       {ContractVersion: ContractVersion, Data: RunView{RunHandle: "opaque_schema_handle_000000001", Phase: PhaseQueued, UpdatedAt: time.Unix(1, 0).UTC()}},
+		"status":       {ContractVersion: ContractVersion, Data: RunView{RunHandle: "opaque_schema_handle_000000001", Phase: PhaseTerminal, Status: OutcomeFailed, UpdatedAt: time.Unix(1, 0).UTC()}},
+		"cancel":       {ContractVersion: ContractVersion, Data: RunView{RunHandle: "opaque_schema_handle_000000001", Phase: PhaseTerminal, Status: OutcomeCancelled, UpdatedAt: time.Unix(1, 0).UTC()}},
+		"result":       {ContractVersion: ContractVersion, Data: ResultView{RunHandle: "opaque_schema_handle_000000001", Phase: PhaseTerminal, Status: OutcomeFailed, Constraints: []ConstraintView{}, Failures: []FailureView{}, Facts: []FactView{}, Evidence: []EvidenceView{}, Reproduction: []ReproductionView{}}},
 	}
 	for _, operation := range operations {
 		validator := compileAdvertisedSchema(t, operation.OutputSchema)
 		if err := validator.Validate(jsonValue(t, examples[operation.Name])); err != nil {
 			t.Fatalf("%s schema rejected real envelope: %v", operation.Name, err)
 		}
-		errorEnvelope := Envelope{ContractVersion: 1, Error: &AppError{Code: CodeInternal}}
+		errorEnvelope := Envelope{ContractVersion: ContractVersion, Error: &AppError{Code: CodeInternal}}
 		if err := validator.Validate(jsonValue(t, errorEnvelope)); err != nil {
 			t.Fatalf("%s schema rejected error envelope: %v", operation.Name, err)
 		}

@@ -146,7 +146,20 @@ func TestRunDispatchesExternalCapabilities(t *testing.T) {
 	}
 	defer os.Chdir(original)
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"capabilities", "--json"}, strings.NewReader(""), &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), `"contract_version":1`) {
+	if code := run([]string{"capabilities", "--json"}, strings.NewReader(""), &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), `"contract_version":2`) {
 		t.Fatalf("code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+}
+
+// TestGitHubProductionCompositionRequiresEverySecretAndExactIdentity proves the executable fails closed before binding a server.
+func TestGitHubProductionCompositionRequiresEverySecretAndExactIdentity(t *testing.T) {
+	for _, name := range []string{"FEATUREPROOF_GITHUB_INSTALLATION_ID", "FEATUREPROOF_GITHUB_REPOSITORY_ID", "FEATUREPROOF_GITHUB_ACTOR_ID", "FEATUREPROOF_GITHUB_APP_ID", "FEATUREPROOF_GITHUB_BOT_ID", "FEATUREPROOF_GITHUB_WEBHOOK_SECRET", "FEATUREPROOF_GITHUB_PRIVATE_KEY_PEM", "FEATUREPROOF_EVIDENCE_ORIGIN"} {
+		t.Setenv(name, "")
+	}
+	if _, _, err := composeGitHubRuntime(context.Background()); err == nil {
+		t.Fatal("github runtime composed without installation identity and secrets")
+	}
+	if _, err := requiredPositiveEnv("FEATUREPROOF_GITHUB_INSTALLATION_ID"); err == nil {
+		t.Fatal("empty installation identity accepted")
 	}
 }

@@ -35,6 +35,26 @@ func (s *Service) Invoke(ctx context.Context, operation string, raw []byte) Enve
 		if err = DecodeStrict(raw, &input); err == nil {
 			envelope.Data, err = s.Cancel(ctx, input)
 		}
+	case "correction_submit":
+		var input CorrectionSubmitInput
+		if err = DecodeStrict(raw, &input); err == nil {
+			envelope.Data, err = s.SubmitCorrection(ctx, input)
+		}
+	case "correction_status":
+		var input CorrectionHandleInput
+		if err = DecodeStrict(raw, &input); err == nil {
+			envelope.Data, err = s.CorrectionStatus(ctx, input)
+		}
+	case "correction_result":
+		var input CorrectionHandleInput
+		if err = DecodeStrict(raw, &input); err == nil {
+			envelope.Data, err = s.CorrectionResult(ctx, input)
+		}
+	case "correction_cancel":
+		var input CorrectionCancelInput
+		if err = DecodeStrict(raw, &input); err == nil {
+			envelope.Data, err = s.CancelCorrection(ctx, input)
+		}
 	default:
 		err = &AppError{Code: CodeInvalidRequest, Field: "operation"}
 	}

@@ -309,7 +309,7 @@
           "Un fallo de infraestructura o una revisión no desplegada detiene la iteración sin atribuir un fallo funcional al código",
           "Los tests cubren corrección exitosa, fallo persistente, regresión nueva, mismo commit, límite agotado, escenario obsoleto y error de infraestructura"
         ],
-        "status": "pending"
+        "status": "done"
     },
     {
         "id": 18,
@@ -327,7 +327,7 @@
           "La integración utiliza permisos mínimos y no modifica código, ramas, revisiones ni otros checks de la pull request",
           "Los tests usan un GitHub falso y cubren publicación, actualización idempotente, nuevo commit, webhook inválido, fork no confiable, rate limit y errores transitorios"
         ],
-        "status": "pending"
+        "status": "done"
     },
     {
         "id": 19,

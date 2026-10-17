@@ -1659,3 +1659,279 @@ aprobadas. No hay feature `in_progress`.
 - Segunda review de `external-agent-interface`: REV-1–REV-3 cerradas; REV-4 incompleta y nueva REV-5. La tabla contractual común ahora añade `invalid_request` representable en ambas superficies, revocación de scope tras discovery, replay de cancelación y conflicto al reutilizar la misma clave con otro handle. Cada respuesta real continúa validándose contra el schema descubierto por su propio transporte antes de comparar envelopes.
 - Corrección REV-5: el supervisor crea un contexto de finalización independiente con deadline antes de registrar `publication_failed` y lo reutiliza para las transiciones finalizing/terminal. Un registro bloqueado respeta el plazo y deja el run recuperable tras liberar worker/lease; un fallo inmediato continúa a terminal `error`. `TestPublicationFailureFinalizationIsBoundedAndRecoverable` prueba ambas rutas mediante `Wait`, `Cancel` y `Close`, sin callback ni worker huérfanos.
 - Reverificación tras segunda review: suite dirigida y ×20, suite global comparable, compile-only, vet, módulos, race global comparable, race ×20 y builds Windows/Linux/macOS pasan. Coverage `internal/externalagent` 88,9 % y global comparable 88,7 %. El único bloqueo literal sigue siendo el symlink preexistente de feature 15 ya confirmado bajo WSL2; no se modificaron feature 15, `feature_list.json` ni `review.md`. Preparado para tercera review independiente.
+
+# Feature activa: correction-loop
+
+- 2026-10-16: el leader inicia la fase SDD de la feature 17 desde estado `pending`.
+- Preflight completado: no existe otra feature `in_progress`; los nueve criterios de aceptación, la arquitectura, las convenciones, el proceso SDD y los contratos de features 14–16 están disponibles.
+- Alcance actual: solo especificación (`requirements.md`, `design.md`, `tasks.md`); no se modificará código ni tests antes de aprobación humana explícita.
+- 2026-10-16: el spec author completó `requirements.md`, `design.md` y `tasks.md`; el leader verificó los tres artefactos, R1–R12, referencias T1–T8 y el bloque de aprobación vacío.
+- Estado: `in_progress`. El usuario aprobó la especificación al ordenar continuar con la implementación.
+- 2026-10-16: implementer inicia T1–T11 en orden. Se implementará `internal/githubpr` con contratos propios, boundary HMAC, stores durables, autorización/head/forks, proyección verificada, publicación idempotente, adapter REST hermético, retry/supervisor y composición productiva fail-closed.
+- 2026-10-16: T1–T10 implementadas y verificadas con fake GitHub hermético. El módulo autentica HMAC antes de decode, conserva receipts/asociaciones/intents en journal append-only, refresca y sella el head, aplica forks secretless, proyecta solo packages verificados y reconcilia check/comentario por identidad propia. El adapter REST limita DTOs, permisos y tokens al boundary; retries usan reloj/jitter inyectados y el coordinator hace join. Composición sin preview de feature 19 usa `FailClosedValidation`.
+- Cobertura dirigida provisional de `internal/githubpr`: 85,0 %. Falta completar T11 con race, vet, suite global, builds y limpieza de artefactos temporales.
+- 2026-10-16: T11 completada. Suite hermética ×20, race dirigida ×10, vet global, compile-only global, módulos, diff y builds Windows/Linux/macOS pasan. Coverage final `internal/githubpr`: 85,1 %. La suite literal global conserva únicamente el fallo ambiental preexistente del symlink de feature 15; race global comparable sin ese paquete pasa. Se limpiaron `githubpr` y `githubpr.cover` de la raíz. T1–T11 quedan completas y la implementación está lista para review independiente.
+- 2026-10-16: aprobación explícita del usuario registrada (`approved_at: 2026-10-16T21:51:08+02:00`) y transición del leader de `spec_ready` a `in_progress`.
+- Siguiente fase: implementación ordenada de T1–T11, verificación canónica y review independiente.
+- 2026-10-16: aprobación explícita del usuario registrada (`approved_at: 2026-10-16T17:25:00+02:00`) y transición del leader de `spec_ready` a `in_progress`.
+- Siguiente fase: implementación ordenada de T1–T8, verificación canónica y review independiente.
+- 2026-10-16: implementer inicia T1. Se fijan como invariantes la lectura exclusiva mediante `ReadPackage`, reserva durable previa a callbacks, cadena lineal y comparación separada del veredicto actual.
+- 2026-10-16: correction-loop T1–T7 completadas. Flujo hermético, idempotencia durable, CAS lineal, preflight, aprobación, failed-first, regresión, comparación y contrato CLI/MCP v2 pasan; coverage 85,1 % en `correction` y 85,9 % en `externalagent`.
+- 2026-10-16: T8 completada al localizar MSYS2 UCRT64. Race dirigida, race repetida ×20 y race global comparable pasan; el gate global literal conserva únicamente el fallo ambiental preexistente de symlink de feature 15. Implementación lista para review independiente; informe en `progress/correction-loop/implementation.md`.
+- 2026-10-16: primera review independiente rechazada con REV-1–REV-6. Quedan por corregir autorización previa a cancelación, reserva acumulada de llamadas/tokens, store/leases multiproceso por cadena, comparación sin identidades ambiguas, journal detallado de aprobación/escenarios y tests sin `time.Sleep` con comentarios sistémicos completos.
+- Estado: `in_progress`; hallazgos devueltos al implementer para corrección y reverificación completa.
+- 2026-10-16: REV-1–REV-6 corregidas. La cancelación reautoriza dentro del CAS;
+  llamadas/tokens se reservan acumulativamente antes de failed-first, regresión
+  y finalización; el store usa locks OS y leases por cadena/handle con recovery
+  de owner perdido; comparación ambigua falla cerrada; aprobación y resultados
+  por escenario quedan journalizados en orden; los tests no usan `time.Sleep`.
+- Regresiones nuevas cubren journal byte-for-byte ante principal ajeno, última
+  unidad de presupuesto concurrente, uso de `Finalize`, procesos reales,
+  failure injection, lease viva/perdida, identidades v1 ambiguas y resolución
+  de aprobación rechazada/stale. El proceso hijo multiproceso tiene timeout
+  determinista de 15 segundos.
+- Reverificación final: suite comparable, compile-only, vet, módulos, diff,
+  builds Windows/Linux/macOS, race global comparable y race ×20 por paquete
+  afectado pasan con MSYS2 UCRT64. Coverage: `correction` 85,2 % y
+  `externalagent` 85,9 %. T1–T8 permanecen completas; preparado para segunda
+  review independiente.
+- 2026-10-16: segunda review independiente rechazada. REV-1, REV-2, REV-4, REV-5 y REV-6 quedan cerradas; REV-3 es parcial. REV-7–REV-10 requieren reconciliar append incierto, contabilizar usage terminal una vez, bloquear lecturas de journals activos por cadena y proyectar `limit_exhausted` con paridad CLI/MCP.
+- Estado: `in_progress`; hallazgos activos devueltos al implementer para tercera iteración.
+- 2026-10-16: REV-7–REV-10 y el remanente de REV-3 corregidos. Las reservas
+  con resultado incierto se reconcilian y conservan ownership para un único
+  worker; recovery comprueba lease incluso si el proceso reinicia con el mismo
+  owner. El ledger suma usage solo en la primera transición terminal.
+- El discovery usa índices inmutables con locks OS por handle/run; todo replay
+  de journal ocurre bajo el lock de su cadena. Una regresión multiproceso pausa
+  un append parcial y demuestra que status/cancel esperan mientras otra cadena
+  progresa. Las admisiones agotadas son terminales tipados con las cuatro
+  dimensiones allowlisted y paridad/schema CLI-MCP.
+- Verificación de tercera iteración: regresiones ×10, suite comparable,
+  compile-only, vet, módulos, diff, builds Windows/Linux/macOS, race dirigida,
+  race global comparable y race ×20 separada de `correction`/`externalagent`
+  pasan. Coverage global 88,4 %, `correction` 85,0 % y `externalagent` 87,2 %.
+  T1–T8 permanecen completas; preparado para tercera review independiente.
+- 2026-10-16: tercera review independiente rechazada. REV-8–REV-10 y la protección de leases vivas quedan cerradas. Permanecen REV-7 y REV-11–REV-13: reconciliación independiente del contexto cancelado, publicación posterior al accounting de `Finalize`, clasificación tipada de errores de presupuesto y projector estricto de eventos/transiciones.
+- Estado: `in_progress`; cuarta iteración asignada al implementer.
+- 2026-10-16: REV-7 y REV-11–REV-13 corregidas. La reconciliación de append
+  confirmado usa contexto interno acotado y mantiene ownership hasta instalar
+  worker o terminal; la regresión cancela exactamente después del append y
+  prueba replay/join/cancel sin duplicar hijo.
+- Finalize prepara staging y usage antes de cualquier publicación, confirma el
+  ledger y solo entonces hace commit del paquete. Los errores de presupuesto
+  conservan cancelación/integridad/infraestructura y solo el agotamiento real
+  expone una dimensión allowlisted.
+- El projector aplica vocabulario cerrado y valida cada evento contra el
+  snapshot previo, incluidos lineage, fase, ordinal/tail, hashes, usage,
+  approval, confirmaciones, owner y comparison. La tabla adversarial de
+  journals desconocidos o contradictorios falla cerrada.
+- Reverificación de cuarta iteración: suite afectada y regresiones ×20, vet,
+  compile-only, módulos, diff, builds Windows/Linux/macOS, race afectada y
+  race global comparable pasan. Coverage global comparable 88,3 %,
+  `correction` 85,1 % y `externalagent` 87,2 %. Los gates literales de test y
+  race conservan únicamente el fallo ambiental preexistente del symlink de
+  feature 15. T1–T8 siguen completas; preparado para cuarta review.
+- 2026-10-16: cuarta review independiente rechazada con REV-11 parcial y
+  REV-13. Se cerró el protocolo de publicación: preparación durable validada,
+  commit idempotente/reconciliable por `PreparationID` y comparison
+  idempotente/reconciliable por digest canónico. Failure injection antes y
+  después demuestra cero o un artifact, retry, reopen y journal coherente.
+- El projector deriva deadline y allowance desde el prefijo, verifica el
+  snapshot sellado de policy y la partición/expansión canónica del plan, y usa
+  una matriz cerrada de outcome, terminal reason y comparison. Tablas
+  positivas/negativas cubren cada invariante autorizada.
+- Reverificación de quinta iteración: suite afectada, regresiones y race ×20,
+  vet, compile-only, módulos, diff, builds Windows/Linux/macOS y race global
+  comparable pasan. Coverage global comparable 88,3 %, `correction` 85,4 % y
+  `externalagent` 87,2 %. Test/race literal conservan solo el symlink
+  preexistente de feature 15. T1–T8 siguen completas; listo para review.
+- 2026-10-16: cuarta review independiente rechazada. REV-7 y REV-12 quedan cerradas y REV-3 está materialmente cerrada. Permanecen REV-11 y REV-13: publicación final/comparison idempotente y reconciliable ante respuesta incierta, y projector con validación semántica completa de deadline, plan, allowance y matriz terminal.
+- Estado: `in_progress`; quinta iteración devuelta al implementer.
+- 2026-10-16: quinta iteración completada tras el rechazo de la cuarta review.
+  `CommitFinalize` valida y journaliza la preparación antes del accounting,
+  reconcilia el commit durable por `PreparationID` y garantiza cero o una
+  publicación. Comparison aplica el mismo protocolo por digest y reconcilia
+  además el append terminal antes/después de `fsync`.
+- El projector valida valores derivados y no solo formas: deadline, snapshot
+  sellado de policy, plan completo/canónico, allowance remanente exacto y
+  matriz cerrada outcome-reason-comparison. Las tablas positivas y negativas
+  cubren las mutaciones autorizadas y rechazan corrupción como integridad.
+- Verificación final de quinta iteración: suite global comparable, compile-only,
+  vet, módulos, diff, builds Windows/Linux/macOS, race global comparable y race
+  dirigida ×20 pasan. Coverage comparable global 88,3 % y `correction` 85,2 %.
+  Los gates literales mantienen únicamente el symlink preexistente de feature
+  15. Se limpiaron binarios y perfiles temporales; T1–T8 permanecen completas
+  y la implementación queda lista para nueva review independiente.
+- 2026-10-16: quinta review independiente rechazó únicamente REV-14. REV-11 y REV-13 quedan cerradas. Falta intención durable previa a hacer visible la comparación y recovery ante deadline/pérdida de owner entre publicación, resolución y append.
+- Estado: `in_progress`; sexta iteración asignada al implementer.
+- 2026-10-16: REV-14 corregido. El journal persiste `comparison_intended` con
+  digest, comparación canónica y child locator antes de publicar. Cada frontera
+  visible usa un contexto interno nuevo, y recovery reclama intents abandonados
+  mediante lock/lease antes de completar publicación y append.
+- Las regresiones agotan el contexto justo después de crear el artefacto y
+  después de resolverlo; también pierden owner y reabren el store en ambas
+  ventanas. Todos los casos convergen en un artefacto, un
+  `comparison_published`, un terminal coincidente y replay idempotente.
+- Verificación de sexta iteración: suite afectada y global comparable,
+  compile-only, vet, módulos, diff, builds Windows/Linux/macOS, race global
+  comparable y regresiones race ×20 pasan. Coverage global comparable 88,3 %
+  y `correction` 85,3 %. T1–T8 permanecen completas; implementación lista para
+  sexta review independiente.
+- 2026-10-16: sexta review independiente cerró REV-14 y rechazó REV-15–REV-16. Falta sincronizar la instalación de varios workers recuperados y terminalizar de forma durable conflictos/corrupción definitivos del publisher para evitar recovery infinito.
+- Estado: `in_progress`; séptima iteración asignada al implementer.
+- 2026-10-16: séptima review independiente aprobada. REV-15 y REV-16 quedan cerradas; REV-1–REV-16 no presentan regresiones y R1–R12 están trazados a tests reales.
+- Cierre del leader: T1–T8 completas, suite/race comparable y gates obligatorios verificados, coverage `internal/correction` 85,4 %. Feature 17 transicionada a `done`; no queda ninguna feature `in_progress`.
+- 2026-10-16: REV-15 y REV-16 corregidos. El constructor instala todos los
+  workers recuperados bajo el mismo mutex antes de iniciar goroutines. Una
+  barrera con dos cadenas prueba join, terminal único y liberación de leases
+  bajo race.
+- Los conflictos de digest y bytes corruptos del publisher ahora retiran el
+  intent con terminal durable `error/integrity_failure`. Reopen y replay no
+  generan `comparison_published`, no duplican el terminal y no reclaman de
+  nuevo la cadena.
+- Verificación de séptima iteración: regresiones normales y race ×20, suite
+  afectada/global comparable, compile-only, vet, módulos, diff, builds
+  Windows/Linux/macOS y race global comparable pasan. Coverage comparable
+  global 88,3 % y `correction` 85,4 %. El gate literal conserva solo el symlink
+  preexistente de feature 15. T1–T8 siguen completas; listo para review.
+
+# Feature activa: github-pr-integration
+
+- 2026-10-16: el leader inicia la fase SDD de la feature 18 desde estado `pending`.
+- Preflight completado: no existe otra feature `in_progress`; la feature contiene nueve criterios suficientes y dispone de contratos internos de revisión, evidencias, corrección e interfaz externa.
+- Alcance actual: especificación de autenticación GitHub App/webhook, vinculación exacta al head commit, Checks, comentario resumen idempotente, forks no confiables, permisos mínimos y errores/retries. No se modificará código antes de aprobación humana explícita.
+- 2026-10-16: el spec author completó `requirements.md`, `design.md` y `tasks.md`. El leader verificó R1–R12, T1–T11, trazabilidad completa, fuentes oficiales de GitHub y bloque de aprobación vacío.
+- Estado: `spec_ready`. La implementación queda detenida hasta aprobación humana explícita.
+- 2026-10-16: aprobación explícita ya registrada y feature en `in_progress`; T1–T11 implementadas en primera entrega.
+- Primera review independiente rechazada con REV-1–REV-9: faltan composición/entrypoint real, reautorización refrescada, leases/recovery multiproceso, retry integrado, installation ID y paginación, ownership previo a update, binding completo del package, payload/command compatibles y trazabilidad R12 real.
+- Estado: `in_progress`; hallazgos devueltos al implementer para corrección integral.
+- 2026-10-16: corrección integral REV-1–REV-9 completada. La composición
+  productiva y `github serve` conectan GitHub App, REST, store, retry,
+  publisher, coordinator y webhook, conservando preview fail-closed hasta
+  feature 19 y shutdown acotado.
+- Se separaron actor del comando y autor de PR; cada frontera refresca autoridad
+  y head. CAS+leases durables cubren deliveries, asociaciones e intents con
+  renovación, reclaim y recovery, incluida una elección real entre dos procesos.
+- Retry/reconcile, 403 rate-limit, installation ID exacto, paginación Link,
+  ownership previo a updates, lineage completa del package, proyección de
+  evidencias/failures/unverified y normalización ASCII exacta quedaron cubiertos
+  por regresiones verticales. El checker de comentarios incluye const/var.
+- Verificación: tests afectados ×20, race afectada ×3, suite/race global
+  comparable, vet, compile-only, módulos y builds Windows/Linux/macOS pasan.
+  Coverage `internal/githubpr` 85,1 %. El gate literal conserva únicamente el
+  symlink preexistente de feature 15. T1–T11 siguen completas; listo para review.
+- 2026-10-16: segunda review independiente rechazó REV-10–REV-14. Se corrigió
+  el replay concurrente con lease vigente, incluido mismo owner, y una prueba
+  vertical demuestra una sola admisión y un solo submit.
+- Se añadió el caso de uso interno tipado para asociar runs existentes, con
+  verificación de tupla autorizada/refrescada, run, repo, head, package run y
+  binding. La identidad externa del check ahora nace al confirmar el run, queda
+  sellada y distingue dos runs sobre el mismo head.
+- Retry entrega deadlines reales a operaciones, producción usa cliente HTTP
+  acotado y REST conserva errores transient/rate-limited del token source. El
+  marker de comentario exige la primera línea versionada exacta y rechaza
+  sufijos, espacios y versiones ajenas.
+- Verificación tras REV-10–REV-14: paquete ×20, race paquete ×3, suite/race
+  global comparable, cmd, vet, compile-only, módulos, diff y builds
+  Windows/Linux/macOS pasan. Coverage `internal/githubpr` 85,0 %; T1–T11
+  permanecen completas y la implementación vuelve a `ready_for_review`.
+<!-- leader 2026-10-16: segunda revisión feature 18 -->
+- `github-pr-integration` continúa `in_progress`: la segunda revisión independiente cerró REV-1, REV-2, REV-5, REV-6, REV-7 y REV-8; rechazó la entrega por REV-10–REV-14 (redelivery concurrente, asociación de run existente, identidad de check ligada al run, deadlines/retry de HTTP y marcador exacto de comentario). Se devolvió al implementador con pruebas de regresión obligatorias.
+<!-- leader 2026-10-16: tercera revisión feature 18 -->
+- `github-pr-integration` continúa `in_progress`: REV-10–REV-14 quedaron cerrados en la tercera revisión. La entrega volvió al implementador por REV-15–REV-17: relación insegura entre lease y deadline, recuperación incompleta de intents preparados e invariantes incompletas de lineage durable.
+- 2026-10-16: REV-15–REV-17 corregidos. Los leases se validan por encima de
+  todos los deadlines con margen y la delivery deduplica durablemente la
+  asociación; una prueba A bloqueado → expiry/reclaim B demuestra un submit y
+  una escritura de check.
+- Los intents conservan el payload seguro original y su digest. El constructor
+  los refresca y reconcilia antes de iniciar una fase nueva; restart tras efecto
+  incierto recupera checks y comentarios existentes sin otra mutación.
+- El linaje durable exige sus cuatro componentes vacíos o completos/coherentes;
+  las catorce combinaciones parciales y los boundaries verify/store/publisher
+  fallan cerrados.
+- Verificación tras REV-15–REV-17: paquete ×20, race paquete ×3, suite/race
+  global comparable, cmd, vet, compile-only, módulos, diff y builds
+  Windows/Linux/macOS pasan. Coverage `internal/githubpr` 85,1 %. El gate
+  literal conserva solo el fallo ambiental de symlink de feature 15. T1–T11
+  permanecen completas y la entrega vuelve a `ready_for_review`.
+- 2026-10-16: cuarta review rechazó REV-18–REV-20. El presupuesto del run
+  empezaba después de Submit, un error de startup podía dejar claims tomados y
+  recovery regeneraba el check con configuración actual.
+- REV-18–REV-20 corregidos: el deadline del run comienza antes de refresh y
+  Submit; dos coordinators/stores prueban exclusión hasta cancel, join y release.
+  Todo error de recovery cede asociaciones e intents, incluida asociación no
+  relacionada, y el intent vuelve a ser reclamable de inmediato.
+- Recovery usa directamente `CheckPublication` y `CommentPublication`
+  persistidos tras validar identidad y allowlists. Un cambio de DetailsURL no
+  altera el retry; efecto presente se reconcilia y efecto ausente publica el
+  payload original exacto.
+- Verificación tras REV-18–REV-20: paquete ×20, race paquete ×3, suite/race
+  global comparable, cmd, vet, compile-only, módulos, diff y builds
+  Windows/Linux/macOS pasan; coverage `internal/githubpr` 85,2 %. El gate
+  literal conserva solo el symlink preexistente de feature 15. T4, T6, T10 y
+  T11 vuelven a cumplir sus garantías y T1–T11 permanecen completas.
+<!-- leader 2026-10-16: cuarta revisión feature 18 -->
+- `github-pr-integration` continúa `in_progress`: REV-17 quedó cerrado y REV-15/REV-16 mejoraron, pero la cuarta revisión rechazó por REV-18–REV-20: `Submit` fuera del deadline que respalda la lease, claims no liberados ante fallo de recovery y reconstrucción no exacta del payload persistido.
+- Corrección posterior a cuarta review completada: REV-18–REV-20 quedan
+  cubiertos por las regresiones nominales y gates descritos arriba; la entrega
+  vuelve a `ready_for_review` sin modificar el estado de la feature.
+<!-- leader 2026-10-16: quinta revisión feature 18 -->
+- `github-pr-integration` continúa `in_progress`: REV-18 quedó cerrado. La quinta revisión mantuvo abiertos dos caminos de REV-19/REV-20: claims parciales si `ClaimPending` falla internamente y confirmación de un comentario reconciliado cuyo body no coincide con el payload durable.
+- Remanentes REV-19/REV-20 corregidos. `ClaimPending` valida primero y publica
+  asociaciones e intents como un único lote durable; orphan y fallo de append
+  dejan el trabajo válido libre para owner B sin ownership parcial.
+- La reconciliación de comentarios compara el body exacto. Body coincidente
+  adopta el ID con cero writes; body antiguo adopta el ID y hace un único update
+  con el DTO durable antes de confirmar, tanto en publicación normal como tras
+  restart.
+- Verificación: paquete ×20, race paquete ×3, suite/race global comparable,
+  cmd, vet, compile-only, módulos y builds Windows/Linux/macOS pasan; coverage
+  85,4 %. T1–T11 permanecen completas y la entrega vuelve a
+  `ready_for_review`.
+<!-- leader 2026-10-16: sexta revisión feature 18 -->
+- `github-pr-integration` continúa `in_progress`: REV-19 y REV-20 quedaron cerrados. La sexta revisión dejó un único bloqueo, REV-21: `ClaimBatch` debe trocearse para que cada registro durable quede siempre bajo el límite de lectura del journal y el backlog completo pueda progresar.
+- REV-21 corregido. Cada claim batch se mide con su JSON final y queda
+  estrictamente por debajo de 1 MiB; el constructor drena lotes sucesivos sin
+  volver a emitir claims vivos del mismo owner y revierte lotes anteriores si
+  una iteración falla.
+- La regresión >1 MiB reabre el store entre lotes, comprueba cada línea,
+  procesa cada asociación/intent una vez y verifica renew, confirm, terminal y
+  release sin remanentes para owner B. Paquete ×20, race ×3 y coverage 85,4 %
+  pasan. Suite/race global comparable, cmd, vet, compile-only, módulos y builds
+  Windows/Linux/macOS también pasan; T1–T11 permanecen completas y la entrega
+  vuelve a `ready_for_review`.
+<!-- leader 2026-10-17: séptima revisión feature 18 -->
+- `github-pr-integration` continúa `in_progress`: REV-21 quedó cerrado. La séptima revisión dejó REV-22 como único bloqueo: `NewCoordinator` debe recuperar y renovar lote a lote para que un backlog lento no consuma las leases de los claims aún en cola.
+
+- REV-22 corregido: el store reclama un solo grupo de asociación e intents por
+  batch y `NewCoordinator` lo refresca, recupera y entrega antes de pedir otro.
+  El rollback solo cede el lote actual; el supervisor conserva la propiedad de
+  lo ya entregado y lo cancela/join ante un fallo posterior.
+- La regresión vertical usa un backlog >1 MiB, reloj que avanza durante cada
+  recovery y dos coordinators sobre el mismo journal. Ambos componen sin error,
+  ninguna lease expira, cada owner confirma antes de su siguiente claim y cada
+  efecto se recupera exactamente una vez.
+- Verificación REV-22: paquete ×20 y race paquete ×3 pasan; coverage vuelve a
+  85,4 %. Suite y race global comparables, cmd, vet, compile-only, módulos y
+  builds Windows/Linux/macOS pasan. El gate literal conserva únicamente el
+  fallo ambiental preexistente del symlink de feature 15. T1–T11 permanecen
+  completas y la entrega vuelve a `ready_for_review`.
+<!-- leader 2026-10-17: octava revisión feature 18 -->
+- `github-pr-integration` continúa `in_progress`: REV-22 quedó cerrado. La octava revisión dejó REV-23: durante el drain de startup una asociación no terminal ya entregada a un worker no puede volver a reclamarse si ese worker falla y libera; además debe eliminarse la intermitencia observada en el gate repetido.
+
+- REV-23 corregido: cada startup excluye del store los IDs ya entregados al
+  supervisor. Un fallo rápido puede liberar la lease para otro coordinator,
+  pero el mismo drain no la reclama otra vez y continúa con el backlog restante.
+- La regresión vertical bloquea un recovery independiente, fuerza fallo y
+  release de un worker no terminal, verifica que no es reclamable antes del
+  release y prueba un único handoff al segundo coordinator después del release.
+- El flake se eliminó observando el canal de idle del supervisor en lugar de un
+  timeout de pared de un segundo. El test nominal pasa 500 veces consecutivas;
+  submit y comentario se validan después de la salida real del worker.
+- Verificación REV-23: paquete ×20, race paquete ×3 y race global comparable
+  pasan; coverage `internal/githubpr` 85,6 %. Suite comparable, cmd, vet,
+  compile-only, módulos y builds Windows/Linux/macOS pasan. El gate literal
+  conserva solo el fallo ambiental preexistente del symlink de feature 15.
+  T1–T11 permanecen completas y la entrega vuelve a `ready_for_review`.
+<!-- leader 2026-10-17: cierre feature 18 -->
+- `github-pr-integration` aprobada en la novena revisión independiente. R1–R12 y T1–T11 pasan; REV-1–REV-23 están cerrados. El leader cambia la feature 18 de `in_progress` a `done` y registra el cierre en `progress/history.md`.

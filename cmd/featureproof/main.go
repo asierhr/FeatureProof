@@ -10,11 +10,13 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agenteval"
 	"github.com/asierhr/featureProof/internal/externalagent"
+	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/model"
 	"github.com/asierhr/featureProof/internal/model/openai"
@@ -93,6 +95,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) >= 2 && args[0] == "eval" && args[1] == "agent" {
 		return agenteval.RunCommand(ctx, args[2:], stdout, stderr, productionEvalComposer{})
 	}
+	if len(args) == 2 && args[0] == "github" && args[1] == "serve" {
+		return runGitHubServer(ctx, stderr)
+	}
 	if isExternalAgentCommand(args) {
 		service, err := composeExternalAgentService()
 		if err != nil {
@@ -111,9 +116,97 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return localvalidation.RunCommand(localvalidation.TerminalSignalContext(ctx), args, stdin, stdout, stderr)
 }
 
+// runGitHubServer composes secrets at the executable boundary and owns bounded HTTP shutdown.
+func runGitHubServer(ctx context.Context, stderr io.Writer) int {
+	runtime, address, err := composeGitHubRuntime(ctx)
+	if err != nil {
+		return 3
+	}
+	server := &http.Server{Addr: address, Handler: runtime.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	done := make(chan error, 1)
+	go func() { done <- server.ListenAndServe() }()
+	select {
+	case err = <-done:
+		if !errors.Is(err, http.ErrServerClosed) {
+			_ = runtime.Close(context.WithoutCancel(ctx))
+			return 3
+		}
+		return 0
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+		if runtime.Close(shutdownCtx) != nil {
+			return 3
+		}
+		return 0
+	}
+}
+
+// composeGitHubRuntime resolves GitHub App secrets and exact allowlists without passing them to the harness.
+func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error) {
+	installation, err := requiredPositiveEnv("FEATUREPROOF_GITHUB_INSTALLATION_ID")
+	if err != nil {
+		return nil, "", err
+	}
+	repository, err := requiredPositiveEnv("FEATUREPROOF_GITHUB_REPOSITORY_ID")
+	if err != nil {
+		return nil, "", err
+	}
+	actor, err := requiredPositiveEnv("FEATUREPROOF_GITHUB_ACTOR_ID")
+	if err != nil {
+		return nil, "", err
+	}
+	appID, err := requiredPositiveEnv("FEATUREPROOF_GITHUB_APP_ID")
+	if err != nil {
+		return nil, "", err
+	}
+	botID, err := requiredPositiveEnv("FEATUREPROOF_GITHUB_BOT_ID")
+	if err != nil {
+		return nil, "", err
+	}
+	secret := []byte(os.Getenv("FEATUREPROOF_GITHUB_WEBHOOK_SECRET"))
+	privateKey := []byte(os.Getenv("FEATUREPROOF_GITHUB_PRIVATE_KEY_PEM"))
+	if len(secret) < 16 || len(privateKey) == 0 {
+		return nil, "", errors.New("github secrets unavailable")
+	}
+	clock := githubpr.WallClock{}
+	httpClient := &http.Client{Timeout: 2 * time.Minute}
+	tokenSource, err := githubpr.NewGitHubAppTokenSource(githubpr.GitHubAppTokenConfig{AppID: appID, BaseURL: "https://api.github.com", APIVersion: "2022-11-28", PrivateKeyPEM: privateKey, HTTP: httpClient, Clock: clock, MaxResponse: 1 << 20})
+	if err != nil {
+		return nil, "", err
+	}
+	root, err := os.Getwd()
+	if err != nil {
+		return nil, "", err
+	}
+	config := githubpr.ProductionConfig{AppID: appID, BotID: botID, Permissions: githubpr.RequiredPermissions(), APIOrigin: "https://api.github.com", APIVersion: "2022-11-28", EvidenceOrigin: requiredEnv("FEATUREPROOF_EVIDENCE_ORIGIN"), StoreDir: filepath.Join(root, ".featureproof", "github-pr"), MaxWebhookBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxPages: 10, MaxAttempts: 4, RunTimeout: 30 * time.Minute, CloseTimeout: 10 * time.Second, LeaseTTL: 32 * time.Minute, PollInterval: 2 * time.Second, RetryMaxDuration: 2 * time.Minute, RetryMaxWait: time.Minute, RetryInitialBackoff: time.Second, RetryMaxBackoff: 30 * time.Second, Authorization: githubpr.AuthorizationConfig{Installations: map[int64]map[int64]bool{installation: {repository: true}}, Actors: map[int64]bool{actor: true}, Selections: map[string]githubpr.Selection{"default": {Alias: "default", Secretless: false}}, Forks: map[int64]map[int64]bool{}}}
+	runtime, err := githubpr.ComposeRuntime(ctx, config, githubpr.CompositionSecrets{WebhookSecret: secret}, githubpr.RuntimeDependencies{Credentials: tokenSource, HTTP: httpClient, Packages: externalagent.VerifiedPackageReader{}, Validation: githubpr.FailClosedValidation{}, Clock: clock, Jitter: githubpr.RandomJitter{}, IDs: githubpr.RandomIDs{}})
+	if err != nil {
+		return nil, "", err
+	}
+	address := os.Getenv("FEATUREPROOF_GITHUB_LISTEN")
+	if address == "" {
+		address = "127.0.0.1:8081"
+	}
+	return runtime, address, nil
+}
+
+// requiredPositiveEnv parses one mandatory positive numeric GitHub identity.
+func requiredPositiveEnv(name string) (int64, error) {
+	value, err := strconv.ParseInt(os.Getenv(name), 10, 64)
+	if err != nil || value <= 0 {
+		return 0, errors.New("github identity unavailable")
+	}
+	return value, nil
+}
+
+// requiredEnv returns one mandatory non-secret configuration value.
+func requiredEnv(name string) string { return os.Getenv(name) }
+
 // isExternalAgentCommand keeps the existing validate/eval dispatch stable.
 func isExternalAgentCommand(args []string) bool {
-	return len(args) > 0 && (args[0] == "capabilities" || args[0] == "run" || args[0] == "mcp")
+	return len(args) > 0 && (args[0] == "capabilities" || args[0] == "run" || args[0] == "correction" || args[0] == "mcp")
 }
 
 // composeExternalAgentService resolves OS identity but grants no preview execution scopes.

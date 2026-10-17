@@ -9,7 +9,7 @@ import (
 )
 
 // ContractVersion identifies the backward-incompatible application DTO set.
-const ContractVersion = 1
+const ContractVersion = 2
 
 // MCPVersion identifies the only MCP wire protocol accepted by this release.
 const MCPVersion = "2026-07-28"
@@ -94,6 +94,63 @@ type HandleInput struct {
 type CancelInput struct {
 	RunHandle      string `json:"run_handle"`
 	IdempotencyKey string `json:"idempotency_key"`
+}
+
+// CorrectionSubmitInput selects only an owned failed run, trusted alias and idempotency key.
+type CorrectionSubmitInput struct {
+	ParentRunHandle string `json:"parent_run_handle"`
+	SelectionAlias  string `json:"selection_alias"`
+	IdempotencyKey  string `json:"idempotency_key"`
+}
+
+// CorrectionHandleInput addresses a correction without conveying authority by possession.
+type CorrectionHandleInput struct {
+	CorrectionHandle string `json:"correction_handle"`
+}
+
+// CorrectionCancelInput makes correction cancellation durably idempotent.
+type CorrectionCancelInput struct {
+	CorrectionHandle string `json:"correction_handle"`
+	IdempotencyKey   string `json:"idempotency_key"`
+}
+
+// CorrectionView is the bounded lifecycle projection shared by CLI and MCP.
+type CorrectionView struct {
+	CorrectionHandle string    `json:"correction_handle"`
+	ParentRunHandle  string    `json:"parent_run_handle"`
+	ChildRunHandle   string    `json:"child_run_handle,omitempty"`
+	Phase            string    `json:"phase"`
+	Status           Outcome   `json:"status,omitempty"`
+	TerminalReason   string    `json:"terminal_reason,omitempty"`
+	LimitDimension   string    `json:"limit_dimension,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// ComparisonScenarioView exposes only allowlisted structural scenario identity.
+type ComparisonScenarioView struct {
+	ConstraintID  string `json:"constraint_id"`
+	Scenario      string `json:"scenario"`
+	BatchID       string `json:"batch_id"`
+	CheckID       string `json:"check_id,omitempty"`
+	StepID        string `json:"step_id"`
+	DeclarationID string `json:"declaration_id"`
+}
+
+// ComparisonEntryView exposes a deterministic class and opaque evidence handles.
+type ComparisonEntryView struct {
+	Scenario        ComparisonScenarioView `json:"scenario"`
+	Class           string                 `json:"class"`
+	EvidenceHandles []string               `json:"evidence_handles"`
+}
+
+// CorrectionResultView returns current-child outcome and a safe verified comparison.
+type CorrectionResultView struct {
+	CorrectionView
+	Corrected     []ComparisonEntryView `json:"corrected"`
+	Persistent    []ComparisonEntryView `json:"persistent"`
+	New           []ComparisonEntryView `json:"new"`
+	NotApplicable []ComparisonEntryView `json:"not_applicable"`
+	Inconclusive  []ComparisonEntryView `json:"inconclusive"`
 }
 
 // RunView is the safe lifecycle projection returned by submit, status, and cancel.

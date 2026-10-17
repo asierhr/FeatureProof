@@ -14,9 +14,12 @@ import (
 )
 
 const (
-	ScopeCreate = "runs:create"
-	ScopeRead   = "runs:read"
-	ScopeCancel = "runs:cancel"
+	ScopeCreate           = "runs:create"
+	ScopeRead             = "runs:read"
+	ScopeCancel           = "runs:cancel"
+	ScopeCorrectionCreate = "corrections:create"
+	ScopeCorrectionRead   = "corrections:read"
+	ScopeCorrectionCancel = "corrections:cancel"
 )
 
 // Principal is trusted host identity plus currently granted scopes.
@@ -55,6 +58,14 @@ type ApprovedExecutor interface {
 // PackageReader verifies an evidence package before returning its semantic index.
 type PackageReader interface {
 	Read(context.Context, string) (localvalidation.PackageIndex, error)
+}
+
+// CorrectionUseCases is the transport-neutral correction boundary implemented by trusted composition.
+type CorrectionUseCases interface {
+	SubmitCorrection(context.Context, string, CorrectionSubmitInput) (CorrectionView, error)
+	CorrectionStatus(context.Context, string, CorrectionHandleInput) (CorrectionView, error)
+	CorrectionResult(context.Context, string, CorrectionHandleInput) (CorrectionResultView, error)
+	CancelCorrection(context.Context, string, CorrectionCancelInput) (CorrectionView, error)
 }
 
 // Clock supplies auditable transition timestamps.
@@ -116,16 +127,17 @@ type Registry interface {
 
 // ServiceDependencies declares all trust, persistence, execution, and time boundaries.
 type ServiceDependencies struct {
-	Identity   IdentitySource
-	Catalog    SelectionCatalog
-	Registry   Registry
-	Executor   ApprovedExecutor
-	Packages   PackageReader
-	Clock      Clock
-	IDs        IDSource
-	Owner      string
-	Retention  time.Duration
-	RunTimeout time.Duration
+	Identity    IdentitySource
+	Catalog     SelectionCatalog
+	Registry    Registry
+	Executor    ApprovedExecutor
+	Packages    PackageReader
+	Clock       Clock
+	IDs         IDSource
+	Owner       string
+	Retention   time.Duration
+	RunTimeout  time.Duration
+	Corrections CorrectionUseCases
 }
 
 // Service is the single application use case shared by CLI and MCP.
@@ -153,7 +165,7 @@ func (s *Service) Capabilities(ctx context.Context) (CapabilitiesResult, error) 
 	if err != nil {
 		return CapabilitiesResult{}, err
 	}
-	operations := operationsFor(principal)
+	operations := operationsFor(principal, s.deps.Corrections != nil)
 	return CapabilitiesResult{ContractVersion: ContractVersion, ResultSchemaVersion: 1, RetentionSeconds: int64(s.deps.Retention.Seconds()), Operations: operations}, nil
 }
 
@@ -259,6 +271,54 @@ func (s *Service) Cancel(ctx context.Context, input CancelInput) (RunView, error
 	return viewOf(record), nil
 }
 
+// SubmitCorrection reauthorizes correction creation and delegates only safe DTOs.
+func (s *Service) SubmitCorrection(ctx context.Context, input CorrectionSubmitInput) (CorrectionView, error) {
+	principal, err := s.authorize(ctx, ScopeCorrectionCreate)
+	if err != nil {
+		return CorrectionView{}, err
+	}
+	if s.deps.Corrections == nil {
+		return CorrectionView{}, &AppError{Code: CodeInternal}
+	}
+	return s.deps.Corrections.SubmitCorrection(ctx, principal.ID, input)
+}
+
+// CorrectionStatus reauthorizes every correction lookup before delegation.
+func (s *Service) CorrectionStatus(ctx context.Context, input CorrectionHandleInput) (CorrectionView, error) {
+	principal, err := s.authorize(ctx, ScopeCorrectionRead)
+	if err != nil {
+		return CorrectionView{}, err
+	}
+	if s.deps.Corrections == nil {
+		return CorrectionView{}, &AppError{Code: CodeInternal}
+	}
+	return s.deps.Corrections.CorrectionStatus(ctx, principal.ID, input)
+}
+
+// CorrectionResult reauthorizes result projection and never accepts package locations.
+func (s *Service) CorrectionResult(ctx context.Context, input CorrectionHandleInput) (CorrectionResultView, error) {
+	principal, err := s.authorize(ctx, ScopeCorrectionRead)
+	if err != nil {
+		return CorrectionResultView{}, err
+	}
+	if s.deps.Corrections == nil {
+		return CorrectionResultView{}, &AppError{Code: CodeInternal}
+	}
+	return s.deps.Corrections.CorrectionResult(ctx, principal.ID, input)
+}
+
+// CancelCorrection reauthorizes mutable cancellation and preserves its idempotency key.
+func (s *Service) CancelCorrection(ctx context.Context, input CorrectionCancelInput) (CorrectionView, error) {
+	principal, err := s.authorize(ctx, ScopeCorrectionCancel)
+	if err != nil {
+		return CorrectionView{}, err
+	}
+	if s.deps.Corrections == nil {
+		return CorrectionView{}, &AppError{Code: CodeInternal}
+	}
+	return s.deps.Corrections.CancelCorrection(ctx, principal.ID, input)
+}
+
 // waitTerminal joins cross-process cancellation through the durable registry signal.
 func (s *Service) waitTerminal(ctx context.Context, handle string) (RunRecord, error) {
 	for {
@@ -322,7 +382,8 @@ func (s *Service) ownedRecord(ctx context.Context, handle, scope string) (RunRec
 }
 
 // operationsFor returns deterministic discovery filtered by current authority.
-func operationsFor(principal Principal) []Operation {
+func operationsFor(principal Principal, hasCorrections ...bool) []Operation {
+	correctionsEnabled := len(hasCorrections) > 0 && hasCorrections[0]
 	operations := []Operation{{Name: "capabilities", InputSchema: objectSchema(nil, nil), OutputSchema: envelopeSchema(capabilitiesSchema())}}
 	if principal.Scopes[ScopeCreate] {
 		operations = append(operations, Operation{Name: "submit", InputSchema: objectSchema([]string{"selection_alias", "idempotency_key"}, map[string]string{"selection_alias": "string", "idempotency_key": "string"}), OutputSchema: envelopeSchema(runSchema())})
@@ -333,8 +394,48 @@ func operationsFor(principal Principal) []Operation {
 	if principal.Scopes[ScopeCancel] {
 		operations = append(operations, Operation{Name: "cancel", InputSchema: objectSchema([]string{"run_handle", "idempotency_key"}, map[string]string{"run_handle": "string", "idempotency_key": "string"}), OutputSchema: envelopeSchema(runSchema())})
 	}
+	if principal.Scopes[ScopeCorrectionCreate] && correctionsEnabled {
+		operations = append(operations, Operation{Name: "correction_submit", InputSchema: objectSchema([]string{"parent_run_handle", "selection_alias", "idempotency_key"}, map[string]string{"parent_run_handle": "string", "selection_alias": "string", "idempotency_key": "string"}), OutputSchema: envelopeSchema(correctionSchema())})
+	}
+	if principal.Scopes[ScopeCorrectionRead] && correctionsEnabled {
+		operations = append(operations, Operation{Name: "correction_status", InputSchema: correctionHandleSchema(), OutputSchema: envelopeSchema(correctionSchema())}, Operation{Name: "correction_result", InputSchema: correctionHandleSchema(), OutputSchema: envelopeSchema(correctionResultSchema())})
+	}
+	if principal.Scopes[ScopeCorrectionCancel] && correctionsEnabled {
+		operations = append(operations, Operation{Name: "correction_cancel", InputSchema: objectSchema([]string{"correction_handle", "idempotency_key"}, map[string]string{"correction_handle": "string", "idempotency_key": "string"}), OutputSchema: envelopeSchema(correctionSchema())})
+	}
 	sort.Slice(operations, func(i, j int) bool { return operations[i].Name < operations[j].Name })
 	return operations
+}
+
+// correctionHandleSchema describes one opaque correction lookup.
+func correctionHandleSchema() map[string]any {
+	return objectSchema([]string{"correction_handle"}, map[string]string{"correction_handle": "string"})
+}
+
+// correctionSchema describes bounded lifecycle fields for correction operations.
+func correctionSchema() map[string]any {
+	return closedSchema([]string{"correction_handle", "parent_run_handle", "phase", "updated_at"}, map[string]any{"correction_handle": stringSchema(), "parent_run_handle": stringSchema(), "child_run_handle": stringSchema(), "phase": enumSchema("reserved", "preflight", "awaiting_approval", "failed_first", "regression", "finalizing", "terminal"), "status": enumSchema("passed", "failed", "inconclusive", "cancelled", "error"), "terminal_reason": enumSchema("limit_exhausted", "revision_not_deployed", "infrastructure_error", "integrity_failure", "cancelled"), "limit_dimension": enumSchema("attempts", "duration", "model_calls", "model_tokens"), "updated_at": map[string]any{"type": "string", "format": "date-time"}})
+}
+
+// correctionResultSchema closes comparison classes and prevents free-form adapter output.
+func correctionResultSchema() map[string]any {
+	scenario := closedSchema([]string{"constraint_id", "scenario", "batch_id", "step_id", "declaration_id"}, map[string]any{"constraint_id": stringSchema(), "scenario": stringSchema(), "batch_id": stringSchema(), "check_id": stringSchema(), "step_id": stringSchema(), "declaration_id": stringSchema()})
+	entry := closedSchema([]string{"scenario", "class", "evidence_handles"}, map[string]any{"scenario": scenario, "class": enumSchema("corrected", "persistent", "new", "not_applicable", "inconclusive"), "evidence_handles": map[string]any{"type": "array", "items": stringSchema()}})
+	properties := correctionSchema()["properties"].(map[string]any)
+	for _, name := range []string{"corrected", "persistent", "new", "not_applicable", "inconclusive"} {
+		properties[name] = map[string]any{"type": "array", "items": entry}
+	}
+	return closedSchema([]string{"correction_handle", "parent_run_handle", "phase", "updated_at", "corrected", "persistent", "new", "not_applicable", "inconclusive"}, properties)
+}
+
+// stringSchema provides the bounded scalar reused by correction schemas.
+func stringSchema() map[string]any {
+	return map[string]any{"type": "string", "minLength": 1, "maxLength": 256}
+}
+
+// enumSchema creates a closed JSON string vocabulary.
+func enumSchema(values ...string) map[string]any {
+	return map[string]any{"type": "string", "enum": values}
 }
 
 // objectSchema creates a closed JSON schema used consistently by both adapters.
@@ -381,7 +482,7 @@ func appErrorSchema() map[string]any {
 // capabilitiesSchema describes nested operations and their JSON Schema documents.
 func capabilitiesSchema() map[string]any {
 	schemaDocument := map[string]any{"type": "object"}
-	operation := closedSchema([]string{"name", "input_schema", "output_schema"}, map[string]any{"name": map[string]any{"type": "string", "enum": []string{"capabilities", "submit", "status", "result", "cancel"}}, "input_schema": schemaDocument, "output_schema": schemaDocument})
+	operation := closedSchema([]string{"name", "input_schema", "output_schema"}, map[string]any{"name": map[string]any{"type": "string", "enum": []string{"capabilities", "submit", "status", "result", "cancel", "correction_submit", "correction_status", "correction_result", "correction_cancel"}}, "input_schema": schemaDocument, "output_schema": schemaDocument})
 	return closedSchema([]string{"contract_version", "result_schema_version", "retention_seconds", "operations"}, map[string]any{"contract_version": map[string]any{"type": "integer", "const": ContractVersion}, "result_schema_version": map[string]any{"type": "integer", "const": 1}, "retention_seconds": map[string]any{"type": "integer", "minimum": 1}, "operations": map[string]any{"type": "array", "items": operation, "minItems": 1, "uniqueItems": true}})
 }
 
