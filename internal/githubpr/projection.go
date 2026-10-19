@@ -60,7 +60,17 @@ type Projector struct {
 
 // ProjectTerminal verifies run identity, head binding, and package contents before rendering facts.
 func (p Projector) ProjectTerminal(ctx context.Context, association Association, run RunState) (Projection, error) {
-	if p.Packages == nil || p.MaxItems <= 0 || p.MaxSummary <= 0 || run.Package == "" {
+	if p.Packages == nil || p.MaxItems <= 0 || p.MaxSummary <= 0 {
+		return Projection{}, &Error{Code: CodeInternal, Operation: "project"}
+	}
+	if run.Package == "" && (run.Outcome == "error" || run.Outcome == "cancelled" || run.Outcome == "inconclusive") {
+		if !association.Provisional || run.RunHandle == "" || association.RunHandle != run.RunHandle || run.RepositoryID != association.Snapshot.RepositoryID || run.HeadOID != association.Snapshot.HeadOID {
+			return Projection{}, &Error{Code: CodeIntegrity, Operation: "operational_lineage"}
+		}
+		outcome := safeOutcome(run.Outcome)
+		return Projection{Outcome: outcome, Title: "FeatureProof: " + outcome, Summary: "FeatureProof outcome: **" + outcome + "**\n\nOperational preview validation ended without an evidence package."}, nil
+	}
+	if run.Package == "" {
 		return Projection{}, &Error{Code: CodeInternal, Operation: "project"}
 	}
 	index, err := p.Packages.Read(ctx, run.Package)

@@ -21,6 +21,7 @@ import (
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
+	specyaml "github.com/asierhr/featureProof/internal/specification/yaml"
 )
 
 // testClock supplies deterministic timestamps to complete runner tests.
@@ -56,6 +57,34 @@ func writeInputs(t *testing.T, expected int, maxCalls int) (string, string) {
 		t.Fatal(err)
 	}
 	return specPath, planPath
+}
+
+// TestPreparedRunnerUsesHistoricalDeterministicComposition proves generated plans enter the same runner as explicit manifests.
+func TestPreparedRunnerUsesHistoricalDeterministicComposition(t *testing.T) {
+	specPath, planPath := writeInputs(t, 200, 1)
+	spec, err := specyaml.Load(context.Background(), specPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := planmanifest.Load(context.Background(), planPath, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	deps := DefaultDependencies(root, &bytes.Buffer{}, &bytes.Buffer{})
+	commit := strings.Repeat("a", 40)
+	deps.RevisionResolver = fakeRevision{revisionbinding.Revision{RepositoryID: "repo", CommitOID: commit}}
+	deps.EnvironmentAttestor = fakeAttestation{revisionbinding.Attestation{EnvironmentID: "preview", RepositoryID: "repo", CommitOID: commit, Reference: "proof-1", ValidUntil: time.Unix(10000, 0), Verified: true}}
+	deps.SafeProjector, deps.Clock, deps.IDs, deps.Waiter, deps.FinalizeTimeout = legacyFixtureProjector{}, &testClock{next: time.Unix(100, 0)}, &testIDs{}, testWaiter{}, time.Second
+	runner, err := NewPreparedRunner(context.Background(), PreparedRequest{Specification: spec, Runtime: manifest, Plans: manifest.Plans, Target: "http://127.0.0.1:1", RepositoryID: "repo", Revision: "main", EnvironmentID: "preview"}, deps)
+	if err != nil || runner == nil {
+		t.Fatalf("prepared runner unavailable: %v", err)
+	}
+	bad := manifest.Plans
+	bad[0].ConstraintID = "other"
+	if _, err = NewPreparedRunner(context.Background(), PreparedRequest{Specification: spec, Runtime: manifest, Plans: bad, Target: "http://127.0.0.1:1", RepositoryID: "repo", Revision: "main", EnvironmentID: "preview"}, deps); err == nil {
+		t.Fatal("mismatched prepared plan accepted")
+	}
 }
 
 // runnerFor binds a scenario to local-only network and deterministic process boundaries.
@@ -493,13 +522,43 @@ func TestPlanSnapshotPreservesSafeStructureWithoutLiteralValues(t *testing.T) {
 		"reference": {Reference: &planning.OutputReference{StepID: "prior", ValueType: planning.ValueString, Path: []planning.PathSegment{{Field: &field}}}},
 	}, Assertions: []planning.AssertionDeclaration{{ID: "a", Definition: definition}}}
 	manifest := planmanifest.Manifest{Version: 1, Plans: []planning.ValidationPlan{{ID: "p", ConstraintID: "c", Steps: []planning.PlanStep{step}}}}
-	raw, err := json.Marshal(safeManifest(manifest))
+	raw, err := json.Marshal(safeManifest(manifest, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(raw)
-	if strings.Contains(text, "CANARY") || !strings.Contains(text, "reference") || !strings.Contains(text, "[REDACTED]") {
+	var document struct {
+		Plans json.RawMessage `json:"plans"`
+	}
+	if err = json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	text := string(document.Plans)
+	if strings.Contains(text, "CANARY") || strings.Contains(text, "commitment") || !strings.Contains(text, "reference") || !strings.Contains(text, "[REDACTED]") {
 		t.Fatalf("unsafe snapshot %s", text)
+	}
+}
+
+// TestHistoricalValidatePlanPackageHasNoCommitmentOracle proves the production legacy runner publishes no unkeyed value hashes.
+func TestHistoricalValidatePlanPackageHasNoCommitmentOracle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer server.Close()
+	runner, root, _, _ := runnerFor(t, server.URL, 200, 1)
+	if code := runner.Run(context.Background()); code != 0 {
+		t.Fatalf("historical validate exit=%d", code)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, ".featureproof", "runs", "id-1", "plan.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Plans json.RawMessage `json:"plans"`
+	}
+	if err = json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	text := string(document.Plans)
+	if strings.Contains(text, "commitment") || strings.Contains(text, "GET") || strings.Contains(text, "200") {
+		t.Fatalf("legacy package exposes a dictionary oracle: %s", text)
 	}
 }
 

@@ -75,11 +75,12 @@ type Binding struct {
 
 // PlanBinding records an approved or approval-free batch against one base binding.
 type PlanBinding struct {
-	Version       int    `json:"version"`
-	BindingSHA256 string `json:"binding_sha256"`
-	Batch         int    `json:"batch"`
-	PlanSHA256    string `json:"plan_sha256"`
-	Mode          string `json:"mode"`
+	Version           int    `json:"version"`
+	BindingSHA256     string `json:"binding_sha256"`
+	Batch             int    `json:"batch"`
+	PlanSHA256        string `json:"plan_sha256"`
+	Mode              string `json:"mode"`
+	ApprovalReference string `json:"approval_reference,omitempty"`
 }
 
 var safeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
@@ -192,6 +193,16 @@ func NewPlanBinding(ctx context.Context, base Binding, batch int, planDigest, mo
 		return PlanBinding{}, &Error{BindingIntegrity, "plan"}
 	}
 	return PlanBinding{Version: 1, BindingSHA256: base.BindingSHA256, Batch: batch, PlanSHA256: planDigest, Mode: mode}, nil
+}
+
+// NewApprovedPlanBinding seals an approved batch together with its opaque consumed-grant reference.
+func NewApprovedPlanBinding(ctx context.Context, base Binding, batch int, planDigest, approvalReference string) (PlanBinding, error) {
+	binding, err := NewPlanBinding(ctx, base, batch, planDigest, "approved", true)
+	if err != nil || !safeID.MatchString(approvalReference) {
+		return PlanBinding{}, &Error{BindingIntegrity, "plan_approval"}
+	}
+	binding.ApprovalReference = approvalReference
+	return binding, nil
 }
 
 // VerifyPlanChain rejects foreign, reordered or malformed batch bindings before publication.

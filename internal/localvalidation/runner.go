@@ -32,6 +32,18 @@ type Request struct {
 	RepositoryID, Revision, EnvironmentID string
 }
 
+// PreparedRequest supplies already validated specification/runtime inputs and canonical generated plans to the shared runner.
+type PreparedRequest struct {
+	Specification                         specification.Specification
+	Runtime                               planmanifest.Manifest
+	Plans                                 []planning.ValidationPlan
+	Target                                string
+	RepositoryID, Revision, EnvironmentID string
+	ApprovalMode, ApprovalReference       string
+	PlanArtifactSHA256                    string
+	PlanCommitmentKey                     []byte
+}
+
 // prepareBinding rechecks source/deployment and hashes a complete trusted safe
 // projection before new work is authorized. It returns digest fields without
 // assigning a run ID; the caller seals them once that ID is generated.
@@ -121,6 +133,10 @@ type Runner struct {
 	selection       revisionbinding.Selection
 	revision        revisionbinding.Revision
 	attestation     revisionbinding.Attestation
+	approvalMode    string
+	approvalRef     string
+	artifactDigest  string
+	commitmentKey   []byte
 }
 
 // constraintCatalog exposes the specification constraint namespace to deterministic plan validation.
@@ -140,6 +156,41 @@ func NewRunner(ctx context.Context, request Request, deps RuntimeDependencies) (
 	if err != nil {
 		return nil, safeError("load plan manifest", err)
 	}
+	return newRunner(ctx, spec, manifest, request.Target, request.RepositoryID, request.Revision, request.EnvironmentID, deps)
+}
+
+// NewPreparedRunner reuses the historical runner after replacing only manifest plans with generated canonical plans.
+func NewPreparedRunner(ctx context.Context, request PreparedRequest, deps RuntimeDependencies) (*Runner, error) {
+	if request.PlanArtifactSHA256 != "" && (len(request.PlanArtifactSHA256) != 64 || len(request.PlanCommitmentKey) != 32) || request.PlanArtifactSHA256 == "" && len(request.PlanCommitmentKey) != 0 {
+		return nil, safeError("validate prepared plans", &planmanifest.Error{Category: "invalid_value", Field: "plan_artifact_binding"})
+	}
+	manifest := request.Runtime
+	manifest.Plans = append([]planning.ValidationPlan(nil), request.Plans...)
+	spec := request.Specification
+	spec.Target.BaseURL = request.Target
+	if len(manifest.Plans) != len(spec.Constraints) || len(manifest.Plans) == 0 {
+		return nil, safeError("validate prepared plans", &planmanifest.Error{Category: "invalid_relation", Field: "plans"})
+	}
+	for index, plan := range manifest.Plans {
+		if plan.ConstraintID != spec.Constraints[index].ID {
+			return nil, safeError("validate prepared plans", &planmanifest.Error{Category: "invalid_relation", Field: "plans"})
+		}
+	}
+	runner, err := newRunner(ctx, spec, manifest, request.Target, request.RepositoryID, request.Revision, request.EnvironmentID, deps)
+	if err != nil {
+		return nil, err
+	}
+	if request.ApprovalMode != "" {
+		runner.approvalMode, runner.approvalRef = request.ApprovalMode, request.ApprovalReference
+	}
+	runner.artifactDigest = request.PlanArtifactSHA256
+	runner.commitmentKey = append([]byte(nil), request.PlanCommitmentKey...)
+	return runner, nil
+}
+
+// newRunner is the single deterministic composition path shared by explicit and generated plans.
+func newRunner(ctx context.Context, spec specification.Specification, manifest planmanifest.Manifest, target, repositoryID, revisionRef, environmentID string, deps RuntimeDependencies) (*Runner, error) {
+	spec.Target.BaseURL = target
 	redactionPolicy, err := evidence.NewPolicy(manifest.Redaction)
 	if err != nil {
 		return nil, safeError("validate redaction", err)
@@ -147,10 +198,10 @@ func NewRunner(ctx context.Context, request Request, deps RuntimeDependencies) (
 	if deps.Clock == nil || deps.IDs == nil || deps.Waiter == nil || deps.Resolver == nil || deps.Dialer == nil || deps.WithTimeout == nil || deps.PublisherFactory == nil || deps.PolicyFactory == nil || deps.EvidenceFactory == nil || deps.Evaluator == nil || deps.Stdout == nil || deps.Stderr == nil || deps.Root == "" || deps.FinalizeTimeout <= 0 {
 		return nil, fmt.Errorf("runtime dependencies are required")
 	}
-	selection := revisionbinding.Selection{RepositoryID: request.RepositoryID, Ref: request.Revision, EnvironmentID: request.EnvironmentID}
+	selection := revisionbinding.Selection{RepositoryID: repositoryID, Ref: revisionRef, EnvironmentID: environmentID}
 	var revision revisionbinding.Revision
 	var attestation revisionbinding.Attestation
-	if request.RepositoryID != "" || request.Revision != "" || request.EnvironmentID != "" {
+	if repositoryID != "" || revisionRef != "" || environmentID != "" {
 		if deps.RevisionResolver == nil || deps.EnvironmentAttestor == nil || deps.SafeProjector == nil {
 			return nil, &revisionbinding.Error{Category: revisionbinding.UnverifiedEnvironment, Phase: "composition"}
 		}
@@ -190,7 +241,7 @@ func NewRunner(ctx context.Context, request Request, deps RuntimeDependencies) (
 	if runPolicy == nil {
 		return nil, fmt.Errorf("policy factory returned nil")
 	}
-	return &Runner{spec: spec, manifest: manifest, validated: validated, registry: registry, policy: runPolicy, sanitizer: evidence.NewSanitizer(redactionPolicy), redactionPolicy: redactionPolicy, deps: deps, selection: selection, revision: revision, attestation: attestation}, nil
+	return &Runner{spec: spec, manifest: manifest, validated: validated, registry: registry, policy: runPolicy, sanitizer: evidence.NewSanitizer(redactionPolicy), redactionPolicy: redactionPolicy, deps: deps, selection: selection, revision: revision, attestation: attestation, approvalMode: "approval_not_required"}, nil
 }
 
 // Run executes constraints sequentially, publishes a terminal bundle when possible, and returns the public exit code.
@@ -270,7 +321,13 @@ func (r *Runner) Run(ctx context.Context) int {
 			status = ResultInconclusive
 			break
 		}
-		planBinding, bindErr := revisionbinding.NewPlanBinding(ctx, *binding, n+1, planDigests[n], "approval_not_required", true)
+		var planBinding revisionbinding.PlanBinding
+		var bindErr error
+		if r.approvalMode == "approved" {
+			planBinding, bindErr = revisionbinding.NewApprovedPlanBinding(ctx, *binding, n+1, planDigests[n], r.approvalRef)
+		} else {
+			planBinding, bindErr = revisionbinding.NewPlanBinding(ctx, *binding, n+1, planDigests[n], "approval_not_required", true)
+		}
 		if bindErr != nil {
 			status = ResultError
 			operational = bindErr
@@ -354,7 +411,7 @@ func (r *Runner) Run(ctx context.Context) int {
 	}
 	_ = journal.Append(finalCtx, harness.Event{Type: terminalType, RunID: runID, Status: string(status)})
 	finished := r.deps.Clock.Now()
-	snapshot := RunSnapshot{ID: runID, Binding: binding, PlanBindings: planBindings, FeatureID: r.spec.Feature.ID, TargetID: r.spec.Target.ID, TargetURL: r.spec.Target.BaseURL, Status: status, StartedAt: started, FinishedAt: finished, DurationMS: durationMillis(started, finished), Limits: r.spec.Limits, Consumed: shared.Consumed, Constraints: results}
+	snapshot := RunSnapshot{ID: runID, Binding: binding, PlanBindings: planBindings, PlanArtifactSHA256: r.artifactDigest, PlanCommitmentKey: append([]byte(nil), r.commitmentKey...), FeatureID: r.spec.Feature.ID, TargetID: r.spec.Target.ID, TargetURL: r.spec.Target.BaseURL, Status: status, StartedAt: started, FinishedAt: finished, DurationMS: durationMillis(started, finished), Limits: r.spec.Limits, Consumed: shared.Consumed, Constraints: results}
 	events, eventErr := journal.Events(finalCtx, runID)
 	if eventErr == nil {
 		fmt.Fprintln(r.deps.Stdout, "phase=reporting")

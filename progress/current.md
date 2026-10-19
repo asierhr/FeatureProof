@@ -1935,3 +1935,143 @@ aprobadas. No hay feature `in_progress`.
   T1–T11 permanecen completas y la entrega vuelve a `ready_for_review`.
 <!-- leader 2026-10-17: cierre feature 18 -->
 - `github-pr-integration` aprobada en la novena revisión independiente. R1–R12 y T1–T11 pasan; REV-1–REV-23 están cerrados. El leader cambia la feature 18 de `in_progress` a `done` y registra el cierre en `progress/history.md`.
+
+## 2026-10-17 — preview-environment-adapter
+
+- Leader preflight completado: feature 19 `pending`, `sdd: true`, criterios de aceptación suficientes y ninguna otra feature activa.
+- Se inicia la fase de especificación. El `spec_author` debe producir `requirements.md`, `design.md` y `tasks.md`; no se modificará código antes de aprobación humana explícita.
+- Spec completada: 11 requirements EARS y 12 tasks trazables, sin decisiones abiertas ni cambios de código. El leader cambia la feature 19 de `pending` a `spec_ready`.
+- Estado: pausa obligatoria en la puerta humana. La implementación comenzará únicamente después de una aprobación explícita de esta spec.
+- El usuario aprueba explícitamente la spec el `2026-10-17T18:03:28+02:00`. Se registra la aprobación y el leader cambia la feature 19 de `spec_ready` a `in_progress`.
+- Se inicia la implementación de T1–T12; el estado permanecerá `in_progress` hasta una review independiente aprobada.
+
+### Implementer feature 19 — 2026-10-17
+- T1–T7 en implementación: creado `internal/previewenv` con modelos sellados, catálogo explícito, contrato Provider no destructivo, autorización de target, bridge de atestación, coordinator acotado, release/recovery durable, fake auditable y bridges de consumidores.
+- Suite dirigida inicial cubre selección, idempotencia, target, attestation, readiness, cancelación, timeout, release y clasificación funcional/operacional.
+- Estado: in_progress; pendientes composición de secretos, cierre de integración runner, trazabilidad y gates.
+- T1–T12 completadas por implementer; trazabilidad y gates registrados en `progress/preview-environment-adapter/implementation.md`.
+- Verificación: suite dirigida y repetida, race dirigida/global comparable, vet, compile-only, módulos y builds multiplataforma pasan; cobertura del paquete nuevo 85,6%.
+- `go test ./...` conserva únicamente la limitación ambiental preexistente de symlinks Windows en feature 15.
+- Estado solicitado al leader: `ready_for_review`; el implementer no cambia `feature_list.json` ni marca la feature done.
+
+- Primera review independiente de feature 19: `rejected`. Se devuelven REV-1–REV-9 al implementador: composición productiva ausente, límites inciertos de reserva, ownership/CAS, lifecycle GitHub, clasificación externalagent, resolución secretless, snapshot seguro, cobertura real de timeouts y `diff --check`.
+- Corrección REV-1–REV-9 en curso: los roots CLI, MCP y GitHub ya componen una configuración preview explícita y conservan fail-closed cuando está ausente o incompleta; los tres entrypoints tienen pruebas verticales.
+- El lifecycle persiste intención antes de reserve, reconcilia estados `selected`, usa owner/lease/CAS y lock entre procesos, y el gateway GitHub expone handles activos durables, cancelación, restart y join.
+- La selección filtra provider/perfil antes de resolver secretos; snapshots hostiles no se persisten; supervisor real distingue error previo a admisión de `inconclusive/cancelled` posterior.
+- Tests dirigidos de límites independientes, deadline padre, cancelación, cleanup, multiproceso y shutdown pasan. Cobertura actual de `internal/previewenv`: 85,4 %. Pendientes gates repetidos/globales y actualización final del informe.
+- Corrección REV-1–REV-9 completada. Paquete ×20, race paquete y race ×3 pasan; coverage final 85,1 %. Suite global comparable y race comparable, vet, compile-only, módulos y builds Windows/Linux/macOS pasan.
+- El gate literal global conserva únicamente el fallo ambiental preexistente del symlink Windows de feature 15, sin cambiar assertions. `git diff --check` queda limpio tras normalizar EOF.
+- T1–T12 permanecen completas y el informe actualizado solicita nuevamente `ready_for_review`; el implementer no cambia el estado de la feature.
+- Segunda review independiente de feature 19: `rejected`. REV-1–REV-9 quedan cerrados o mejorados, pero se devuelven REV-10–REV-15 sobre recovery tras restart/lease viva, terminales GitHub, inconclusive consumible, target ligado al binding, selección durable completa y observabilidad real.
+- Corrección REV-10–REV-15 en curso: un supervisor durable reclama tras expirar
+  la lease y siempre reconcilia por key antes de liberar, incluso con store,
+  coordinator y provider reconstruidos. Cada salida persiste un terminal; los
+  consumidores externalagent/GitHub aceptan la proyección operacional segura
+  sin paquete y el polling publica check/comentario terminal reales.
+- El binding incluye target canónico completo y policy; la selección durable y
+  su CAS cubren secretless, referencia de credencial y el resto de propiedades
+  de seguridad. El lifecycle emite eventos y métricas allowlisted persistentes
+  para selección, reserva, readiness, ready, drift, release y recovery. Los
+  tests dirigidos pasan; quedan coverage y gates finales.
+- Corrección REV-10–REV-15 completada. El restart real reconstruye store,
+  coordinator y provider con lease inicialmente viva; la publicación
+  operacional se valida en externalagent y en check/comentario GitHub reales.
+- Verificación final: paquete ×20, race ×3 afectada, suite/race globales
+  comparables, vet, compile-only, módulos y builds nativo/Windows/Linux/macOS
+  pasan. Coverage: previewenv 85,4 %, githubpr 85,1 % y externalagent 87,0 %.
+  El gate literal conserva solo el symlink Windows preexistente; diff y formato
+  del conjunto modificado están limpios. Se solicita `ready_for_review`.
+- Tercera review independiente: `rejected` por REV-16 y REV-17. El MCP podía
+  confirmar `queued` antes del intent preview y el test de restart dependía de
+  lease/reloj reales; un CAS final de release tampoco dejaba siempre una
+  intención inequívoca.
+- Corrección REV-16/17 en curso: `Submit` ejecuta un preflight idempotente que
+  persiste `selected` sin owner antes de responder; cierre inmediato y restart
+  recuperan ese handoff. Recovery renueva ownership tras claim y Reconcile, y
+  persiste `release_pending` antes del provider para que cualquier CAS final
+  fallido converja.
+- Las regresiones usan reloj lógico y barreras, prueban lease viva, expiry,
+  reclaim, orden Reconcile→Release y final CAS fallido. MCP y las tres
+  regresiones pasan ×200; quedan coverage y gates globales finales.
+- REV-16/17 completadas. El gate ×20 detectó y eliminó un timeout de pared del
+  test GitHub operacional; la señal de idle durable pasa las 20 iteraciones.
+  Bajo carga global también se probó la renovación segura de una lease expirada
+  únicamente cuando su versión no cambió, sin permitir overwrite de otro owner.
+- Gates finales: suite y race global comparables, vet, compile-only, módulos,
+  builds nativo/Windows/Linux/macOS, AST y diff pasan. Coverage final:
+  previewenv 85,4 %, githubpr 85,0 % y externalagent 87,5 %. El único límite
+  ambiental continúa siendo el symlink Windows preexistente. Se solicita de
+  nuevo `ready_for_review`.
+- Tercera review independiente de feature 19: `rejected`. REV-11–REV-15 quedaron cerrados; REV-16 y REV-17 reproducen una aceptación MCP sin intención preview durable y una pérdida de ownership durante recovery/reconcile/release. Se devuelven al implementador con tests deterministas y repetidos.
+- Cuarta review independiente de feature 19: `rejected`. REV-16/REV-17 quedaron cerrados; REV-18–REV-20 exigen separar el checkpoint durable del presupuesto de release, hacer linealizable el handoff preflight→worker→recovery y eliminar un deadline de pared frágil bajo race.
+- Corrección REV-18–REV-20: cleanup usa presupuestos independientes para el
+  checkpoint durable y `Provider.Release`; un fallo controlado del checkpoint
+  conserva estado reconciliable y no evita el intento obligatorio de release.
+- El preflight persiste `handoff` con owner/lease antes del ACK. Recovery
+  respeta el owner vivo; el worker adopta por CAS exactamente una vez y solo un
+  crash con lease expirada permite reclaim, Reconcile y Release sin runner.
+- La regresión de finalización externalagent sustituyó el deadline real de 40
+  ms por barreras explícitas de lifecycle. Regresiones nuevas ×200 y paquetes
+  afectados ×20 pasan.
+- REV-18–REV-20 completadas. Race afectada ×2 y race global comparable pasan
+  con GCC/UCRT64. Suite global comparable, vet, compile-only, módulos, builds
+  nativo/Windows/Linux/macOS, AST y diff pasan. Coverage: previewenv 85,4 %,
+  githubpr 85,1 % y externalagent 87,4 %. El único límite ambiental sigue
+  siendo el symlink Windows preexistente. Se solicita `ready_for_review`.
+- Quinta review independiente: REV-18/19 cerrados y REV-20 corregido, pero
+  `Cancel` podía observar un terminal antes de que el worker liberase su lease.
+  REV-21 vuelve al implementer como único bloqueo.
+- Corrección REV-21 en curso: el worker permanece registrado hasta completar
+  `ReleaseOwner`, y `Cancel` une `entry.done` aun cuando el registro ya es
+  terminal. Una barrera determinista fuerza exactamente esa ventana y prueba
+  que Cancel no retorna antes de liberar ownership.
+- REV-21 corregida: el orden de cleanup es ReleaseOwner→remove worker→close
+  done; por ello una observación terminal une siempre el worker registrado y
+  no deja una ventana sin join. La ruta sin worker sigue siendo idempotente y
+  una segunda barrera verifica cancelación del contexto durante el join.
+- La regresión terminal/finalización pasa ×1000. Race conjunto y cierre de
+  coverage/gates están en ejecución.
+- REV-21 completada. Race del conjunto afectado ×2, suite afectada y global
+  comparable, vet, compile-only, módulos, AST y diff pasan. La cobertura de
+  externalagent permanece en 87,4 %. T1–T12 siguen completas y la entrega
+  vuelve a `ready_for_review` sin cambiar `feature_list.json`.
+- Quinta review independiente de feature 19: `rejected`. REV-18/REV-19 quedaron cerrados; REV-21 exige que `externalagent.Cancel` una cualquier worker local aún registrado aunque el estado durable ya sea terminal, antes de devolver y liberar recursos.
+- Sexta review independiente de feature 19: `approved`. REV-1–REV-21 están cerrados, R1–R11 y T1–T12 pasan. El leader cambia `preview-environment-adapter` de `in_progress` a `done` y registra el cierre en `progress/history.md`.
+
+## 2026-10-19 — validation-workflow-orchestration
+
+- Leader preflight completado: feature 20 `pending`, `sdd: true`, criterios suficientes y ninguna feature activa.
+- Se inicia la fase de especificación para componer carga de spec, generación agéntica, validación, aprobación y ejecución sin exigir un plan JSON manual.
+- Spec completada: 13 requirements EARS y 12 tasks trazables, sin decisiones abiertas ni cambios de código. El leader cambia la feature 20 de `pending` a `spec_ready`.
+- Estado: pausa obligatoria en la puerta humana antes de implementar.
+- El usuario aprueba explícitamente la spec el `2026-10-19T11:12:00+02:00`. El leader registra la aprobación y cambia únicamente la feature 20 de `spec_ready` a `in_progress`.
+- Se inicia la implementación de T1–T12; el estado permanecerá `in_progress` hasta una review independiente aprobada.
+- Implementer feature 20: T1-T8 y T11 implementadas en primera pasada. `internal/validationworkflow` contiene modelo cerrado, preflight, store durable CAS/leases/journal, artefacto canónico, aprobación exacta, ejecución/finalización, cancelación y recovery conservador.
+- T7 reutiliza el runner histórico mediante `localvalidation.NewPreparedRunner`; el test vertical ejecuta HTTP local, publica package y proyecta el outcome exclusivamente desde `localvalidation.ReadPackage`.
+- CLI/API/MCP/GitHub comparten `validationworkflow.Service`; CLI exige flags completos y aliases confiables, MCP no acepta targets crudos y GitHub nunca autoaprueba el comentario de inicio. Queda cerrar el wiring productivo en `cmd/featureproof` y las extensiones del MCP/GitHub existentes antes de marcar T9/T10.
+- Tests herméticos del paquete pasan; cobertura actual 85,1 %. Cubiertos pre-admission sin efectos, idempotencia concurrente, approval exacta/stale/reject/disabled, missing context, tampering, recovery por checkpoint, cancel, canarios, paridad de adapters y runner/package vertical.
+- T9 ya dispone de composición productiva en `cmd/featureproof`, configuración estricta en snake_case, selección explícita sin modelo por defecto y resolución OAuth confinada al composition root; `workflow start|status|view|approve|reject|cancel|result` está conectado sin alterar `validate --plan`.
+- T10 conecta el gateway GitHub al mismo `Service` y añade `workflow mcp serve` con JSON-RPC/MCP versionado, discovery, listado cerrado de tools, argumentos alias-only y límites de entrada. Los tests dirigidos de CLI/API/MCP/GitHub y la compilación del command pasan.
+- El artefacto canónico fusiona de forma determinista múltiples scenarios de una constraint para el contrato histórico de un plan por constraint, con IDs de steps namespaced para evitar colisiones. La regresión confirma que ningún check preparado se pierde.
+- Implementación feature 20 cerrada para review: T1–T12 están marcadas, el informe R1–R13 está en `progress/validation-workflow-orchestration/implementation.md` y `internal/validationworkflow` alcanza 85,7 % statements.
+- Gates: gofmt, vet, compile-only, suite global ordinaria, repetición ×20, race afectada ×3, módulos, builds y diff pasan. La race global conserva únicamente la excepción ambiental conocida del symlink Windows; no se modificó el test.
+- 2026-10-19T11:40:00+02:00 — Leader: primera revisión independiente de feature 20 rechazada. Se devuelven al implementer REV-1..REV-9: integración real de aprobación y preview, ownership/leases multiproceso, persistencia y cleanup recuperables, validación productiva, binding canónico completo y saneado de secretos. Estado conservado en `in_progress` hasta una nueva aprobación independiente.
+- Review feature 20 rechazada con REV-1–REV-9. Se reabren T3–T8 y T10–T12: aprobación, ownership/leases, atomicidad, cleanup, preview, policy/package y redacción requieren corrección material; no se conservarán como completas hasta verificar cada frontera.
+- 2026-10-19 — Correcciones REV-1..REV-9 de feature 20 completadas. Aprobación real con grant one-use, owners multiproceso, heartbeat, checkpoint atómico, intents de package/cleanup, previewenv real, descriptor/policy productivos y proyección canónica saneada quedan integrados y cubiertos.
+- Gates finales: validationworkflow y previewenv 85,0 %; pruebas repetidas ×10 y race ×3 afectada pasan; vet, compile-only, módulos, builds Windows/Linux/macOS y diff pasan. La suite/race amplia conserva únicamente el fallo ambiental preexistente de symlink Windows sin privilegio.
+- T1–T12 vuelven a completas y se solicita nueva revisión independiente; `feature_list.json` permanece `in_progress` sin cambios de implementer.
+- 2026-10-19T12:25:00+02:00 — Implementer: REV-1..REV-9 corregidos y entrega devuelta a revisión independiente. Se reportan aprobación/grant reales, ownership y heartbeat multiproceso, checkpoints e intents recuperables, lifecycle previewenv, policy/descriptor productivos, proyección canónica saneada y binding por digest. El leader mantiene la feature en `in_progress` hasta el veredicto.
+- 2026-10-19T13:05:00+02:00 — Leader: segunda revisión independiente rechazada. Cerradas REV-1/2-direct/3/4/5/7; vuelven al implementer los blockers de preview durable, commitments semánticos del plan, sellado del snapshot privado, recovery correcto de plan_ready, deadline durable de aprobación y propagación de contexto en RestoreRun. Estado sigue `in_progress`.
+- 2026-10-19 — Correcciones de segunda review completadas: preview sellado se restaura en el mismo proceso y entre owners; valores redactados usan commitments privados por ubicación; el snapshot ejecutable queda ligado al artefacto y se retira al terminal; `plan_ready` restagea exactamente o conserva approval disabled; la espera de aprobación tiene deadline durable y `RestoreRun` recibe el contexto cancelable.
+- Pruebas nuevas cubren approve+execute preview, coordinador reconstruido, literals/headers/references/assertions/expected distintos, tampering required y disabled recovery, restage real, expiración cross-owner y cancelación durante restore. Repetición ×10 y race ×3 afectada pasan con GCC/UCRT64; coverage validationworkflow/previewenv queda en 85,0 %. Se solicita tercera revisión sin cambiar `feature_list.json`.
+- 2026-10-19 — Tercera review de feature 20 rechazada por REV-13/14: el runner histórico publicaba SHA-256 sin clave para valores redactados y recovery no recalculaba el contexto completo recompuesto.
+- REV-13/14 corregidos: el camino histórico no emite commitments sin clave privada fuerte; el workflow mantiene HMAC con nonce aleatorio privado. Recovery recalcula un digest de spec, contrato/OpenAPI, revisión, target/attestation, runtime/policy, provider/model, constraints, capabilities y límites antes de approval o tools.
+- Tests de dictionary oracle/package histórico y canarios de clave pasan; drift separado de spec, contrato, OpenAPI, runtime/policy, capability, limits y constraints se rechaza en required, antes de Stage y en disabled recovery cross-owner. Focales ×10 y race ×3 pasan; validationworkflow queda en 85,3 %. Se solicita cuarta revisión sin cambiar `feature_list.json`.
+- 2026-10-19T13:42:00+02:00 — Implementer: segunda ronda de correcciones completa (REV-6/8/9/10/11/12), con pruebas cross-owner, tamper, deadlines y cancelación. Entrega enviada a tercera revisión independiente; feature conserva `in_progress`.
+- 2026-10-19T14:10:00+02:00 — Leader: tercera revisión rechazada con solo REV-13 y REV-14 abiertos. Se corrigen commitments sin clave en el camino histórico y la recomputación/verificación íntegra de ContextDigest durante recovery. Resto de REV-1..REV-12 cerrado; estado permanece `in_progress`.
+- 2026-10-19 — Cuarta review mantiene abierto un remanente de REV-14: target/runtime productivos todavía se resumían por IDs parciales. Se reemplazaron las fronteras de digest por `BindingContext` y `RuntimeContext` efectivos y canónicos; el builder deriva hashes y no acepta hashes del caller como contenido.
+- El contexto liga target, EnvironmentID, attestation y validUntil, snapshot preview, manifest HTTP, redaction, registry/schema/validator, policy y network rules. Drift con IDs estables se rechaza antes de Stage/approval/tools en required y disabled recovery cross-owner. Focales ×10 y race ×3 pasan; coverage validationworkflow 85,8 %, previewenv 85,0 %. Se solicita quinta revisión sin cambiar `feature_list.json`.
+- 2026-10-19T14:38:00+02:00 — Implementer: REV-13 y REV-14 corregidos; commitments públicos sin clave quedan redactados y recovery verifica el ContextDigest recompuesto antes de cada frontera sensible. Entrega enviada a cuarta revisión independiente; feature sigue `in_progress`.
+- 2026-10-19T15:02:00+02:00 — Leader: cuarta revisión rechazada; REV-13 cerrada y REV-14 reducida a canonicalización incompleta de target/runtime/policy/network bajo IDs estables. Se exige ligar contenido efectivo y pruebas de drift subyacente cross-owner. Estado permanece `in_progress`.
+- 2026-10-19T15:31:00+02:00 — Implementer: canonicalización efectiva de target/runtime/policy/network completada con pruebas de drift bajo IDs estables. Entrega enviada a quinta revisión independiente; feature sigue `in_progress`.
+- 2026-10-19T15:50:00+02:00 — Reviewer/Leader: quinta revisión independiente aprobada; REV-1..REV-14 cerradas, T1–T12 y R1–R13 verificadas. Smoke final de `validationworkflow`, `previewenv` y CLI pasa; feature 20 cambia de `in_progress` a `done` y se registra en `progress/history.md`.

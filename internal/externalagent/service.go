@@ -55,6 +55,11 @@ type ApprovedExecutor interface {
 	Execute(context.Context, Selection, string) (ExecutionResult, error)
 }
 
+// SubmissionPreparer establishes an idempotent durable handoff before Submit acknowledges queued work.
+type SubmissionPreparer interface {
+	Prepare(context.Context, Selection, string) error
+}
+
 // PackageReader verifies an evidence package before returning its semantic index.
 type PackageReader interface {
 	Read(context.Context, string) (localvalidation.PackageIndex, error)
@@ -203,6 +208,15 @@ func (s *Service) Submit(ctx context.Context, input SubmitInput) (RunView, error
 		return RunView{}, &AppError{Code: CodeNotFound}
 	}
 	if reserved.New {
+		if preparer, ok := s.deps.Executor.(SubmissionPreparer); ok {
+			if prepareErr := preparer.Prepare(ctx, selection, reserved.Record.InternalID); prepareErr != nil {
+				finalCtx, cancel := context.WithTimeout(context.Background(), s.deps.RunTimeout)
+				_, _ = s.deps.Registry.Transition(finalCtx, reserved.Record.Handle, PhaseQueued, PhaseTerminal, OutcomeError, "", "", s.deps.Clock.Now())
+				cancel()
+				s.deps.Registry.ReleaseOwner(reserved.Record.Handle)
+				return RunView{}, &AppError{Code: CodeInternal}
+			}
+		}
 		s.supervisor.Start(reserved.Record, selection)
 	}
 	return viewOf(reserved.Record), nil
@@ -226,7 +240,7 @@ func (s *Service) Result(ctx context.Context, input HandleInput) (ResultView, er
 	if record.Phase != PhaseTerminal {
 		return ResultView{}, &AppError{Code: CodeInProgress, Retryable: true}
 	}
-	if record.Status == OutcomeCancelled || record.Status == OutcomeError {
+	if record.Status == OutcomeCancelled || record.Status == OutcomeError || record.Status == OutcomeInconclusive && record.PackageDir == "" {
 		return ResultView{RunHandle: record.Handle, Phase: record.Phase, Status: record.Status, Constraints: []ConstraintView{}, Failures: []FailureView{}, Facts: []FactView{}, Evidence: []EvidenceView{}, Reproduction: []ReproductionView{}}, nil
 	}
 	if record.PackageDir == "" {
@@ -262,6 +276,14 @@ func (s *Service) Cancel(ctx context.Context, input CancelInput) (RunView, error
 			if err != nil {
 				return RunView{}, err
 			}
+		}
+		record, err = s.deps.Registry.Get(ctx, record.Handle)
+		if err != nil {
+			return RunView{}, normalizeRegistry(err)
+		}
+	} else {
+		if err := s.supervisor.Wait(ctx, record.Handle); err != nil {
+			return RunView{}, &AppError{Code: CodeInternal, Retryable: true}
 		}
 		record, err = s.deps.Registry.Get(ctx, record.Handle)
 		if err != nil {
@@ -345,7 +367,15 @@ func (s *Service) Wait(ctx context.Context, handle string) error {
 }
 
 // Close cancels and joins every owned worker before a transport process exits.
-func (s *Service) Close(ctx context.Context) error { return s.supervisor.Close(ctx) }
+func (s *Service) Close(ctx context.Context) error {
+	if err := s.supervisor.Close(ctx); err != nil {
+		return err
+	}
+	if closer, ok := s.deps.Executor.(interface{ Close(context.Context) error }); ok {
+		return closer.Close(ctx)
+	}
+	return nil
+}
 
 // principal converts identity boundary failures to the closed authorization category.
 func (s *Service) principal(ctx context.Context) (Principal, error) {

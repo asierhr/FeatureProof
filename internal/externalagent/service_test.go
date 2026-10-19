@@ -75,6 +75,35 @@ type fakeExecutor struct {
 	err     error
 }
 
+// preparingExecutor exposes the synchronous handoff boundary independently of worker scheduling.
+type preparingExecutor struct {
+	started    chan struct{}
+	resume     chan struct{}
+	prepareErr error
+	executed   atomic.Int32
+}
+
+// Prepare blocks acknowledgement at a deterministic durable-handoff barrier.
+func (e *preparingExecutor) Prepare(ctx context.Context, _ Selection, _ string) error {
+	if e.started != nil {
+		close(e.started)
+	}
+	if e.resume != nil {
+		select {
+		case <-e.resume:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return e.prepareErr
+}
+
+// Execute records that no worker can start before successful preparation.
+func (e *preparingExecutor) Execute(context.Context, Selection, string) (ExecutionResult, error) {
+	e.executed.Add(1)
+	return ExecutionResult{Status: OutcomeError}, nil
+}
+
 // Execute represents the approved composed path in application tests.
 func (e *fakeExecutor) Execute(ctx context.Context, _ Selection, _ string) (ExecutionResult, error) {
 	e.calls.Add(1)
@@ -116,6 +145,56 @@ func testService(t *testing.T, identity *fixedIdentity, executor *fakeExecutor, 
 	}
 	t.Cleanup(func() { _ = service.Close(context.Background()) })
 	return service, registry
+}
+
+// TestSubmitAcknowledgesOnlyAfterDurablePreparation verifies success ordering and fail-closed handoff errors.
+func TestSubmitAcknowledgesOnlyAfterDurablePreparation(t *testing.T) {
+	identity := &fixedIdentity{principal: Principal{ID: "alice", Scopes: allScopes()}}
+	for name, executor := range map[string]*preparingExecutor{
+		"success": {started: make(chan struct{}), resume: make(chan struct{})},
+		"failure": {prepareErr: errors.New("CANARY-PREPARE")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			registry, err := NewLocalRegistry(filepath.Join(t.TempDir(), "registry"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			service, err := NewService(ServiceDependencies{Identity: identity, Catalog: fixedCatalog{allowed: map[string]map[string]bool{"alice": {"safe": true}}}, Registry: registry, Executor: executor, Packages: fakePackages{}, Clock: fixedClock{now: time.Unix(1000, 0).UTC()}, IDs: &sequenceIDs{}, Owner: "prepare-owner", Retention: time.Hour, RunTimeout: time.Minute})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "success" {
+				result := make(chan error, 1)
+				go func() {
+					_, submitErr := service.Submit(context.Background(), SubmitInput{SelectionAlias: "safe", IdempotencyKey: "prepare-key"})
+					result <- submitErr
+				}()
+				<-executor.started
+				select {
+				case err = <-result:
+					t.Fatalf("submit returned before preparation: %v", err)
+				default:
+				}
+				if executor.executed.Load() != 0 {
+					t.Fatal("worker started before preparation")
+				}
+				close(executor.resume)
+				if err = <-result; err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err = service.Submit(context.Background(), SubmitInput{SelectionAlias: "safe", IdempotencyKey: "prepare-key"}); err == nil || strings.Contains(err.Error(), "CANARY") {
+					t.Fatalf("prepare failure=%v", err)
+				}
+				if executor.executed.Load() != 0 {
+					t.Fatal("failed handoff started worker")
+				}
+			}
+			if err = service.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
 
 // allScopes returns the standard authority set used by positive fixtures.

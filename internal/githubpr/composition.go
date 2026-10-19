@@ -53,6 +53,7 @@ type RuntimeDependencies struct {
 type Runtime struct {
 	handler      http.Handler
 	coordinator  *Coordinator
+	validation   ValidationGateway
 	closeTimeout time.Duration
 }
 
@@ -90,7 +91,7 @@ func ComposeRuntime(ctx context.Context, config ProductionConfig, secrets Compos
 		return nil, err
 	}
 	handler := &WebhookHandler{Secret: append([]byte(nil), secrets.WebhookSecret...), MaxBody: config.MaxWebhookBytes, Store: store, Admit: coordinator.Admit, Owner: owner, Clock: deps.Clock, LeaseTTL: config.LeaseTTL}
-	return &Runtime{handler: handler, coordinator: coordinator, closeTimeout: config.CloseTimeout}, nil
+	return &Runtime{handler: handler, coordinator: coordinator, validation: deps.Validation, closeTimeout: config.CloseTimeout}, nil
 }
 
 // Handler exposes only the authenticated webhook boundary to the HTTP server.
@@ -100,7 +101,13 @@ func (r *Runtime) Handler() http.Handler { return r.handler }
 func (r *Runtime) Close(ctx context.Context) error {
 	bounded, cancel := context.WithTimeout(ctx, r.closeTimeout)
 	defer cancel()
-	return r.coordinator.Close(bounded)
+	if err := r.coordinator.Close(bounded); err != nil {
+		return err
+	}
+	if closer, ok := r.validation.(interface{ Close(context.Context) error }); ok {
+		return closer.Close(bounded)
+	}
+	return nil
 }
 
 // WallClock supplies production UTC time and cancelable timer waits.

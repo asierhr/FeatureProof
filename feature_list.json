@@ -345,6 +345,358 @@
           "Esta primera versión no crea, modifica ni destruye infraestructura y deja explícitamente fuera de alcance el aprovisionamiento de previews",
           "Los tests usan un provider falso y cubren conexión, readiness, revisión incorrecta, target denegado, timeout, cancelación, liberación y ausencia de secretos"
         ],
+        "status": "done"
+    },
+    {
+        "id": 20,
+        "name": "validation-workflow-orchestration",
+        "title": "Flujo completo de planificación y validación",
+        "sdd": true,
+        "acceptance": [
+          "Un usuario puede iniciar una validación a partir de la specification sin tener que escribir manualmente un archivo ValidationPlan",
+          "El comando exige seleccionar explícitamente proveedor, modelo, perfil de autenticación y target o entorno preview autorizado, sin valores implícitos de modelo ni credenciales",
+          "La specification, la revisión, el entorno, el contrato disponible y el catálogo de herramientas se validan antes de solicitar al agente que genere el plan",
+          "El plan generado atraviesa validación de esquema, validación semántica, políticas y presupuestos antes de poder aprobarse o ejecutarse",
+          "Cuando la aprobación humana está habilitada, el plan queda en awaiting_approval y ninguna herramienta se ejecuta hasta aprobar exactamente sus hashes de plan, contexto, revisión y target",
+          "Tras una aprobación válida, el sistema ejecuta el plan mediante el runner existente y publica los mismos eventos, evidencias, package e informe que una validación con plan proporcionado explícitamente",
+          "El plan generado se persiste como artefacto auditable del run junto con proveedor, modelo, versión de prompt, uso y decisiones seguras, sin guardar secretos ni contexto sensible sin redactar",
+          "Si el agente devuelve contexto insuficiente, un plan inválido o una propuesta denegada, el flujo termina o solicita la información necesaria sin ejecutar herramientas",
+          "La cancelación, los timeouts, la idempotencia y la recuperación se propagan por las fases de generación, aprobación y ejecución sin duplicar planes, runs ni efectos",
+          "Los tests usan modelo, preview y herramientas falsos y cubren generación y ejecución correctas, plan inválido, contexto insuficiente, aprobación, aprobación obsoleta, cancelación, recuperación y ausencia de secretos sin utilizar red real"
+        ],
+        "status": "done"
+    },
+    {
+        "id": 21,
+        "name": "contract-source-abstraction",
+        "title": "Fuentes de contrato independientes de OpenAPI",
+        "sdd": true,
+        "acceptance": [
+          "El planificador consume un OperationCatalog interno y versionado sin importar tipos propios de OpenAPI, analizadores de código ni otros formatos de entrada",
+          "Una interfaz ContractSource permite obtener operaciones desde OpenAPI aprobada, análisis estático, observaciones autorizadas o configuración declarada mediante el mismo contrato interno",
+          "Cada operación, parámetro, schema, requisito de seguridad y respuesta conserva procedencia, ubicación segura, fuente, nivel de confianza y estado de completitud",
+          "El catálogo distingue información authoritative, derived, observed y declared y ningún dato inferido u observado se presenta como contrato oficial",
+          "Varias fuentes se combinan de forma determinista y un conflicto de método, path, schema o seguridad queda explícito en lugar de sobrescribirse silenciosamente",
+          "El adapter OpenAPI existente produce el nuevo OperationCatalog sin perder validación, reducción de contexto, seguridad ni compatibilidad con las features ya terminadas",
+          "Fuentes incompletas, contradictorias o sin confianza suficiente producen contexto insuficiente o requieren revisión según política antes de permitir ejecución",
+          "La carga de fuentes respeta límites de tamaño y no ejecuta código, resuelve credenciales, accede a red ni entrega contenido no relevante al modelo",
+          "Los tests contractuales cubren OpenAPI, fuente derivada, combinación, conflicto, procedencia, confianza, contexto insuficiente y compatibilidad del planificador"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 22,
+        "name": "go-backend-inspector",
+        "title": "Inspector estático de backends Go",
+        "sdd": true,
+        "acceptance": [
+          "El inspector analiza una revisión local autorizada de un backend Go y produce un OperationCatalog derivado sin ejecutar el programa, tests, generadores ni scripts del repositorio",
+          "La primera versión reconoce registros de rutas soportados de net/http y Chi con método, path, handler y composición estática de grupos o prefijos",
+          "Cuando el código lo permite, el inspector deriva parámetros de path y query, tipos de request body, respuestas explícitas y middleware de autenticación sin inventar información ausente",
+          "Cada elemento derivado conserva archivo, línea, símbolo, framework, revisión y confianza mediante ubicaciones relativas y seguras",
+          "Rutas, prefijos, reflection, registros o schemas construidos dinámicamente se marcan como parciales o no resolubles y generan diagnósticos acotados",
+          "El análisis utiliza parsing, AST e información de tipos bajo límites de archivos, bytes, profundidad y duración, sin abrir red ni resolver dependencias no disponibles mediante ejecución",
+          "Los cambios de una pull request pueden limitar el análisis o destacar operaciones afectadas, pero no ocultan dependencias estáticas necesarias para resolver rutas y tipos",
+          "Errores de sintaxis, paquetes incompletos y construcciones no soportadas producen resultados parciales identificados o contexto insuficiente, nunca operaciones fabricadas",
+          "Los tests usan repositorios fixture locales y cubren net/http, Chi, prefijos, parámetros, bodies, middleware, rutas dinámicas, errores, límites y ausencia de ejecución"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 23,
+        "name": "spring-boot-backend-inspector",
+        "title": "Inspector estático de backends Spring Boot",
+        "sdd": true,
+        "acceptance": [
+          "El inspector analiza una revisión local autorizada de un backend Spring Boot Java y produce un OperationCatalog derivado sin ejecutar Maven, Gradle, annotation processors, tests ni la aplicación",
+          "Reconoce controllers y combinaciones estáticas de RequestMapping, GetMapping, PostMapping, PutMapping, PatchMapping y DeleteMapping a nivel de clase y método",
+          "Deriva cuando es posible PathVariable, RequestParam, RequestHeader, RequestBody, tipos Java, content types, ResponseStatus y respuestas expresadas mediante ResponseEntity",
+          "Detecta la presencia y procedencia de restricciones declarativas de seguridad soportadas como PreAuthorize, Secured y RolesAllowed sin afirmar semánticas de autorización que no pueda demostrar",
+          "Cada operación y campo conserva archivo, línea, clase, método, annotation, revisión y confianza mediante ubicaciones relativas y seguras",
+          "Valores calculados, mappings condicionales, configuración externa, reflection, filtros dinámicos y schemas no resolubles se marcan como parciales y no se inventan",
+          "El análisis de source sets y tipos está limitado en tamaño, profundidad y duración y no descarga dependencias ni interpreta instrucciones incluidas en comentarios o recursos",
+          "Errores de sintaxis, clases incompletas y annotations no soportadas producen diagnósticos acotados, resultados parciales o contexto insuficiente sin bloquear operaciones independientes válidas",
+          "Los tests usan proyectos Spring Boot fixture y cubren mappings, prefijos, parámetros, DTOs, respuestas, seguridad, constantes, construcciones dinámicas, errores y ausencia de ejecución"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 24,
+        "name": "generated-contract-review",
+        "title": "Revisión y exportación de contratos derivados",
+        "sdd": true,
+        "acceptance": [
+          "FeatureProof genera un artefacto de revisión versionado que muestra las operaciones derivadas, su procedencia, confianza, campos parciales y conflictos antes de tratarlas como contrato aprobado",
+          "La revisión compara el catálogo derivado con una OpenAPI o baseline aprobada y clasifica operaciones, parámetros, schemas, respuestas y seguridad como añadidos, modificados, eliminados o inciertos",
+          "Un usuario puede aprobar o rechazar el catálogo completo o decisiones explícitamente identificadas sin editar directamente artefactos internos ni convertir inferencias silenciosamente en hechos",
+          "La aprobación registra actor, instante, repositorio, commit, versiones de analizadores y digests del catálogo y fuentes revisadas",
+          "Cualquier cambio de revisión, fuente, analyzer, decisión o catálogo invalida la aprobación anterior antes de utilizar el contrato en una nueva validación",
+          "El catálogo aprobado puede exportarse de forma explícita y atómica como OpenAPI 3.1 con extensiones FeatureProof de procedencia, confianza y completitud",
+          "La exportación nunca sobrescribe una OpenAPI existente sin una ruta y confirmación explícitas y declara cualquier comportamiento que no haya podido representar",
+          "Un contrato derivado no aprobado solo puede utilizarse para propuesta o análisis cuando la política lo permita y no sirve como única prueba determinista de conformidad",
+          "Los tests cubren diff, conflicto, aprobación, rechazo, invalidación, exportación OpenAPI, escritura atómica, contrato parcial y ausencia de secretos"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 25,
+        "name": "test-identities",
+        "title": "Identidades seguras de prueba",
+        "sdd": true,
+        "acceptance": [
+          "La specification puede declarar identidades de prueba con identificadores únicos y referencias opacas a su fuente de credenciales, sin contener tokens ni secretos en texto claro",
+          "Cada operación que requiera autenticación selecciona explícitamente una identidad declarada y no puede inventar nombres, credenciales ni mecanismos de autenticación",
+          "Las credenciales se resuelven durante la composición o justo antes del transporte autorizado y nunca se entregan al modelo, al plan, al journal ni al paquete de evidencias",
+          "El modelo recibe únicamente descriptores no secretos de las identidades y las operaciones para las que están autorizadas",
+          "La inyección de credenciales se realiza después de validar plan, identidad, operación, target y política, y solo el transporte HTTP autorizado observa su valor",
+          "Headers, cookies, bodies, errores y metadatos relacionados con autenticación se redactan antes de persistirse, registrarse o enviarse al modelo",
+          "Una identidad desconocida, no autorizada, sin credencial, expirada o incompatible detiene el paso sin abrir una conexión y no se clasifica como fallo funcional de la feature",
+          "Los tests usan secretos canario y cubren selección, aislamiento entre identidades, credencial ausente, redacción, cancelación y prohibición de exposición al modelo"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 26,
+        "name": "fixture-api",
+        "title": "Preparación y limpieza de fixtures mediante API",
+        "sdd": true,
+        "acceptance": [
+          "La specification puede declarar fixtures con operaciones HTTP de create y cleanup autorizadas, identificadas y vinculadas a un target y contrato conocidos",
+          "La preparación y limpieza utilizan exclusivamente la herramienta HTTP controlada y no conceden acceso directo a bases de datos, shells, SDKs cloud ni URLs arbitrarias",
+          "Una operación de create puede capturar outputs tipados y limitados para que pasos posteriores y cleanup los referencien explícitamente",
+          "Cada operación de fixture selecciona una identidad de prueba autorizada y sus credenciales permanecen fuera del modelo, plan y evidencias",
+          "Los fixtures se preparan respetando dependencias y se limpian en orden inverso incluso tras fallo funcional, resultado inconclusive, cancelación o error operativo",
+          "Cleanup utiliza un contexto propio, finito y auditable, con idempotencia y retries acotados que no ocultan el resultado principal del run",
+          "Un fallo de preparación impide ejecutar escenarios dependientes y un fallo de cleanup queda registrado como incidencia operativa sin fabricar un veredicto funcional",
+          "Los tests cubren create, referencias de outputs, varias identidades, limpieza correcta, fallo intermedio, cancelación, retry, cleanup parcial y ausencia de secretos"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 27,
+        "name": "functional-flow-validation",
+        "title": "Validación de flujos funcionales reales",
+        "sdd": true,
+        "acceptance": [
+          "FeatureProof puede ejecutar un flujo completo generado o proporcionado que combina fixtures, identidades, operaciones de negocio, assertions y comprobaciones de estado final",
+          "El flujo se representa como un plan de dependencias validado y cada paso referencia una restricción, identidad, operación y evidencia requerida existentes",
+          "Los outputs de preparación y de pasos anteriores solo se consumen mediante referencias explícitas y tipadas validadas antes de ejecutar",
+          "El mismo recurso puede observarse antes y después de una acción para comprobar efectos secundarios, ausencia de mutación y estado final",
+          "Las assertions deterministas calculan el resultado de cada restricción y el agente no puede alterar un fallo observado mediante una conclusión textual",
+          "El ejecutor aplica por paso las políticas, presupuestos, target autorizado e identidad seleccionada sin exponer credenciales al modelo",
+          "La limpieza de fixtures se intenta siempre y queda separada del veredicto funcional, incluso cuando el flujo falla, se cancela o se replantea",
+          "El informe reconstruye el orden completo de preparación, acciones, observaciones, assertions y limpieza con sus referencias de evidencia",
+          "Los tests cubren un flujo positivo, autorización entre dos usuarios, estado posterior, fallo funcional, dependencia bloqueada, cancelación y limpieza garantizada"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 28,
+        "name": "validated-project-memory",
+        "title": "Memoria de proyecto validada y versionada",
+        "sdd": true,
+        "acceptance": [
+          "FeatureProof representa recuerdos mediante un contrato versionado y tipado con ID, scope, clase, estado, procedencia, autoridad, confianza, sensibilidad, validez y referencias de evidencia",
+          "La memoria distingue los scopes run, revisión y proyecto y ningún recuerdo se aplica fuera de su proyecto, revisión compatible o periodo de validez",
+          "Los estados proposed, observed, approved, invalidated, superseded y expired tienen transiciones explícitas y solo configuración confiable o una decisión humana autorizada puede producir memoria approved",
+          "El agente puede consultar recuerdos autorizados y proponer nuevos candidatos, pero no puede aprobarlos, ampliar su scope, elevar su autoridad ni invalidar otros por iniciativa propia",
+          "Cada recuerdo conserva la fuente exacta, actor, instante, commit o digest de configuración aplicable y evidencias que permiten revisar por qué fue creado",
+          "La primera implementación usa un MemoryStore propio con adapter local bajo .featureproof/memory, journal append-only, snapshots íntegros y publicaciones atómicas sin acoplar el dominio al filesystem",
+          "Invalidar, expirar o sustituir un recuerdo añade eventos auditables y nunca reescribe retroactivamente la memoria utilizada por runs anteriores",
+          "Tokens, cookies, credenciales, variables sensibles, bodies sin redactar, prompts completos y chain of thought se rechazan antes de persistirse o indexarse",
+          "Escrituras concurrentes, retries, cancelación y reinicio preservan idempotencia, CAS, orden de eventos e integridad sin aceptar archivos manipulados, symlinks ni paths fuera del root autorizado",
+          "Los tests cubren propuesta, aprobación, invalidación, sustitución, scope, memoria obsoleta, concurrencia, recovery, corrupción, memory poisoning y secretos canario"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 29,
+        "name": "context-assembly",
+        "title": "Ensamblado seguro de contexto para agentes",
+        "sdd": true,
+        "acceptance": [
+          "Un ContextAssembler construye para cada rol agéntico una proyección mínima a partir de restricciones, contrato, diff, configuración, memoria validada, historial y evidencias permitidas",
+          "La selección filtra primero de forma determinista por proyecto, scope, revisión, estado, autoridad, validez, sensibilidad y capacidad del agente antes de aplicar cualquier ranking semántico",
+          "Cada elemento incluido conserva su ID, procedencia, autoridad y referencia segura y el contexto declara fuentes truncadas, omitidas, contradictorias o insuficientes",
+          "Instrucciones confiables, configuración aprobada y datos no confiables procedentes de código, diffs, logs, respuestas o documentos viajan en secciones separadas que el modelo no puede reclasificar",
+          "El ensamblado respeta presupuestos explícitos de elementos, bytes y tokens mediante un orden estable y truncado por unidades completas sin incluir secretos ni contenido sin redactar",
+          "Planificador, analizador y diagnóstico reciben proyecciones diferentes y ningún agente obtiene automáticamente toda la memoria, evidencias completas, credenciales o capacidades ejecutables",
+          "Un índice vectorial puede ordenar candidatos previamente autorizados, pero es derivado y reconstruible, no concede autoridad y nunca sustituye los filtros estructurales ni al MemoryStore",
+          "El snapshot final posee versión y digest canónico y queda vinculado al run, revisión, configuración y plan para detectar contexto obsoleto antes de aprobar o ejecutar",
+          "El journal registra IDs y motivos seguros de inclusión u omisión sin guardar el prompt completo, secretos, chain of thought ni contenido externo innecesario",
+          "Los tests cubren selección por rol, presupuesto, orden estable, memoria obsoleta, scopes incompatibles, contradicción, prompt injection, ranking opcional, invalidación y ausencia de secretos"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 30,
+        "name": "github-pull-request-context",
+        "title": "Contexto acotado de pull requests de GitHub",
+        "sdd": true,
+        "acceptance": [
+          "Bajo una solicitud de validación autorizada, FeatureProof obtiene de GitHub el título, descripción, head commit, archivos modificados y diff acotado de la pull request",
+          "El contexto queda vinculado al head OID completo y se invalida si la pull request cambia antes de generar, aprobar o ejecutar el plan",
+          "Las restricciones solo se extraen de una sección o referencia versionada y explícitamente configurada, y el resto del texto de la pull request se trata como datos no confiables",
+          "Los archivos y fragmentos de diff se limitan por cantidad, tamaño y tipos autorizados, declarando de forma explícita cualquier contenido omitido",
+          "La selección de contratos OpenAPI afectados se deriva de rutas configuradas y cambios observados sin ejecutar código, hacer checkout ni obedecer instrucciones incluidas en el diff",
+          "Solo el contexto mínimo relevante se entrega al planificador y nunca se incluyen credenciales, patches binarios, contenido fuera del repositorio autorizado ni payloads completos de GitHub",
+          "Retries, rate limits, paginación, cancelación y respuestas inciertas se resuelven de forma acotada e idempotente",
+          "Los tests usan un GitHub falso y cubren contexto válido, truncado, cambio de head, diff malicioso, contrato afectado, paginación, rate limit y ausencia de secretos"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 31,
+        "name": "environment-provider",
+        "title": "Abstracción de obtención de entornos",
+        "sdd": true,
+        "acceptance": [
+          "El flujo de validación obtiene un ValidationTarget mediante una interfaz propia sin conocer si procede de una URL existente, un preview reservado o infraestructura gestionada",
+          "La selección del provider y de una plantilla o referencia autorizada es explícita, pertenece a la configuración confiable y no puede proceder del modelo",
+          "ExistingURLProvider adapta los previews existentes de la feature 19 sin modificar su contrato no destructivo ni duplicar sus reglas de atestación y red",
+          "Los providers gestionados pueden adquirir y liberar un entorno mediante un lifecycle acotado, pero el harness solo recibe el target, identidad, revisión, capacidades y handle opaco de lifecycle",
+          "Todo target se vincula a repositorio, commit, entorno y atestación antes de ejecutar y vuelve a pasar por la política de red existente",
+          "Credenciales y APIs del proveedor quedan confinadas al adapter concreto y no aparecen en modelos internos, planes, eventos, evidencias ni reportes",
+          "Fallo, cancelación o timeout durante adquisición o liberación producen estados operativos tipados y nunca un fallo funcional de la aplicación",
+          "Los tests contractuales ejecutan los mismos casos de selección, adquisición, readiness, binding, cancelación y liberación contra providers falsos existentes y gestionados"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 32,
+        "name": "kubernetes-environment",
+        "title": "Entornos efímeros sobre Kubernetes",
+        "sdd": true,
+        "acceptance": [
+          "Un KubernetesProvider autorizado puede crear bajo demanda un namespace aislado por run a partir de una plantilla versionada y una imagen identificada de forma inmutable",
+          "El modelo y el solicitante no pueden aportar manifests arbitrarios, comandos, service accounts, volúmenes, namespaces ni configuraciones fuera de los parámetros permitidos por la plantilla",
+          "El entorno aplica límites de CPU y memoria, quota, seguridad y conectividad definidos por la política del proyecto antes de ejecutar workloads",
+          "El provider espera readiness de workloads y servicios dentro de presupuestos finitos y solo devuelve un ValidationTarget tras verificar endpoint, entorno, repositorio y revisión desplegada",
+          "Los secretos se resuelven en composición y se entregan únicamente a Kubernetes o al transporte autorizado, sin exponerse al modelo ni persistirse en evidencias",
+          "Cada entorno incorpora owner, run ID, proyecto, instante de expiración y TTL verificables para permitir recuperación y limpieza independiente",
+          "Un fallo de despliegue, readiness, policy, quota o atestación termina como incidencia operativa y no como fallo de la feature validada",
+          "Cancelar o finalizar el run registra una intención durable de limpieza aunque el proceso principal se interrumpa",
+          "Los tests usan un cliente Kubernetes falso o un entorno hermético controlado y cubren creación, aislamiento, límites, readiness, timeout, cancelación, atestación y secretos"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 33,
+        "name": "kubernetes-validation-tool",
+        "title": "Herramienta de validación operativa de Kubernetes",
+        "sdd": true,
+        "acceptance": [
+          "Existe una herramienta de solo lectura que observa exclusivamente el namespace y los recursos asociados al entorno del run actual",
+          "La herramienta puede comprobar disponibilidad de Deployments, réplicas preparadas, reinicios de Pods, estado de Jobs, Services, Endpoints, eventos y conectividad declarada entre servicios",
+          "Cada comprobación utiliza operaciones permitidas y selectores derivados del entorno autorizado, nunca nombres, namespaces o queries arbitrarias propuestas por el modelo",
+          "La identidad Kubernetes utiliza permisos mínimos de lectura y no puede crear, modificar, borrar, escalar, ejecutar comandos en Pods ni leer Secrets",
+          "Los resultados se normalizan, limitan y redactan antes de convertirse en evidencia o contexto para el agente",
+          "Las condiciones operativas se evalúan mediante assertions deterministas y distinguen incumplimiento, evidencia insuficiente, recurso ausente y error de acceso",
+          "Timeout, cancelación, paginación y cambios concurrentes del cluster se manejan de forma acotada y se registra la versión observada cuando está disponible",
+          "Los tests usan un API server falso y cubren cada recurso soportado, aislamiento de namespace, permisos denegados, truncado, cancelación y ausencia de secretos"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 34,
+        "name": "environment-cleanup-controller",
+        "title": "Controlador durable de limpieza de entornos",
+        "sdd": true,
+        "acceptance": [
+          "Un controlador independiente reconcilia periódicamente entornos gestionados activos, finalizados, cancelados, expirados o huérfanos hasta confirmar su limpieza",
+          "Cada entorno posee una identidad, owner, proyecto, run, TTL y estado durable suficientes para recuperar la limpieza tras reinicios o pérdida del proceso principal",
+          "La limpieza es idempotente y utiliza retries acotados, backoff y clasificación de errores sin eliminar recursos que no pertenezcan inequívocamente a FeatureProof",
+          "Finalización correcta, fallo funcional, error operativo, cancelación y expiración generan una intención durable de limpieza",
+          "Los límites por equipo impiden superar entornos simultáneos, recursos acumulados y TTL máximo antes de adquirir nueva capacidad",
+          "Un fallo de limpieza queda visible y auditable, puede reintentarse y no transforma retroactivamente el veredicto funcional del run",
+          "Dos controladores concurrentes coordinan ownership mediante leases o CAS y no limpian dos veces ni pierden un entorno entre handoffs",
+          "Los tests usan reloj y provider falsos para cubrir TTL, restart, cancelación, huérfano, retry, conflicto de ownership, límites y convergencia"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 35,
+        "name": "persistent-control-plane",
+        "title": "Control plane persistente y distribuible",
+        "sdd": true,
+        "acceptance": [
+          "Runs, eventos, aprobaciones, bindings, trabajos, paquetes, entornos y relaciones de corrección se almacenan en PostgreSQL mediante contratos propios y migraciones versionadas",
+          "La fuente de verdad persistente conserva las invariantes append-only, CAS, idempotencia e integridad existentes aunque API y workers se reinicien",
+          "Una cola durable entrega trabajos a workers autorizados con leases, heartbeats, reintentos acotados y recuperación de ejecuciones abandonadas",
+          "La recepción de webhooks y solicitudes externas confirma trabajo solo después de persistir su identidad e intención idempotente",
+          "Los workers no reciben más secretos, targets ni autoridad que los necesarios para la fase y proyecto asignados",
+          "Cancelación, shutdown y pérdida de un worker convergen a un estado durable sin duplicar herramientas, publicaciones ni limpieza",
+          "El almacenamiento local continúa disponible para ejecución de desarrollo o se migra mediante una frontera explícita sin mezclar ambos modos en un mismo run",
+          "Los tests de integración cubren migraciones, concurrencia, restart, redelivery, lease expirada, cancelación, recuperación e idempotencia con PostgreSQL y workers controlados"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 36,
+        "name": "project-configuration",
+        "title": "Configuración versionada por proyecto",
+        "sdd": true,
+        "acceptance": [
+          "Cada repositorio autorizado puede asociarse a una configuración versionada que define contratos OpenAPI, providers de entorno, identidades, fixtures, límites, aprobación y retención",
+          "La configuración se valida de forma estructural y semántica antes de activarse y sus referencias a recursos, perfiles y políticas deben existir y ser compatibles",
+          "Los secretos se representan solo mediante referencias opacas y se resuelven fuera del dominio; exportar o consultar la configuración nunca devuelve sus valores",
+          "Cada run queda vinculado a una versión o digest inmutable de configuración y los cambios posteriores no alteran ejecuciones anteriores",
+          "Las actualizaciones se autorizan, auditan y publican de forma atómica, con historial y posibilidad de volver a una versión anterior válida",
+          "La configuración efectiva aplica defaults organizativos explícitos sin permitir que un proyecto amplíe permisos o límites que la organización restringe",
+          "Una configuración ausente, inválida, obsoleta o incompatible impide admitir nuevo trabajo sin afectar runs ya vinculados",
+          "Los tests cubren carga, validación cruzada, versionado, rollback, concurrencia, herencia de políticas, referencias secretas y binding a runs"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 37,
+        "name": "tenant-security",
+        "title": "Seguridad y aislamiento multi-tenant",
+        "sdd": true,
+        "acceptance": [
+          "El sistema representa organizaciones, proyectos, miembros e identidades de servicio con relaciones explícitas y ninguna identidad obtiene acceso por conocer un ID opaco",
+          "RBAC autoriza cada operación sobre runs, configuración, evidencias, entornos, credenciales y administración dentro del tenant correcto",
+          "Datos, colas, caches, objetos, logs, métricas y ejecuciones quedan aislados por tenant y proyecto mediante controles verificables en cada frontera",
+          "Credenciales y datos sensibles se cifran en tránsito y reposo, se resuelven con mínimo privilegio y admiten rotación y revocación sin exponer su valor",
+          "Las acciones sensibles generan auditoría inmutable con actor, tenant, proyecto, recurso, instante y resultado sin registrar secretos",
+          "Las políticas de retención y eliminación permiten expirar runs, paquetes y datos de proyecto sin romper la integridad de registros que deban conservarse",
+          "Rate limits, cuotas y presupuestos se aplican por tenant y proyecto antes de reservar workers, modelos o infraestructura",
+          "Los tests adversariales cubren acceso cruzado, escalada de rol, IDs manipulados, caches compartidas, rotación, eliminación, auditoría y aislamiento concurrente"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 38,
+        "name": "execution-history",
+        "title": "Historial y comparación de validaciones",
+        "sdd": true,
+        "acceptance": [
+          "Los usuarios autorizados pueden consultar ejecuciones anteriores filtradas por organización, proyecto, repositorio, pull request, commit, feature, resultado y periodo",
+          "Cada entrada muestra revisión, entorno, restricciones, plan aprobado, resultado, duración, evidencias y relaciones con correcciones sin exponer secretos",
+          "El sistema compara dos commits o runs y distingue restricciones corregidas, persistentes, nuevas, retiradas e inconclusive",
+          "Las estadísticas agregadas identifican restricciones que fallan frecuentemente, duración, estabilidad y uso del modelo sin utilizar conclusiones textuales como fuente de verdad",
+          "Tokens, llamadas y duración se muestran siempre que existan; el coste monetario solo se muestra cuando el proveedor entrega o la configuración define datos verificables y nunca se estima con precios embebidos en el core",
+          "Paginación, orden y cursores son estables y las consultas respetan aislamiento, RBAC, retención y límites de tamaño",
+          "Las referencias de evidencia se resuelven mediante el lector verificado de paquetes y un artefacto ausente o expirado se indica sin alterar el resultado histórico",
+          "Los tests cubren filtros, paginación, comparación, agregados, coste opcional, retención, evidencia expirada y acceso cruzado denegado"
+        ],
+        "status": "pending"
+    },
+    {
+        "id": 39,
+        "name": "validation-dashboard",
+        "title": "Panel web de validación",
+        "sdd": true,
+        "acceptance": [
+          "Un usuario autenticado puede seleccionar un proyecto autorizado y lanzar una validación bajo demanda con revisión, entorno y configuración explícitos",
+          "El panel muestra el plan pendiente y permite aprobarlo, rechazarlo o solicitar regeneración aplicando las mismas reglas, hashes y auditoría del workflow existente",
+          "Durante una ejecución el usuario puede observar estados y eventos seguros, actualizar la vista y cancelar sin iniciar trabajo duplicado",
+          "La vista final presenta restricciones passed, failed e inconclusive, hechos observados, plan ejecutado, duración, commit y enlaces autorizados a evidencias",
+          "El panel permite consultar el historial y comparar ejecuciones sin leer directamente stores, rutas locales ni payloads internos",
+          "La administración de proyecto permite gestionar configuración no secreta y referencias opacas respetando RBAC, versionado y auditoría",
+          "Toda mutación usa protección CSRF, idempotencia y autorización server-side; ningún dato del navegador amplía targets, permisos o credenciales",
+          "Los tests cubren lanzamiento, aprobación, regeneración, seguimiento, cancelación, historial, configuración, estados vacíos, errores y aislamiento entre tenants"
+        ],
         "status": "pending"
     }
   ]

@@ -85,3 +85,11 @@ func PrepareAdditional(ctx context.Context, request GenerationRequest, checks []
 	}
 	return PreparedPlan{id: snapshot.PlanID, checks: prepared, provenance: provenance}, nil
 }
+
+// RestorePrepared revalidates a private snapshot through every registry, assertion, policy and provenance gate.
+func RestorePrepared(ctx context.Context, request GenerationRequest, snapshot PreparedSnapshot, assertions AssertionValidator, policy GenerationPolicy) (PreparedPlan, error) {
+	if snapshot.ID == "" || snapshot.ID != request.PlanID {
+		return PreparedPlan{}, typedError(CategoryInvalidInput, "restore_prepared", "plan_id", nil)
+	}
+	return PrepareAdditional(ctx, request, snapshot.Checks, assertions, policy)
+}

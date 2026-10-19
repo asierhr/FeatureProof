@@ -287,6 +287,17 @@ func (c *Coordinator) run(ctx context.Context, a Association) {
 			return
 		}
 		if run.Outcome != "" {
+			if a.BindingSHA256 == "" && run.BindingSHA256 != "" {
+				prior := a.VersionCAS
+				a, statusErr = BindAssociationRun(a, run)
+				if statusErr != nil {
+					return
+				}
+				a, statusErr = c.deps.Store.UpdateAssociation(runCtx, a, prior)
+				if statusErr != nil {
+					return
+				}
+			}
 			c.publishTerminal(runCtx, a, run)
 			return
 		}

@@ -204,6 +204,7 @@ type Association struct {
 	RunHandle       string              `json:"run_handle,omitempty"`
 	PackageRunID    string              `json:"package_run_id,omitempty"`
 	BindingSHA256   string              `json:"binding_sha256,omitempty"`
+	Provisional     bool                `json:"provisional,omitempty"`
 	Lifecycle       string              `json:"lifecycle"`
 	ExternalCheckID string              `json:"external_check_id"`
 	CheckID         int64               `json:"check_id,omitempty"`
@@ -225,10 +226,13 @@ func NewAssociation(id, deliveryID, alias string, commandActorID int64, snapshot
 
 // BindAssociationRun verifies exact run lineage and derives the check identity from the stable run tuple.
 func BindAssociationRun(association Association, run RunState) (Association, error) {
-	if run.RunHandle == "" || run.PackageRunID == "" || run.BindingRunID != run.PackageRunID || run.BindingSHA256 == "" || run.RepositoryID != association.Snapshot.RepositoryID || run.HeadOID != association.Snapshot.HeadOID {
+	operational := run.Outcome == "error" || run.Outcome == "cancelled" || run.Outcome == "inconclusive"
+	provisional := (run.Phase == "running" || operational) && run.PackageRunID == "" && run.BindingRunID == "" && run.BindingSHA256 == ""
+	complete := run.PackageRunID != "" && run.BindingRunID == run.PackageRunID && run.BindingSHA256 != ""
+	if run.RunHandle == "" || (!provisional && !complete) || run.RepositoryID != association.Snapshot.RepositoryID || run.HeadOID != association.Snapshot.HeadOID {
 		return Association{}, &Error{Code: CodeIntegrity, Operation: "run_binding"}
 	}
-	association.RunHandle, association.PackageRunID, association.BindingSHA256 = run.RunHandle, run.PackageRunID, run.BindingSHA256
+	association.RunHandle, association.PackageRunID, association.BindingSHA256, association.Provisional = run.RunHandle, run.PackageRunID, run.BindingSHA256, provisional
 	association.ExternalCheckID = deriveExternalCheckID(association.Snapshot, run.RunHandle)
 	return SealAssociation(association)
 }
@@ -241,9 +245,10 @@ func deriveExternalCheckID(snapshot PullRequestSnapshot, runHandle string) strin
 
 // SealAssociation fingerprints every durable identity and owned publication ID before commit.
 func SealAssociation(association Association) (Association, error) {
-	emptyLineage := association.RunHandle == "" && association.PackageRunID == "" && association.BindingSHA256 == "" && association.ExternalCheckID == ""
-	completeLineage := association.RunHandle != "" && association.PackageRunID != "" && association.BindingSHA256 != "" && association.ExternalCheckID == deriveExternalCheckID(association.Snapshot, association.RunHandle)
-	if association.Version != SchemaVersion || !safeName.MatchString(association.ID) || !safeName.MatchString(association.DeliveryID) || association.CommandActorID <= 0 || VerifySnapshot(association.Snapshot) != nil || (!emptyLineage && !completeLineage) {
+	emptyLineage := association.RunHandle == "" && association.PackageRunID == "" && association.BindingSHA256 == "" && association.ExternalCheckID == "" && !association.Provisional
+	provisionalLineage := association.RunHandle != "" && association.PackageRunID == "" && association.BindingSHA256 == "" && association.ExternalCheckID == deriveExternalCheckID(association.Snapshot, association.RunHandle) && association.Provisional
+	completeLineage := association.RunHandle != "" && association.PackageRunID != "" && association.BindingSHA256 != "" && association.ExternalCheckID == deriveExternalCheckID(association.Snapshot, association.RunHandle) && !association.Provisional
+	if association.Version != SchemaVersion || !safeName.MatchString(association.ID) || !safeName.MatchString(association.DeliveryID) || association.CommandActorID <= 0 || VerifySnapshot(association.Snapshot) != nil || (!emptyLineage && !provisionalLineage && !completeLineage) {
 		return Association{}, &Error{Code: CodeIntegrity, Operation: "association_seal"}
 	}
 	association.IntegritySHA256 = ""

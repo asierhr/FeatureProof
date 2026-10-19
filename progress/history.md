@@ -377,3 +377,62 @@ Bitácora append-only de features completadas.
   preexistente de symlink de feature 15, que Windows no puede crear sin el
   privilegio correspondiente; la suite comparable excluye solo ese caso y
   pasa.
+
+## 2026-10-17 — preview-environment-adapter
+
+- Estado final: `done`.
+- Resultado: lifecycle provider-neutral para seleccionar y reservar previews
+  existentes, atestar repository/commit, autorizar el target, esperar
+  readiness, ejecutar la validación compartida y liberar la reserva sin crear,
+  modificar ni destruir infraestructura.
+- Spec aprobada por el usuario el `2026-10-17T18:03:28+02:00`.
+- Tasks T1–T12 completas; R1–R11 trazados a pruebas concretas en
+  `progress/preview-environment-adapter/implementation.md`.
+- Integración: CLI, MCP y GitHub componen el mismo coordinator cuando existe
+  configuración explícita y fallan cerrados cuando falta. El handoff queda
+  durable antes del ACK y los terminales operacionales conservan su categoría.
+- Seguridad: target y policy forman parte del binding; los secretos se
+  resuelven únicamente para la selección autorizada y no entran en core,
+  journal, harness, evidencias ni telemetría.
+- Durabilidad: intención, handoff, owner, lease, CAS, reconcile, release pending
+  y recovery multiproceso convergen con claves estables y sin repetir runs
+  funcionales confirmados.
+- Review independiente aprobada en la sexta revisión tras cerrar REV-1–REV-21.
+  Pasan regresiones repetidas hasta ×1000, paquetes afectados ×20, race,
+  suite global comparable, vet, compile-only, módulos, diff y builds
+  Windows/Linux/macOS.
+- Coverage: `internal/previewenv` 85,4 %, `internal/githubpr` 85,1 % e
+  `internal/externalagent` 87,4 %.
+- Limitación del host: `go test ./...` conserva únicamente el subtest
+  preexistente de symlink de feature 15 que Windows no puede crear sin el
+  privilegio correspondiente; suite y race comparables excluyen solo ese
+  paquete y pasan.
+
+## 2026-10-19 — validation-workflow-orchestration
+
+- Estado final: `done`.
+- Resultado: flujo completo desde specification hasta planificación por agente,
+  aprobación exacta, ejecución con el runner compartido y publicación del
+  package verificable, sin exigir un `ValidationPlan` escrito manualmente.
+- Spec aprobada por el usuario el `2026-10-19T11:12:00+02:00`.
+- Tasks T1–T12 completas; R1–R13 trazados a pruebas concretas en
+  `progress/validation-workflow-orchestration/implementation.md`.
+- Integración: API Go, CLI `workflow`, MCP y GitHub comparten el mismo service,
+  store y modelo de estados. El comando histórico `validate --plan` conserva
+  su comportamiento y usa el mismo runner de validación.
+- Seguridad e integridad: `planapproval` autoriza el artefacto, contexto,
+  revisión y target exactos mediante un grant de un solo uso; el plan público
+  usa compromisos HMAC privados por workflow y el material ejecutable se sella
+  y se revalida antes de aprobación y tools.
+- Durabilidad: checkpoints atómicos, CAS, leases renovables, deadlines de
+  aprobación, intents de package/cleanup y recovery multiproceso evitan repetir
+  inferencia o efectos inciertos. Preview se restaura y libera mediante el
+  lifecycle de `previewenv`.
+- Review independiente aprobada en la quinta revisión tras cerrar REV-1–REV-14.
+  Pasan focales ×20, paquetes afectados ×10, race focal ×3, vet, compile-only,
+  módulos, diff y builds Windows/Linux/macOS.
+- Coverage: `internal/validationworkflow` 85,8 % e `internal/previewenv` 85,0 %.
+- Limitación del host: la suite global conserva únicamente el subtest
+  preexistente de symlink de feature 15 que Windows no puede crear sin el
+  privilegio correspondiente; suite y race comparables excluyen solo ese caso
+  y pasan.

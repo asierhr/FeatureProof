@@ -270,11 +270,26 @@ type PreparedPlan struct {
 	provenance string
 }
 
+// PreparedSnapshot is the private serializable proposal required to revalidate a prepared plan after restart.
+type PreparedSnapshot struct {
+	ID     string           `json:"id"`
+	Checks []CandidateCheck `json:"checks"`
+}
+
 // ID returns the caller-selected plan identifier.
 func (p PreparedPlan) ID() string { return p.id }
 
 // Checks returns isolated prepared entries without granting execution authority.
 func (p PreparedPlan) Checks() []PreparedCheck { return append([]PreparedCheck(nil), p.checks...) }
+
+// Snapshot returns isolated executable proposal values for storage behind a private composition boundary.
+func (p PreparedPlan) Snapshot() PreparedSnapshot {
+	checks := make([]CandidateCheck, len(p.checks))
+	for i := range p.checks {
+		checks[i] = cloneCheck(p.checks[i].check)
+	}
+	return PreparedSnapshot{ID: p.id, Checks: checks}
+}
 
 // ProvenanceInput is the non-executable generation context that an approval boundary may verify against a prepared plan.
 type ProvenanceInput struct {

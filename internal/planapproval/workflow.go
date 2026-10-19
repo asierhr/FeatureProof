@@ -96,7 +96,7 @@ func (w *ApprovalWorkflow) Stage(ctx context.Context, command StageCommand) (App
 	if err := ctx.Err(); err != nil {
 		return ApprovalView{}, contextFailure("stage", err)
 	}
-	if strings.TrimSpace(run.ID) == "" || run.Status() != harness.StatusPlanning || command.Plan.ID() == "" {
+	if strings.TrimSpace(run.ID) == "" || command.Plan.ID() == "" {
 		return ApprovalView{}, typedError(CategoryInvalidInput, "stage", "command", nil)
 	}
 	events, err := w.store.Events(ctx, run.ID)
@@ -106,6 +106,9 @@ func (w *ApprovalWorkflow) Stage(ctx context.Context, command StageCommand) (App
 	projection, err := Project(ctx, events, w.limits.MaxEvents)
 	if err != nil {
 		return ApprovalView{}, err
+	}
+	if run.Status() != harness.StatusPlanning {
+		return ApprovalView{}, typedError(CategoryInvalidState, "stage", "state", nil)
 	}
 	if projection.State != harness.StatusPlanning {
 		return ApprovalView{}, typedError(CategoryInvalidState, "stage", "state", nil)
@@ -169,6 +172,37 @@ func (w *ApprovalWorkflow) Stage(ctx context.Context, command StageCommand) (App
 		return ApprovalView{}, projectionErr
 	}
 	return cloneView(view), nil
+}
+
+// Restage confirms that an already staged request has exactly the supplied plan and context after recovery.
+func (w *ApprovalWorkflow) Restage(ctx context.Context, command StageCommand) (ApprovalView, error) {
+	run := w.lifecycle.run
+	if err := ctx.Err(); err != nil {
+		return ApprovalView{}, contextFailure("restage", err)
+	}
+	if strings.TrimSpace(run.ID) == "" || command.Plan.ID() == "" || run.Status() != harness.StatusAwaitingApproval {
+		return ApprovalView{}, typedError(CategoryInvalidState, "restage", "state", nil)
+	}
+	events, err := w.store.Events(ctx, run.ID)
+	if err != nil {
+		return ApprovalView{}, err
+	}
+	projection, err := Project(ctx, events, w.limits.MaxEvents)
+	if err != nil {
+		return ApprovalView{}, err
+	}
+	planHash, err := fingerprintPlan(ctx, command.Plan, w.limits)
+	if err != nil {
+		return ApprovalView{}, err
+	}
+	contextHashes, err := fingerprintContext(ctx, command.Context, w.limits)
+	if err != nil {
+		return ApprovalView{}, err
+	}
+	if projection.State != harness.StatusAwaitingApproval || projection.PlanID != command.Plan.ID() || projection.PlanHash != planHash || projection.ContextHash != contextHashes.All {
+		return ApprovalView{}, typedError(CategoryStaleApproval, "restage", "binding", nil)
+	}
+	return w.View(ctx, run.ID)
 }
 
 // View returns the safe immutable projection for the currently awaiting revision.

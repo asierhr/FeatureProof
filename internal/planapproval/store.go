@@ -408,6 +408,48 @@ func (s *LocalStore) BindRun(run *harness.Run) (*runLifecycle, error) {
 	return s.backend.memory.BindRun(run)
 }
 
+// RestoreRun returns the exact shared aggregate identity, rebuilding its projected status after process restart.
+func (s *LocalStore) RestoreRun(ctx context.Context, runID string) (*harness.Run, error) {
+	if err := s.ensureLoaded(ctx, runID); err != nil {
+		return nil, err
+	}
+	s.backend.memory.mu.Lock()
+	owner := s.backend.memory.lifecycles[runID]
+	s.backend.memory.mu.Unlock()
+	if owner != nil {
+		return owner.run, nil
+	}
+	events, err := s.Events(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	projection, err := Project(ctx, events, 100000)
+	if err != nil {
+		return nil, err
+	}
+	run, err := harness.NewRun(runID, "recovered approval", "workflow", harness.Limits{MaxSteps: 1, MaxToolCalls: 1, MaxRetries: 1})
+	if err != nil {
+		return nil, typedError(CategoryIntegrityFailure, "restore_run", "run", nil)
+	}
+	if err = run.Transition(harness.StatusPlanning); err != nil {
+		return nil, err
+	}
+	if projection.State != harness.StatusPlanning {
+		if err = run.Transition(harness.StatusAwaitingApproval); err != nil {
+			return nil, err
+		}
+	}
+	if projection.State == harness.StatusExecuting {
+		if err = run.Transition(harness.StatusExecuting); err != nil {
+			return nil, err
+		}
+	}
+	if _, err = s.backend.memory.BindRun(run); err != nil {
+		return nil, err
+	}
+	return run, nil
+}
+
 // recoverJournalFiles restores a previously confirmed backup when publication was interrupted between pathname updates.
 func (s *LocalStore) recoverJournalFiles(path string) error {
 	backup := path + ".bak"

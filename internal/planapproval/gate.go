@@ -2,6 +2,8 @@ package planapproval
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/harness"
@@ -98,6 +100,15 @@ func (a *ExecutionAuthorization) Binding() (string, string, uint64, string, stri
 		return "", "", 0, "", ""
 	}
 	return a.runID, a.planID, a.revision, a.planHash, a.contextHash
+}
+
+// Reference returns a stable opaque identifier for binding the consumed grant into evidence packages.
+func (a *ExecutionAuthorization) Reference() string {
+	if a == nil || a.seal == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(a.runID + "\x00" + a.planID + "\x00" + a.decisionID))
+	return "approval:" + hex.EncodeToString(sum[:])[:32]
 }
 
 // PlanRunner is the existing deterministic executor boundary retained behind approval.

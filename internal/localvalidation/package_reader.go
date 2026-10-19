@@ -18,9 +18,10 @@ import (
 )
 
 type packagePlanDocument struct {
-	Version int             `json:"version"`
-	Runtime json.RawMessage `json:"runtime"`
-	Plans   []struct {
+	Version            int             `json:"version"`
+	PlanArtifactSHA256 string          `json:"plan_artifact_sha256,omitempty"`
+	Runtime            json.RawMessage `json:"runtime"`
+	Plans              []struct {
 		ID           string `json:"id"`
 		ConstraintID string `json:"constraint_id"`
 		Steps        []struct {

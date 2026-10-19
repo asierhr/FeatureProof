@@ -22,6 +22,13 @@ type blockingReleaseRegistry struct {
 	once    sync.Once
 }
 
+// cancelObservedRegistry signals after cancellation idempotency is durable and before the join completes.
+type cancelObservedRegistry struct {
+	*blockingReleaseRegistry
+	reserved chan struct{}
+	once     sync.Once
+}
+
 // finalizationRegistry exposes blocked and failed publication-event persistence to supervisor tests.
 type finalizationRegistry struct {
 	Registry
@@ -29,18 +36,23 @@ type finalizationRegistry struct {
 	fail     error
 	started  chan struct{}
 	returned chan struct{}
+	allow    chan struct{}
 	active   atomic.Int32
 }
 
-// MarkPublicationFailure observes the deadline and records when no persistence callback remains.
+// MarkPublicationFailure exposes a deterministic persistence barrier and records when no callback remains.
 func (r *finalizationRegistry) MarkPublicationFailure(ctx context.Context, _ string, _ time.Time) error {
 	r.active.Add(1)
 	defer r.active.Add(-1)
 	close(r.started)
 	defer close(r.returned)
 	if r.block {
-		<-ctx.Done()
-		return ctx.Err()
+		select {
+		case <-r.allow:
+			return context.DeadlineExceeded
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return r.fail
 }
@@ -50,6 +62,13 @@ func (r *blockingReleaseRegistry) ReleaseOwner(handle string) {
 	r.once.Do(func() { close(r.started) })
 	<-r.allow
 	r.Registry.ReleaseOwner(handle)
+}
+
+// ReserveCancel exposes the point after which Cancel waits only for local worker cleanup.
+func (r *cancelObservedRegistry) ReserveCancel(ctx context.Context, handle, keyHash, requestHash string) (RunRecord, bool, error) {
+	record, reserved, err := r.Registry.ReserveCancel(ctx, handle, keyHash, requestHash)
+	r.once.Do(func() { close(r.reserved) })
+	return record, reserved, err
 }
 
 // compileAdvertisedSchema creates an offline draft-2020 validator for discovery output.
@@ -247,8 +266,8 @@ func TestJoinWaitsForWorkerRemovalAndLeaseRelease(t *testing.T) {
 			service.supervisor.mu.Lock()
 			_, stillRegistered := service.supervisor.workers[view.RunHandle]
 			service.supervisor.mu.Unlock()
-			if stillRegistered {
-				t.Fatal("worker was not removed before lease cleanup")
+			if !stillRegistered {
+				t.Fatal("worker was removed before lease cleanup completed")
 			}
 			select {
 			case err := <-returned:
@@ -263,6 +282,97 @@ func TestJoinWaitsForWorkerRemovalAndLeaseRelease(t *testing.T) {
 	}
 }
 
+// TestCancelJoinsTerminalWorkerThroughLeaseRelease proves terminal observation cannot bypass local cleanup.
+func TestCancelJoinsTerminalWorkerThroughLeaseRelease(t *testing.T) {
+	local, err := NewLocalRegistry(filepath.Join(t.TempDir(), "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocking := &blockingReleaseRegistry{Registry: local, started: make(chan struct{}), allow: make(chan struct{})}
+	identity := &fixedIdentity{principal: Principal{ID: "alice", Scopes: allScopes()}}
+	service, err := NewService(ServiceDependencies{Identity: identity, Catalog: fixedCatalog{allowed: map[string]map[string]bool{"alice": {"safe": true}}}, Registry: blocking, Executor: &fakeExecutor{result: ExecutionResult{Status: OutcomePassed}}, Packages: fakePackages{}, Clock: fixedClock{now: time.Unix(2000, 0)}, IDs: &sequenceIDs{}, Owner: "terminal-cleanup-owner", Retention: time.Hour, RunTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := service.Submit(context.Background(), SubmitInput{SelectionAlias: "safe", IdempotencyKey: "terminal-cleanup-submit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-blocking.started
+	terminal, err := local.Get(context.Background(), view.RunHandle)
+	if err != nil || terminal.Phase != PhaseTerminal {
+		t.Fatalf("terminal=%#v err=%v", terminal, err)
+	}
+	returned := make(chan error, 1)
+	go func() {
+		_, cancelErr := service.Cancel(context.Background(), CancelInput{RunHandle: view.RunHandle, IdempotencyKey: "terminal-cleanup-cancel"})
+		returned <- cancelErr
+	}()
+	select {
+	case cancelErr := <-returned:
+		t.Fatalf("cancel returned before lease cleanup: %v", cancelErr)
+	default:
+	}
+	service.supervisor.mu.Lock()
+	_, registered := service.supervisor.workers[view.RunHandle]
+	service.supervisor.mu.Unlock()
+	if !registered {
+		t.Fatal("terminal worker was removed while its lease remained held")
+	}
+	close(blocking.allow)
+	if cancelErr := <-returned; cancelErr != nil {
+		t.Fatal(cancelErr)
+	}
+	release, acquired, lockErr := tryRegistryLock(local.ownerPath(view.RunHandle))
+	if lockErr != nil || !acquired {
+		t.Fatalf("lease remained held: acquired=%v err=%v", acquired, lockErr)
+	}
+	release()
+	service.supervisor.mu.Lock()
+	_, registered = service.supervisor.workers[view.RunHandle]
+	service.supervisor.mu.Unlock()
+	if registered {
+		t.Fatal("terminal worker remained registered after cleanup join")
+	}
+}
+
+// TestTerminalWorkerJoinHonorsCallerCancellation proves a blocked cleanup join remains context bounded.
+func TestTerminalWorkerJoinHonorsCallerCancellation(t *testing.T) {
+	local, err := NewLocalRegistry(filepath.Join(t.TempDir(), "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocking := &blockingReleaseRegistry{Registry: local, started: make(chan struct{}), allow: make(chan struct{})}
+	observed := &cancelObservedRegistry{blockingReleaseRegistry: blocking, reserved: make(chan struct{})}
+	identity := &fixedIdentity{principal: Principal{ID: "alice", Scopes: allScopes()}}
+	service, err := NewService(ServiceDependencies{Identity: identity, Catalog: fixedCatalog{allowed: map[string]map[string]bool{"alice": {"safe": true}}}, Registry: observed, Executor: &fakeExecutor{result: ExecutionResult{Status: OutcomePassed}}, Packages: fakePackages{}, Clock: fixedClock{now: time.Unix(2100, 0)}, IDs: &sequenceIDs{}, Owner: "bounded-terminal-owner", Retention: time.Hour, RunTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := service.Submit(context.Background(), SubmitInput{SelectionAlias: "safe", IdempotencyKey: "bounded-terminal-submit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-blocking.started
+	ctx, cancel := context.WithCancel(context.Background())
+	returned := make(chan error, 1)
+	go func() {
+		_, cancelErr := service.Cancel(ctx, CancelInput{RunHandle: view.RunHandle, IdempotencyKey: "bounded-terminal-cancel"})
+		returned <- cancelErr
+	}()
+	<-observed.reserved
+	cancel()
+	cancelErr := <-returned
+	var appErr *AppError
+	if !errors.As(cancelErr, &appErr) || appErr.Code != CodeInternal || !appErr.Retryable {
+		t.Fatalf("cancel error=%v", cancelErr)
+	}
+	close(blocking.allow)
+	if err := service.Wait(context.Background(), view.RunHandle); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestPublicationFailureFinalizationIsBoundedAndRecoverable closes REV-5 for every join surface.
 func TestPublicationFailureFinalizationIsBoundedAndRecoverable(t *testing.T) {
 	for _, mode := range []string{"blocked", "failed"} {
@@ -272,9 +382,9 @@ func TestPublicationFailureFinalizationIsBoundedAndRecoverable(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				wrapped := &finalizationRegistry{Registry: local, block: mode == "blocked", fail: errors.New("persist failed"), started: make(chan struct{}), returned: make(chan struct{})}
+				wrapped := &finalizationRegistry{Registry: local, block: mode == "blocked", fail: errors.New("persist failed"), started: make(chan struct{}), returned: make(chan struct{}), allow: make(chan struct{})}
 				identity := &fixedIdentity{principal: Principal{ID: "alice", Scopes: allScopes()}}
-				service, err := NewService(ServiceDependencies{Identity: identity, Catalog: fixedCatalog{allowed: map[string]map[string]bool{"alice": {"safe": true}}}, Registry: wrapped, Executor: &fakeExecutor{err: ErrPublicationFailed}, Packages: fakePackages{}, Clock: fixedClock{now: time.Unix(3000, 0).UTC()}, IDs: &sequenceIDs{}, Owner: "finalization-owner", Retention: time.Hour, RunTimeout: 40 * time.Millisecond})
+				service, err := NewService(ServiceDependencies{Identity: identity, Catalog: fixedCatalog{allowed: map[string]map[string]bool{"alice": {"safe": true}}}, Registry: wrapped, Executor: &fakeExecutor{err: ErrPublicationFailed}, Packages: fakePackages{}, Clock: fixedClock{now: time.Unix(3000, 0).UTC()}, IDs: &sequenceIDs{}, Owner: "finalization-owner", Retention: time.Hour, RunTimeout: time.Minute})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -295,18 +405,12 @@ func TestPublicationFailureFinalizationIsBoundedAndRecoverable(t *testing.T) {
 				case "close":
 					go func() { joined <- service.Close(context.Background()) }()
 				}
-				select {
-				case <-wrapped.returned:
-				case <-time.After(time.Second):
-					t.Fatal("publication persistence ignored its finalization deadline")
+				if mode == "blocked" {
+					close(wrapped.allow)
 				}
-				select {
-				case joinErr := <-joined:
-					if joinErr != nil {
-						t.Fatal(joinErr)
-					}
-				case <-time.After(time.Second):
-					t.Fatalf("%s did not join finalization", operation)
+				<-wrapped.returned
+				if joinErr := <-joined; joinErr != nil {
+					t.Fatal(joinErr)
 				}
 				if wrapped.active.Load() != 0 {
 					t.Fatal("publication persistence goroutine remained active")
@@ -326,18 +430,7 @@ func TestPublicationFailureFinalizationIsBoundedAndRecoverable(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if mode == "blocked" {
-					if record.Phase == PhaseTerminal {
-						t.Fatalf("deadline unexpectedly published terminal: %#v", record)
-					}
-					if err := local.Recover(context.Background(), "recovery-owner", time.Unix(3001, 0).UTC()); err != nil {
-						t.Fatal(err)
-					}
-					record, _ = local.Get(context.Background(), view.RunHandle)
-					if record.Phase != PhaseTerminal || record.Status != OutcomeError || record.Cause != "interrupted" {
-						t.Fatalf("unrecoverable snapshot: %#v", record)
-					}
-				} else if record.Phase != PhaseTerminal || record.Status != OutcomeError {
+				if record.Phase != PhaseTerminal || record.Status != OutcomeError {
 					t.Fatalf("failed marker did not continue safe terminal persistence: %#v", record)
 				}
 			})

@@ -155,7 +155,7 @@ func (p *Publisher) Publish(ctx context.Context, snapshot RunSnapshot, events []
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := p.writeJSON("plan.json", safeManifest(manifest)); err != nil {
+	if err := p.writeJSON("plan.json", safeManifest(manifest, snapshot.PlanArtifactSHA256, snapshot.PlanCommitmentKey)); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -369,45 +369,20 @@ func reportAssertions(values []planning.AssertionResult) []reportAssertion {
 }
 
 // safeManifest records explicit runtime and plan topology while excluding inputs and assertion values.
-func safeManifest(manifest planmanifest.Manifest) any {
-	type safeStep struct {
-		ID         string         `json:"id"`
-		Tool       string         `json:"tool"`
-		Input      map[string]any `json:"input"`
-		Assertions []any          `json:"assertions"`
-		DependsOn  []string       `json:"depends_on"`
-	}
-	type safePlan struct {
-		ID           string     `json:"id"`
-		ConstraintID string     `json:"constraint_id"`
-		Steps        []safeStep `json:"steps"`
-	}
-	plans := make([]safePlan, len(manifest.Plans))
-	for n, plan := range manifest.Plans {
-		plans[n] = safePlan{ID: plan.ID, ConstraintID: plan.ConstraintID, Steps: make([]safeStep, len(plan.Steps))}
-		for i, step := range plan.Steps {
-			input := make(map[string]any, len(step.Input))
-			for key, value := range step.Input {
-				input[key] = safeInputValue(value)
-			}
-			assertions := make([]any, len(step.Assertions))
-			for index, declaration := range step.Assertions {
-				assertions[index] = map[string]any{"id": declaration.ID, "definition": safeAssertionDefinition(declaration.Definition)}
-			}
-			plans[n].Steps[i] = safeStep{ID: step.ID, Tool: step.Tool, Input: input, Assertions: assertions, DependsOn: append([]string(nil), step.DependsOn...)}
-		}
-	}
+func safeManifest(manifest planmanifest.Manifest, artifactDigest string, commitmentKeys ...[]byte) any {
+	plans := ProjectPlans(manifest.Plans, commitmentKeys...)
 	return struct {
-		Version int `json:"version"`
-		Runtime struct {
+		Version            int    `json:"version"`
+		PlanArtifactSHA256 string `json:"plan_artifact_sha256,omitempty"`
+		Runtime            struct {
 			HTTP      planmanifest.HTTPConfig `json:"http"`
 			Redaction evidence.Config         `json:"redaction"`
 			Policy    struct {
 				AllowedTools []string `json:"allowed_tools"`
 			} `json:"policy"`
 		} `json:"runtime"`
-		Plans []safePlan `json:"plans"`
-	}{Version: manifest.Version, Runtime: struct {
+		Plans []PlanProjection `json:"plans"`
+	}{Version: manifest.Version, PlanArtifactSHA256: artifactDigest, Runtime: struct {
 		HTTP      planmanifest.HTTPConfig `json:"http"`
 		Redaction evidence.Config         `json:"redaction"`
 		Policy    struct {

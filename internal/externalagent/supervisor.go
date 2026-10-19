@@ -48,8 +48,8 @@ func (s *Supervisor) Start(record RunRecord, selection Selection) {
 // run executes transitions without retaining the supervisor mutex across callbacks or disk I/O.
 func (s *Supervisor) run(ctx context.Context, entry *worker, record RunRecord, selection Selection) {
 	defer func() {
-		s.finish(record.Handle, entry)
 		s.service.deps.Registry.ReleaseOwner(record.Handle)
+		s.finish(record.Handle, entry)
 		close(entry.done)
 	}()
 	defer entry.cancel()
