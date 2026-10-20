@@ -3,7 +3,9 @@ package validationworkflow
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"go/ast"
@@ -18,15 +20,16 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/localvalidation"
-	"github.com/asierhr/featureProof/internal/openapi"
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
@@ -217,6 +220,31 @@ type fakeModel struct {
 	calls int
 }
 
+// countingGenerationPort records any forbidden inference attempt after a pre-admission contract decision.
+type countingGenerationPort struct{ calls atomic.Int32 }
+
+// Generate fails the test boundary if admission incorrectly permits model inference.
+func (p *countingGenerationPort) Generate(context.Context, AdmissionSnapshot) (agentplanning.Result, ModelUsage, error) {
+	p.calls.Add(1)
+	return agentplanning.Result{}, ModelUsage{}, errors.New("generation should not run")
+}
+
+// admissionBuilderFunc adapts one test function to the side-effect-free admission port.
+type admissionBuilderFunc func(context.Context, StartCommand) (AdmissionSnapshot, error)
+
+// Build delegates a controlled pre-admission outcome.
+func (f admissionBuilderFunc) Build(ctx context.Context, command StartCommand) (AdmissionSnapshot, error) {
+	return f(ctx, command)
+}
+
+// contractReducerFunc adapts a closure into the neutral contract reducer port for authority-boundary tests.
+type contractReducerFunc func(context.Context, string, specification.Specification) (contractcatalog.ReducedContext, error)
+
+// Reduce delegates to the test closure while preserving the production port signature.
+func (f contractReducerFunc) Reduce(ctx context.Context, ref string, spec specification.Specification) (contractcatalog.ReducedContext, error) {
+	return f(ctx, ref, spec)
+}
+
 // Generate implements agentplanning.PlanningModel without network access.
 func (f *fakeModel) Generate(ctx context.Context, request agentplanning.StructuredRequest) (agentplanning.ModelResponse, error) {
 	if ctx.Err() != nil {
@@ -273,6 +301,22 @@ type blockingExecution struct {
 type blockingGeneration struct {
 	started chan struct{}
 	stopped chan struct{}
+}
+
+// driftingGeneration changes trusted contract authority only after a valid model result is produced.
+type driftingGeneration struct {
+	inner     GenerationPort
+	admission *fakeAdmission
+}
+
+// Generate simulates catalog drift during inference without adding wall-clock races.
+func (d driftingGeneration) Generate(ctx context.Context, snapshot AdmissionSnapshot) (agentplanning.Result, ModelUsage, error) {
+	result, usage, err := d.inner.Generate(ctx, snapshot)
+	d.admission.mu.Lock()
+	d.admission.snapshot.Generation.Contract = workflowContract("policy-v2")
+	d.admission.snapshot.ContractPolicyDigest = d.admission.snapshot.Generation.Contract.PolicyDigest()
+	d.admission.mu.Unlock()
+	return result, usage, err
 }
 
 // Generate waits for cancellation and never returns a partial model decision.
@@ -424,13 +468,13 @@ func (f *fakeSpecifications) Load(context.Context, string) (specification.Specif
 
 // fakeContracts returns one bounded reduced contract.
 type fakeContracts struct {
-	reduced openapi.ReducedContext
+	reduced contractcatalog.ReducedContext
 	calls   int
 	err     error
 }
 
 // Reduce counts and returns the configured contract context.
-func (f *fakeContracts) Reduce(context.Context, string, specification.Specification) (openapi.ReducedContext, error) {
+func (f *fakeContracts) Reduce(context.Context, string, specification.Specification) (contractcatalog.ReducedContext, error) {
 	f.calls++
 	return f.reduced, f.err
 }
@@ -440,6 +484,18 @@ type fakeBindings struct {
 	binding BindingContext
 	calls   int
 	err     error
+}
+
+// fakeAuthorityBindings exposes sealed source authority before the later full binding verification boundary.
+type fakeAuthorityBindings struct {
+	*fakeBindings
+	authority RevisionContext
+	err       error
+}
+
+// ContractAuthority returns the configured trusted source authority or deterministic boundary failure.
+func (f *fakeAuthorityBindings) ContractAuthority(context.Context, StartCommand) (RevisionContext, error) {
+	return f.authority, f.err
 }
 
 // Verify counts and returns the safe effective binding context.
@@ -532,16 +588,54 @@ func validSnapshot() AdmissionSnapshot {
 	runtime := RuntimeContext{Profile: "runtime-1", ManifestVersion: 1, HTTP: planmanifest.HTTPConfig{AllowedMethods: []string{"GET"}, AllowedRequestHeaders: []string{}, AllowedResponseHeaders: []string{}, FollowRedirectsForMethods: []string{}, MaxRedirects: 0, TimeoutMS: 1000, MaxURLBytes: 2048, MaxRequestHeaderBytes: 1024, MaxRequestBodyBytes: 1024, MaxResponseHeaderBytes: 1024, MaxResponseBodyBytes: 1024}, Redaction: evidence.Config{MaxBodyBytes: 1024, AdditionalHeaders: []string{}, SensitiveJSONPaths: []string{}, ModelSensitiveJSONPaths: []string{}}, Registry: RegistryContext{Version: "v1", Tools: []string{"probe"}}, Schema: SchemaContext{Version: "v1", ReferenceVersion: "v1", Fields: []string{"input"}}, Validator: ValidatorContext{Tool: "probe", ToolVersion: "v1", AssertionEngine: "fake", AssertionVersion: "v1"}, Policy: PolicyContext{ID: "policy-1", AllowedTools: []string{"probe"}, Reason: "test_allowlist"}, Network: binding.Target.Network}
 	revisionDigest, targetDigest, _ := bindingDigests(binding)
 	runtimeDigest, _ := runtimeContextDigest(runtime)
+	contract := workflowContract("policy-v1")
 	return AdmissionSnapshot{
-		SpecificationDigest: strings.Repeat("1", 64), ContractDigest: strings.Repeat("2", 64),
+		SpecificationDigest: strings.Repeat("1", 64), ContractDigest: strings.Repeat("2", 64), CatalogDigest: contract.CatalogDigest(), ContractPolicyDigest: contract.PolicyDigest(),
 		RevisionDigest: revisionDigest, TargetDigest: targetDigest, RuntimeDigest: runtimeDigest, Binding: binding, Runtime: runtime,
 		Generation: agentplanning.GenerationRequest{
 			Constraints:  []agentplanning.Constraint{{ID: "c1", Description: "observable"}},
-			OpenAPI:      openapi.ReducedContext{MediaType: "application/vnd.featureproof.openapi-context+json;v=1", Untrusted: true, Bytes: []byte(`{"retained":[]}`)},
+			Contract:     contract,
 			Capabilities: []agentplanning.CapabilityDescriptor{{Name: "probe", Class: "read", Validate: func(map[string]planning.InputValue) error { return nil }}},
 			Limits:       agentplanning.Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 5, MaxCapabilities: 5, MaxChecks: 5, MaxStepsPerCheck: 5, MaxAssertionsPerStep: 5, MaxMissingItems: 5, MaxValidationWork: 100},
 		},
 	}
+}
+
+// workflowContract creates a verified immutable contract fixture for workflow admission and drift tests.
+func workflowContract(policyID string) contractcatalog.ReducedContext {
+	sum := sha256.Sum256([]byte(policyID))
+	digest := hex.EncodeToString(sum[:])
+	provenance := contractcatalog.Provenance{SourceID: "fixture", Class: contractcatalog.ClassAuthoritative, SourceDigest: digest, AdapterVersion: "test-v1", SafeLocation: "catalog/operations/0", Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete}
+	operation := contractcatalog.OperationDescriptor{Key: contractcatalog.OperationKey{Method: "GET", Path: "/pets"}, LogicalID: "fixture", Responses: map[string]contractcatalog.Response{"200": {}}, Security: []contractcatalog.SecurityRequirement{}, Provenance: []contractcatalog.Provenance{provenance}, Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete, Classes: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative}}
+	operation.Claims = contractcatalog.ClaimsForOperation(operation, provenance)
+	snapshot := contractcatalog.SourceSnapshot{Version: contractcatalog.VersionV1, Source: contractcatalog.SourceSummary{ID: "fixture", Kind: "fixture", Class: contractcatalog.ClassAuthoritative, Digest: digest, AdapterVersion: "test-v1", Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete}, Operations: []contractcatalog.OperationDescriptor{operation}}
+	limits := contractcatalog.Limits{MaxSources: 1, MaxOperations: 8, MaxClaims: 128, MaxBytes: 1 << 20, MaxDepth: 32, MaxDiagnostics: 32, MaxLocationBytes: 256}
+	projection := contractcatalog.ProjectionPolicy{MaxStringBytes: 512, AllowedURLSchemes: []string{"https"}, SensitiveNames: []string{}, SensitivePaths: []string{}, SensitiveHeaderNames: []string{"authorization", "cookie"}, ForbiddenValues: []string{}}
+	registry, err := contractcatalog.NewRegistry(map[string]contractcatalog.ContractSource{"fixture": &contractcatalog.StaticSource{Snapshot: snapshot}})
+	if err != nil {
+		panic(err)
+	}
+	loaded, err := registry.Load(context.Background(), []contractcatalog.SourceRequest{contractcatalog.NewSourceRequest(contractcatalog.SourceDescriptor{Kind: "fixture", ID: "fixture", Class: contractcatalog.ClassAuthoritative, Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete, ExpectedDigest: digest, AdapterVersion: "test-v1", Limits: limits, Projection: projection})}, limits)
+	if err != nil {
+		panic(err)
+	}
+	catalog, err := contractcatalog.Build(context.Background(), loaded, limits)
+	if err != nil {
+		panic(err)
+	}
+	rules := map[contractcatalog.ClaimKind]contractcatalog.ClaimRule{}
+	for _, kind := range []contractcatalog.ClaimKind{contractcatalog.ClaimOperationIdentity, contractcatalog.ClaimSchema, contractcatalog.ClaimSecurity, contractcatalog.ClaimResponse} {
+		rules[kind] = contractcatalog.ClaimRule{AllowedClasses: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative}, MinimumConfidence: map[contractcatalog.SourceClass]contractcatalog.Confidence{contractcatalog.ClassAuthoritative: contractcatalog.ConfidenceHigh}, RequiredCompleteness: contractcatalog.CompletenessComplete, Required: true}
+	}
+	policy, err := contractcatalog.NewPolicy(contractcatalog.SufficiencyPolicy{ID: policyID, Version: contractcatalog.VersionV1, Claims: rules, ConflictTreatment: contractcatalog.ConflictDeny})
+	if err != nil {
+		panic(err)
+	}
+	reduced, err := contractcatalog.BuildContext(context.Background(), catalog, policy, []contractcatalog.ConstraintSelection{{ConstraintID: "c1", Operations: []contractcatalog.OperationKey{{Method: "GET", Path: "/pets"}}}}, contractcatalog.ReductionLimits{MaxBytes: 1 << 20, MaxOperations: 8, MaxClaims: 128, MaxDepth: 32, MaxDiagnostics: 32})
+	if err != nil {
+		panic(err)
+	}
+	return reduced
 }
 
 // validCommand creates all explicit workflow selections with required approval.
@@ -574,7 +668,7 @@ func TestStartRequiresEveryExplicitSelectionAndPreservesPreAdmissionBoundary(t *
 func TestAdmissionValidatesBindingContractPolicyAndBudgetsBeforeModel(t *testing.T) {
 	command := validCommand()
 	specifications := &fakeSpecifications{spec: specification.Specification{Version: 1, Feature: specification.Feature{ID: "feature-1"}, Constraints: []specification.Constraint{{ID: "c1", Description: "observable", TargetID: "target-1"}}, Limits: specification.Limits{MaxSteps: 2, MaxToolCalls: 2}}}
-	contracts := &fakeContracts{reduced: validSnapshot().Generation.OpenAPI}
+	contracts := &fakeContracts{reduced: validSnapshot().Generation.Contract}
 	bindings := &fakeBindings{binding: validSnapshot().Binding}
 	catalog := &fakeCatalog{descriptors: validSnapshot().Generation.Capabilities, runtime: validSnapshot().Runtime}
 	builder := TrustedAdmissionBuilder{Specifications: specifications, Contracts: contracts, Bindings: bindings, Catalog: catalog, Config: AdmissionConfig{Limits: validSnapshot().Generation.Limits, Provider: command.Provider, Model: command.Model, CompositionRef: command.CompositionRef}}
@@ -593,13 +687,87 @@ func TestAdmissionValidatesBindingContractPolicyAndBudgetsBeforeModel(t *testing
 	}
 }
 
+// TestAdmissionCarriesNeutralContractAuthority verifies canonical copies reach the reducer and provider failure stops all later authority ports.
+func TestAdmissionCarriesNeutralContractAuthority(t *testing.T) {
+	command := validCommand()
+	base := validSnapshot()
+	specifications := &fakeSpecifications{spec: specification.Specification{Version: 1, Feature: specification.Feature{ID: "feature-1"}, Constraints: []specification.Constraint{{ID: "c1", Description: "observable", TargetID: "target-1"}}, Limits: specification.Limits{MaxSteps: 2, MaxToolCalls: 2}}}
+	observed := RevisionContext{}
+	contracts := &fakeContracts{reduced: base.Generation.Contract}
+	contractPort := contractReducerFunc(func(ctx context.Context, _ string, _ specification.Specification) (contractcatalog.ReducedContext, error) {
+		observed, _ = ContractAuthority(ctx)
+		return contracts.reduced, nil
+	})
+	authority := RevisionContext{RepositoryID: command.RepositoryID, CommitOID: command.Revision, Roots: []string{"app"}, ChangedPaths: []string{"app/main.go"}}
+	bindings := &fakeAuthorityBindings{fakeBindings: &fakeBindings{binding: base.Binding}, authority: authority}
+	catalog := &fakeCatalog{descriptors: base.Generation.Capabilities, runtime: base.Runtime}
+	builder := TrustedAdmissionBuilder{Specifications: specifications, Contracts: contractPort, Bindings: bindings, Catalog: catalog, Config: AdmissionConfig{Limits: base.Generation.Limits, Provider: command.Provider, Model: command.Model, CompositionRef: command.CompositionRef}}
+	if _, err := builder.Build(context.Background(), command); err != nil || len(observed.Roots) != 1 || len(observed.ChangedPaths) != 1 {
+		t.Fatalf("neutral authority missing: %+v %v", observed, err)
+	}
+	authority.Roots[0] = "changed"
+	if observed.Roots[0] != "app" {
+		t.Fatal("authority context aliased caller state")
+	}
+	bindings.err = errors.New("authority drift")
+	observed = RevisionContext{}
+	if _, err := builder.Build(context.Background(), command); !IsCode(err, CodeUnauthorized) || observed.RepositoryID != "" || bindings.calls != 1 || catalog.calls != 1 {
+		t.Fatalf("authority failure crossed later ports: %+v %v calls=%d/%d", observed, err, bindings.calls, catalog.calls)
+	}
+	if _, ok := ContractAuthority(context.Background()); ok {
+		t.Fatal("ambient context unexpectedly carried authority")
+	}
+}
+
+// TestTypedContractDecisionStopsAdmissionBeforeLaterAuthorityPorts proves insufficient and review outcomes survive the workflow boundary.
+func TestTypedContractDecisionStopsAdmissionBeforeLaterAuthorityPorts(t *testing.T) {
+	command := validCommand()
+	base := validSnapshot()
+	spec := specification.Specification{Version: 1, Feature: specification.Feature{ID: "feature", Description: "feature"}, Target: specification.Target{ID: "target", BaseURL: "https://target.example"}, Constraints: []specification.Constraint{{ID: "c1", Description: "observable", TargetID: "target"}}, Limits: specification.Limits{MaxSteps: 1, MaxToolCalls: 1, MaxRetries: 0}}
+	for _, category := range []contractcatalog.ErrorCategory{contractcatalog.CategoryInsufficient, contractcatalog.CategoryReviewRequired} {
+		contracts := &fakeContracts{err: &contractcatalog.DecisionError{Category: category, MissingKinds: []string{"operation_selection"}, Operations: []contractcatalog.OperationKey{{Method: "GET", Path: "/pets"}}, ConflictIDs: []string{"conflict-1"}}}
+		bindings := &fakeBindings{binding: base.Binding}
+		catalog := &fakeCatalog{descriptors: base.Generation.Capabilities, runtime: base.Runtime}
+		builder := TrustedAdmissionBuilder{Specifications: &fakeSpecifications{spec: spec}, Contracts: contracts, Bindings: bindings, Catalog: catalog, Config: AdmissionConfig{Limits: base.Generation.Limits, Provider: command.Provider, Model: command.Model, CompositionRef: command.CompositionRef}}
+		_, err := builder.Build(context.Background(), command)
+		var typed *Error
+		if !errors.As(err, &typed) || typed.Decision == nil || len(typed.Decision.Operations) != 1 || len(typed.Decision.ConflictIDs) != 1 || bindings.calls != 0 || catalog.calls != 0 {
+			t.Fatalf("decision lost or later port called: %#v %v %d/%d", typed, err, bindings.calls, catalog.calls)
+		}
+		if category == contractcatalog.CategoryInsufficient && typed.Code != CodeInsufficientContext {
+			t.Fatal("insufficient category changed")
+		}
+		if category == contractcatalog.CategoryReviewRequired && typed.Code != CodeReviewRequired {
+			t.Fatal("review category changed")
+		}
+		projected := errorDecision(err)
+		projected.Operations[0].Path = "/changed"
+		if typed.Decision.Operations[0].Path != "/pets" {
+			t.Fatal("adapter decision leaked mutable state")
+		}
+	}
+	service, _, execution, store, _ := workflowFixture(t, validPlanResponse())
+	modelSpy := &countingGenerationPort{}
+	service.deps.Generation = modelSpy
+	service.deps.Admission = admissionBuilderFunc(func(context.Context, StartCommand) (AdmissionSnapshot, error) {
+		return AdmissionSnapshot{}, &Error{Code: CodeInsufficientContext, Operation: "contract", Decision: &ContextDecision{MissingKinds: []string{"operation_selection"}}}
+	})
+	view, err := service.Start(context.Background(), command)
+	if !IsCode(err, CodeInsufficientContext) || errorDecision(err) == nil || view.Handle != "" || modelSpy.calls.Load() != 0 || execution.callCount() != 0 {
+		t.Fatalf("pre-admission effects occurred: %#v %v model=%d tools=%d", view, err, modelSpy.calls.Load(), execution.callCount())
+	}
+	if events, eventsErr := store.Events(context.Background(), "workflow-1"); eventsErr == nil || len(events) != 0 {
+		t.Fatalf("approval/durable state created: %#v %v", events, eventsErr)
+	}
+}
+
 // TestAdmissionFailsClosedAtEveryBoundary proves dependency failures never yield a partial snapshot.
 func TestAdmissionFailsClosedAtEveryBoundary(t *testing.T) {
 	command := validCommand()
 	baseSpec := specification.Specification{Version: 1, Feature: specification.Feature{ID: "f"}, Constraints: []specification.Constraint{{ID: "c", Description: "d"}}, Limits: specification.Limits{MaxSteps: 1, MaxToolCalls: 1}}
 	makeBuilder := func() (TrustedAdmissionBuilder, *fakeSpecifications, *fakeContracts, *fakeBindings, *fakeCatalog) {
 		specifications := &fakeSpecifications{spec: baseSpec}
-		contracts := &fakeContracts{reduced: validSnapshot().Generation.OpenAPI}
+		contracts := &fakeContracts{reduced: validSnapshot().Generation.Contract}
 		bindings := &fakeBindings{binding: validSnapshot().Binding}
 		catalog := &fakeCatalog{descriptors: validSnapshot().Generation.Capabilities, runtime: validSnapshot().Runtime}
 		return TrustedAdmissionBuilder{Specifications: specifications, Contracts: contracts, Bindings: bindings, Catalog: catalog, Config: AdmissionConfig{Limits: validSnapshot().Generation.Limits, Provider: command.Provider, Model: command.Model, CompositionRef: command.CompositionRef}}, specifications, contracts, bindings, catalog
@@ -613,6 +781,16 @@ func TestAdmissionFailsClosedAtEveryBoundary(t *testing.T) {
 	contracts.err = errors.New("read")
 	if _, err := builder.Build(context.Background(), command); !IsCode(err, CodeInvalid) {
 		t.Fatal(err)
+	}
+	builder, _, contracts, _, _ = makeBuilder()
+	contracts.reduced = contractcatalog.ReducedContext{}
+	if _, err := builder.Build(context.Background(), command); !IsCode(err, CodeInvalid) {
+		t.Fatalf("missing catalog binding accepted: %v", err)
+	}
+	builder, _, contracts, _, _ = makeBuilder()
+	contracts.reduced = contractcatalog.ReducedContext{}
+	if _, err := builder.Build(context.Background(), command); !IsCode(err, CodeInvalid) {
+		t.Fatalf("missing policy binding accepted: %v", err)
 	}
 	builder, _, _, bindings, _ := makeBuilder()
 	bindings.err = errors.New("attest")
@@ -824,9 +1002,9 @@ func TestAdmissionContextDriftIsRejectedAcrossOwners(t *testing.T) {
 	}{
 		{name: "specification", mutate: func(snapshot *AdmissionSnapshot) { snapshot.SpecificationDigest = strings.Repeat("a", 64) }},
 		{name: "contract", mutate: func(snapshot *AdmissionSnapshot) { snapshot.ContractDigest = strings.Repeat("b", 64) }},
-		{name: "openapi", mutate: func(snapshot *AdmissionSnapshot) {
-			snapshot.Generation.OpenAPI.Bytes = []byte(`{"retained":["changed"]}`)
-		}},
+		{name: "catalog", mutate: func(snapshot *AdmissionSnapshot) { snapshot.CatalogDigest = "changed-catalog" }},
+		{name: "contract_policy", mutate: func(snapshot *AdmissionSnapshot) { snapshot.ContractPolicyDigest = "changed-policy" }},
+		{name: "contract_context", mutate: func(snapshot *AdmissionSnapshot) { snapshot.Generation.Contract = workflowContract("changed-policy") }},
 		{name: "runtime_policy", mutate: func(snapshot *AdmissionSnapshot) { snapshot.RuntimeDigest = strings.Repeat("c", 64) }},
 		{name: "target_url_same_alias", mutate: func(snapshot *AdmissionSnapshot) { snapshot.Binding.Target.URL = "https://changed.example/" }},
 		{name: "environment_same_alias", mutate: func(snapshot *AdmissionSnapshot) {
@@ -908,6 +1086,35 @@ func TestAdmissionContextDriftIsRejectedAcrossOwners(t *testing.T) {
 	}
 }
 
+// TestContractPolicyDriftDuringInferenceStopsBeforeApprovalAndExecution proves the post-model sufficiency checkpoint.
+func TestContractPolicyDriftDuringInferenceStopsBeforeApprovalAndExecution(t *testing.T) {
+	service, admission, execution, _, _ := workflowFixture(t, validPlanResponse())
+	service.deps.Generation = driftingGeneration{inner: service.deps.Generation, admission: admission}
+	view, err := service.Start(context.Background(), validCommand())
+	if err != nil || view.Phase != PhaseTerminal || view.Outcome == nil || *view.Outcome != OutcomeInconclusive || execution.callCount() != 0 {
+		t.Fatalf("drift crossed checkpoint: %#v %v", view, err)
+	}
+	if _, approvalErr := service.ApprovalView(context.Background(), view.Handle); !IsCode(approvalErr, CodeConflict) {
+		t.Fatalf("approval staged after drift: %v", approvalErr)
+	}
+}
+
+// TestDurableApprovalRevalidatesContractImmediatelyBeforeToolExecution closes the approval-wait mutation window with zero tool calls.
+func TestDurableApprovalRevalidatesContractImmediatelyBeforeToolExecution(t *testing.T) {
+	service, admission, execution, _, _ := workflowFixture(t, validPlanResponse())
+	view, err := service.Start(context.Background(), validCommand())
+	if err != nil || view.Phase != PhaseAwaitingApproval {
+		t.Fatalf("approval was not staged: %#v %v", view, err)
+	}
+	mutateAdmissionSnapshot(admission, func(snapshot *AdmissionSnapshot) {
+		snapshot.ContractDigest = strings.Repeat("b", 64)
+	})
+	_, err = service.Decide(context.Background(), DecisionCommand{Principal: "user-1", Handle: view.Handle, DecisionID: "source-mutated", Revision: view.ApprovalRevision, Action: DecisionApprove})
+	if !IsCode(err, CodeConflict) || execution.callCount() != 0 {
+		t.Fatalf("mutated source reached tools: %v calls=%d", err, execution.callCount())
+	}
+}
+
 // mutateAdmissionSnapshot changes one trusted recomposition dimension under the fake boundary lock.
 func mutateAdmissionSnapshot(admission *fakeAdmission, mutate func(*AdmissionSnapshot)) {
 	admission.mu.Lock()
@@ -923,6 +1130,8 @@ func TestPlanReadyContextDriftNeverStagesApproval(t *testing.T) {
 	}{
 		{name: "specification", mutate: func(snapshot *AdmissionSnapshot) { snapshot.SpecificationDigest = strings.Repeat("a", 64) }},
 		{name: "contract", mutate: func(snapshot *AdmissionSnapshot) { snapshot.ContractDigest = strings.Repeat("b", 64) }},
+		{name: "catalog", mutate: func(snapshot *AdmissionSnapshot) { snapshot.CatalogDigest = "changed-catalog" }},
+		{name: "contract_policy", mutate: func(snapshot *AdmissionSnapshot) { snapshot.ContractPolicyDigest = "changed-policy" }},
 		{name: "runtime", mutate: func(snapshot *AdmissionSnapshot) { snapshot.RuntimeDigest = strings.Repeat("c", 64) }},
 		{name: "environment_object", mutate: func(snapshot *AdmissionSnapshot) {
 			snapshot.Binding.Target.EnvironmentID, snapshot.Binding.Target.Attestation.EnvironmentID = "environment-2", "environment-2"
@@ -1531,6 +1740,24 @@ func TestGitHubWorkflowStatusResolveAndCancel(t *testing.T) {
 	}
 	if status, _ := gateway.Status(context.Background(), state.RunHandle); status.Phase != "terminal" || status.Outcome != string(OutcomeCancelled) {
 		t.Fatal(status)
+	}
+}
+
+// TestGitHubGatewaySealsHeadAndChangedPathsBeforeAdmission verifies PR authority is internal context rather than payload data.
+func TestGitHubGatewaySealsHeadAndChangedPathsBeforeAdmission(t *testing.T) {
+	service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+	observed := RevisionContext{}
+	service.deps.Admission = admissionBuilderFunc(func(ctx context.Context, command StartCommand) (AdmissionSnapshot, error) {
+		observed, _ = GitHubContractAuthority(ctx)
+		return AdmissionSnapshot{}, errors.New("stop")
+	})
+	command := validCommand()
+	command.Approval = ApprovalRequired
+	snapshot, _ := githubpr.SealSnapshot(githubpr.PullRequestSnapshot{Version: 1, InstallationID: 1, RepositoryID: 7, Number: 2, AuthorID: 9, State: "open", HeadOID: strings.Repeat("a", 40), HeadRepositoryID: 7, ChangedPaths: []string{"app/z.go", "app/a.go"}})
+	gateway := GitHubGateway{Service: service, Principal: "user-1", Commands: map[string]StartCommand{"default": command}}
+	_, _ = gateway.Submit(context.Background(), githubpr.Selection{Alias: "default"}, snapshot, "github-authority")
+	if observed.RepositoryID != "7" || observed.CommitOID != snapshot.HeadOID || !reflect.DeepEqual(observed.ChangedPaths, []string{"app/a.go", "app/z.go"}) {
+		t.Fatalf("GitHub authority not sealed: %+v", observed)
 	}
 }
 

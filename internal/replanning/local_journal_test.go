@@ -25,6 +25,15 @@ func (j *failAfterLocalEvent) CompareAndAppend(ctx context.Context, runID string
 	return confirmed, replayed, err
 }
 
+func (j *failAfterLocalEvent) OwnedCompareAndAppend(ctx context.Context, runID string, lease RunLease, now time.Time, expected uint64, key string, event Event) (Event, bool, error) {
+	confirmed, replayed, err := j.LocalJournal.OwnedCompareAndAppend(ctx, runID, lease, now, expected, key, event)
+	if err == nil && event.Type == j.target && !j.failed {
+		j.failed = true
+		return Event{}, false, failure(CategoryDependency, "local_journal", "uncertain_append")
+	}
+	return confirmed, replayed, err
+}
+
 // TestLocalJournalRehydratesCompletedBatchAcrossHandles verifies durable facts and no repeated tools after restart.
 func TestLocalJournalRehydratesCompletedBatchAcrossHandles(t *testing.T) {
 	root := t.TempDir()

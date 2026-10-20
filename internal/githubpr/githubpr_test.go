@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -508,15 +509,18 @@ func TestRESTAdapterKeepsSecretsAndDTOsAtBoundary(t *testing.T) {
 		if request.Header.Get("Authorization") != "Bearer sentinel-token" {
 			t.Fatal("token absent")
 		}
-		body := `{"number":3,"state":"open","user":{"id":4},"head":{"sha":"` + testOID + `","repo":{"id":2}},"base":{"repo":{"id":2}}}`
+		body := `{"number":3,"state":"open","user":{"id":4},"head":{"sha":"` + testOID + `","repo":{"id":2}},"base":{"repo":{"id":2,"full_name":"owner/repository"}}}`
+		if strings.HasSuffix(request.URL.Path, "/files") {
+			body = `[{"filename":"src/main.go"}]`
+		}
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 	})
-	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: tokens, HTTP: transport, Clock: clock, MaxResponse: 4096})
+	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: tokens, HTTP: transport, Clock: clock, MaxResponse: 4096, MaxPages: 2, MaxChangedPaths: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := adapter.PullRequest(context.Background(), 1, 2, 3)
-	if err != nil || snapshot.HeadOID != testOID {
+	if err != nil || snapshot.HeadOID != testOID || !reflect.DeepEqual(snapshot.ChangedPaths, []string{"src/main.go"}) {
 		t.Fatal(err)
 	}
 	if strings.Contains(mustJSON(snapshot), "sentinel-token") {
@@ -781,7 +785,7 @@ func TestRESTAdapterCoversAllowedEndpoints(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
-	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: tokens, HTTP: transport, Clock: clock, MaxResponse: 4096})
+	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: tokens, HTTP: transport, Clock: clock, MaxResponse: 4096, MaxPages: 2, MaxChangedPaths: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1047,7 +1051,7 @@ func TestRESTAdapterFailureBoundaries(t *testing.T) {
 	clock := &fakeClock{now: time.Unix(100, 0)}
 	tokens := &fakeTokenSource{clock: clock}
 	makeAdapter := func(doer HTTPDoer) *RESTAdapter {
-		adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: tokens, HTTP: doer, Clock: clock, MaxResponse: 32})
+		adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: tokens, HTTP: doer, Clock: clock, MaxResponse: 32, MaxPages: 2, MaxChangedPaths: 100})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1122,7 +1126,7 @@ func TestCoordinatorRejectsUntrustedCommand(t *testing.T) {
 
 // TestProductionCompositionValidatesAndFailsClosed traces R5, R9, and R10 startup policy.
 func TestProductionCompositionValidatesAndFailsClosed(t *testing.T) {
-	config := ProductionConfig{AppID: 1, BotID: 2, Permissions: RequiredPermissions(), APIOrigin: "https://api.github.com", APIVersion: "2022-11-28", EvidenceOrigin: "https://evidence.example", StoreDir: t.TempDir(), MaxWebhookBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxPages: 2, MaxAttempts: 3, RunTimeout: time.Minute, CloseTimeout: time.Second, LeaseTTL: 2 * time.Minute, PollInterval: time.Millisecond, RetryMaxDuration: time.Minute, RetryMaxWait: 30 * time.Second, RetryInitialBackoff: time.Millisecond, RetryMaxBackoff: time.Second, Authorization: AuthorizationConfig{}}
+	config := ProductionConfig{AppID: 1, BotID: 2, Permissions: RequiredPermissions(), APIOrigin: "https://api.github.com", APIVersion: "2022-11-28", EvidenceOrigin: "https://evidence.example", StoreDir: t.TempDir(), MaxWebhookBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxPages: 2, MaxChangedPaths: 100, MaxAttempts: 3, RunTimeout: time.Minute, CloseTimeout: time.Second, LeaseTTL: 2 * time.Minute, PollInterval: time.Millisecond, RetryMaxDuration: time.Minute, RetryMaxWait: 30 * time.Second, RetryInitialBackoff: time.Millisecond, RetryMaxBackoff: time.Second, Authorization: AuthorizationConfig{}}
 	if err := config.Validate(); err != nil {
 		t.Fatal(err)
 	}

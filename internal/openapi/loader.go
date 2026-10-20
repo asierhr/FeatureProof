@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -88,10 +89,126 @@ func (l *Loader) Load(ctx context.Context, entry string) (*Contract, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, cancelledError(s.documentLocation(canonical)+"#", err)
+	location := s.documentLocation(canonical) + "#/projection/omitted"
+	excluded, err := collectExcludedValues(ctx, normalized, excludedLimitsFromConfig(l.cfg), location)
+	if err != nil {
+		return nil, err
 	}
-	return &Contract{version: version, operations: operations, schemes: schemes, omitted: s.omitted, maxBody: l.cfg.MaxObservedBodyBytes, maxContext: l.cfg.MaxContextBytes}, nil
+	return &Contract{version: version, operations: operations, schemes: schemes, excluded: excluded, omitted: s.omitted, maxBody: l.cfg.MaxObservedBodyBytes, maxContext: l.cfg.MaxContextBytes}, nil
+}
+
+// excludedTraversalLimits bounds the private extraction of defaults and examples before a Contract may be published.
+type excludedTraversalLimits struct{ MaxDepth, MaxNodes, MaxBytes, MaxValues int }
+
+// excludedLimitsFromConfig derives traversal work from the already explicit document, reference and depth budgets.
+func excludedLimitsFromConfig(config Config) excludedTraversalLimits {
+	maxInt := int64(^uint(0) >> 1)
+	nodeBudget := config.MaxTotalBytes
+	if nodeBudget > maxInt {
+		nodeBudget = maxInt
+	}
+	return excludedTraversalLimits{MaxDepth: config.MaxReferenceDepth + config.MaxDocuments, MaxNodes: int(nodeBudget), MaxBytes: int(nodeBudget), MaxValues: config.MaxReferences}
+}
+
+// excludedFrame represents one enter or exit step in the iterative, stack-safe traversal.
+type excludedFrame struct {
+	value          any
+	collect        bool
+	depth          int
+	exit           bool
+	containerKind  byte
+	containerToken uintptr
+}
+
+// excludedContainer identifies one active map or slice so cyclic test values fail instead of looping.
+type excludedContainer struct {
+	kind  byte
+	token uintptr
+}
+
+// collectExcludedValues retains scalar defaults and examples privately under explicit cancellation and work limits.
+func collectExcludedValues(ctx context.Context, value any, limits excludedTraversalLimits, location string) ([]string, error) {
+	if limits.MaxDepth <= 0 || limits.MaxNodes <= 0 || limits.MaxBytes <= 0 || limits.MaxValues <= 0 {
+		return nil, typedError(LimitExceeded, location, errors.New("invalid omitted-value traversal limits"))
+	}
+	stack := []excludedFrame{{value: value, depth: 1}}
+	active := map[excludedContainer]bool{}
+	values := []string{}
+	nodes, pendingNodes, bytes := 0, 1, 0
+	for len(stack) > 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, cancelledError(location, err)
+		}
+		index := len(stack) - 1
+		frame := stack[index]
+		stack = stack[:index]
+		identity := excludedContainer{kind: frame.containerKind, token: frame.containerToken}
+		if frame.exit {
+			delete(active, identity)
+			continue
+		}
+		pendingNodes--
+		nodes++
+		if nodes > limits.MaxNodes || frame.depth > limits.MaxDepth {
+			return nil, typedError(LimitExceeded, location, errors.New("omitted-value traversal work exceeded"))
+		}
+		switch typed := frame.value.(type) {
+		case []any:
+			if len(typed) > limits.MaxNodes-nodes-pendingNodes {
+				return nil, typedError(LimitExceeded, location, errors.New("omitted-value node reservation exceeded"))
+			}
+			token := reflect.ValueOf(typed).Pointer()
+			identity = excludedContainer{kind: 's', token: token}
+			if token != 0 && active[identity] {
+				return nil, typedError(LimitExceeded, location, errors.New("cyclic omitted-value traversal"))
+			}
+			if token != 0 {
+				active[identity] = true
+				stack = append(stack, excludedFrame{exit: true, containerKind: identity.kind, containerToken: identity.token})
+			}
+			for child := len(typed) - 1; child >= 0; child-- {
+				stack = append(stack, excludedFrame{value: typed[child], collect: frame.collect, depth: frame.depth + 1})
+			}
+			pendingNodes += len(typed)
+		case map[string]any:
+			if len(typed) > limits.MaxNodes-nodes-pendingNodes {
+				return nil, typedError(LimitExceeded, location, errors.New("omitted-value node reservation exceeded"))
+			}
+			token := reflect.ValueOf(typed).Pointer()
+			identity = excludedContainer{kind: 'm', token: token}
+			if token != 0 && active[identity] {
+				return nil, typedError(LimitExceeded, location, errors.New("cyclic omitted-value traversal"))
+			}
+			if token != 0 {
+				active[identity] = true
+				stack = append(stack, excludedFrame{exit: true, containerKind: identity.kind, containerToken: identity.token})
+			}
+			keys := sortedKeys(typed)
+			for child := len(keys) - 1; child >= 0; child-- {
+				key := keys[child]
+				bytes += len(key)
+				if bytes > limits.MaxBytes {
+					return nil, typedError(LimitExceeded, location, errors.New("omitted-value bytes exceeded"))
+				}
+				collect := frame.collect || strings.EqualFold(key, "default") || strings.EqualFold(key, "example") || strings.EqualFold(key, "examples")
+				stack = append(stack, excludedFrame{value: typed[key], collect: collect, depth: frame.depth + 1})
+			}
+			pendingNodes += len(keys)
+		case string:
+			bytes += len(typed)
+			if frame.collect {
+				values = append(values, typed)
+				if len(values) > limits.MaxValues {
+					return nil, typedError(LimitExceeded, location, errors.New("omitted-value count exceeded"))
+				}
+			}
+		}
+		if bytes > limits.MaxBytes {
+			return nil, typedError(LimitExceeded, location, errors.New("omitted-value bytes exceeded"))
+		}
+	}
+	sort.Strings(values)
+	return values, nil
 }
 
 // readDocument reads, parses and caches one canonical local document under configured budgets.

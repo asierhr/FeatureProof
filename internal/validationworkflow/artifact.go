@@ -8,8 +8,8 @@ import (
 	"sort"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/localvalidation"
-	"github.com/asierhr/featureProof/internal/openapi"
 	"github.com/asierhr/featureProof/internal/planning"
 )
 
@@ -19,24 +19,24 @@ type contextCapability struct {
 	Effects, Idempotent      bool
 }
 
-// contextOpenAPI binds the bounded untrusted bytes and their safe reduction metadata without publishing either.
-type contextOpenAPI struct {
+// contextContract binds neutral untrusted bytes and their safe reduction metadata without publishing either.
+type contextContract struct {
 	MediaType   string
 	Untrusted   bool
 	BytesSHA256 string
-	Omissions   openapi.OmissionCounts
+	Omissions   contractcatalog.OmissionCounts
 }
 
 // artifactContext is the complete safe admission context whose drift invalidates a generated artifact.
 type artifactContext struct {
-	SpecificationDigest, ContractDigest, RevisionDigest, TargetDigest, RuntimeDigest string
-	Provider, Model                                                                  string
-	Binding                                                                          BindingContext
-	Runtime                                                                          RuntimeContext
-	Constraints                                                                      []agentplanning.Constraint
-	OpenAPI                                                                          contextOpenAPI
-	Capabilities                                                                     []contextCapability
-	Limits                                                                           agentplanning.Limits
+	SpecificationDigest, ContractDigest, CatalogDigest, ContractPolicyDigest, RevisionDigest, TargetDigest, RuntimeDigest string
+	Provider, Model                                                                                                       string
+	Binding                                                                                                               BindingContext
+	Runtime                                                                                                               RuntimeContext
+	Constraints                                                                                                           []agentplanning.Constraint
+	Contract                                                                                                              contextContract
+	Capabilities                                                                                                          []contextCapability
+	Limits                                                                                                                agentplanning.Limits
 }
 
 // buildArtifact converts only validated PreparedPlan snapshots into a deterministic auditable artifact.
@@ -68,21 +68,23 @@ func canonicalContextDigest(snapshot AdmissionSnapshot) (string, error) {
 	for index, capability := range snapshot.Generation.Capabilities {
 		capabilities[index] = contextCapability{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
-	openAPISum := sha256.Sum256(snapshot.Generation.OpenAPI.Bytes)
+	openAPISum := sha256.Sum256(snapshot.Generation.Contract.Bytes())
 	return safeDigest(artifactContext{
-		SpecificationDigest: snapshot.SpecificationDigest,
-		ContractDigest:      snapshot.ContractDigest,
-		RevisionDigest:      snapshot.RevisionDigest,
-		TargetDigest:        snapshot.TargetDigest,
-		RuntimeDigest:       snapshot.RuntimeDigest,
-		Provider:            snapshot.Provider,
-		Model:               snapshot.Model,
-		Binding:             canonicalBindingContext(snapshot.Binding),
-		Runtime:             canonicalRuntimeContext(snapshot.Runtime),
-		Constraints:         append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...),
-		OpenAPI:             contextOpenAPI{MediaType: snapshot.Generation.OpenAPI.MediaType, Untrusted: snapshot.Generation.OpenAPI.Untrusted, BytesSHA256: hex.EncodeToString(openAPISum[:]), Omissions: snapshot.Generation.OpenAPI.Omissions},
-		Capabilities:        capabilities,
-		Limits:              snapshot.Generation.Limits,
+		SpecificationDigest:  snapshot.SpecificationDigest,
+		ContractDigest:       snapshot.ContractDigest,
+		CatalogDigest:        snapshot.CatalogDigest,
+		ContractPolicyDigest: snapshot.ContractPolicyDigest,
+		RevisionDigest:       snapshot.RevisionDigest,
+		TargetDigest:         snapshot.TargetDigest,
+		RuntimeDigest:        snapshot.RuntimeDigest,
+		Provider:             snapshot.Provider,
+		Model:                snapshot.Model,
+		Binding:              canonicalBindingContext(snapshot.Binding),
+		Runtime:              canonicalRuntimeContext(snapshot.Runtime),
+		Constraints:          append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...),
+		Contract:             contextContract{MediaType: snapshot.Generation.Contract.MediaType(), Untrusted: snapshot.Generation.Contract.Untrusted(), BytesSHA256: hex.EncodeToString(openAPISum[:]), Omissions: snapshot.Generation.Contract.Omissions()},
+		Capabilities:         capabilities,
+		Limits:               snapshot.Generation.Limits,
 	})
 }
 

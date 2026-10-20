@@ -5,9 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
-	"github.com/asierhr/featureProof/internal/openapi"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/specification"
 )
 
@@ -18,12 +19,33 @@ type SpecificationLoader interface {
 
 // ContractReducer loads one authorized contract and exposes only bounded untrusted reduced context.
 type ContractReducer interface {
-	Reduce(context.Context, string, specification.Specification) (openapi.ReducedContext, error)
+	Reduce(context.Context, string, specification.Specification) (contractcatalog.ReducedContext, error)
+}
+
+// contractAuthorityKey identifies source authority placed in context only after trusted binding verification.
+type contractAuthorityKey struct{}
+
+// ContractAuthority returns the verified revision, roots and changed paths available to neutral contract adapters.
+// feature22:coverage validationworkflow.ContractAuthority
+func ContractAuthority(ctx context.Context) (RevisionContext, bool) {
+	value, ok := ctx.Value(contractAuthorityKey{}).(RevisionContext)
+	return value, ok
+}
+
+// ContextWithContractAuthority binds authority already verified by a composition adapter for a neutral reducer.
+// feature22:coverage validationworkflow.ContextWithContractAuthority
+func ContextWithContractAuthority(ctx context.Context, authority RevisionContext) context.Context {
+	return context.WithValue(ctx, contractAuthorityKey{}, canonicalBindingContext(BindingContext{Revision: authority}).Revision)
 }
 
 // BindingVerifier returns the exact effective repository, revision, target and attestation before admission.
 type BindingVerifier interface {
 	Verify(context.Context, StartCommand) (BindingContext, error)
+}
+
+// ContractAuthorityProvider optionally exposes prevalidated source authority without acquiring deployment state.
+type ContractAuthorityProvider interface {
+	ContractAuthority(context.Context, StartCommand) (RevisionContext, error)
 }
 
 // DescriptorCatalog returns non-executable capability descriptors and the complete effective runtime context.
@@ -47,6 +69,7 @@ type TrustedAdmissionBuilder struct {
 }
 
 // Build performs the complete side-effect-free workflow preflight and returns isolated safe snapshots.
+// feature22:coverage TrustedAdmissionBuilder.Build
 func (b TrustedAdmissionBuilder) Build(ctx context.Context, command StartCommand) (AdmissionSnapshot, error) {
 	if b.Specifications == nil || b.Contracts == nil || b.Bindings == nil || b.Catalog == nil || !validGenerationLimits(b.Config.Limits) || b.Config.Provider != command.Provider || b.Config.Model != command.Model || b.Config.CompositionRef != command.CompositionRef {
 		return AdmissionSnapshot{}, &Error{Code: CodeInvalid, Operation: "admission_composition"}
@@ -58,9 +81,28 @@ func (b TrustedAdmissionBuilder) Build(ctx context.Context, command StartCommand
 	if err = validateSpecification(spec); err != nil {
 		return AdmissionSnapshot{}, err
 	}
-	reduced, err := b.Contracts.Reduce(ctx, command.ContractRef, spec)
+	contractContext := ctx
+	if provider, ok := b.Bindings.(ContractAuthorityProvider); ok {
+		authority, authorityErr := provider.ContractAuthority(ctx, command)
+		if authorityErr != nil {
+			return AdmissionSnapshot{}, &Error{Code: CodeUnauthorized, Operation: "binding"}
+		}
+		contractContext = ContextWithContractAuthority(ctx, authority)
+	}
+	reduced, err := b.Contracts.Reduce(contractContext, command.ContractRef, spec)
 	if err != nil {
+		var decision *contractcatalog.DecisionError
+		if errors.As(err, &decision) {
+			code := CodeInsufficientContext
+			if decision.Category == contractcatalog.CategoryReviewRequired {
+				code = CodeReviewRequired
+			}
+			return AdmissionSnapshot{}, &Error{Code: code, Operation: "contract", Decision: &ContextDecision{MissingKinds: append([]string(nil), decision.MissingKinds...), Operations: append([]contractcatalog.OperationKey(nil), decision.Operations...), ConflictIDs: append([]string(nil), decision.ConflictIDs...)}}
+		}
 		return AdmissionSnapshot{}, &Error{Code: CodeInvalid, Operation: "contract"}
+	}
+	if reduced.Validate() != nil {
+		return AdmissionSnapshot{}, &Error{Code: CodeInvalid, Operation: "contract_binding"}
 	}
 	binding, err := b.Bindings.Verify(ctx, command)
 	if err != nil {
@@ -95,7 +137,7 @@ func (b TrustedAdmissionBuilder) Build(ctx context.Context, command StartCommand
 	for i, constraint := range spec.Constraints {
 		constraints[i] = agentplanning.Constraint{ID: constraint.ID, Description: constraint.Description}
 	}
-	return AdmissionSnapshot{SpecificationDigest: specDigest, ContractDigest: contractDigest, RevisionDigest: revisionDigest, TargetDigest: targetDigest, RuntimeDigest: runtimeDigest, Provider: command.Provider, Model: command.Model, Binding: binding, Runtime: runtime, Generation: agentplanning.GenerationRequest{Constraints: constraints, OpenAPI: reduced, Capabilities: append([]agentplanning.CapabilityDescriptor(nil), descriptors...), Limits: b.Config.Limits}}, nil
+	return AdmissionSnapshot{SpecificationDigest: specDigest, ContractDigest: contractDigest, CatalogDigest: reduced.CatalogDigest(), ContractPolicyDigest: reduced.PolicyDigest(), RevisionDigest: revisionDigest, TargetDigest: targetDigest, RuntimeDigest: runtimeDigest, Provider: command.Provider, Model: command.Model, Binding: binding, Runtime: runtime, Generation: agentplanning.GenerationRequest{Constraints: constraints, Contract: reduced, Capabilities: append([]agentplanning.CapabilityDescriptor(nil), descriptors...), Limits: b.Config.Limits}}, nil
 }
 
 // validBindingContext rejects partial or caller-substituted source, target and attestation objects.

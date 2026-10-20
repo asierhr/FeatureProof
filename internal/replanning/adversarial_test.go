@@ -81,7 +81,7 @@ func TestFingerprintAndSummaryCompositionRejectEmptyInputs(t *testing.T) {
 	if _, err := ModelRequest("", []byte(`{}`), testLimits()); err == nil {
 		t.Fatal("missing run accepted")
 	}
-	if _, err := NewCoordinator(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, testLimits(), revisionbinding.Binding{}, nil); err == nil {
+	if _, err := NewCoordinator(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, testLimits(), revisionbinding.Binding{}, nil, testOwnershipConfig()); err == nil {
 		t.Fatal("missing coordinator boundaries")
 	}
 }
@@ -130,11 +130,12 @@ func TestSummaryRejectsUnsafeContextAndNestedEvidence(t *testing.T) {
 	if len(summary.Checks[0].Steps[0].Assertions) != 2 || strings.Contains(string(raw), "CANARY") {
 		t.Fatal("nested assertion escaped")
 	}
-	input.OpenAPI.Bytes = []byte("not json")
-	if _, _, _, err := builder.Build(context.Background(), input); err == nil {
-		t.Fatal("accepted malformed contract")
+	input.Contract = replanningContract(t, "/pets")
+	copyBytes := input.Contract.Bytes()
+	copyBytes[0] = 'x'
+	if _, _, _, err := builder.Build(context.Background(), input); err != nil {
+		t.Fatal("accessor mutation altered immutable contract")
 	}
-	input.OpenAPI.Bytes = nil
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, _, _, err := builder.Build(ctx, input); err == nil {

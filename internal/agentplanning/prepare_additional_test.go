@@ -28,7 +28,7 @@ func TestAdditionalBatchReusesAllPlanningGates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(prepared.Checks()) != 1 || len(policy.calls) != 1 || !prepared.MatchesProvenance(ProvenanceInput{Constraints: request.Constraints, OpenAPI: request.OpenAPI, Capabilities: request.Capabilities}) {
+	if len(prepared.Checks()) != 1 || len(policy.calls) != 1 || !prepared.MatchesProvenance(ProvenanceInput{Constraints: request.Constraints, Contract: request.Contract, Capabilities: request.Capabilities}) {
 		t.Fatal("preparation bypassed a gate")
 	}
 	bad := decision.Plan.Checks[:1]

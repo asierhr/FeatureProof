@@ -2,15 +2,15 @@ package agentplanning
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/asierhr/featureProof/internal/openapi"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/planning"
 )
 
@@ -255,34 +255,54 @@ func TestUntrustedInputsRemainDataInProviderRequest(t *testing.T) {
 	}
 }
 
-// generationFixture creates a local OpenAPI context and descriptor-only request without network or credentials.
+// generationFixture creates a neutral contract context and descriptor-only request without network or credentials.
 func generationFixture(t *testing.T) GenerationRequest {
 	t.Helper()
-	root := t.TempDir()
-	doc := `{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{"/pets":{"get":{"responses":{"200":{"description":"ok"}}}}}}`
-	path := filepath.Join(root, "api.json")
-	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := openapi.Config{AuthorizedRoot: root, MaxDocumentBytes: 1 << 20, MaxTotalBytes: 1 << 20, MaxDocuments: 2, MaxReferences: 8, MaxReferenceDepth: 4, MaxObservedBodyBytes: 1024, MaxContextBytes: 8192}
-	loader, err := openapi.NewLoader(context.Background(), cfg, openapi.LocalFS{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	contract, err := loader.Load(context.Background(), "api.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	reduced, err := contract.BuildContext(context.Background(), openapi.ContextRequest{Constraints: []openapi.ConstraintSelection{{ConstraintID: "c1", Operations: []openapi.OperationKey{{Method: "GET", Path: "/pets"}}}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return GenerationRequest{RunID: "run-1", PlanID: "plan-1", Constraints: []Constraint{{ID: "c1", Description: "pets are listed"}}, OpenAPI: reduced, Capabilities: []CapabilityDescriptor{{Name: "http.request", Class: "http", Validate: func(input map[string]planning.InputValue) error {
+	reduced := generationContract(t, "/pets")
+	return GenerationRequest{RunID: "run-1", PlanID: "plan-1", Constraints: []Constraint{{ID: "c1", Description: "pets are listed"}}, Contract: reduced, Capabilities: []CapabilityDescriptor{{Name: "http.request", Class: "http", Validate: func(input map[string]planning.InputValue) error {
 		if input["method"].Literal == nil || input["path"].Literal == nil || input["method"].Literal.Value != "GET" || input["path"].Literal.Value != "/pets" {
 			return errors.New("invalid derived input")
 		}
 		return nil
 	}}}, Limits: Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 4, MaxCapabilities: 4, MaxChecks: 16, MaxStepsPerCheck: 4, MaxAssertionsPerStep: 4, MaxMissingItems: 4, MaxValidationWork: 10000}}
+}
+
+// generationContract builds a fully verified neutral context through the same sealed registry and policy boundaries as production.
+func generationContract(t *testing.T, path string) contractcatalog.ReducedContext {
+	t.Helper()
+	sum := sha256.Sum256([]byte(path))
+	digest := hex.EncodeToString(sum[:])
+	provenance := contractcatalog.Provenance{SourceID: "fixture", Class: contractcatalog.ClassAuthoritative, SourceDigest: digest, AdapterVersion: "test-v1", SafeLocation: "catalog/operations/0", Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete}
+	op := contractcatalog.OperationDescriptor{Key: contractcatalog.OperationKey{Method: "GET", Path: path}, LogicalID: "fixture", Responses: map[string]contractcatalog.Response{"200": {}}, Security: []contractcatalog.SecurityRequirement{}, Provenance: []contractcatalog.Provenance{provenance}, Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete, Classes: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative}}
+	op.Claims = contractcatalog.ClaimsForOperation(op, provenance)
+	snapshot := contractcatalog.SourceSnapshot{Version: contractcatalog.VersionV1, Source: contractcatalog.SourceSummary{ID: "fixture", Kind: "fixture", Class: contractcatalog.ClassAuthoritative, Digest: digest, AdapterVersion: "test-v1", Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete}, Operations: []contractcatalog.OperationDescriptor{op}}
+	limits := contractcatalog.Limits{MaxSources: 1, MaxOperations: 8, MaxClaims: 128, MaxBytes: 1 << 20, MaxDepth: 32, MaxDiagnostics: 32, MaxLocationBytes: 256}
+	projection := contractcatalog.ProjectionPolicy{MaxStringBytes: 512, AllowedURLSchemes: []string{"https"}, SensitiveNames: []string{}, SensitivePaths: []string{}, SensitiveHeaderNames: []string{"authorization", "cookie"}, ForbiddenValues: []string{}}
+	registry, err := contractcatalog.NewRegistry(map[string]contractcatalog.ContractSource{"fixture": &contractcatalog.StaticSource{Snapshot: snapshot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := registry.Load(context.Background(), []contractcatalog.SourceRequest{contractcatalog.NewSourceRequest(contractcatalog.SourceDescriptor{Kind: "fixture", ID: "fixture", Class: contractcatalog.ClassAuthoritative, Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete, ExpectedDigest: digest, AdapterVersion: "test-v1", Limits: limits, Projection: projection})}, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := contractcatalog.Build(context.Background(), loaded, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := map[contractcatalog.ClaimKind]contractcatalog.ClaimRule{}
+	for _, kind := range []contractcatalog.ClaimKind{contractcatalog.ClaimOperationIdentity, contractcatalog.ClaimSchema, contractcatalog.ClaimSecurity, contractcatalog.ClaimResponse} {
+		rules[kind] = contractcatalog.ClaimRule{AllowedClasses: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative}, MinimumConfidence: map[contractcatalog.SourceClass]contractcatalog.Confidence{contractcatalog.ClassAuthoritative: contractcatalog.ConfidenceHigh}, RequiredCompleteness: contractcatalog.CompletenessComplete, Required: true}
+	}
+	policy, err := contractcatalog.NewPolicy(contractcatalog.SufficiencyPolicy{ID: "fixture", Version: contractcatalog.VersionV1, Claims: rules, ConflictTreatment: contractcatalog.ConflictDeny})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reduced, err := contractcatalog.BuildContext(context.Background(), catalog, policy, []contractcatalog.ConstraintSelection{{ConstraintID: "c1", Operations: []contractcatalog.OperationKey{{Method: "GET", Path: path}}}}, contractcatalog.ReductionLimits{MaxBytes: 1 << 20, MaxOperations: 8, MaxClaims: 128, MaxDepth: 32, MaxDiagnostics: 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reduced
 }
 
 // validPlanJSON creates a complete three-scenario protocol response and optionally duplicates the positive check.

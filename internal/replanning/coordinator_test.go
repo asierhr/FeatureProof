@@ -63,6 +63,7 @@ func testRevisionBinding(t *testing.T, runID string) (revisionbinding.Binding, *
 type scriptedReplanModel struct {
 	outputs [][]byte
 	calls   int
+	mu      sync.Mutex
 }
 
 // cancellingReplanModel cancels the caller at the model boundary without starting downstream work.
@@ -108,9 +109,26 @@ func (j *failBeforeEventJournal) CompareAndAppend(ctx context.Context, runID str
 	return j.MemoryJournal.CompareAndAppend(ctx, runID, expected, key, event)
 }
 
+func (j *failBeforeEventJournal) OwnedCompareAndAppend(ctx context.Context, runID string, lease RunLease, now time.Time, expected uint64, key string, event Event) (Event, bool, error) {
+	if event.Type == j.target && !j.failed {
+		j.failed = true
+		return Event{}, false, failure(CategoryDependency, "journal", "before_append")
+	}
+	return j.MemoryJournal.OwnedCompareAndAppend(ctx, runID, lease, now, expected, key, event)
+}
+
 // CompareAndAppend persists the event and reports one injected transport error afterward.
 func (j *failAfterEventJournal) CompareAndAppend(ctx context.Context, runID string, expected uint64, key string, event Event) (Event, bool, error) {
 	confirmed, replayed, err := j.MemoryJournal.CompareAndAppend(ctx, runID, expected, key, event)
+	if err == nil && event.Type == j.target && !j.failed {
+		j.failed = true
+		return Event{}, false, failure(CategoryDependency, "journal", "uncertain_append")
+	}
+	return confirmed, replayed, err
+}
+
+func (j *failAfterEventJournal) OwnedCompareAndAppend(ctx context.Context, runID string, lease RunLease, now time.Time, expected uint64, key string, event Event) (Event, bool, error) {
+	confirmed, replayed, err := j.MemoryJournal.OwnedCompareAndAppend(ctx, runID, lease, now, expected, key, event)
 	if err == nil && event.Type == j.target && !j.failed {
 		j.failed = true
 		return Event{}, false, failure(CategoryDependency, "journal", "uncertain_append")
@@ -128,14 +146,28 @@ func (j *ambiguousCancelJournal) CompareAndAppend(ctx context.Context, runID str
 	return confirmed, replayed, err
 }
 
+func (j *ambiguousCancelJournal) OwnedCompareAndAppend(ctx context.Context, runID string, lease RunLease, now time.Time, expected uint64, key string, event Event) (Event, bool, error) {
+	confirmed, replayed, err := j.MemoryJournal.OwnedCompareAndAppend(ctx, runID, lease, now, expected, key, event)
+	j.once.Do(j.cancel)
+	if ctx.Err() != nil {
+		return Event{}, false, ctx.Err()
+	}
+	return confirmed, replayed, err
+}
+
 // InferStructured captures only the bounded request and returns the next fake response.
 func (m *scriptedReplanModel) InferStructured(_ context.Context, _ model.StructuredRequest) (model.StructuredResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.calls++
 	if m.calls > len(m.outputs) {
 		return model.StructuredResult{Output: []byte(`{"version":1,"kind":"terminate","terminate":{}}`)}, nil
 	}
 	return model.StructuredResult{Output: m.outputs[m.calls-1]}, nil
 }
+
+// callCount returns the synchronized inference count without weakening the adversarial exactly-once assertion.
+func (m *scriptedReplanModel) callCount() int { m.mu.Lock(); defer m.mu.Unlock(); return m.calls }
 
 // rejectingPreparer proves terminal decisions do not touch generation gates.
 type rejectingPreparer struct{ calls int }
@@ -220,7 +252,7 @@ func coordinatorFixture(t *testing.T, status planning.AssertionStatus, limits Li
 	a := &quietApproval{}
 	e := &quietExecutor{}
 	base, guard := testRevisionBinding(t, run.ID)
-	c, err := NewCoordinator(run, m, summary, budgets, NewMemoryJournal(), ledger, NewFingerprintSet(), p, a, e, limits, base, guard)
+	c, err := NewCoordinator(run, m, summary, budgets, NewMemoryJournal(), ledger, NewFingerprintSet(), p, a, e, limits, base, guard, testOwnershipConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,8 +402,9 @@ func TestRecoveryCheckpointSanitizesNestedAssertionValues(t *testing.T) {
 func TestConcurrentCycleHasOneModelCall(t *testing.T) {
 	c, input, m, _, _, _ := coordinatorFixture(t, planning.AssertionPassed, testLimits(), `{"version":1,"kind":"terminate","terminate":{}}`)
 	var wg sync.WaitGroup
-	results := make(chan error, 2)
-	for i := 0; i < 2; i++ {
+	const workers = 32
+	results := make(chan error, workers)
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() { defer wg.Done(); _, err := c.Run(context.Background(), input); results <- err }()
 	}
@@ -386,8 +419,8 @@ func TestConcurrentCycleHasOneModelCall(t *testing.T) {
 			failures = append(failures, err)
 		}
 	}
-	if success == 0 || m.calls != 1 {
-		t.Fatalf("success=%d calls=%d errors=%v", success, m.calls, failures)
+	if success != workers || m.callCount() != 1 {
+		t.Fatalf("success=%d calls=%d errors=%v", success, m.callCount(), failures)
 	}
 }
 

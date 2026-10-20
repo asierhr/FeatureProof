@@ -14,7 +14,7 @@ type ProductionConfig struct {
 	Permissions                                                                                  PermissionSet
 	APIOrigin, APIVersion, EvidenceOrigin                                                        string
 	MaxWebhookBytes, MaxResponseBytes                                                            int64
-	MaxPages, MaxAttempts                                                                        int
+	MaxPages, MaxChangedPaths, MaxAttempts                                                       int
 	RunTimeout, CloseTimeout                                                                     time.Duration
 	LeaseTTL, PollInterval, RetryMaxDuration, RetryMaxWait, RetryInitialBackoff, RetryMaxBackoff time.Duration
 	StoreDir                                                                                     string
@@ -23,13 +23,13 @@ type ProductionConfig struct {
 
 // Validate rejects incomplete, overprivileged, unbounded, or non-HTTPS production composition.
 func (c ProductionConfig) Validate() error {
-	if c.AppID <= 0 || c.BotID <= 0 || ValidatePermissions(c.Permissions) != nil || c.APIVersion == "" || c.StoreDir == "" || c.MaxWebhookBytes <= 0 || c.MaxResponseBytes <= 0 || c.MaxPages <= 0 || c.MaxAttempts <= 0 || c.RunTimeout <= 0 || c.CloseTimeout <= 0 || c.PollInterval <= 0 || c.RetryMaxDuration <= 0 || c.RetryMaxWait < 0 || c.RetryInitialBackoff <= 0 || c.RetryMaxBackoff < c.RetryInitialBackoff || !leaseCovers(c.LeaseTTL, c.RunTimeout, c.CloseTimeout, c.RetryMaxDuration) {
+	if c.AppID <= 0 || c.BotID <= 0 || ValidatePermissions(c.Permissions) != nil || c.APIVersion == "" || c.StoreDir == "" || c.MaxWebhookBytes <= 0 || c.MaxResponseBytes <= 0 || c.MaxPages <= 0 || c.MaxChangedPaths <= 0 || c.MaxAttempts <= 0 || c.RunTimeout <= 0 || c.CloseTimeout <= 0 || c.PollInterval <= 0 || c.RetryMaxDuration <= 0 || c.RetryMaxWait < 0 || c.RetryInitialBackoff <= 0 || c.RetryMaxBackoff < c.RetryInitialBackoff || !leaseCovers(c.LeaseTTL, c.RunTimeout, c.CloseTimeout, c.RetryMaxDuration) {
 		return &Error{Code: CodeInvalid, Operation: "production_config"}
 	}
 	if _, err := NewEvidenceLinker(c.EvidenceOrigin, 2048); err != nil {
 		return err
 	}
-	if _, err := NewRESTAdapter(RESTConfig{BaseURL: c.APIOrigin, APIVersion: c.APIVersion, AppID: c.AppID, Tokens: failClosedCredentials{}, HTTP: failClosedHTTP{}, Clock: WallClock{}, MaxResponse: c.MaxResponseBytes}); err != nil {
+	if _, err := NewRESTAdapter(RESTConfig{BaseURL: c.APIOrigin, APIVersion: c.APIVersion, AppID: c.AppID, Tokens: failClosedCredentials{}, HTTP: failClosedHTTP{}, Clock: WallClock{}, MaxResponse: c.MaxResponseBytes, MaxPages: c.MaxPages, MaxChangedPaths: c.MaxChangedPaths}); err != nil {
 		return err
 	}
 	return nil
@@ -72,7 +72,7 @@ func ComposeRuntime(ctx context.Context, config ProductionConfig, secrets Compos
 	if err != nil {
 		return nil, err
 	}
-	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: config.APIOrigin, APIVersion: config.APIVersion, AppID: config.AppID, Tokens: deps.Credentials, HTTP: deps.HTTP, Clock: deps.Clock, MaxResponse: config.MaxResponseBytes})
+	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: config.APIOrigin, APIVersion: config.APIVersion, AppID: config.AppID, Tokens: deps.Credentials, HTTP: deps.HTTP, Clock: deps.Clock, MaxResponse: config.MaxResponseBytes, MaxPages: config.MaxPages, MaxChangedPaths: config.MaxChangedPaths})
 	if err != nil {
 		return nil, err
 	}

@@ -31,28 +31,30 @@ type contextEnvelope struct {
 	Context canonicalContext `json:"context"`
 }
 
-// canonicalContext includes OpenAPI bytes and retained provenance omitted by its ordinary JSON representation.
+// canonicalContext includes neutral contract bytes and retained authority omitted by its ordinary JSON representation.
 type canonicalContext struct {
 	Target       TargetSnapshot             `json:"target"`
 	Constraints  any                        `json:"constraints"`
-	OpenAPI      any                        `json:"openapi"`
+	Contract     any                        `json:"contract"`
 	Capabilities []CapabilitySnapshot       `json:"capabilities"`
 	Runtime      RuntimeSnapshot            `json:"runtime"`
 	Generation   GenerationContractSnapshot `json:"generation"`
 }
 
-// canonicalOpenAPI captures both the reduced untrusted envelope and its exact retained provenance.
-type canonicalOpenAPI struct {
-	MediaType string `json:"media_type"`
-	Untrusted bool   `json:"untrusted"`
-	Bytes     []byte `json:"bytes"`
-	Omissions any    `json:"omissions"`
-	Retained  any    `json:"retained"`
+// canonicalContract captures both the reduced untrusted envelope and its exact retained provenance.
+type canonicalContract struct {
+	MediaType     string `json:"media_type"`
+	Untrusted     bool   `json:"untrusted"`
+	Bytes         []byte `json:"bytes"`
+	Omissions     any    `json:"omissions"`
+	CatalogDigest string `json:"catalog_digest"`
+	PolicyDigest  string `json:"policy_digest"`
+	Retained      any    `json:"retained"`
 }
 
 // contextFingerprints retains category hashes so stale decisions can report a structural reason only.
 type contextFingerprints struct {
-	All, Target, Constraints, OpenAPI, Capabilities, Runtime, Generation string
+	All, Target, Constraints, Contract, Capabilities, Runtime, Generation string
 }
 
 // fingerprintPlan hashes the complete immutable plan semantics after enforcing traversal budgets.
@@ -91,14 +93,14 @@ func fingerprintContext(ctx context.Context, snapshot ContractSnapshot, limits L
 	if err := validateContext(snapshot, limits); err != nil {
 		return contextFingerprints{}, err
 	}
-	openapiValue := canonicalOpenAPI{MediaType: snapshot.OpenAPI.MediaType, Untrusted: snapshot.OpenAPI.Untrusted, Bytes: append([]byte(nil), snapshot.OpenAPI.Bytes...), Omissions: snapshot.OpenAPI.Omissions, Retained: snapshot.OpenAPI.RetainedOperations()}
-	all := canonicalContext{Target: snapshot.Target, Constraints: snapshot.Constraints, OpenAPI: openapiValue, Capabilities: snapshot.Capabilities, Runtime: snapshot.Runtime, Generation: snapshot.GenerationContract}
+	contractValue := canonicalContract{MediaType: snapshot.Contract.MediaType(), Untrusted: snapshot.Contract.Untrusted(), Bytes: snapshot.Contract.Bytes(), Omissions: snapshot.Contract.Omissions(), CatalogDigest: snapshot.Contract.CatalogDigest(), PolicyDigest: snapshot.Contract.PolicyDigest(), Retained: snapshot.Contract.RetainedOperations()}
+	all := canonicalContext{Target: snapshot.Target, Constraints: snapshot.Constraints, Contract: contractValue, Capabilities: snapshot.Capabilities, Runtime: snapshot.Runtime, Generation: snapshot.GenerationContract}
 	parts := []struct {
 		value  any
 		target *string
 	}{
 		{contextEnvelope{Version: 1, Context: all}, nil},
-		{snapshot.Target, nil}, {snapshot.Constraints, nil}, {openapiValue, nil},
+		{snapshot.Target, nil}, {snapshot.Constraints, nil}, {contractValue, nil},
 		{snapshot.Capabilities, nil}, {snapshot.Runtime, nil}, {snapshot.GenerationContract, nil},
 	}
 	values := make([]string, len(parts))
@@ -109,12 +111,12 @@ func fingerprintContext(ctx context.Context, snapshot ContractSnapshot, limits L
 		}
 		values[i] = hash
 	}
-	return contextFingerprints{All: values[0], Target: values[1], Constraints: values[2], OpenAPI: values[3], Capabilities: values[4], Runtime: values[5], Generation: values[6]}, nil
+	return contextFingerprints{All: values[0], Target: values[1], Constraints: values[2], Contract: values[3], Capabilities: values[4], Runtime: values[5], Generation: values[6]}, nil
 }
 
 // validateContext rejects incomplete or unbounded snapshots before a request can become visible.
 func validateContext(snapshot ContractSnapshot, limits Limits) error {
-	if snapshot.Target.ID == "" || snapshot.Target.BaseURL == "" || len(snapshot.Constraints) == 0 || snapshot.OpenAPI.MediaType == "" || len(snapshot.Capabilities) == 0 || snapshot.Runtime.PolicyVersion == "" || snapshot.GenerationContract.ProtocolVersion == "" || snapshot.GenerationContract.PromptVersion == "" {
+	if snapshot.Target.ID == "" || snapshot.Target.BaseURL == "" || len(snapshot.Constraints) == 0 || snapshot.Contract.Validate() != nil || len(snapshot.Capabilities) == 0 || snapshot.Runtime.PolicyVersion == "" || snapshot.GenerationContract.ProtocolVersion == "" || snapshot.GenerationContract.PromptVersion == "" {
 		return typedError(CategoryInvalidInput, "validate_context", "context", nil)
 	}
 	if len(snapshot.Constraints) > limits.MaxConstraints {
@@ -212,8 +214,8 @@ func staleReason(staged, currentPlan string, stagedContext, currentContext conte
 	if stagedContext.Constraints != currentContext.Constraints {
 		return ReasonConstraintsChanged
 	}
-	if stagedContext.OpenAPI != currentContext.OpenAPI {
-		return ReasonOpenAPIChanged
+	if stagedContext.Contract != currentContext.Contract {
+		return ReasonContractChanged
 	}
 	if stagedContext.Capabilities != currentContext.Capabilities {
 		return ReasonCapabilitiesChanged

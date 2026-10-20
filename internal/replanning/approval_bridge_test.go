@@ -65,7 +65,7 @@ func TestWorkflowApprovalStagesFreshRevision(t *testing.T) {
 	if err := run.Transition(harness.StatusPlanning); err != nil {
 		t.Fatal(err)
 	}
-	contract := planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: "target", BaseURL: "https://example.invalid"}, Constraints: request.Constraints, OpenAPI: request.OpenAPI, Capabilities: []planapproval.CapabilitySnapshot{{Name: "http.request", Class: "http"}}, Runtime: planapproval.RuntimeSnapshot{PolicyVersion: "v1", Limits: map[string]int{"tools": 2}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: "v1", PromptVersion: "p1", Provider: "fake", Model: "fake"}}
+	contract := planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: "target", BaseURL: "https://example.invalid"}, Constraints: request.Constraints, Contract: request.Contract, Capabilities: []planapproval.CapabilitySnapshot{{Name: "http.request", Class: "http"}}, Runtime: planapproval.RuntimeSnapshot{PolicyVersion: "v1", Limits: map[string]int{"tools": 2}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: "v1", PromptVersion: "p1", Provider: "fake", Model: "fake"}}
 	limits := planapproval.Limits{MaxBytes: 1 << 20, MaxDepth: 64, MaxEvents: 100, MaxConstraints: 10, MaxChecks: 10, MaxSteps: 20, MaxAssertions: 20, MaxEvidence: 20}
 	store := planapproval.NewMemoryStore()
 	workflow, err := planapproval.NewWorkflow(store, approvalSanitizer{}, approvalClock{}, limits, run)
@@ -144,7 +144,7 @@ func TestCoordinatorRecoversResolvedWorkflowApprovalWithoutSecondHumanDecision(t
 		t.Fatal(err)
 	}
 	c.run, executor.run = run, run
-	input.Contract = planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: "target", BaseURL: "https://example.invalid"}, Constraints: input.Generation.Constraints, OpenAPI: input.Generation.OpenAPI, Capabilities: []planapproval.CapabilitySnapshot{{Name: "http.request", Class: "http"}}, Runtime: planapproval.RuntimeSnapshot{PolicyVersion: "v1", Limits: map[string]int{"tools": 2}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: "v1", PromptVersion: "p1", Provider: "fake", Model: "fake"}}
+	input.Contract = planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: "target", BaseURL: "https://example.invalid"}, Constraints: input.Generation.Constraints, Contract: input.Generation.Contract, Capabilities: []planapproval.CapabilitySnapshot{{Name: "http.request", Class: "http"}}, Runtime: planapproval.RuntimeSnapshot{PolicyVersion: "v1", Limits: map[string]int{"tools": 2}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: "v1", PromptVersion: "p1", Provider: "fake", Model: "fake"}}
 	limits := planapproval.Limits{MaxBytes: 1 << 20, MaxDepth: 64, MaxEvents: 100, MaxConstraints: 10, MaxChecks: 10, MaxSteps: 20, MaxAssertions: 20, MaxEvidence: 20}
 	store := planapproval.NewMemoryStore()
 	workflow, err := planapproval.NewWorkflow(store, approvalSanitizer{}, approvalClock{}, limits, run)

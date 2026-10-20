@@ -210,7 +210,7 @@ func TestRESTUsesExactInstallationAndFollowsPagination(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Header: header, Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
-	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: tokens, HTTP: transport, Clock: clock, MaxResponse: 4096})
+	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: tokens, HTTP: transport, Clock: clock, MaxResponse: 4096, MaxPages: 2, MaxChangedPaths: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,10 +306,13 @@ func TestComposedRuntimeAuthenticatesAndFailsClosedAtPreview(t *testing.T) {
 	clock := &fakeClock{now: time.Unix(100, 0)}
 	tokens := &fakeTokenSource{clock: clock}
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		body := `{"number":3,"state":"open","user":{"id":5},"head":{"sha":"` + testOID + `","repo":{"id":2}},"base":{"repo":{"id":2}},"ignored":"provider-field"}`
+		body := `{"number":3,"state":"open","user":{"id":5},"head":{"sha":"` + testOID + `","repo":{"id":2}},"base":{"repo":{"id":2,"full_name":"owner/repository"}},"ignored":"provider-field"}`
+		if strings.HasSuffix(request.URL.Path, "/files") {
+			body = `[]`
+		}
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
-	config := ProductionConfig{AppID: 10, BotID: 20, Permissions: RequiredPermissions(), APIOrigin: "https://api.github.test", APIVersion: "2022-11-28", EvidenceOrigin: "https://evidence.example", StoreDir: t.TempDir(), MaxWebhookBytes: 4096, MaxResponseBytes: 4096, MaxPages: 2, MaxAttempts: 2, RunTimeout: time.Minute, CloseTimeout: time.Second, LeaseTTL: 2 * time.Minute, PollInterval: time.Millisecond, RetryMaxDuration: time.Minute, RetryMaxWait: time.Second, RetryInitialBackoff: time.Millisecond, RetryMaxBackoff: time.Second, Authorization: AuthorizationConfig{Installations: map[int64]map[int64]bool{1: {2: true}}, Actors: map[int64]bool{4: true}, Selections: map[string]Selection{"default": {Alias: "default"}}, Forks: map[int64]map[int64]bool{}}}
+	config := ProductionConfig{AppID: 10, BotID: 20, Permissions: RequiredPermissions(), APIOrigin: "https://api.github.test", APIVersion: "2022-11-28", EvidenceOrigin: "https://evidence.example", StoreDir: t.TempDir(), MaxWebhookBytes: 4096, MaxResponseBytes: 4096, MaxPages: 2, MaxChangedPaths: 100, MaxAttempts: 2, RunTimeout: time.Minute, CloseTimeout: time.Second, LeaseTTL: 2 * time.Minute, PollInterval: time.Millisecond, RetryMaxDuration: time.Minute, RetryMaxWait: time.Second, RetryInitialBackoff: time.Millisecond, RetryMaxBackoff: time.Second, Authorization: AuthorizationConfig{Installations: map[int64]map[int64]bool{1: {2: true}}, Actors: map[int64]bool{4: true}, Selections: map[string]Selection{"default": {Alias: "default"}}, Forks: map[int64]map[int64]bool{}}}
 	runtime, err := ComposeRuntime(context.Background(), config, CompositionSecrets{WebhookSecret: []byte("0123456789abcdef")}, RuntimeDependencies{Credentials: tokens, HTTP: transport, Packages: fakePackageReader{}, Clock: clock, Jitter: fixedJitter{}, IDs: &sequenceIDs{}})
 	if err != nil {
 		t.Fatal(err)
@@ -340,7 +343,7 @@ func TestSupervisorCancellationFinalizesAndJoins(t *testing.T) {
 	clock := blockingClock{now: time.Unix(100, 0)}
 	authorizer := StaticAuthorizer{Config: AuthorizationConfig{Installations: map[int64]map[int64]bool{1: {2: true}}, Actors: map[int64]bool{4: true}, Selections: map[string]Selection{"default": {Alias: "default"}}, Forks: map[int64]map[int64]bool{}}}
 	retry := RetryPolicy{Clock: clock, Jitter: fixedJitter{}, Config: RetryConfig{MaxAttempts: 2, MaxDuration: time.Minute, MaxWait: time.Second, InitialBackoff: time.Millisecond, MaxBackoff: time.Second}}
-	coordinator, err := NewCoordinator(context.Background(), CoordinatorDependencies{GitHub: gateway, Authorizer: authorizer, Validation: validation, Store: store, Publisher: Publisher{GitHub: gateway, Store: store, Retry: retry, AppID: 10, Clock: clock, Owner: "owner", LeaseTTL: 2 * time.Minute, MaxPages: 2}, Projector: Projector{}, Retry: retry, IDs: &sequenceIDs{}, Clock: clock, Owner: "owner", RunTimeout: time.Minute, CloseTimeout: time.Second, LeaseTTL: 2 * time.Minute, PollInterval: time.Millisecond})
+	coordinator, err := NewCoordinator(context.Background(), CoordinatorDependencies{GitHub: gateway, Authorizer: authorizer, Validation: validation, Store: store, Publisher: Publisher{GitHub: gateway, Store: store, Retry: retry, AppID: 10, Clock: clock, Owner: "owner", LeaseTTL: 3 * time.Minute, MaxPages: 2}, Projector: Projector{}, Retry: retry, IDs: &sequenceIDs{}, Clock: clock, Owner: "owner", RunTimeout: time.Minute, CloseTimeout: 5 * time.Second, LeaseTTL: 3 * time.Minute, PollInterval: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +352,7 @@ func TestSupervisorCancellationFinalizesAndJoins(t *testing.T) {
 	}
 	<-validation.submitted
 	<-validation.statusRead
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err = coordinator.Close(ctx); err != nil {
 		t.Fatal(err)

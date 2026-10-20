@@ -4,22 +4,58 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/parser"
+	"go/token"
+	"os"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/model"
-	"github.com/asierhr/featureProof/internal/openapi"
 	"github.com/asierhr/featureProof/internal/planning"
 )
 
+// TestPlannerConsumesOnlyVersionedNeutralCatalog enforces the source-format dependency boundary in production files.
+func TestPlannerConsumesOnlyVersionedNeutralCatalog(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		parsed, parseErr := parser.ParseFile(token.NewFileSet(), entry.Name(), nil, parser.ImportsOnly)
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		for _, imported := range parsed.Imports {
+			path, quoteErr := strconv.Unquote(imported.Path.Value)
+			if quoteErr != nil {
+				t.Fatal(quoteErr)
+			}
+			if path == "github.com/asierhr/featureProof/internal/openapi" {
+				t.Fatalf("planner source imports adapter package in %s", entry.Name())
+			}
+		}
+	}
+	requestType := reflect.TypeOf(GenerationRequest{})
+	field, ok := requestType.FieldByName("Contract")
+	if !ok || field.Type.PkgPath() != "github.com/asierhr/featureProof/internal/contractcatalog" || generationFixture(t).Contract.MediaType() != contractcatalog.ContextMediaType {
+		t.Fatalf("planner does not expose the versioned neutral contract: %#v", field)
+	}
+}
+
 // TestPathParameterExpansionValidatesTypesEscapesSegmentsAndRejectsSubstitution exercises trusted operation materialization boundaries.
 func TestPathParameterExpansionValidatesTypesEscapesSegmentsAndRejectsSubstitution(t *testing.T) {
-	operation := openapi.OperationDescriptor{Key: openapi.OperationKey{Method: "GET", Path: "/pets/{name}/{count}/{ratio}/{active}"}, Parameters: []openapi.Parameter{
-		{Name: "name", In: "path", Required: true, Schema: &openapi.Schema{Type: "string"}}, {Name: "count", In: "path", Required: true, Schema: &openapi.Schema{Type: "integer"}}, {Name: "ratio", In: "path", Required: true, Schema: &openapi.Schema{Type: "number"}}, {Name: "active", In: "path", Required: true, Schema: &openapi.Schema{Type: "boolean"}},
+	operation := contractcatalog.OperationDescriptor{Key: contractcatalog.OperationKey{Method: "GET", Path: "/pets/{name}/{count}/{ratio}/{active}"}, Parameters: []contractcatalog.Parameter{
+		{Name: "name", In: "path", Required: true, Schema: &contractcatalog.Schema{Type: "string"}}, {Name: "count", In: "path", Required: true, Schema: &contractcatalog.Schema{Type: "integer"}}, {Name: "ratio", In: "path", Required: true, Schema: &contractcatalog.Schema{Type: "number"}}, {Name: "active", In: "path", Required: true, Schema: &contractcatalog.Schema{Type: "boolean"}},
 	}}
 	bindings := map[string]any{"name": "a/b", "count": json.Number("2"), "ratio": json.Number("1.5"), "active": true}
 	path, err := expandPath(operation, bindings)

@@ -436,3 +436,94 @@ Bitácora append-only de features completadas.
   preexistente de symlink de feature 15 que Windows no puede crear sin el
   privilegio correspondiente; suite y race comparables excluyen solo ese caso
   y pasan.
+
+## 2026-10-19 — contract-source-abstraction
+
+- Estado final: `done`.
+- Resultado: el planificador consume un `OperationCatalog` neutral y versionado,
+  independiente de OpenAPI, con fuentes pasivas, procedencia granular,
+  confianza, completitud y conflictos explícitos.
+- Spec aprobada por el usuario el `2026-10-19T13:52:53+02:00`.
+- Tasks T1–T12 completas; R1–R12 trazados a pruebas concretas en
+  `progress/contract-source-abstraction/implementation.md`.
+- Integración: el adapter OpenAPI proyecta desde el contrato normalizado sin
+  reparsear ni perder operaciones, schemas, security schemes, responses,
+  omisiones o validación de respuestas. `agentplanning`, aprobación,
+  replanning y workflow sellan y revalidan el catálogo neutral.
+- Seguridad: los descriptors confiables y policies se sellan con copias
+  privadas; las fuentes no reciben red, credenciales, procesos ni tools. La
+  proyección productiva bloquea contenido sensible antes de modelo, aprobación,
+  ejecución o persistencia.
+- Determinismo: merge, digests y reducción son canónicos ante permutaciones;
+  límites por fuente y agregados, cancelación y recorridos iterativos evitan
+  estados parciales o entradas no acotadas.
+- Review independiente aprobada en la cuarta revisión tras cerrar REV-1–REV-14.
+  Pasan focales ×20, race UCRT64, compatibilidad CLI, vet, compile-only, gofmt,
+  módulos y diff.
+- Coverage afectado: `contractcatalog` 87,7 %, `openapi` 91,5 %,
+  `agentplanning` 87,3 %, `planapproval` 86,4 %, `replanning` 85,2 %,
+  `validationworkflow` 85,9 % y `agenteval` 91,2 %; composición y reducer
+  productivos superan 85 %.
+- Limitación del host: la suite global y race de `localvalidation` conservan
+  únicamente el subtest preexistente de symlink que Windows no puede crear sin
+  el privilegio correspondiente.
+
+## 2026-10-20 — go-backend-inspector
+
+- Estado final: `done`.
+- Resultado: inspector estático hermético de backends Go que produce una fuente
+  `derived` para `OperationCatalog`, con patrones cerrados de `net/http` y Chi,
+  parámetros, schemas, responses y autenticación demostrables sin ejecutar el
+  repositorio ni resolver dependencias externas.
+- Spec aprobada por el usuario el `2026-10-19T16:16:15+02:00`.
+- Tasks T1–T12 completas; R1–R13 trazados a pruebas en
+  `progress/go-backend-inspector/implementation.md`.
+- Seguridad: filesystem enraizado por handles, protección ante symlink/reparse y
+  TOCTOU, authority/projection selladas, límites y deadline continuo, redacción
+  integral y ausencia de procesos, red, credenciales, environment o importers
+  del host.
+- Integración: fuente Go y OpenAPI comparten catálogo/policy y las superficies
+  CLI, API, MCP y GitHub; head, roots y changed paths quedan ligados a revisión.
+- Durabilidad: replanning usa lease generacional con fencing atómico antes del
+  modelo, ownership multiproceso, heartbeat configurable y recovery; GitHub
+  conserva ownership hasta finalize/release/join.
+- Review independiente aprobada en la duodécima revisión tras cerrar
+  REV-1–REV-26.
+- Verificación: focales hasta ×2000, rehidratación ×200, replanning ×50,
+  concurrencia ×500, combined ×20, multiproceso/race ×20, race global ×2,
+  coverage, vet, compile-only, gofmt y diff pasan.
+- Coverage: `goinspector` 86,7 % y `replanning` 85,5 %; el manifest diferencial
+  de composición supera 85 %.
+- Limitación del host: la suite/race global conserva únicamente las dos
+  repeticiones del subtest histórico de symlink sin privilegios en Windows.
+
+## 2026-10-20 — spring-boot-backend-inspector
+
+- Estado final: `done`.
+- Resultado: inspector estático hermético de backends Java/Spring Boot que
+  deriva un `OperationCatalog` sin ejecutar Maven, Gradle, `javac`, annotation
+  processors, tests ni la aplicación.
+- Spec aprobada por el usuario el `2026-10-20T11:18:38+02:00`.
+- Tasks T1–T13 completas; R1–R13 y REV-1–REV-13 trazados a pruebas en
+  `progress/spring-boot-backend-inspector/implementation.md` y validados en
+  `progress/spring-boot-backend-inspector/review.md`.
+- Análisis: controllers y mappings Spring MVC de lista cerrada, parámetros,
+  DTOs/records/enums/generics, media types, estados, `ResponseEntity` por rama y
+  seguridad declarativa inerte con procedencia exacta.
+- Seguridad: root, source sets, framework identities, repositorio y revisión
+  sellados; ambigüedades, shapes dinámicos y límites fallan cerrado; no usa
+  procesos, red, classpath, environment ni credenciales durante el análisis.
+- Integración: composición explícita OpenAPI/Go/Spring bajo un catálogo y policy
+  comunes; revalidación durable pre-aprobación y pre-ejecución.
+- GitHub: el adapter REST autenticado pagina changed files con límites y
+  canonicalización, liga metadata→files→metadata contra TOCTOU y detecta drift
+  tras restart/cambio de owner antes de cualquier aprobación, consumo o tool.
+- Review independiente aprobada en la cuarta revisión.
+- Verificación final: smoke de `springinspector`, `contractcatalog`,
+  `validationworkflow`, `githubpr` y CLI pasa; focales repetidos, race UCRT64,
+  vet, compile-only, gofmt y diff también pasan.
+- Coverage: `springinspector` 88,7 %, `contractcatalog` 85,0 %,
+  `validationworkflow` 86,5 % y `githubpr` 85,8 %; funciones nuevas de
+  composición y autoridad superan 85 %.
+- Limitación del host: `go test ./...` conserva únicamente el subtest histórico
+  de symlink de `localvalidation`, que Windows no puede crear sin privilegio.

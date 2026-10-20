@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/model"
-	"github.com/asierhr/featureProof/internal/openapi"
 	"github.com/asierhr/featureProof/internal/planning"
 )
 
@@ -98,7 +98,7 @@ func TestPolicyErrorAndModelBudgetRemainTypedWithoutRetries(t *testing.T) {
 // TestPreflightRejectsContextCountsDuplicatesAndOversizedProjectionBeforeInference covers each bounded input family.
 func TestPreflightRejectsContextCountsDuplicatesAndOversizedProjectionBeforeInference(t *testing.T) {
 	mutations := []func(*GenerationRequest){
-		func(r *GenerationRequest) { r.OpenAPI.Untrusted = false },
+		func(r *GenerationRequest) { r.Contract = contractcatalog.ReducedContext{} },
 		func(r *GenerationRequest) { r.Constraints = append(r.Constraints, r.Constraints[0]) },
 		func(r *GenerationRequest) { r.Limits.MaxConstraints = 0 },
 		func(r *GenerationRequest) { r.Limits.MaxCapabilities = 0 },
@@ -117,24 +117,24 @@ func TestPreflightRejectsContextCountsDuplicatesAndOversizedProjectionBeforeInfe
 
 // TestPathSchemaValidationHonorsAllOfEnumAndNumericKinds proves typed bindings meet retained schema constraints.
 func TestPathSchemaValidationHonorsAllOfEnumAndNumericKinds(t *testing.T) {
-	stringEnum := &openapi.Schema{Type: "string", Enum: []any{"a", "b"}}
+	stringEnum := &contractcatalog.Schema{Type: "string", Enum: []any{"a", "b"}}
 	if !schemaValue(stringEnum, "a") || schemaValue(stringEnum, "c") {
 		t.Fatal("string enum mismatch")
 	}
-	integer := &openapi.Schema{Type: "integer"}
+	integer := &contractcatalog.Schema{Type: "integer"}
 	if !schemaValue(integer, json.Number("1e2")) || schemaValue(integer, json.Number("1.5")) {
 		t.Fatal("integer semantics mismatch")
 	}
-	number := &openapi.Schema{Type: "number"}
+	number := &contractcatalog.Schema{Type: "number"}
 	if !schemaValue(number, json.Number("1.5")) || schemaValue(number, "1.5") {
 		t.Fatal("number semantics mismatch")
 	}
-	boolean := &openapi.Schema{Type: "boolean"}
+	boolean := &contractcatalog.Schema{Type: "boolean"}
 	if !schemaValue(boolean, true) || schemaValue(boolean, "true") {
 		t.Fatal("boolean semantics mismatch")
 	}
-	all := &openapi.Schema{Type: "string", AllOf: []*openapi.Schema{{Type: "string", Enum: []any{"allowed"}}}}
-	if !schemaValue(all, "allowed") || schemaValue(all, "denied") || schemaValue(&openapi.Schema{Type: "object"}, "x") {
+	all := &contractcatalog.Schema{Type: "string", AllOf: []*contractcatalog.Schema{{Type: "string", Enum: []any{"allowed"}}}}
+	if !schemaValue(all, "allowed") || schemaValue(all, "denied") || schemaValue(&contractcatalog.Schema{Type: "object"}, "x") {
 		t.Fatal("composed schema mismatch")
 	}
 }

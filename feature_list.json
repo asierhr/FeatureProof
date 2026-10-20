@@ -382,7 +382,7 @@
           "La carga de fuentes respeta límites de tamaño y no ejecuta código, resuelve credenciales, accede a red ni entrega contenido no relevante al modelo",
           "Los tests contractuales cubren OpenAPI, fuente derivada, combinación, conflicto, procedencia, confianza, contexto insuficiente y compatibilidad del planificador"
         ],
-        "status": "pending"
+        "status": "done"
     },
     {
         "id": 22,
@@ -400,7 +400,7 @@
           "Errores de sintaxis, paquetes incompletos y construcciones no soportadas producen resultados parciales identificados o contexto insuficiente, nunca operaciones fabricadas",
           "Los tests usan repositorios fixture locales y cubren net/http, Chi, prefijos, parámetros, bodies, middleware, rutas dinámicas, errores, límites y ausencia de ejecución"
         ],
-        "status": "pending"
+        "status": "done"
     },
     {
         "id": 23,
@@ -418,7 +418,7 @@
           "Errores de sintaxis, clases incompletas y annotations no soportadas producen diagnósticos acotados, resultados parciales o contexto insuficiente sin bloquear operaciones independientes válidas",
           "Los tests usan proyectos Spring Boot fixture y cubren mappings, prefijos, parámetros, DTOs, respuestas, seguridad, constantes, construcciones dinámicas, errores y ausencia de ejecución"
         ],
-        "status": "pending"
+        "status": "done"
     },
     {
         "id": 24,

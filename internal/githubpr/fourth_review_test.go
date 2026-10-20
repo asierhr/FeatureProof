@@ -109,19 +109,23 @@ func TestSubmitBudgetPrecedesExternalCallAndLeaseExcludesSecondCoordinator(t *te
 	if validationB.submitCount() != 0 {
 		t.Fatal("second coordinator entered submit under the live lease")
 	}
-	closeCtx, closeCancel := context.WithTimeout(context.Background(), time.Second)
-	defer closeCancel()
-	if err = coordinatorA.Close(closeCtx); err != nil {
+	closeA, cancelA := context.WithTimeout(context.Background(), time.Second)
+	if err = coordinatorA.Close(closeA); err != nil {
+		cancelA()
 		t.Fatal(err)
 	}
+	cancelA()
 	select {
 	case <-validationA.finished:
 	default:
 		t.Fatal("cancel did not join the blocked submit")
 	}
-	if err = coordinatorB.Close(closeCtx); err != nil {
+	closeB, cancelB := context.WithTimeout(context.Background(), time.Second)
+	if err = coordinatorB.Close(closeB); err != nil {
+		cancelB()
 		t.Fatal(err)
 	}
+	cancelB()
 	coordinatorB, err = NewCoordinator(context.Background(), coordinatorTestDependencies(gateway, validationB, storeB, clock, "owner-b"))
 	if err != nil {
 		t.Fatal(err)
@@ -130,9 +134,12 @@ func TestSubmitBudgetPrecedesExternalCallAndLeaseExcludesSecondCoordinator(t *te
 	if validationB.submitCount() != 1 {
 		t.Fatalf("post-release submits=%d", validationB.submitCount())
 	}
-	if err = coordinatorB.Close(closeCtx); err != nil {
+	closeFinal, cancelFinal := context.WithTimeout(context.Background(), time.Second)
+	if err = coordinatorB.Close(closeFinal); err != nil {
+		cancelFinal()
 		t.Fatal(err)
 	}
+	cancelFinal()
 }
 
 // TestRecoveryFailureReleasesEveryStartupClaim closes REV-19 after one successful and one invalid intent.

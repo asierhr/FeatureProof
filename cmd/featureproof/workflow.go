@@ -14,14 +14,17 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/assertion"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/githubpr"
+	"github.com/asierhr/featureProof/internal/goinspector"
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/model"
@@ -34,32 +37,91 @@ import (
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 	"github.com/asierhr/featureProof/internal/specification"
 	specyaml "github.com/asierhr/featureProof/internal/specification/yaml"
+	"github.com/asierhr/featureProof/internal/springinspector"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 )
 
 // workflowConfig is the trusted local composition record; it contains references but no credential bytes.
 type workflowConfig struct {
-	Provider              string    `json:"provider"`
-	Model                 string    `json:"model"`
-	AuthProfile           string    `json:"auth_profile"`
-	ProfileStore          string    `json:"profile_store"`
-	RuntimeProfile        string    `json:"runtime_profile"`
-	SpecificationPath     string    `json:"specification_path"`
-	ContractPath          string    `json:"contract_path"`
-	RuntimeManifestPath   string    `json:"runtime_manifest_path"`
-	RepositoryID          string    `json:"repository_id"`
-	CommitOID             string    `json:"commit_oid"`
-	EnvironmentID         string    `json:"environment_id"`
-	AttestationRef        string    `json:"attestation_ref"`
-	TargetAlias           string    `json:"target_alias"`
-	TargetURL             string    `json:"target_url"`
-	TargetKind            string    `json:"target_kind"`
-	PolicyID              string    `json:"policy_id"`
-	AttestationValidUntil time.Time `json:"attestation_valid_until"`
-	AllowDisabledApproval bool      `json:"allow_disabled_approval"`
+	Provider              string                                  `json:"provider"`
+	Model                 string                                  `json:"model"`
+	AuthProfile           string                                  `json:"auth_profile"`
+	ProfileStore          string                                  `json:"profile_store"`
+	RuntimeProfile        string                                  `json:"runtime_profile"`
+	SpecificationPath     string                                  `json:"specification_path"`
+	ContractPath          string                                  `json:"contract_path"`
+	ContractSource        string                                  `json:"contract_source,omitempty"`
+	ContractSources       []string                                `json:"contract_sources,omitempty"`
+	OpenAPIContractPath   string                                  `json:"openapi_contract_path,omitempty"`
+	RepositoryRoot        string                                  `json:"repository_root,omitempty"`
+	GoInspector           *workflowGoInspectorConfig              `json:"go_inspector,omitempty"`
+	SpringInspector       *workflowSpringInspectorConfig          `json:"spring_inspector,omitempty"`
+	RuntimeManifestPath   string                                  `json:"runtime_manifest_path"`
+	RepositoryID          string                                  `json:"repository_id"`
+	CommitOID             string                                  `json:"commit_oid"`
+	EnvironmentID         string                                  `json:"environment_id"`
+	AttestationRef        string                                  `json:"attestation_ref"`
+	TargetAlias           string                                  `json:"target_alias"`
+	TargetURL             string                                  `json:"target_url"`
+	TargetKind            string                                  `json:"target_kind"`
+	PolicyID              string                                  `json:"policy_id"`
+	AttestationValidUntil time.Time                               `json:"attestation_valid_until"`
+	AllowDisabledApproval bool                                    `json:"allow_disabled_approval"`
+	ContractSelections    map[string][]workflowOperationSelection `json:"contract_selections"`
+	ContractProjection    workflowProjectionConfig                `json:"contract_projection"`
+}
+
+// workflowGoInspectorConfig carries the explicit trusted roots, PR impact, build selector, auth allowlist, and budgets for Go analysis.
+type workflowGoInspectorConfig struct {
+	Roots            []string                  `json:"roots"`
+	ChangedPaths     []string                  `json:"changed_paths"`
+	GOOS             string                    `json:"goos"`
+	GOARCH           string                    `json:"goarch"`
+	BuildTags        []string                  `json:"build_tags"`
+	Auth             []goinspector.AuthMatcher `json:"auth_matchers"`
+	Limits           goinspector.Limits        `json:"limits"`
+	IncludeGenerated bool                      `json:"include_generated"`
+	EntrySymbols     []string                  `json:"entry_symbols"`
+}
+
+// workflowSpringInspectorConfig carries explicit Java source sets, release, generated policy and bounded inspection authority.
+type workflowSpringInspectorConfig struct {
+	RootIdentity        string                          `json:"root_identity"`
+	FrameworkIdentities []string                        `json:"framework_identities"`
+	SourceSets          []springinspector.SourceSet     `json:"source_sets"`
+	ChangedPaths        []string                        `json:"changed_paths"`
+	JavaRelease         int                             `json:"java_release"`
+	Generated           springinspector.GeneratedPolicy `json:"generated_policy"`
+	Limits              springinspector.Limits          `json:"limits"`
+}
+
+// workflowOperationSelection is one trusted method/path pair assigned to a specification constraint.
+type workflowOperationSelection struct {
+	Method string `json:"method"`
+	Path   string `json:"path"`
+}
+
+// workflowProjectionConfig is the required trusted redaction and structural allowlist record for contract ingestion.
+type workflowProjectionConfig struct {
+	MaxStringBytes       int      `json:"max_string_bytes"`
+	AllowedURLSchemes    []string `json:"allowed_url_schemes"`
+	SensitiveNames       []string `json:"sensitive_names"`
+	SensitivePaths       []string `json:"sensitive_paths"`
+	SensitiveHeaderNames []string `json:"sensitive_header_names"`
+	ForbiddenValues      []string `json:"forbidden_values"`
+}
+
+// policy validates and seals configuration plus manifest-owned sensitive header names without introducing defaults.
+func (c workflowProjectionConfig) policy(additionalHeaders []string) (contractcatalog.ProjectionPolicy, error) {
+	if c.AllowedURLSchemes == nil || c.SensitiveNames == nil || c.SensitivePaths == nil || c.SensitiveHeaderNames == nil || c.ForbiddenValues == nil {
+		return contractcatalog.ProjectionPolicy{}, errors.New("incomplete contract projection configuration")
+	}
+	headers := append(append([]string{}, c.SensitiveHeaderNames...), additionalHeaders...)
+	return contractcatalog.NewProjectionPolicy(contractcatalog.ProjectionPolicy{MaxStringBytes: c.MaxStringBytes, AllowedURLSchemes: append([]string{}, c.AllowedURLSchemes...), SensitiveNames: append([]string{}, c.SensitiveNames...), SensitivePaths: append([]string{}, c.SensitivePaths...), SensitiveHeaderNames: headers, ForbiddenValues: append([]string{}, c.ForbiddenValues...)})
 }
 
 // loadWorkflowConfig strictly decodes one bounded trusted configuration selected outside workflow input.
+// feature22:coverage loadWorkflowConfig
 func loadWorkflowConfig() (workflowConfig, error) {
 	path := os.Getenv("FEATUREPROOF_WORKFLOW_CONFIG")
 	if path == "" {
@@ -78,11 +140,73 @@ func loadWorkflowConfig() (workflowConfig, error) {
 	if config.Provider != "openai" || config.Model == "" || config.AuthProfile == "" || config.ProfileStore == "" || config.RuntimeProfile == "" || config.SpecificationPath == "" || config.ContractPath == "" || config.RuntimeManifestPath == "" || !revisionbinding.ValidID(config.RepositoryID) || !revisionbinding.ValidOID(config.CommitOID) || !revisionbinding.ValidID(config.EnvironmentID) || !revisionbinding.ValidID(config.AttestationRef) || config.TargetAlias == "" || config.TargetURL == "" || config.PolicyID == "" || !config.AttestationValidUntil.After(time.Now()) || (config.TargetKind != "direct" && config.TargetKind != "preview") {
 		return workflowConfig{}, errors.New("invalid workflow configuration")
 	}
+	if config.ContractSource != "" && config.ContractSource != "openapi" && config.ContractSource != goinspector.SourceKind && config.ContractSource != springinspector.SourceKind && config.ContractSource != "combined" {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
+	if len(config.ContractSources) > 0 && !validContractSources(config.ContractSources) {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
+	if len(config.ContractSources) > 0 && config.ContractSource != "combined" {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
+	if config.ContractSource == goinspector.SourceKind && (config.GoInspector == nil || len(config.GoInspector.Roots) == 0 || len(config.GoInspector.EntrySymbols) == 0 || config.GoInspector.GOOS == "" || config.GoInspector.GOARCH == "") {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
+	if config.ContractSource == springinspector.SourceKind && (config.SpringInspector == nil || config.SpringInspector.RootIdentity == "" || len(config.SpringInspector.FrameworkIdentities) == 0 || len(config.SpringInspector.SourceSets) == 0 || config.SpringInspector.JavaRelease == 0 || config.RepositoryRoot == "") {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
+	if config.ContractSource == "combined" && (config.RepositoryRoot == "" || len(config.ContractSources) < 2) {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
+	combinedSources := config.ContractSources
+	if config.ContractSource == "combined" && len(combinedSources) == 0 {
+		combinedSources = []string{"openapi", goinspector.SourceKind}
+	}
+	if containsContractSource(combinedSources, "openapi") && config.OpenAPIContractPath == "" {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
+	if containsContractSource(combinedSources, goinspector.SourceKind) && (config.GoInspector == nil || len(config.GoInspector.Roots) == 0 || len(config.GoInspector.EntrySymbols) == 0 || config.GoInspector.GOOS == "" || config.GoInspector.GOARCH == "") {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
+	if containsContractSource(config.ContractSources, springinspector.SourceKind) && (config.SpringInspector == nil || config.SpringInspector.RootIdentity == "" || len(config.SpringInspector.FrameworkIdentities) == 0 || len(config.SpringInspector.SourceSets) == 0) {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
+	if _, err := config.ContractProjection.policy(nil); err != nil {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
 	return config, nil
 }
 
+// validContractSources requires a duplicate-free explicit list from the closed adapter registry.
+func validContractSources(values []string) bool {
+	seen := map[string]bool{}
+	for _, value := range values {
+		if seen[value] || (value != "openapi" && value != goinspector.SourceKind && value != springinspector.SourceKind) {
+			return false
+		}
+		seen[value] = true
+	}
+	return len(seen) > 0
+}
+
+// containsContractSource checks one exact adapter identity in a sealed source list.
+func containsContractSource(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
+}
+
 // composeWorkflowCLI resolves OAuth and filesystem references only in the executable composition root.
+// feature22:coverage composeWorkflowCLI
 func composeWorkflowCLI(ctx context.Context, stdout, stderr io.Writer) (*validationworkflow.CLI, error) {
+	return composeWorkflowCLIWithGitHubAuthority(ctx, stdout, stderr, nil)
+}
+
+// composeWorkflowCLIWithGitHubAuthority additionally binds a composition-owned PR refresher for durable GitHub decisions.
+func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr io.Writer, githubAuthority validationworkflow.GitHubPullRequestAuthority) (*validationworkflow.CLI, error) {
 	config, err := loadWorkflowConfig()
 	if err != nil {
 		return nil, err
@@ -169,7 +293,12 @@ func composeWorkflowCLI(ctx context.Context, stdout, stderr io.Writer) (*validat
 	if workflowPreview != nil {
 		targetContext.ProviderID, targetContext.EnvironmentRef, targetContext.ProfileID = workflowPreview.configured.Config.ProviderID, workflowPreview.configured.Config.EnvironmentRef, workflowPreview.configured.Config.ProfileID
 	}
-	bindingContext := validationworkflow.BindingContext{Revision: validationworkflow.RevisionContext{RepositoryID: config.RepositoryID, CommitOID: config.CommitOID}, Target: targetContext}
+	revisionContext := validationworkflow.RevisionContext{RepositoryID: config.RepositoryID, CommitOID: config.CommitOID}
+	if config.GoInspector != nil {
+		revisionContext.Roots = append([]string{}, config.GoInspector.Roots...)
+		revisionContext.ChangedPaths = append([]string{}, config.GoInspector.ChangedPaths...)
+	}
+	bindingContext := validationworkflow.BindingContext{Revision: revisionContext, Target: targetContext}
 	runtimeContext := workflowRuntimeContext(config, manifest, network)
 	targetDigest, err := validationworkflow.TargetContextDigest(targetContext)
 	if err != nil {
@@ -180,7 +309,16 @@ func composeWorkflowCLI(ctx context.Context, stdout, stderr io.Writer) (*validat
 		return nil, err
 	}
 	compositionRef := workflowDigest("composition", config.Provider, config.Model, config.AuthProfile)
-	admission := validationworkflow.TrustedAdmissionBuilder{Specifications: workflowSpecLoader{path: config.SpecificationPath}, Contracts: workflowContractReducer{path: config.ContractPath}, Bindings: workflowBindingVerifier{config: config, binding: bindingContext}, Catalog: workflowCatalog{profile: config.RuntimeProfile, runtime: runtimeContext, descriptors: []agentplanning.CapabilityDescriptor{capability}}, Config: validationworkflow.AdmissionConfig{Provider: config.Provider, Model: config.Model, CompositionRef: compositionRef, Limits: agentplanning.Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 128, MaxCapabilities: 16, MaxChecks: 384, MaxStepsPerCheck: 64, MaxAssertionsPerStep: 64, MaxMissingItems: 32, MaxValidationWork: 100000}}}
+	projection, err := config.ContractProjection.policy(manifest.Redaction.AdditionalHeaders)
+	if err != nil {
+		return nil, errors.New("invalid contract projection configuration")
+	}
+	contractReducer := workflowContractReducerFor(config, projection)
+	trustedAdmission := validationworkflow.TrustedAdmissionBuilder{Specifications: workflowSpecLoader{path: config.SpecificationPath}, Contracts: contractReducer, Bindings: workflowBindingVerifier{config: config, binding: bindingContext}, Catalog: workflowCatalog{profile: config.RuntimeProfile, runtime: runtimeContext, descriptors: []agentplanning.CapabilityDescriptor{capability}}, Config: validationworkflow.AdmissionConfig{Provider: config.Provider, Model: config.Model, CompositionRef: compositionRef, Limits: agentplanning.Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 128, MaxCapabilities: 16, MaxChecks: 384, MaxStepsPerCheck: 64, MaxAssertionsPerStep: 64, MaxMissingItems: 32, MaxValidationWork: 100000}}}
+	var admission validationworkflow.AdmissionBuilder = trustedAdmission
+	if githubAuthority != nil {
+		admission = validationworkflow.GitHubRefreshingAdmission{Next: trustedAdmission, Authority: githubAuthority}
+	}
 	storeRoot := filepath.Join(root, ".featureproof", "workflows")
 	store, err := validationworkflow.OpenLocalStore(storeRoot)
 	if err != nil {
@@ -228,6 +366,25 @@ func composeWorkflowCLI(ctx context.Context, stdout, stderr io.Writer) (*validat
 	return cli, nil
 }
 
+// workflowContractReducerFor is the neutral composition point reused by CLI, API, MCP and GitHub through the shared service.
+// feature22:coverage workflowContractReducerFor
+func workflowContractReducerFor(config workflowConfig, projection contractcatalog.ProjectionPolicy) validationworkflow.ContractReducer {
+	if config.ContractSource == goinspector.SourceKind {
+		return workflowGoContractReducer{root: config.ContractPath, repositoryID: config.RepositoryID, revision: config.CommitOID, config: *config.GoInspector, selections: config.ContractSelections, projection: projection}
+	}
+	if config.ContractSource == springinspector.SourceKind {
+		return workflowSpringContractReducer{root: config.RepositoryRoot, authorizedRef: config.ContractPath, repositoryID: config.RepositoryID, revision: config.CommitOID, config: *config.SpringInspector, selections: config.ContractSelections, projection: projection}
+	}
+	if config.ContractSource == "combined" {
+		goConfig := workflowGoInspectorConfig{}
+		if config.GoInspector != nil {
+			goConfig = *config.GoInspector
+		}
+		return workflowCombinedContractReducer{openAPIPath: config.OpenAPIContractPath, root: config.RepositoryRoot, authorizedRef: config.ContractPath, repositoryID: config.RepositoryID, revision: config.CommitOID, config: goConfig, spring: config.SpringInspector, sources: append([]string(nil), config.ContractSources...), selections: config.ContractSelections, projection: projection}
+	}
+	return workflowContractReducer{path: config.ContractPath, selections: config.ContractSelections, projection: projection}
+}
+
 // workflowSpecLoader authorizes exactly one configured specification path.
 type workflowSpecLoader struct{ path string }
 
@@ -240,31 +397,262 @@ func (l workflowSpecLoader) Load(ctx context.Context, ref string) (specification
 }
 
 // workflowContractReducer authorizes one contract and retains every operation as untrusted planning data.
-type workflowContractReducer struct{ path string }
+type workflowContractReducer struct {
+	path       string
+	selections map[string][]workflowOperationSelection
+	projection contractcatalog.ProjectionPolicy
+}
 
 // Reduce builds a bounded per-constraint operation context from the configured contract.
-func (r workflowContractReducer) Reduce(ctx context.Context, ref string, spec specification.Specification) (openapipkg.ReducedContext, error) {
+func (r workflowContractReducer) Reduce(ctx context.Context, ref string, spec specification.Specification) (contractcatalog.ReducedContext, error) {
 	if ref != r.path {
-		return openapipkg.ReducedContext{}, errors.New("unauthorized contract")
+		return contractcatalog.ReducedContext{}, errors.New("unauthorized contract")
 	}
 	root := filepath.Dir(r.path)
 	loader, err := openapipkg.NewLoader(ctx, openapipkg.Config{AuthorizedRoot: root, MaxDocumentBytes: 2 << 20, MaxTotalBytes: 4 << 20, MaxDocuments: 32, MaxReferences: 512, MaxReferenceDepth: 16, MaxObservedBodyBytes: 1 << 20, MaxContextBytes: 1 << 20}, openapipkg.LocalFS{})
 	if err != nil {
-		return openapipkg.ReducedContext{}, err
+		return contractcatalog.ReducedContext{}, err
 	}
 	contract, err := loader.Load(ctx, filepath.Base(r.path))
 	if err != nil {
-		return openapipkg.ReducedContext{}, err
+		return contractcatalog.ReducedContext{}, err
 	}
-	catalog := contract.Catalog()
-	selections := make([]openapipkg.ConstraintSelection, len(spec.Constraints))
+	openAPICatalog := contract.Catalog()
+	rawCatalog, err := json.Marshal(openAPICatalog)
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	sum := sha256.Sum256(rawCatalog)
+	sourceDigest := hex.EncodeToString(sum[:])
+	limits := contractcatalog.Limits{MaxSources: 1, MaxOperations: 4096, MaxClaims: 65536, MaxBytes: 2 << 20, MaxDepth: 64, MaxDiagnostics: 4096, MaxLocationBytes: 256}
+	registry, err := contractcatalog.NewRegistry(map[string]contractcatalog.ContractSource{"openapi": openapipkg.ContractSourceAdapter{AdapterVersion: "openapi-v1"}})
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	loaded, err := registry.Load(ctx, []contractcatalog.SourceRequest{contractcatalog.NewSourceRequest(contractcatalog.SourceDescriptor{Kind: "openapi", ID: "configured-openapi", Class: contractcatalog.ClassAuthoritative, Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete, ExpectedDigest: sourceDigest, AdapterVersion: "openapi-v1", Input: contract, Limits: limits, Projection: r.projection})}, limits)
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	catalog, err := contractcatalog.Build(ctx, loaded, limits)
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	rules := map[contractcatalog.ClaimKind]contractcatalog.ClaimRule{}
+	for _, kind := range []contractcatalog.ClaimKind{contractcatalog.ClaimOperationIdentity, contractcatalog.ClaimSchema, contractcatalog.ClaimSecurity, contractcatalog.ClaimResponse} {
+		rules[kind] = contractcatalog.ClaimRule{AllowedClasses: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative}, MinimumConfidence: map[contractcatalog.SourceClass]contractcatalog.Confidence{contractcatalog.ClassAuthoritative: contractcatalog.ConfidenceHigh}, RequiredCompleteness: contractcatalog.CompletenessComplete, Required: true}
+	}
+	policy, err := contractcatalog.NewPolicy(contractcatalog.SufficiencyPolicy{ID: "workflow-openapi", Version: contractcatalog.VersionV1, Claims: rules, ConflictTreatment: contractcatalog.ConflictDeny})
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	selections := make([]contractcatalog.ConstraintSelection, len(spec.Constraints))
 	for i, constraint := range spec.Constraints {
 		selections[i].ConstraintID = constraint.ID
-		for _, operation := range catalog.Operations {
-			selections[i].Operations = append(selections[i].Operations, operation.Key)
+		for _, operation := range r.selections[constraint.ID] {
+			selections[i].Operations = append(selections[i].Operations, contractcatalog.OperationKey{Method: strings.ToUpper(operation.Method), Path: operation.Path})
 		}
 	}
-	return contract.BuildContext(ctx, openapipkg.ContextRequest{Constraints: selections})
+	return contractcatalog.BuildContext(ctx, catalog, policy, selections, contractcatalog.ReductionLimits{MaxBytes: 1 << 20, MaxOperations: 4096, MaxClaims: 65536, MaxDepth: 64, MaxDiagnostics: 4096})
+}
+
+// workflowGoContractReducer freezes one authorized checkout and admits only policy-eligible derived operations.
+type workflowGoContractReducer struct {
+	root         string
+	repositoryID string
+	revision     string
+	config       workflowGoInspectorConfig
+	selections   map[string][]workflowOperationSelection
+	projection   contractcatalog.ProjectionPolicy
+}
+
+// workflowCombinedContractReducer admits authoritative OpenAPI and derived Go facts into one conflict-aware catalog.
+type workflowCombinedContractReducer struct {
+	openAPIPath, root, authorizedRef, repositoryID, revision string
+	config                                                   workflowGoInspectorConfig
+	spring                                                   *workflowSpringInspectorConfig
+	sources                                                  []string
+	selections                                               map[string][]workflowOperationSelection
+	projection                                               contractcatalog.ProjectionPolicy
+}
+
+// Reduce freezes both authorized sources before a single registry, catalog, policy, and reduction pass.
+// feature22:coverage workflowCombinedContractReducer.Reduce
+func (r workflowCombinedContractReducer) Reduce(ctx context.Context, ref string, spec specification.Specification) (contractcatalog.ReducedContext, error) {
+	if ref != r.authorizedRef {
+		return contractcatalog.ReducedContext{}, errors.New("unauthorized contract")
+	}
+	sources := append([]string(nil), r.sources...)
+	if len(sources) == 0 {
+		sources = []string{"openapi", goinspector.SourceKind}
+		if r.spring != nil {
+			sources = append(sources, springinspector.SourceKind)
+		}
+	}
+	if !validContractSources(sources) || (containsContractSource(sources, "openapi") && r.openAPIPath == "") || (containsContractSource(sources, springinspector.SourceKind) && r.spring == nil) {
+		return contractcatalog.ReducedContext{}, errors.New("contract source drift")
+	}
+	duration := r.config.Limits.MaxDuration
+	if !containsContractSource(sources, goinspector.SourceKind) && r.spring != nil {
+		duration = r.spring.Limits.MaxDuration
+	}
+	if duration <= 0 {
+		return contractcatalog.ReducedContext{}, errors.New("contract source limits unavailable")
+	}
+	bounded, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+	effective := r.config
+	if authority, ok := validationworkflow.ContractAuthority(ctx); ok {
+		if authority.RepositoryID != r.repositoryID || authority.CommitOID != r.revision {
+			return contractcatalog.ReducedContext{}, errors.New("contract authority drift")
+		}
+		effective.Roots = append([]string{}, authority.Roots...)
+		effective.ChangedPaths = append([]string{}, authority.ChangedPaths...)
+	}
+	maxSources := len(sources)
+	adapters := map[string]contractcatalog.ContractSource{}
+	requests := []contractcatalog.SourceRequest{}
+	limits := contractcatalog.Limits{MaxSources: maxSources, MaxOperations: maxInt(r.config.Limits.MaxOperations, 4096), MaxClaims: maxInt(r.config.Limits.MaxOperations*128, 65536), MaxBytes: maxInt(r.config.Limits.MaxBytes, 2<<20), MaxDepth: maxInt(r.config.Limits.MaxDepth, 64), MaxDiagnostics: maxInt(r.config.Limits.MaxDiagnostics, 4096), MaxLocationBytes: 1024}
+	perSource := contractcatalog.Limits{MaxSources: 1, MaxOperations: limits.MaxOperations / maxSources, MaxClaims: limits.MaxClaims / maxSources, MaxBytes: limits.MaxBytes / maxSources, MaxDepth: limits.MaxDepth / maxSources, MaxDiagnostics: limits.MaxDiagnostics / maxSources, MaxLocationBytes: limits.MaxLocationBytes}
+	if containsContractSource(sources, "openapi") {
+		loader, err := openapipkg.NewLoader(bounded, openapipkg.Config{AuthorizedRoot: filepath.Dir(r.openAPIPath), MaxDocumentBytes: 2 << 20, MaxTotalBytes: 4 << 20, MaxDocuments: 32, MaxReferences: 512, MaxReferenceDepth: 16, MaxObservedBodyBytes: 1 << 20, MaxContextBytes: 1 << 20}, openapipkg.LocalFS{})
+		if err != nil {
+			return contractcatalog.ReducedContext{}, err
+		}
+		contract, err := loader.Load(bounded, filepath.Base(r.openAPIPath))
+		if err != nil {
+			return contractcatalog.ReducedContext{}, err
+		}
+		raw, err := json.Marshal(contract.Catalog())
+		if err != nil {
+			return contractcatalog.ReducedContext{}, err
+		}
+		digest := sha256.Sum256(raw)
+		adapters["openapi"] = openapipkg.ContractSourceAdapter{AdapterVersion: "openapi-v1"}
+		requests = append(requests, contractcatalog.NewSourceRequest(contractcatalog.SourceDescriptor{Kind: "openapi", ID: "configured-openapi", Class: contractcatalog.ClassAuthoritative, Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete, ExpectedDigest: hex.EncodeToString(digest[:]), AdapterVersion: "openapi-v1", Input: contract, Limits: perSource, Projection: r.projection}))
+	}
+	if containsContractSource(sources, goinspector.SourceKind) {
+		input, err := goinspector.FreezeConfiguredRepository(bounded, goinspector.LocalRepositoryFS{}, r.root, goinspector.Configuration{RepositoryID: r.repositoryID, Revision: r.revision, Roots: append([]string{}, effective.Roots...), ChangedPaths: append([]string{}, effective.ChangedPaths...), Build: goinspector.BuildContext{GOOS: r.config.GOOS, GOARCH: r.config.GOARCH, Tags: append([]string{}, r.config.BuildTags...)}, Auth: append([]goinspector.AuthMatcher{}, r.config.Auth...), Limits: r.config.Limits, Confidence: contractcatalog.ConfidenceMedium, Completeness: contractcatalog.CompletenessPartial, IncludeGenerated: r.config.IncludeGenerated, EntrySymbols: append([]string{}, r.config.EntrySymbols...), Projection: r.projection})
+		if err != nil {
+			return contractcatalog.ReducedContext{}, err
+		}
+		adapters[goinspector.SourceKind] = goinspector.DerivedSource{}
+		requests = append(requests, goinspector.SourceRequest("configured-go", input, perSource, r.projection))
+	}
+	if containsContractSource(sources, springinspector.SourceKind) {
+		springConfig := *r.spring
+		changed := append([]string(nil), springConfig.ChangedPaths...)
+		if authority, ok := validationworkflow.ContractAuthority(ctx); ok {
+			changed = changed[:0]
+			for _, candidate := range authority.ChangedPaths {
+				for _, set := range springConfig.SourceSets {
+					if candidate == set.Root || strings.HasPrefix(candidate, strings.TrimSuffix(set.Root, "/")+"/") {
+						changed = append(changed, candidate)
+						break
+					}
+				}
+			}
+		}
+		springInput, err := springinspector.FreezeConfiguredRepository(bounded, workflowSpringRepository{}, r.root, springinspector.Configuration{RepositoryID: r.repositoryID, Revision: r.revision, RootIdentity: springConfig.RootIdentity, FrameworkIdentities: append([]string(nil), springConfig.FrameworkIdentities...), SourceSets: append([]springinspector.SourceSet(nil), springConfig.SourceSets...), ChangedPaths: changed, JavaRelease: springConfig.JavaRelease, Generated: springConfig.Generated, Limits: springConfig.Limits, Confidence: contractcatalog.ConfidenceMedium, Completeness: contractcatalog.CompletenessPartial, Projection: r.projection})
+		if err != nil {
+			return contractcatalog.ReducedContext{}, err
+		}
+		adapters[springinspector.SourceKind] = springinspector.DerivedSource{}
+		requests = append(requests, springinspector.SourceRequest("configured-spring", springInput, perSource, r.projection))
+	}
+	registry, err := contractcatalog.NewRegistry(adapters)
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	loaded, err := registry.Load(bounded, requests, limits)
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	catalog, err := contractcatalog.Build(bounded, loaded, limits)
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	rules := map[contractcatalog.ClaimKind]contractcatalog.ClaimRule{}
+	for _, kind := range []contractcatalog.ClaimKind{contractcatalog.ClaimOperationIdentity, contractcatalog.ClaimSchema, contractcatalog.ClaimSecurity, contractcatalog.ClaimResponse} {
+		rules[kind] = contractcatalog.ClaimRule{AllowedClasses: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative, contractcatalog.ClassDerived}, MinimumConfidence: map[contractcatalog.SourceClass]contractcatalog.Confidence{contractcatalog.ClassAuthoritative: contractcatalog.ConfidenceHigh, contractcatalog.ClassDerived: contractcatalog.ConfidenceMedium}, RequiredCompleteness: contractcatalog.CompletenessPartial, Required: true}
+	}
+	policy, err := contractcatalog.NewPolicy(contractcatalog.SufficiencyPolicy{ID: "workflow-combined-v1", Version: contractcatalog.VersionV1, Claims: rules, ConflictTreatment: contractcatalog.ConflictDeny})
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	selections := workflowSelections(spec, r.selections)
+	return contractcatalog.BuildContext(bounded, catalog, policy, selections, contractcatalog.ReductionLimits{MaxBytes: 1 << 20, MaxOperations: limits.MaxOperations, MaxClaims: limits.MaxClaims, MaxDepth: limits.MaxDepth, MaxDiagnostics: limits.MaxDiagnostics})
+}
+
+// maxInt selects a finite aggregate budget without introducing an implicit source configuration.
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+// workflowSelections converts trusted constraint mappings into source-neutral operation keys.
+// feature22:coverage workflowSelections
+func workflowSelections(spec specification.Specification, configured map[string][]workflowOperationSelection) []contractcatalog.ConstraintSelection {
+	selections := make([]contractcatalog.ConstraintSelection, len(spec.Constraints))
+	for index, constraint := range spec.Constraints {
+		selections[index].ConstraintID = constraint.ID
+		for _, operation := range configured[constraint.ID] {
+			selections[index].Operations = append(selections[index].Operations, contractcatalog.OperationKey{Method: strings.ToUpper(operation.Method), Path: operation.Path})
+		}
+	}
+	return selections
+}
+
+// Reduce binds repository bytes, revision, inspection settings, catalog, and sufficiency policy before model context exists.
+// feature22:coverage workflowGoContractReducer.Reduce
+func (r workflowGoContractReducer) Reduce(ctx context.Context, ref string, spec specification.Specification) (contractcatalog.ReducedContext, error) {
+	if ref != r.root {
+		return contractcatalog.ReducedContext{}, errors.New("unauthorized contract")
+	}
+	bounded, cancel := context.WithTimeout(ctx, r.config.Limits.MaxDuration)
+	defer cancel()
+	effective := r.config
+	if authority, ok := validationworkflow.ContractAuthority(ctx); ok {
+		if authority.RepositoryID != r.repositoryID || authority.CommitOID != r.revision {
+			return contractcatalog.ReducedContext{}, errors.New("contract authority drift")
+		}
+		effective.Roots = append([]string{}, authority.Roots...)
+		effective.ChangedPaths = append([]string{}, authority.ChangedPaths...)
+	}
+	input, err := goinspector.FreezeConfiguredRepository(bounded, goinspector.LocalRepositoryFS{}, r.root, goinspector.Configuration{RepositoryID: r.repositoryID, Revision: r.revision, Roots: append([]string{}, effective.Roots...), ChangedPaths: append([]string{}, effective.ChangedPaths...), Build: goinspector.BuildContext{GOOS: r.config.GOOS, GOARCH: r.config.GOARCH, Tags: append([]string{}, r.config.BuildTags...)}, Auth: append([]goinspector.AuthMatcher{}, r.config.Auth...), Limits: r.config.Limits, Confidence: contractcatalog.ConfidenceMedium, Completeness: contractcatalog.CompletenessPartial, IncludeGenerated: r.config.IncludeGenerated, EntrySymbols: append([]string{}, r.config.EntrySymbols...), Projection: r.projection})
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	limits := contractcatalog.Limits{MaxSources: 1, MaxOperations: r.config.Limits.MaxOperations, MaxClaims: r.config.Limits.MaxOperations * 128, MaxBytes: r.config.Limits.MaxBytes, MaxDepth: r.config.Limits.MaxDepth + 16, MaxDiagnostics: r.config.Limits.MaxDiagnostics, MaxLocationBytes: 512}
+	registry, err := contractcatalog.NewRegistry(map[string]contractcatalog.ContractSource{goinspector.SourceKind: goinspector.DerivedSource{}})
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	loaded, err := registry.Load(bounded, []contractcatalog.SourceRequest{goinspector.SourceRequest("configured-go", input, limits, r.projection)}, limits)
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	catalog, err := contractcatalog.Build(bounded, loaded, limits)
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	rules := map[contractcatalog.ClaimKind]contractcatalog.ClaimRule{}
+	for _, kind := range []contractcatalog.ClaimKind{contractcatalog.ClaimOperationIdentity, contractcatalog.ClaimSchema, contractcatalog.ClaimSecurity, contractcatalog.ClaimResponse} {
+		rules[kind] = contractcatalog.ClaimRule{AllowedClasses: []contractcatalog.SourceClass{contractcatalog.ClassDerived}, MinimumConfidence: map[contractcatalog.SourceClass]contractcatalog.Confidence{contractcatalog.ClassDerived: contractcatalog.ConfidenceMedium}, RequiredCompleteness: contractcatalog.CompletenessPartial, Required: true}
+	}
+	policy, err := contractcatalog.NewPolicy(contractcatalog.SufficiencyPolicy{ID: "workflow-go-static-v1", Version: contractcatalog.VersionV1, Claims: rules, ConflictTreatment: contractcatalog.ConflictDeny})
+	if err != nil {
+		return contractcatalog.ReducedContext{}, err
+	}
+	selections := make([]contractcatalog.ConstraintSelection, len(spec.Constraints))
+	for index, constraint := range spec.Constraints {
+		selections[index].ConstraintID = constraint.ID
+		for _, operation := range r.selections[constraint.ID] {
+			selections[index].Operations = append(selections[index].Operations, contractcatalog.OperationKey{Method: strings.ToUpper(operation.Method), Path: operation.Path})
+		}
+	}
+	return contractcatalog.BuildContext(bounded, catalog, policy, selections, contractcatalog.ReductionLimits{MaxBytes: 1 << 20, MaxOperations: r.config.Limits.MaxOperations, MaxClaims: limits.MaxClaims, MaxDepth: limits.MaxDepth, MaxDiagnostics: r.config.Limits.MaxDiagnostics})
 }
 
 // workflowBindingVerifier checks exact configured source and deployment identity without exposing credentials.
@@ -273,7 +661,31 @@ type workflowBindingVerifier struct {
 	binding validationworkflow.BindingContext
 }
 
+// ContractAuthority returns roots and changed paths only from trusted workflow composition before contract loading.
+// feature22:coverage workflowBindingVerifier.ContractAuthority
+func (v workflowBindingVerifier) ContractAuthority(ctx context.Context, command validationworkflow.StartCommand) (validationworkflow.RevisionContext, error) {
+	githubAuthority, github := validationworkflow.GitHubContractAuthority(ctx)
+	return contractAuthorityFor(v.config, v.binding, command, githubAuthority, github)
+}
+
+// contractAuthorityFor validates either sealed GitHub authority or the configured local revision and always supplies trusted roots.
+// feature22:coverage contractAuthorityFor
+func contractAuthorityFor(config workflowConfig, binding validationworkflow.BindingContext, command validationworkflow.StartCommand, githubAuthority validationworkflow.RevisionContext, github bool) (validationworkflow.RevisionContext, error) {
+	if github {
+		if githubAuthority.RepositoryID != command.RepositoryID || githubAuthority.CommitOID != command.Revision {
+			return validationworkflow.RevisionContext{}, errors.New("revision mismatch")
+		}
+		githubAuthority.Roots = append([]string{}, binding.Revision.Roots...)
+		return githubAuthority, nil
+	}
+	if command.RepositoryID != config.RepositoryID || command.Revision != config.CommitOID {
+		return validationworkflow.RevisionContext{}, errors.New("revision mismatch")
+	}
+	return binding.Revision, nil
+}
+
 // Verify rejects any source, revision or target drift and returns the effective safe objects.
+// feature22:coverage workflowBindingVerifier.Verify
 func (v workflowBindingVerifier) Verify(_ context.Context, command validationworkflow.StartCommand) (validationworkflow.BindingContext, error) {
 	if command.RepositoryID != v.config.RepositoryID || command.Revision != v.config.CommitOID {
 		return validationworkflow.BindingContext{}, errors.New("revision mismatch")
@@ -289,6 +701,7 @@ type workflowCatalog struct {
 }
 
 // Descriptors rejects unknown runtime profiles and returns no executable handle or credential.
+// feature22:coverage workflowCatalog.Descriptors
 func (c workflowCatalog) Descriptors(_ context.Context, profile string, _ validationworkflow.TargetSelection) ([]agentplanning.CapabilityDescriptor, validationworkflow.RuntimeContext, error) {
 	if profile != c.profile {
 		return nil, validationworkflow.RuntimeContext{}, errors.New("runtime unavailable")

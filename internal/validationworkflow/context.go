@@ -11,9 +11,11 @@ import (
 
 // RevisionContext is the complete safe source identity observed by the binding boundary.
 type RevisionContext struct {
-	RepositoryID string `json:"repository_id"`
-	CommitOID    string `json:"commit_oid"`
-	Dirty        bool   `json:"dirty"`
+	RepositoryID string   `json:"repository_id"`
+	CommitOID    string   `json:"commit_oid"`
+	Dirty        bool     `json:"dirty"`
+	Roots        []string `json:"roots,omitempty"`
+	ChangedPaths []string `json:"changed_paths,omitempty"`
 }
 
 // AttestationContext is the complete safe deployment proof used to authorize execution.
@@ -89,7 +91,10 @@ type RuntimeContext struct {
 }
 
 // canonicalBindingContext normalizes set-like fields and timestamps before stable hashing.
+// feature22:coverage validationworkflow.canonicalBindingContext
 func canonicalBindingContext(value BindingContext) BindingContext {
+	value.Revision.Roots = sortedStrings(value.Revision.Roots, nil)
+	value.Revision.ChangedPaths = sortedStrings(value.Revision.ChangedPaths, nil)
 	value.Target.Attestation.ValidUntil = value.Target.Attestation.ValidUntil.UTC()
 	value.Target.Network = canonicalNetworkContext(value.Target.Network)
 	return value

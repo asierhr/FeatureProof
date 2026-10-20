@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/githubpr"
 )
 
@@ -104,9 +105,10 @@ func (c CLI) Run(ctx context.Context, args []string, output io.Writer) int {
 	}
 	if err != nil {
 		value = struct {
-			ContractVersion string    `json:"contract_version"`
-			Error           ErrorCode `json:"error"`
-		}{ContractVersion, errorCode(err)}
+			ContractVersion string           `json:"contract_version"`
+			Error           ErrorCode        `json:"error"`
+			Decision        *ContextDecision `json:"decision,omitempty"`
+		}{ContractVersion, errorCode(err), errorDecision(err)}
 	}
 	raw, marshalErr := json.Marshal(value)
 	if marshalErr != nil {
@@ -170,9 +172,10 @@ type MCPRequest struct {
 
 // MCPResponse wraps the same application value or safe error code returned by other adapters.
 type MCPResponse struct {
-	Version string    `json:"version"`
-	Value   any       `json:"value,omitempty"`
-	Error   ErrorCode `json:"error,omitempty"`
+	Version  string           `json:"version"`
+	Value    any              `json:"value,omitempty"`
+	Error    ErrorCode        `json:"error,omitempty"`
+	Decision *ContextDecision `json:"decision,omitempty"`
 }
 
 // workflowRPCRequest is the strict JSON-RPC envelope accepted from workflow stdio.
@@ -394,7 +397,7 @@ func (m MCPServer) Handle(ctx context.Context, request MCPRequest) MCPResponse {
 		err = &Error{Code: CodeInvalid, Operation: "mcp"}
 	}
 	if err != nil {
-		return MCPResponse{Version: ContractVersion, Error: errorCode(err)}
+		return MCPResponse{Version: ContractVersion, Error: errorCode(err), Decision: errorDecision(err)}
 	}
 	return MCPResponse{Version: ContractVersion, Value: value}
 }
@@ -422,13 +425,26 @@ type GitHubGateway struct {
 	Commands  map[string]StartCommand
 }
 
+// githubContractAuthorityKey marks PR authority created only inside the authenticated GitHub adapter.
+type githubContractAuthorityKey struct{}
+
+// GitHubContractAuthority returns the trusted PR head and changed paths attached by GitHubGateway.
+// feature22:coverage validationworkflow.GitHubContractAuthority
+func GitHubContractAuthority(ctx context.Context) (RevisionContext, bool) {
+	value, ok := ctx.Value(githubContractAuthorityKey{}).(RevisionContext)
+	return value, ok
+}
+
 // Submit starts planning for the exact refreshed pull-request head and never auto-approves the generated plan.
+// feature22:coverage validationworkflow.GitHubGateway.Submit
 func (g GitHubGateway) Submit(ctx context.Context, selection githubpr.Selection, snapshot githubpr.PullRequestSnapshot, handle string) (githubpr.RunState, error) {
 	command, ok := g.Commands[selection.Alias]
-	if !ok || g.Service == nil || command.Approval != ApprovalRequired {
+	if !ok || g.Service == nil || command.Approval != ApprovalRequired || githubpr.VerifySnapshot(snapshot) != nil {
 		return githubpr.RunState{}, &githubpr.Error{Code: githubpr.CodeUnauthorized, Operation: "workflow_selection"}
 	}
 	command.RepositoryID, command.Revision, command.IdempotencyKey = itoaSigned(snapshot.RepositoryID), snapshot.HeadOID, handle
+	command.GitHubAuthority = githubAuthorityReference(snapshot)
+	ctx = context.WithValue(ctx, githubContractAuthorityKey{}, RevisionContext{RepositoryID: command.RepositoryID, CommitOID: snapshot.HeadOID, ChangedPaths: append([]string{}, snapshot.ChangedPaths...)})
 	view, err := g.Service.Start(ctx, command)
 	if err != nil {
 		return githubpr.RunState{}, githubError(err)
@@ -502,13 +518,22 @@ func errorCode(err error) ErrorCode {
 	return CodeInternal
 }
 
+// errorDecision returns an isolated safe contract decision for CLI and MCP adapters.
+func errorDecision(err error) *ContextDecision {
+	var typed *Error
+	if !errors.As(err, &typed) || typed.Decision == nil {
+		return nil
+	}
+	return &ContextDecision{MissingKinds: append([]string(nil), typed.Decision.MissingKinds...), Operations: append([]contractcatalog.OperationKey(nil), typed.Decision.Operations...), ConflictIDs: append([]string(nil), typed.Decision.ConflictIDs...)}
+}
+
 // githubError maps workflow categories to the closed GitHub integration vocabulary.
 func githubError(err error) error {
 	if err == nil {
 		return nil
 	}
 	switch errorCode(err) {
-	case CodeInvalid:
+	case CodeInvalid, CodeInsufficientContext, CodeReviewRequired:
 		return &githubpr.Error{Code: githubpr.CodeInvalid, Operation: "workflow"}
 	case CodeUnauthorized:
 		return &githubpr.Error{Code: githubpr.CodeUnauthorized, Operation: "workflow"}

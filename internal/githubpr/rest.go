@@ -8,6 +8,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +29,32 @@ type RESTConfig struct {
 	HTTP                HTTPDoer
 	Clock               Clock
 	MaxResponse         int64
+	MaxPages            int
+	MaxChangedPaths     int
+}
+
+// repositorySlug accepts only GitHub owner/repository path segments before constructing the files endpoint.
+var repositorySlug = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})$`)
+
+// pullRequestDTO is the strict structural subset needed to bind metadata, files and the exact base repository route.
+type pullRequestDTO struct {
+	Number int64  `json:"number"`
+	State  string `json:"state"`
+	User   struct {
+		ID int64 `json:"id"`
+	} `json:"user"`
+	Head struct {
+		SHA  string `json:"sha"`
+		Repo struct {
+			ID int64 `json:"id"`
+		} `json:"repo"`
+	} `json:"head"`
+	Base struct {
+		Repo struct {
+			ID       int64  `json:"id"`
+			FullName string `json:"full_name"`
+		} `json:"repo"`
+	} `json:"base"`
 }
 
 // RESTAdapter translates GitHub REST DTOs into the package-owned gateway contract.
@@ -37,36 +66,133 @@ type RESTAdapter struct {
 // NewRESTAdapter validates transport configuration and forbids URL substitution outside HTTPS.
 func NewRESTAdapter(config RESTConfig) (*RESTAdapter, error) {
 	base, err := url.Parse(config.BaseURL)
-	if err != nil || base.Scheme != "https" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || config.APIVersion == "" || config.AppID <= 0 || config.Tokens == nil || config.HTTP == nil || config.Clock == nil || config.MaxResponse <= 0 {
+	if err != nil || base.Scheme != "https" || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || config.APIVersion == "" || config.AppID <= 0 || config.Tokens == nil || config.HTTP == nil || config.Clock == nil || config.MaxResponse <= 0 || config.MaxPages <= 0 || config.MaxChangedPaths <= 0 {
 		return nil, &Error{Code: CodeInvalid, Operation: "rest_config"}
 	}
 	return &RESTAdapter{config: config, base: base}, nil
 }
 
-// PullRequest reads current structural PR identity using a repository-scoped installation token.
+// PullRequest reads metadata, every bounded changed-file page, then metadata again so head and paths form one coherent observation.
 func (a *RESTAdapter) PullRequest(ctx context.Context, installationID, repositoryID, number int64) (PullRequestSnapshot, error) {
-	var dto struct {
-		Number int64  `json:"number"`
-		State  string `json:"state"`
-		User   struct {
-			ID int64 `json:"id"`
-		} `json:"user"`
-		Head struct {
-			SHA  string `json:"sha"`
-			Repo struct {
-				ID int64 `json:"id"`
-			} `json:"repo"`
-		} `json:"head"`
-		Base struct {
-			Repo struct {
-				ID int64 `json:"id"`
-			} `json:"repo"`
-		} `json:"base"`
+	if installationID <= 0 || repositoryID <= 0 || number <= 0 {
+		return PullRequestSnapshot{}, &Error{Code: CodeInvalid, Operation: "pull_request_identity"}
 	}
-	if err := a.request(ctx, installationID, repositoryID, http.MethodGet, fmt.Sprintf("/repositories/%d/pulls/%d", repositoryID, number), nil, &dto); err != nil {
+	first, owner, repository, err := a.readPullRequestMetadata(ctx, installationID, repositoryID, number)
+	if err != nil {
 		return PullRequestSnapshot{}, err
 	}
-	return SealSnapshot(PullRequestSnapshot{Version: SchemaVersion, InstallationID: installationID, RepositoryID: dto.Base.Repo.ID, Number: dto.Number, AuthorID: dto.User.ID, State: dto.State, HeadOID: dto.Head.SHA, HeadRepositoryID: dto.Head.Repo.ID, Fork: dto.Head.Repo.ID != dto.Base.Repo.ID})
+	changedPaths, err := a.readChangedPaths(ctx, installationID, repositoryID, owner, repository, number)
+	if err != nil {
+		return PullRequestSnapshot{}, err
+	}
+	second, secondOwner, secondRepository, err := a.readPullRequestMetadata(ctx, installationID, repositoryID, number)
+	if err != nil {
+		return PullRequestSnapshot{}, err
+	}
+	if first.Fingerprint != second.Fingerprint || owner != secondOwner || repository != secondRepository {
+		return PullRequestSnapshot{}, &Error{Code: CodeConflict, Operation: "pull_request_changed_during_read"}
+	}
+	second.ChangedPaths = changedPaths
+	return SealSnapshot(second)
+}
+
+// readPullRequestMetadata validates the numeric identity and extracts safe owner/repository segments for the files endpoint.
+func (a *RESTAdapter) readPullRequestMetadata(ctx context.Context, installationID, repositoryID, number int64) (PullRequestSnapshot, string, string, error) {
+	var dto pullRequestDTO
+	if err := a.request(ctx, installationID, repositoryID, http.MethodGet, fmt.Sprintf("/repositories/%d/pulls/%d", repositoryID, number), nil, &dto); err != nil {
+		return PullRequestSnapshot{}, "", "", err
+	}
+	parts := strings.Split(dto.Base.Repo.FullName, "/")
+	if len(parts) != 2 || !repositorySlug.MatchString(parts[0]) || !repositorySlug.MatchString(parts[1]) || dto.Base.Repo.ID != repositoryID || dto.Number != number {
+		return PullRequestSnapshot{}, "", "", &Error{Code: CodeIntegrity, Operation: "pull_request_metadata"}
+	}
+	snapshot, err := SealSnapshot(PullRequestSnapshot{Version: SchemaVersion, InstallationID: installationID, RepositoryID: dto.Base.Repo.ID, Number: dto.Number, AuthorID: dto.User.ID, State: dto.State, HeadOID: dto.Head.SHA, HeadRepositoryID: dto.Head.Repo.ID, Fork: dto.Head.Repo.ID != dto.Base.Repo.ID})
+	if err != nil {
+		return PullRequestSnapshot{}, "", "", err
+	}
+	return snapshot, parts[0], parts[1], nil
+}
+
+// readChangedPaths consumes the complete bounded files collection and rejects noncanonical or duplicate authority.
+func (a *RESTAdapter) readChangedPaths(ctx context.Context, installationID, repositoryID int64, owner, repository string, number int64) ([]string, error) {
+	values := make([]string, 0)
+	seen := make(map[string]bool)
+	for pageNumber := 1; pageNumber <= a.config.MaxPages; pageNumber++ {
+		if err := ctx.Err(); err != nil {
+			return nil, &Error{Code: CodeCancelled, Operation: "pull_request_files"}
+		}
+		var pageValues []struct {
+			Filename string `json:"filename"`
+		}
+		resource := fmt.Sprintf("/repos/%s/%s/pulls/%d/files?per_page=100&page=%d", url.PathEscape(owner), url.PathEscape(repository), number, pageNumber)
+		header, err := a.requestHeaders(ctx, installationID, repositoryID, http.MethodGet, resource, nil, &pageValues)
+		if err != nil {
+			return nil, err
+		}
+		if len(pageValues) > 100 {
+			return nil, &Error{Code: CodeIntegrity, Operation: "pull_request_files_page"}
+		}
+		for _, value := range pageValues {
+			canonical, valid := canonicalGitHubChangedPath(value.Filename)
+			if !valid || seen[canonical] {
+				return nil, &Error{Code: CodeIntegrity, Operation: "pull_request_files_path"}
+			}
+			if len(values) >= a.config.MaxChangedPaths {
+				return nil, &Error{Code: CodeConflict, Operation: "pull_request_files_limit"}
+			}
+			seen[canonical] = true
+			values = append(values, canonical)
+		}
+		next, linkErr := strictNextLink(header.Get("Link"))
+		if linkErr != nil || next && len(pageValues) == 0 {
+			return nil, &Error{Code: CodeIntegrity, Operation: "pull_request_files_pagination"}
+		}
+		if !next {
+			sort.Strings(values)
+			return values, nil
+		}
+	}
+	return nil, &Error{Code: CodeConflict, Operation: "pull_request_files_pagination_limit"}
+}
+
+// canonicalGitHubChangedPath accepts only already-canonical repository-relative slash paths.
+func canonicalGitHubChangedPath(value string) (string, bool) {
+	clean := path.Clean(value)
+	return clean, value != "" && value == clean && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../") && !strings.HasPrefix(clean, "/") && !strings.Contains(clean, "\\") && !strings.Contains(clean, ":")
+}
+
+// strictNextLink validates the bounded pagination signal while never following a remote URL from the response.
+func strictNextLink(value string) (bool, error) {
+	if value == "" {
+		return false, nil
+	}
+	found := false
+	relations := make(map[string]bool)
+	for _, raw := range strings.Split(value, ",") {
+		part := strings.TrimSpace(raw)
+		segments := strings.Split(part, ";")
+		if len(segments) != 2 {
+			return false, &Error{Code: CodeIntegrity, Operation: "pull_request_files_link"}
+		}
+		target := strings.TrimSpace(segments[0])
+		relation := strings.TrimSpace(segments[1])
+		if len(target) < 3 || target[0] != '<' || target[len(target)-1] != '>' || !strings.HasPrefix(relation, `rel="`) || !strings.HasSuffix(relation, `"`) {
+			return false, &Error{Code: CodeIntegrity, Operation: "pull_request_files_link"}
+		}
+		parsed, err := url.Parse(target[1 : len(target)-1])
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+			return false, &Error{Code: CodeIntegrity, Operation: "pull_request_files_link"}
+		}
+		name := strings.TrimSuffix(strings.TrimPrefix(relation, `rel="`), `"`)
+		if relations[name] || name != "next" && name != "prev" && name != "first" && name != "last" {
+			return false, &Error{Code: CodeIntegrity, Operation: "pull_request_files_link"}
+		}
+		relations[name] = true
+		if name == "next" {
+			found = true
+		}
+	}
+	return found, nil
 }
 
 // FindChecks lists only the bounded check collection needed for reconciliation.

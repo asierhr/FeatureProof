@@ -1,0 +1,27 @@
+{
+  "profiles": {
+    "cli": { "package": "./cmd/featureproof", "profile": ".feature22-cli.cover" },
+    "workflow": { "package": "./internal/validationworkflow", "profile": ".feature22-workflow.cover" },
+    "github": { "package": "./internal/githubpr", "profile": ".feature22-github.cover" }
+  },
+  "targets": [
+    { "profile": "cli", "file": "cmd/featureproof/workflow.go", "pattern": "^func loadWorkflowConfig", "name": "loadWorkflowConfig" },
+    { "profile": "cli", "file": "cmd/featureproof/workflow.go", "pattern": "^func composeWorkflowCLI", "name": "composeWorkflowCLI" },
+    { "profile": "cli", "file": "cmd/featureproof/workflow.go", "pattern": "^func workflowContractReducerFor", "name": "workflowContractReducerFor" },
+    { "profile": "cli", "file": "cmd/featureproof/workflow.go", "pattern": "^func \\(r workflowCombinedContractReducer\\) Reduce", "name": "workflowCombinedContractReducer.Reduce" },
+    { "profile": "cli", "file": "cmd/featureproof/workflow.go", "pattern": "^func workflowSelections", "name": "workflowSelections" },
+    { "profile": "cli", "file": "cmd/featureproof/workflow.go", "pattern": "^func \\(r workflowGoContractReducer\\) Reduce", "name": "workflowGoContractReducer.Reduce" },
+    { "profile": "cli", "file": "cmd/featureproof/workflow.go", "pattern": "^func \\(v workflowBindingVerifier\\) ContractAuthority", "name": "workflowBindingVerifier.ContractAuthority" },
+    { "profile": "cli", "file": "cmd/featureproof/workflow.go", "pattern": "^func contractAuthorityFor", "name": "contractAuthorityFor" },
+    { "profile": "cli", "file": "cmd/featureproof/workflow.go", "pattern": "^func \\(v workflowBindingVerifier\\) Verify", "name": "workflowBindingVerifier.Verify" },
+    { "profile": "cli", "file": "cmd/featureproof/workflow.go", "pattern": "^func \\(c workflowCatalog\\) Descriptors", "name": "workflowCatalog.Descriptors" },
+    { "profile": "workflow", "file": "internal/validationworkflow/admission.go", "pattern": "^func ContractAuthority", "name": "validationworkflow.ContractAuthority" },
+    { "profile": "workflow", "file": "internal/validationworkflow/admission.go", "pattern": "^func ContextWithContractAuthority", "name": "validationworkflow.ContextWithContractAuthority" },
+    { "profile": "workflow", "file": "internal/validationworkflow/admission.go", "pattern": "^func \\(b TrustedAdmissionBuilder\\) Build", "name": "TrustedAdmissionBuilder.Build" },
+    { "profile": "workflow", "file": "internal/validationworkflow/adapters.go", "pattern": "^func GitHubContractAuthority", "name": "validationworkflow.GitHubContractAuthority" },
+    { "profile": "workflow", "file": "internal/validationworkflow/adapters.go", "pattern": "^func \\(g GitHubGateway\\) Submit", "name": "validationworkflow.GitHubGateway.Submit" },
+    { "profile": "workflow", "file": "internal/validationworkflow/context.go", "pattern": "^func canonicalBindingContext", "name": "validationworkflow.canonicalBindingContext" },
+    { "profile": "github", "file": "internal/githubpr/model.go", "pattern": "^func SealSnapshot", "name": "githubpr.SealSnapshot" },
+    { "profile": "github", "file": "internal/githubpr/model.go", "pattern": "^func uniqueSnapshotPaths", "name": "githubpr.uniqueSnapshotPaths" }
+  ]
+}

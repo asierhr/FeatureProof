@@ -24,13 +24,18 @@ type CoordinatorDependencies struct {
 
 // Coordinator admits commands and owns all joinable association workers.
 type Coordinator struct {
-	deps    CoordinatorDependencies
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	workers map[string]context.CancelFunc
-	idle    chan struct{}
-	wg      sync.WaitGroup
+	deps           CoordinatorDependencies
+	ctx            context.Context
+	cancel         context.CancelFunc
+	mu             sync.Mutex
+	workers        map[string]context.CancelFunc
+	idle           chan struct{}
+	wg             sync.WaitGroup
+	shutdownOnce   sync.Once
+	shutdownMu     sync.Mutex
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	shutdownDone   chan struct{}
 }
 
 // NewCoordinator validates composition and recovers one lease-bounded durable batch before claiming the next.
@@ -97,7 +102,6 @@ func NewCoordinator(ctx context.Context, deps CoordinatorDependencies) (*Coordin
 
 // abortStartup releases only the current undelivered batch and joins workers already handed to the supervisor.
 func (c *Coordinator) abortStartup(ctx context.Context, associations []Association, intents []PublicationIntent, cause error) (*Coordinator, error) {
-	c.cancel()
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.deps.CloseTimeout)
 	defer cancel()
 	for _, intent := range intents {
@@ -227,16 +231,16 @@ func (c *Coordinator) run(ctx context.Context, a Association) {
 	runCtx, cancelRun := context.WithTimeout(ctx, c.deps.RunTimeout)
 	defer cancelRun()
 	defer func() {
-		finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.deps.CloseTimeout)
+		finalCtx, cancel := c.cleanupContext(ctx)
 		defer cancel()
 		_ = c.deps.Store.ReleaseAssociation(finalCtx, a.ID, c.deps.Owner, c.deps.Clock.Now())
+		c.wg.Done()
 		c.mu.Lock()
 		delete(c.workers, a.ID)
 		if len(c.workers) == 0 {
 			close(c.idle)
 		}
 		c.mu.Unlock()
-		c.wg.Done()
 	}()
 	selection, a, drift, err := c.refresh(runCtx, a)
 	if err != nil {
@@ -391,9 +395,9 @@ func (c *Coordinator) stale(ctx context.Context, a Association) {
 	_, _ = c.deps.Publisher.PublishCheck(ctx, a, Projection{Outcome: "stale", Title: "FeatureProof: stale", Summary: "FeatureProof outcome: **stale**"})
 }
 
-// finalizeCancelled records cancellation with a fresh bounded context after the worker context ends.
+// finalizeCancelled records cancellation within the supervisor's single cleanup lifecycle.
 func (c *Coordinator) finalizeCancelled(a Association) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.ctx), c.deps.CloseTimeout)
+	ctx, cancel := c.cleanupContext(c.ctx)
 	defer cancel()
 	if _, renewed, _, err := c.refresh(ctx, a); err != nil {
 		return
@@ -404,6 +408,36 @@ func (c *Coordinator) finalizeCancelled(a Association) {
 		_ = c.deps.Validation.Cancel(ctx, a.RunHandle, "cancelled:"+a.ID)
 	}
 	_, _ = c.deps.Publisher.PublishCheck(ctx, a, Projection{Outcome: "cancelled", Title: "FeatureProof: cancelled", Summary: "FeatureProof outcome: **cancelled**"})
+}
+
+// cleanupContext joins finalization and release to Close's one total budget when shutdown is active.
+func (c *Coordinator) cleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	c.shutdownMu.Lock()
+	ctx := c.shutdownCtx
+	c.shutdownMu.Unlock()
+	if ctx != nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), c.deps.CloseTimeout)
+}
+
+// beginShutdown installs the cleanup budget before signaling workers, so every finalizer shares its ownership.
+func (c *Coordinator) beginShutdown() (<-chan struct{}, context.Context) {
+	c.shutdownOnce.Do(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), c.deps.CloseTimeout)
+		done := make(chan struct{})
+		c.shutdownMu.Lock()
+		c.shutdownCtx, c.shutdownCancel, c.shutdownDone = cleanup, cancel, done
+		c.shutdownMu.Unlock()
+		c.cancel()
+		go func() {
+			c.wg.Wait()
+			close(done)
+		}()
+	})
+	c.shutdownMu.Lock()
+	defer c.shutdownMu.Unlock()
+	return c.shutdownDone, c.shutdownCtx
 }
 
 // Cancel refreshes current authority before signaling a worker or validation run.
@@ -433,18 +467,28 @@ func (c *Coordinator) Cancel(ctx context.Context, id string) error {
 	return nil
 }
 
-// Close cancels all workers and joins them within both configured and caller bounds.
+// Close owns cancel, finalization, release and join under one internal budget and never abandons a worker.
 func (c *Coordinator) Close(ctx context.Context) error {
-	c.cancel()
-	bounded, cancel := context.WithTimeout(ctx, c.deps.CloseTimeout)
-	defer cancel()
-	done := make(chan struct{})
-	go func() { c.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-		return nil
-	case <-bounded.Done():
-		return &Error{Code: CodeCancelled, Operation: "close"}
+	done, cleanup := c.beginShutdown()
+	callerDone := ctx.Done()
+	callerCancelled := ctx.Err() != nil
+	for {
+		select {
+		case <-done:
+			c.shutdownCancel()
+			if callerCancelled {
+				return &Error{Code: CodeCancelled, Operation: "close"}
+			}
+			return nil
+		case <-callerDone:
+			callerCancelled = true
+			callerDone = nil
+		case <-cleanup.Done():
+			// All worker dependencies receive this same cancellation. Retain ownership
+			// until their defers complete and wg confirms there is no orphan.
+			<-done
+			return &Error{Code: CodeCancelled, Operation: "close"}
+		}
 	}
 }
 

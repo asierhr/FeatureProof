@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -102,23 +103,35 @@ func ValidatePermissions(actual PermissionSet) error {
 
 // PullRequestSnapshot is the minimal refreshed identity used for authorization and head binding.
 type PullRequestSnapshot struct {
-	Version          int    `json:"version"`
-	InstallationID   int64  `json:"installation_id"`
-	RepositoryID     int64  `json:"repository_id"`
-	Number           int64  `json:"number"`
-	AuthorID         int64  `json:"author_id"`
-	State            string `json:"state"`
-	HeadOID          string `json:"head_oid"`
-	HeadRepositoryID int64  `json:"head_repository_id"`
-	Fork             bool   `json:"fork"`
-	Fingerprint      string `json:"fingerprint"`
+	Version          int      `json:"version"`
+	InstallationID   int64    `json:"installation_id"`
+	RepositoryID     int64    `json:"repository_id"`
+	Number           int64    `json:"number"`
+	AuthorID         int64    `json:"author_id"`
+	State            string   `json:"state"`
+	HeadOID          string   `json:"head_oid"`
+	HeadRepositoryID int64    `json:"head_repository_id"`
+	Fork             bool     `json:"fork"`
+	ChangedPaths     []string `json:"changed_paths,omitempty"`
+	Fingerprint      string   `json:"fingerprint"`
 }
 
 // SealSnapshot validates and fingerprints trusted structural PR observations.
+// feature22:coverage githubpr.SealSnapshot
 func SealSnapshot(snapshot PullRequestSnapshot) (PullRequestSnapshot, error) {
 	if snapshot.Version != SchemaVersion || snapshot.InstallationID <= 0 || snapshot.RepositoryID <= 0 || snapshot.Number <= 0 || snapshot.AuthorID <= 0 || snapshot.State != "open" || snapshot.HeadRepositoryID <= 0 || !revisionbinding.ValidOID(snapshot.HeadOID) {
 		return PullRequestSnapshot{}, &Error{Code: CodeInvalid, Operation: "snapshot"}
 	}
+	snapshot.ChangedPaths = append([]string{}, snapshot.ChangedPaths...)
+	for index, value := range snapshot.ChangedPaths {
+		clean := path.Clean(strings.ReplaceAll(value, "\\", "/"))
+		if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") || strings.Contains(clean, ":") {
+			return PullRequestSnapshot{}, &Error{Code: CodeInvalid, Operation: "snapshot"}
+		}
+		snapshot.ChangedPaths[index] = clean
+	}
+	sort.Strings(snapshot.ChangedPaths)
+	snapshot.ChangedPaths = uniqueSnapshotPaths(snapshot.ChangedPaths)
 	snapshot.Fingerprint = ""
 	raw, err := json.Marshal(snapshot)
 	if err != nil {
@@ -126,6 +139,21 @@ func SealSnapshot(snapshot PullRequestSnapshot) (PullRequestSnapshot, error) {
 	}
 	snapshot.Fingerprint = digest(raw)
 	return snapshot, nil
+}
+
+// uniqueSnapshotPaths canonicalizes trusted GitHub changed paths before fingerprinting and downstream admission.
+// feature22:coverage githubpr.uniqueSnapshotPaths
+func uniqueSnapshotPaths(values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	out := values[:1]
+	for _, value := range values[1:] {
+		if value != out[len(out)-1] {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 // VerifySnapshot detects persisted identity changes before external calls.

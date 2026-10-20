@@ -144,7 +144,7 @@ func validSHA256(value string) bool {
 // validInvalidationReason limits recovery to the reason vocabulary specified by approval protocol v1.
 func validInvalidationReason(reason InvalidationReason) bool {
 	switch reason {
-	case ReasonConstraintsEdited, ReasonRegenerationRequested, ReasonPlanChanged, ReasonTargetChanged, ReasonConstraintsChanged, ReasonOpenAPIChanged, ReasonCapabilitiesChanged, ReasonRuntimeChanged, ReasonGenerationContractChanged:
+	case ReasonConstraintsEdited, ReasonRegenerationRequested, ReasonPlanChanged, ReasonTargetChanged, ReasonConstraintsChanged, ReasonContractChanged, ReasonCapabilitiesChanged, ReasonRuntimeChanged, ReasonGenerationContractChanged:
 		return true
 	default:
 		return false
@@ -165,7 +165,6 @@ func cloneContext(snapshot ContractSnapshot) ContractSnapshot {
 	for key, value := range snapshot.Runtime.Limits {
 		out.Runtime.Limits[key] = value
 	}
-	out.OpenAPI.Bytes = append([]byte(nil), snapshot.OpenAPI.Bytes...)
 	return out
 }
 

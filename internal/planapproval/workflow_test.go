@@ -2,6 +2,8 @@ package planapproval
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,8 +15,8 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/harness"
-	"github.com/asierhr/featureProof/internal/openapi"
 	"github.com/asierhr/featureProof/internal/planning"
 )
 
@@ -136,23 +138,7 @@ func singleApprovalFixture(t *testing.T) (agentplanning.PreparedPlan, ContractSn
 // approvalFixtureShape controls fixture breadth without bypassing feature 10 generation and validation.
 func approvalFixtureShape(t *testing.T, operator, description string, single bool) (agentplanning.PreparedPlan, ContractSnapshot) {
 	t.Helper()
-	root := t.TempDir()
-	document := `{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{"/pets":{"get":{"responses":{"200":{"description":"ok"}}}}}}`
-	if err := os.WriteFile(filepath.Join(root, "api.json"), []byte(document), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	loader, err := openapi.NewLoader(context.Background(), openapi.Config{AuthorizedRoot: root, MaxDocumentBytes: 1 << 20, MaxTotalBytes: 1 << 20, MaxDocuments: 2, MaxReferences: 4, MaxReferenceDepth: 4, MaxObservedBodyBytes: 1024, MaxContextBytes: 8192}, openapi.LocalFS{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	contract, err := loader.Load(context.Background(), "api.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	reduced, err := contract.BuildContext(context.Background(), openapi.ContextRequest{Constraints: []openapi.ConstraintSelection{{ConstraintID: "c1", Operations: []openapi.OperationKey{{Method: "GET", Path: "/pets"}}}}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	reduced := approvalContract(t, "/pets", "policy", contractcatalog.ConfidenceHigh)
 	checks := make([]agentplanning.CandidateCheck, 0, 3)
 	scenarios := make([]agentplanning.ScenarioEntry, 0, 3)
 	for _, scenario := range []agentplanning.Scenario{agentplanning.ScenarioPositive, agentplanning.ScenarioNegative, agentplanning.ScenarioError} {
@@ -169,12 +155,50 @@ func approvalFixtureShape(t *testing.T, operator, description string, single boo
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := generator.Generate(context.Background(), agentplanning.GenerationRequest{RunID: "run-1", PlanID: "plan-1", Constraints: []agentplanning.Constraint{{ID: "c1", Description: description}}, OpenAPI: reduced, Capabilities: []agentplanning.CapabilityDescriptor{{Name: "http.request", Class: "http", Description: "request", Effects: true, Idempotent: true, Validate: func(map[string]planning.InputValue) error { return nil }}}, Limits: agentplanning.Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 4, MaxCapabilities: 4, MaxChecks: 8, MaxStepsPerCheck: 4, MaxAssertionsPerStep: 4, MaxMissingItems: 4, MaxValidationWork: 10000}})
+	result, err := generator.Generate(context.Background(), agentplanning.GenerationRequest{RunID: "run-1", PlanID: "plan-1", Constraints: []agentplanning.Constraint{{ID: "c1", Description: description}}, Contract: reduced, Capabilities: []agentplanning.CapabilityDescriptor{{Name: "http.request", Class: "http", Description: "request", Effects: true, Idempotent: true, Validate: func(map[string]planning.InputValue) error { return nil }}}, Limits: agentplanning.Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 4, MaxCapabilities: 4, MaxChecks: 8, MaxStepsPerCheck: 4, MaxAssertionsPerStep: 4, MaxMissingItems: 4, MaxValidationWork: 10000}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot := ContractSnapshot{Target: TargetSnapshot{ID: "target-1", BaseURL: "https://example.invalid"}, Constraints: []agentplanning.Constraint{{ID: "c1", Description: description}}, OpenAPI: reduced, Capabilities: []CapabilitySnapshot{{Name: "http.request", Class: "http", Description: "request", Effects: true, Idempotent: true}}, Runtime: RuntimeSnapshot{PolicyVersion: "v1", Limits: map[string]int{"tools": 3}}, GenerationContract: GenerationContractSnapshot{ProtocolVersion: "v1", PromptVersion: "p1", Provider: "fake", Model: "fake"}}
+	snapshot := ContractSnapshot{Target: TargetSnapshot{ID: "target-1", BaseURL: "https://example.invalid"}, Constraints: []agentplanning.Constraint{{ID: "c1", Description: description}}, Contract: reduced, Capabilities: []CapabilitySnapshot{{Name: "http.request", Class: "http", Description: "request", Effects: true, Idempotent: true}}, Runtime: RuntimeSnapshot{PolicyVersion: "v1", Limits: map[string]int{"tools": 3}}, GenerationContract: GenerationContractSnapshot{ProtocolVersion: "v1", PromptVersion: "p1", Provider: "fake", Model: "fake"}}
 	return *result.Prepared, snapshot
+}
+
+// approvalContract composes a verified immutable contract fixture through registry, catalog and claim policy.
+func approvalContract(t *testing.T, path, policyID string, confidence contractcatalog.Confidence) contractcatalog.ReducedContext {
+	t.Helper()
+	sum := sha256.Sum256([]byte(path + policyID + string(confidence)))
+	digest := hex.EncodeToString(sum[:])
+	provenance := contractcatalog.Provenance{SourceID: "fixture", Class: contractcatalog.ClassAuthoritative, SourceDigest: digest, AdapterVersion: "test-v1", SafeLocation: "catalog/operations/0", Confidence: confidence, Completeness: contractcatalog.CompletenessComplete}
+	operation := contractcatalog.OperationDescriptor{Key: contractcatalog.OperationKey{Method: "GET", Path: path}, LogicalID: "fixture", Responses: map[string]contractcatalog.Response{"200": {}}, Security: []contractcatalog.SecurityRequirement{}, Provenance: []contractcatalog.Provenance{provenance}, Confidence: confidence, Completeness: contractcatalog.CompletenessComplete, Classes: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative}}
+	operation.Claims = contractcatalog.ClaimsForOperation(operation, provenance)
+	snapshot := contractcatalog.SourceSnapshot{Version: contractcatalog.VersionV1, Source: contractcatalog.SourceSummary{ID: "fixture", Kind: "fixture", Class: contractcatalog.ClassAuthoritative, Digest: digest, AdapterVersion: "test-v1", Confidence: confidence, Completeness: contractcatalog.CompletenessComplete}, Operations: []contractcatalog.OperationDescriptor{operation}}
+	limits := contractcatalog.Limits{MaxSources: 1, MaxOperations: 8, MaxClaims: 128, MaxBytes: 1 << 20, MaxDepth: 32, MaxDiagnostics: 32, MaxLocationBytes: 256}
+	projection := contractcatalog.ProjectionPolicy{MaxStringBytes: 512, AllowedURLSchemes: []string{"https"}, SensitiveNames: []string{}, SensitivePaths: []string{}, SensitiveHeaderNames: []string{"authorization", "cookie"}, ForbiddenValues: []string{}}
+	registry, err := contractcatalog.NewRegistry(map[string]contractcatalog.ContractSource{"fixture": &contractcatalog.StaticSource{Snapshot: snapshot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := registry.Load(context.Background(), []contractcatalog.SourceRequest{contractcatalog.NewSourceRequest(contractcatalog.SourceDescriptor{Kind: "fixture", ID: "fixture", Class: contractcatalog.ClassAuthoritative, Confidence: confidence, Completeness: contractcatalog.CompletenessComplete, ExpectedDigest: digest, AdapterVersion: "test-v1", Limits: limits, Projection: projection})}, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := contractcatalog.Build(context.Background(), loaded, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := map[contractcatalog.ClaimKind]contractcatalog.ClaimRule{}
+	for _, kind := range []contractcatalog.ClaimKind{contractcatalog.ClaimOperationIdentity, contractcatalog.ClaimSchema, contractcatalog.ClaimSecurity, contractcatalog.ClaimResponse} {
+		rules[kind] = contractcatalog.ClaimRule{AllowedClasses: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative}, MinimumConfidence: map[contractcatalog.SourceClass]contractcatalog.Confidence{contractcatalog.ClassAuthoritative: confidence}, RequiredCompleteness: contractcatalog.CompletenessComplete, Required: true}
+	}
+	policy, err := contractcatalog.NewPolicy(contractcatalog.SufficiencyPolicy{ID: policyID, Version: contractcatalog.VersionV1, Claims: rules, ConflictTreatment: contractcatalog.ConflictDeny})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reduced, err := contractcatalog.BuildContext(context.Background(), catalog, policy, []contractcatalog.ConstraintSelection{{ConstraintID: "c1", Operations: []contractcatalog.OperationKey{{Method: "GET", Path: path}}}}, contractcatalog.ReductionLimits{MaxBytes: 1 << 20, MaxOperations: 8, MaxClaims: 128, MaxDepth: 32, MaxDiagnostics: 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reduced
 }
 
 // testLimits supplies explicit generous budgets shared by approval tests.
@@ -340,7 +364,9 @@ func TestEveryRelevantContextChangeInvalidatesApproval(t *testing.T) {
 	changes := []struct {
 		name   string
 		mutate func(*ContractSnapshot)
-	}{{"target", func(s *ContractSnapshot) { s.Target.ID = "other" }}, {"constraints", func(s *ContractSnapshot) { s.Constraints[0].Description = "other" }}, {"openapi", func(s *ContractSnapshot) { s.OpenAPI.Bytes = append(s.OpenAPI.Bytes, ' ') }}, {"capabilities", func(s *ContractSnapshot) { s.Capabilities[0].Effects = false }}, {"runtime", func(s *ContractSnapshot) { s.Runtime.PolicyVersion = "v2" }}, {"generation", func(s *ContractSnapshot) { s.GenerationContract.PromptVersion = "p2" }}}
+	}{{"target", func(s *ContractSnapshot) { s.Target.ID = "other" }}, {"constraints", func(s *ContractSnapshot) { s.Constraints[0].Description = "other" }}, {"contract_context", func(s *ContractSnapshot) {
+		s.Contract = approvalContract(t, "/other", "policy", contractcatalog.ConfidenceHigh)
+	}}, {"capabilities", func(s *ContractSnapshot) { s.Capabilities[0].Effects = false }}, {"runtime", func(s *ContractSnapshot) { s.Runtime.PolicyVersion = "v2" }}, {"generation", func(s *ContractSnapshot) { s.GenerationContract.PromptVersion = "p2" }}}
 	for _, change := range changes {
 		t.Run(change.name, func(t *testing.T) {
 			plan, snapshot := approvalFixture(t)

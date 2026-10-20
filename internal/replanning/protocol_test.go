@@ -176,8 +176,11 @@ func TestMalformedDecisionStartsNoDownstreamWork(t *testing.T) {
 	}
 }
 
-// fakeModelBudget provides deterministic confirmed usage for budget reservation tests.
-type fakeModelBudget struct{ snapshot model.Snapshot }
+// fakeModelBudget provides synchronized deterministic confirmed usage for concurrent budget reservation tests.
+type fakeModelBudget struct {
+	mu       sync.Mutex
+	snapshot model.Snapshot
+}
 
 // blockingBudgetSnapshot simulates a slow injected model session without a provider.
 type blockingBudgetSnapshot struct {
@@ -195,11 +198,20 @@ func (m *blockingBudgetSnapshot) Snapshot() model.Snapshot {
 	return model.Snapshot{Calls: 1, Replans: 1}
 }
 
-// ReserveReplan models the session reservation without a provider call.
-func (f *fakeModelBudget) ReserveReplan(context.Context) error { f.snapshot.Replans++; return nil }
+// ReserveReplan models an atomic session reservation without a provider call.
+func (f *fakeModelBudget) ReserveReplan(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapshot.Replans++
+	return nil
+}
 
-// Snapshot returns a stable value for budget projection tests.
-func (f *fakeModelBudget) Snapshot() model.Snapshot { return f.snapshot }
+// Snapshot returns a synchronized value for budget projection tests.
+func (f *fakeModelBudget) Snapshot() model.Snapshot {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.snapshot
+}
 
 // TestEveryBudgetIsReservedBeforeItsWork proves the final deterministic unit has one owner.
 func TestEveryBudgetIsReservedBeforeItsWork(t *testing.T) {

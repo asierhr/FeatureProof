@@ -115,7 +115,27 @@ func (c *Contract) BuildContext(ctx context.Context, request ContextRequest) (Re
 		return ReducedContext{}, cancelledError("context", err)
 	}
 	retained := c.retainedIndex(envelope, constraints)
-	return ReducedContext{MediaType: "application/vnd.featureproof.openapi-context+json;v=1", Untrusted: true, Bytes: append([]byte(nil), b...), Omissions: omitted, retained: retained}, nil
+	reachableSchemes := c.reachableSchemes(retained)
+	return ReducedContext{MediaType: "application/vnd.featureproof.openapi-context+json;v=1", Untrusted: true, Bytes: append([]byte(nil), b...), Omissions: omitted, retained: retained, securitySchemes: reachableSchemes}, nil
+}
+
+// reachableSchemes carries only authentication definitions referenced by operations that survived selection and size limits.
+func (c *Contract) reachableSchemes(retained []RetainedOperation) []SecurityScheme {
+	wanted := map[string]bool{}
+	for _, item := range retained {
+		for _, requirement := range item.Operation.Security {
+			for name := range requirement.Schemes {
+				wanted[name] = true
+			}
+		}
+	}
+	out := make([]SecurityScheme, 0, len(wanted))
+	for _, scheme := range c.schemes {
+		if wanted[scheme.Name] {
+			out = append(out, scheme)
+		}
+	}
+	return cloneSchemes(out)
 }
 
 // retainedIndex derives provenance from the final serialized envelope so size-omitted operations remain unavailable.

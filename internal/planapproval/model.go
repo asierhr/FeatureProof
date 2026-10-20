@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/harness"
-	"github.com/asierhr/featureProof/internal/openapi"
 )
 
 // Action is the closed set of decisions a trusted approval surface may submit.
@@ -43,7 +43,7 @@ const (
 	ReasonPlanChanged               InvalidationReason = "plan_changed"
 	ReasonTargetChanged             InvalidationReason = "target_changed"
 	ReasonConstraintsChanged        InvalidationReason = "constraints_changed"
-	ReasonOpenAPIChanged            InvalidationReason = "openapi_changed"
+	ReasonContractChanged           InvalidationReason = "contract_context_changed"
 	ReasonCapabilitiesChanged       InvalidationReason = "capabilities_changed"
 	ReasonRuntimeChanged            InvalidationReason = "runtime_changed"
 	ReasonGenerationContractChanged InvalidationReason = "generation_contract_changed"
@@ -125,7 +125,7 @@ type GenerationContractSnapshot struct {
 type ContractSnapshot struct {
 	Target             TargetSnapshot
 	Constraints        []agentplanning.Constraint
-	OpenAPI            openapi.ReducedContext
+	Contract           contractcatalog.ReducedContext
 	Capabilities       []CapabilitySnapshot
 	Runtime            RuntimeSnapshot
 	GenerationContract GenerationContractSnapshot

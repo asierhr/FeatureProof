@@ -49,7 +49,7 @@ func TestCompositionAndModelFailureBoundaries(t *testing.T) {
 	if value, err := (RandomIDs{}).Next(); err != nil || len(value) != 32 {
 		t.Fatalf("value=%q err=%v", value, err)
 	}
-	config := ProductionConfig{AppID: 10, BotID: 20, Permissions: RequiredPermissions(), APIOrigin: "https://api.github.test", APIVersion: "2022-11-28", EvidenceOrigin: "https://evidence.example", StoreDir: t.TempDir(), MaxWebhookBytes: 4096, MaxResponseBytes: 4096, MaxPages: 2, MaxAttempts: 2, RunTimeout: time.Minute, CloseTimeout: time.Second, LeaseTTL: 2 * time.Minute, PollInterval: time.Millisecond, RetryMaxDuration: time.Minute, RetryMaxWait: time.Second, RetryInitialBackoff: time.Millisecond, RetryMaxBackoff: time.Second, Authorization: AuthorizationConfig{}}
+	config := ProductionConfig{AppID: 10, BotID: 20, Permissions: RequiredPermissions(), APIOrigin: "https://api.github.test", APIVersion: "2022-11-28", EvidenceOrigin: "https://evidence.example", StoreDir: t.TempDir(), MaxWebhookBytes: 4096, MaxResponseBytes: 4096, MaxPages: 2, MaxChangedPaths: 100, MaxAttempts: 2, RunTimeout: time.Minute, CloseTimeout: time.Second, LeaseTTL: 2 * time.Minute, PollInterval: time.Millisecond, RetryMaxDuration: time.Minute, RetryMaxWait: time.Second, RetryInitialBackoff: time.Millisecond, RetryMaxBackoff: time.Second, Authorization: AuthorizationConfig{}}
 	if _, err := ComposeRuntime(context.Background(), ProductionConfig{}, CompositionSecrets{}, RuntimeDependencies{}); !IsCode(err, CodeInvalid) {
 		t.Fatal(err)
 	}
@@ -60,6 +60,31 @@ func TestCompositionAndModelFailureBoundaries(t *testing.T) {
 	dependencies := RuntimeDependencies{Credentials: &fakeTokenSource{clock: clock}, HTTP: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("unused") }), Packages: fakePackageReader{}, Clock: clock, Jitter: fixedJitter{}, IDs: failingIDs{}}
 	if _, err := ComposeRuntime(context.Background(), config, CompositionSecrets{WebhookSecret: []byte("0123456789abcdef")}, dependencies); !IsCode(err, CodeInternal) {
 		t.Fatal(err)
+	}
+}
+
+// TestSnapshotChangedPathsAreCanonicalUniqueAndBound verifies trusted PR file authority is safe, immutable and fingerprinted.
+func TestSnapshotChangedPathsAreCanonicalUniqueAndBound(t *testing.T) {
+	base := PullRequestSnapshot{Version: SchemaVersion, InstallationID: 1, RepositoryID: 2, Number: 3, AuthorID: 4, State: "open", HeadOID: testOID, HeadRepositoryID: 2, ChangedPaths: []string{"app/z.go", "app\\a.go", "app/z.go"}}
+	sealed, err := SealSnapshot(base)
+	if err != nil || len(sealed.ChangedPaths) != 2 || sealed.ChangedPaths[0] != "app/a.go" || sealed.ChangedPaths[1] != "app/z.go" || VerifySnapshot(sealed) != nil {
+		t.Fatalf("changed paths not sealed: %+v %v", sealed, err)
+	}
+	base.ChangedPaths[0] = "changed.go"
+	if sealed.ChangedPaths[0] != "app/a.go" {
+		t.Fatal("sealed changed paths aliased caller state")
+	}
+	for _, invalid := range []string{"../escape.go", "/absolute.go", "C:/drive.go", "."} {
+		candidate := base
+		candidate.ChangedPaths = []string{invalid}
+		if _, err := SealSnapshot(candidate); !IsCode(err, CodeInvalid) {
+			t.Fatalf("unsafe changed path accepted %q: %v", invalid, err)
+		}
+	}
+	empty := base
+	empty.ChangedPaths = nil
+	if sealedEmpty, err := SealSnapshot(empty); err != nil || len(sealedEmpty.ChangedPaths) != 0 {
+		t.Fatalf("empty changed paths rejected: %+v %v", sealedEmpty, err)
 	}
 }
 
@@ -107,7 +132,7 @@ func TestBoundedReconciliationAndPaginationRejectAmbiguity(t *testing.T) {
 		}
 		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Link": []string{`<https://api.github.test/next>; rel="next"`}}, Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
-	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: &fakeTokenSource{clock: clock}, HTTP: transport, Clock: clock, MaxResponse: 4096})
+	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: &fakeTokenSource{clock: clock}, HTTP: transport, Clock: clock, MaxResponse: 4096, MaxPages: 2, MaxChangedPaths: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +147,7 @@ func TestBoundedReconciliationAndPaginationRejectAmbiguity(t *testing.T) {
 // TestRESTRequestFailuresRemainBounded covers credential, response-size, and response-decode failures.
 func TestRESTRequestFailuresRemainBounded(t *testing.T) {
 	clock := &fakeClock{now: time.Unix(100, 0)}
-	config := RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: rejectingCredentials{}, HTTP: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("unused") }), Clock: clock, MaxResponse: 64}
+	config := RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: rejectingCredentials{}, HTTP: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("unused") }), Clock: clock, MaxResponse: 64, MaxPages: 2, MaxChangedPaths: 100}
 	adapter, err := NewRESTAdapter(config)
 	if err != nil {
 		t.Fatal(err)

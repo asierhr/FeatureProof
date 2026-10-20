@@ -2,17 +2,18 @@ package replanning
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/harness"
-	"github.com/asierhr/featureProof/internal/openapi"
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
@@ -129,33 +130,54 @@ func (e *executingFake) ExecuteBound(ctx context.Context, authorization *planapp
 	return e.Execute(ctx, authorization, prepared, contract)
 }
 
-// replanningRequest builds a retained OpenAPI operation and descriptor-only capability with local files.
+// replanningRequest builds a retained contract operation and descriptor-only capability with local files.
 func replanningRequest(t *testing.T) agentplanning.GenerationRequest {
 	t.Helper()
-	root := t.TempDir()
-	doc := `{"openapi":"3.1.0","info":{"title":"x","version":"1"},"paths":{"/pets":{"get":{"responses":{"200":{"description":"ok"}}}}}}`
-	if err := os.WriteFile(filepath.Join(root, "api.json"), []byte(doc), 0600); err != nil {
-		t.Fatal(err)
-	}
-	cfg := openapi.Config{AuthorizedRoot: root, MaxDocumentBytes: 1 << 20, MaxTotalBytes: 1 << 20, MaxDocuments: 2, MaxReferences: 8, MaxReferenceDepth: 4, MaxObservedBodyBytes: 1024, MaxContextBytes: 8192}
-	loader, err := openapi.NewLoader(context.Background(), cfg, openapi.LocalFS{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	contract, err := loader.Load(context.Background(), "api.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	reduced, err := contract.BuildContext(context.Background(), openapi.ContextRequest{Constraints: []openapi.ConstraintSelection{{ConstraintID: "c", Operations: []openapi.OperationKey{{Method: "GET", Path: "/pets"}}}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return agentplanning.GenerationRequest{RunID: "run", PlanID: "plan", Constraints: []agentplanning.Constraint{{ID: "c", Description: "pets listed"}}, OpenAPI: reduced, Capabilities: []agentplanning.CapabilityDescriptor{{Name: "http.request", Class: "http", Validate: func(input map[string]planning.InputValue) error {
+	reduced := replanningContract(t, "/pets")
+	return agentplanning.GenerationRequest{RunID: "run", PlanID: "plan", Constraints: []agentplanning.Constraint{{ID: "c", Description: "pets listed"}}, Contract: reduced, Capabilities: []agentplanning.CapabilityDescriptor{{Name: "http.request", Class: "http", Validate: func(input map[string]planning.InputValue) error {
 		if input["method"].Literal == nil || input["path"].Literal == nil || input["method"].Literal.Value != "GET" || input["path"].Literal.Value != "/pets" {
 			return errors.New("invalid")
 		}
 		return nil
 	}}}, Limits: agentplanning.Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 4, MaxCapabilities: 4, MaxChecks: 4, MaxStepsPerCheck: 4, MaxAssertionsPerStep: 4, MaxMissingItems: 4, MaxValidationWork: 10000}}
+}
+
+// replanningContract builds a verified immutable context without provider, network or execution effects.
+func replanningContract(t *testing.T, path string) contractcatalog.ReducedContext {
+	t.Helper()
+	sum := sha256.Sum256([]byte(path))
+	digest := hex.EncodeToString(sum[:])
+	provenance := contractcatalog.Provenance{SourceID: "fixture", Class: contractcatalog.ClassAuthoritative, SourceDigest: digest, AdapterVersion: "test-v1", SafeLocation: "catalog/operations/0", Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete}
+	operation := contractcatalog.OperationDescriptor{Key: contractcatalog.OperationKey{Method: "GET", Path: path}, LogicalID: "fixture", Responses: map[string]contractcatalog.Response{"200": {}}, Security: []contractcatalog.SecurityRequirement{}, Provenance: []contractcatalog.Provenance{provenance}, Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete, Classes: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative}}
+	operation.Claims = contractcatalog.ClaimsForOperation(operation, provenance)
+	snapshot := contractcatalog.SourceSnapshot{Version: contractcatalog.VersionV1, Source: contractcatalog.SourceSummary{ID: "fixture", Kind: "fixture", Class: contractcatalog.ClassAuthoritative, Digest: digest, AdapterVersion: "test-v1", Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete}, Operations: []contractcatalog.OperationDescriptor{operation}}
+	limits := contractcatalog.Limits{MaxSources: 1, MaxOperations: 8, MaxClaims: 128, MaxBytes: 1 << 20, MaxDepth: 32, MaxDiagnostics: 32, MaxLocationBytes: 256}
+	projection := contractcatalog.ProjectionPolicy{MaxStringBytes: 512, AllowedURLSchemes: []string{"https"}, SensitiveNames: []string{}, SensitivePaths: []string{}, SensitiveHeaderNames: []string{"authorization", "cookie"}, ForbiddenValues: []string{}}
+	registry, err := contractcatalog.NewRegistry(map[string]contractcatalog.ContractSource{"fixture": &contractcatalog.StaticSource{Snapshot: snapshot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := registry.Load(context.Background(), []contractcatalog.SourceRequest{contractcatalog.NewSourceRequest(contractcatalog.SourceDescriptor{Kind: "fixture", ID: "fixture", Class: contractcatalog.ClassAuthoritative, Confidence: contractcatalog.ConfidenceHigh, Completeness: contractcatalog.CompletenessComplete, ExpectedDigest: digest, AdapterVersion: "test-v1", Limits: limits, Projection: projection})}, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := contractcatalog.Build(context.Background(), loaded, limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rules := map[contractcatalog.ClaimKind]contractcatalog.ClaimRule{}
+	for _, kind := range []contractcatalog.ClaimKind{contractcatalog.ClaimOperationIdentity, contractcatalog.ClaimSchema, contractcatalog.ClaimSecurity, contractcatalog.ClaimResponse} {
+		rules[kind] = contractcatalog.ClaimRule{AllowedClasses: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative}, MinimumConfidence: map[contractcatalog.SourceClass]contractcatalog.Confidence{contractcatalog.ClassAuthoritative: contractcatalog.ConfidenceHigh}, RequiredCompleteness: contractcatalog.CompletenessComplete, Required: true}
+	}
+	policy, err := contractcatalog.NewPolicy(contractcatalog.SufficiencyPolicy{ID: "fixture", Version: contractcatalog.VersionV1, Claims: rules, ConflictTreatment: contractcatalog.ConflictDeny})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reduced, err := contractcatalog.BuildContext(context.Background(), catalog, policy, []contractcatalog.ConstraintSelection{{ConstraintID: "c", Operations: []contractcatalog.OperationKey{{Method: "GET", Path: path}}}}, contractcatalog.ReductionLimits{MaxBytes: 1 << 20, MaxOperations: 8, MaxClaims: 128, MaxDepth: 32, MaxDiagnostics: 32})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reduced
 }
 
 // additionalWire serializes one complete candidate check through the same strict decision codec as production.
@@ -202,7 +224,7 @@ func integrationCoordinator(t *testing.T, allowed bool, outputs ...string) (*Coo
 	gate := &policyDecision{allowed: allowed}
 	executor := &executingFake{run: run, records: records}
 	base, guard := testRevisionBinding(t, run.ID)
-	c, err := NewCoordinator(run, m, summary, budgets, NewMemoryJournal(), ledger, NewFingerprintSet(), ExistingPreparer{Assertions: permissiveAssertions{}, Policy: gate}, DisabledApproval{Run: run}, executor, limits, base, guard)
+	c, err := NewCoordinator(run, m, summary, budgets, NewMemoryJournal(), ledger, NewFingerprintSet(), ExistingPreparer{Assertions: permissiveAssertions{}, Policy: gate}, DisabledApproval{Run: run}, executor, limits, base, guard, testOwnershipConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,6 +234,11 @@ func integrationCoordinator(t *testing.T, allowed bool, outputs ...string) (*Coo
 		t.Fatal(err)
 	}
 	return c, RunInput{Initial: []ConfirmedCheck{initial}, InitialBinding: initialBinding, Constraints: []ConstraintStatus{{ID: "c", Status: "passed"}}, Generation: replanningRequest(t)}, m, gate, executor, ledger
+}
+
+// testOwnershipConfig keeps test coordinators explicit while leaving enough lease slack for bounded store work.
+func testOwnershipConfig() OwnershipConfig {
+	return OwnershipConfig{LeaseTTL: 2 * time.Minute, RenewInterval: 10 * time.Second, StoreOperationTimeout: 30 * time.Second, FinalizeTimeout: 70 * time.Second, Clock: systemReplanClock{}, Waiter: timerReplanWaiter{}}
 }
 
 // TestBoundedReplanningEndToEndWithFakes covers preparation, policy, execution, evidence and final ledger verdict.

@@ -187,16 +187,19 @@ func TestRetryDeadlineAndCredentialCategories(t *testing.T) {
 	for _, code := range []ErrorCode{CodeTransient, CodeRateLimited} {
 		clock := &fakeClock{now: time.Unix(100, 0)}
 		credentials := &scriptedCredentials{code: code, clock: clock}
-		transport := roundTripFunc(func(*http.Request) (*http.Response, error) {
-			body := `{"number":3,"state":"open","user":{"id":5},"head":{"sha":"` + testOID + `","repo":{"id":2}},"base":{"repo":{"id":2}}}`
+		transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			body := `{"number":3,"state":"open","user":{"id":5},"head":{"sha":"` + testOID + `","repo":{"id":2}},"base":{"repo":{"id":2,"full_name":"owner/repository"}}}`
+			if strings.HasSuffix(request.URL.Path, "/files") {
+				body = `[]`
+			}
 			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 		})
-		adapter, newErr := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: credentials, HTTP: transport, Clock: clock, MaxResponse: 4096})
+		adapter, newErr := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: credentials, HTTP: transport, Clock: clock, MaxResponse: 4096, MaxPages: 2, MaxChangedPaths: 100})
 		if newErr != nil {
 			t.Fatal(newErr)
 		}
 		retry := testRetryPolicy(clock)
-		if err = retry.Do(context.Background(), func(ctx context.Context) error { _, readErr := adapter.PullRequest(ctx, 1, 2, 3); return readErr }); err != nil || credentials.calls != 2 {
+		if err = retry.Do(context.Background(), func(ctx context.Context) error { _, readErr := adapter.PullRequest(ctx, 1, 2, 3); return readErr }); err != nil || credentials.calls != 4 {
 			t.Fatalf("code=%s calls=%d err=%v", code, credentials.calls, err)
 		}
 	}
@@ -217,7 +220,7 @@ func TestCanonicalCommentMarkerRejectsPrefixVariants(t *testing.T) {
 		body := `[{"id":1,"body":"` + SummaryMarker + `spoof\nsummary","user":{"id":20}},{"id":2,"body":"` + SummaryMarker + ` \nsummary","user":{"id":20}},{"id":3,"body":"<!-- featureproof-summary:v2 -->\nsummary","user":{"id":20}},{"id":4,"body":"` + SummaryMarker + `\nsummary","user":{"id":20}}]`
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 	})
-	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: &fakeTokenSource{clock: clock}, HTTP: transport, Clock: clock, MaxResponse: 4096})
+	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: "https://api.github.test", APIVersion: "2022-11-28", AppID: 10, Tokens: &fakeTokenSource{clock: clock}, HTTP: transport, Clock: clock, MaxResponse: 4096, MaxPages: 2, MaxChangedPaths: 100})
 	if err != nil {
 		t.Fatal(err)
 	}

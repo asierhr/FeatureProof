@@ -150,6 +150,13 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		}
 		return viewOf(record), nil
 	}
+	if err = s.revalidateGeneratedPlan(workCtx, command, snapshot, *result.Prepared); err != nil {
+		record, err = s.terminal(workCtx, record, OutcomeInconclusive, "admission_drift")
+		if err != nil {
+			return WorkflowView{}, err
+		}
+		return viewOf(record), nil
+	}
 	commitmentKey := make([]byte, 32)
 	if _, err = rand.Read(commitmentKey); err != nil {
 		return WorkflowView{}, &Error{Code: CodeInternal, Operation: "commitment_key"}
@@ -203,6 +210,23 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		return WorkflowView{}, err
 	}
 	return viewOf(record), nil
+}
+
+// revalidateGeneratedPlan reloads contract policy and planning authority after inference and before approval or execution.
+func (s *Service) revalidateGeneratedPlan(ctx context.Context, command StartCommand, expected AdmissionSnapshot, prepared agentplanning.PreparedPlan) error {
+	current, err := s.deps.Admission.Build(ctx, command)
+	if err != nil || validateSnapshot(current, command) != nil {
+		return &Error{Code: CodeConflict, Operation: "admission_drift"}
+	}
+	current.Generation.RunID, current.Generation.PlanID = expected.Generation.RunID, expected.Generation.PlanID
+	unchanged := current.SpecificationDigest == expected.SpecificationDigest && current.ContractDigest == expected.ContractDigest && current.CatalogDigest == expected.CatalogDigest && current.ContractPolicyDigest == expected.ContractPolicyDigest && current.RevisionDigest == expected.RevisionDigest && current.RuntimeDigest == expected.RuntimeDigest && current.Provider == expected.Provider && current.Model == expected.Model
+	if command.Target.Direct != nil {
+		unchanged = unchanged && current.TargetDigest == expected.TargetDigest
+	}
+	if !unchanged || !prepared.MatchesProvenance(agentplanning.ProvenanceInput{Constraints: current.Generation.Constraints, Contract: current.Generation.Contract, Capabilities: current.Generation.Capabilities}) {
+		return &Error{Code: CodeConflict, Operation: "admission_drift"}
+	}
+	return nil
 }
 
 // Status returns the durable lifecycle projection without touching external dependencies.
@@ -537,6 +561,11 @@ func (s *Service) execute(ctx context.Context, record Record, snapshot Admission
 		return s.terminal(ctx, record, OutcomeError, "artifact_integrity")
 	}
 	record.Artifact = &artifactValue
+	currentSnapshot, currentPrepared, revalidationErr := s.restorePrepared(ctx, record)
+	if revalidationErr != nil {
+		return s.terminal(ctx, record, OutcomeInconclusive, "admission_drift")
+	}
+	snapshot, prepared = currentSnapshot, currentPrepared
 	material, materialErr := s.deps.Executables.Load(ctx, record.Handle)
 	if materialErr != nil || verifyExecutableMaterial(record, snapshot, prepared, material) != nil {
 		return s.terminal(ctx, record, OutcomeError, "executable_integrity")
@@ -719,6 +748,9 @@ func validateStart(command StartCommand) error {
 	if command.Target.Preview != nil && (!safeID.MatchString(command.Target.Preview.Alias) || len(command.Target.Preview.Digest) != 64) {
 		return &Error{Code: CodeInvalid, Operation: "preview"}
 	}
+	if command.GitHubAuthority != nil && (!validGitHubAuthorityReference(command.GitHubAuthority) || command.RepositoryID != itoaSigned(command.GitHubAuthority.RepositoryID) || command.Revision != command.GitHubAuthority.HeadOID) {
+		return &Error{Code: CodeInvalid, Operation: "github_authority"}
+	}
 	return nil
 }
 
@@ -726,7 +758,7 @@ func validateStart(command StartCommand) error {
 func validateSnapshot(snapshot AdmissionSnapshot, command StartCommand) error {
 	revisionDigest, targetDigest, bindingErr := bindingDigests(snapshot.Binding)
 	runtimeDigest, runtimeErr := runtimeContextDigest(snapshot.Runtime)
-	if bindingErr != nil || runtimeErr != nil || revisionDigest != snapshot.RevisionDigest || targetDigest != snapshot.TargetDigest || runtimeDigest != snapshot.RuntimeDigest || !validBindingContext(snapshot.Binding, command) || !validRuntimeContext(snapshot.Runtime, command.RuntimeProfile) || len(snapshot.SpecificationDigest) != 64 || len(snapshot.ContractDigest) != 64 || len(snapshot.RevisionDigest) != 64 || len(snapshot.TargetDigest) != 64 || len(snapshot.RuntimeDigest) != 64 || snapshot.Provider != command.Provider || snapshot.Model != command.Model || len(snapshot.Generation.Constraints) == 0 || len(snapshot.Generation.Capabilities) == 0 {
+	if bindingErr != nil || runtimeErr != nil || revisionDigest != snapshot.RevisionDigest || targetDigest != snapshot.TargetDigest || runtimeDigest != snapshot.RuntimeDigest || !validBindingContext(snapshot.Binding, command) || !validRuntimeContext(snapshot.Runtime, command.RuntimeProfile) || len(snapshot.SpecificationDigest) != 64 || len(snapshot.ContractDigest) != 64 || snapshot.Generation.Contract.Validate() != nil || snapshot.CatalogDigest != snapshot.Generation.Contract.CatalogDigest() || snapshot.ContractPolicyDigest != snapshot.Generation.Contract.PolicyDigest() || len(snapshot.RevisionDigest) != 64 || len(snapshot.TargetDigest) != 64 || len(snapshot.RuntimeDigest) != 64 || snapshot.Provider != command.Provider || snapshot.Model != command.Model || len(snapshot.Generation.Constraints) == 0 || len(snapshot.Generation.Capabilities) == 0 {
 		return &Error{Code: CodeInvalid, Operation: "snapshot"}
 	}
 	return nil
@@ -772,6 +804,10 @@ func viewOf(record Record) WorkflowView {
 func mapBoundaryError(ctx context.Context, operation string, err error) error {
 	if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
 		return &Error{Code: CodeCancelled, Operation: operation}
+	}
+	var typed *Error
+	if errors.As(err, &typed) {
+		return &Error{Code: typed.Code, Operation: operation, Decision: errorDecision(typed)}
 	}
 	return &Error{Code: CodeInvalid, Operation: operation}
 }

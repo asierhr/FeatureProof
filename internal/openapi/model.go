@@ -196,12 +196,16 @@ type OmissionCounts struct {
 
 // ReducedContext is a canonical untrusted-data envelope for a future model adapter.
 type ReducedContext struct {
-	MediaType string         `json:"media_type"`
-	Untrusted bool           `json:"untrusted"`
-	Bytes     []byte         `json:"-"`
-	Omissions OmissionCounts `json:"omissions"`
-	retained  []RetainedOperation
+	MediaType       string         `json:"media_type"`
+	Untrusted       bool           `json:"untrusted"`
+	Bytes           []byte         `json:"-"`
+	Omissions       OmissionCounts `json:"omissions"`
+	retained        []RetainedOperation
+	securitySchemes []SecurityScheme
 }
+
+// SecuritySchemes returns isolated normalized schemes reachable from the operations retained in this historical context.
+func (r ReducedContext) SecuritySchemes() []SecurityScheme { return cloneSchemes(r.securitySchemes) }
 
 // RetainedOperation ties one caller constraint to an operation actually serialized into reduced context.
 type RetainedOperation struct {
@@ -223,6 +227,7 @@ type Contract struct {
 	version    string
 	operations []OperationDescriptor
 	schemes    []SecurityScheme
+	excluded   []string
 	omitted    OmissionCounts
 	maxBody    int
 	maxContext int

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planning"
@@ -89,6 +90,10 @@ type ErrorCode string
 const (
 	// CodeInvalid rejects malformed or incomplete selections.
 	CodeInvalid ErrorCode = "invalid_request"
+	// CodeInsufficientContext reports a safe pre-model contract selection gap.
+	CodeInsufficientContext ErrorCode = "insufficient_context"
+	// CodeReviewRequired reports explicit catalog conflicts requiring an external decision.
+	CodeReviewRequired ErrorCode = "review_required"
 	// CodeUnauthorized rejects a principal or selection outside trusted composition.
 	CodeUnauthorized ErrorCode = "unauthorized"
 	// CodeConflict reports idempotency, revision or ownership collisions.
@@ -105,6 +110,14 @@ const (
 type Error struct {
 	Code      ErrorCode
 	Operation string
+	Decision  *ContextDecision
+}
+
+// ContextDecision carries only safe typed operation keys, missing dimensions and conflict IDs across adapters.
+type ContextDecision struct {
+	MissingKinds []string                       `json:"missing_kinds,omitempty"`
+	Operations   []contractcatalog.OperationKey `json:"operations,omitempty"`
+	ConflictIDs  []string                       `json:"conflict_ids,omitempty"`
 }
 
 // Error formats a safe workflow diagnostic without external payloads.
@@ -141,15 +154,16 @@ type StartCommand struct {
 	RepositoryID, Revision                                   string
 	Approval                                                 ApprovalMode
 	Target                                                   TargetSelection
+	GitHubAuthority                                          *GitHubAuthorityReference
 }
 
 // AdmissionSnapshot is an immutable, secret-free model and execution snapshot produced before admission.
 type AdmissionSnapshot struct {
-	SpecificationDigest, ContractDigest, RevisionDigest, TargetDigest, RuntimeDigest string
-	Provider, Model                                                                  string
-	Binding                                                                          BindingContext
-	Runtime                                                                          RuntimeContext
-	Generation                                                                       agentplanning.GenerationRequest
+	SpecificationDigest, ContractDigest, CatalogDigest, ContractPolicyDigest, RevisionDigest, TargetDigest, RuntimeDigest string
+	Provider, Model                                                                                                       string
+	Binding                                                                                                               BindingContext
+	Runtime                                                                                                               RuntimeContext
+	Generation                                                                                                            agentplanning.GenerationRequest
 }
 
 // Clone returns a deep-enough snapshot copy so caller mutation cannot alter admitted generation data.
@@ -157,7 +171,6 @@ func (s AdmissionSnapshot) Clone() AdmissionSnapshot {
 	out := s
 	out.Generation.Constraints = append([]agentplanning.Constraint(nil), s.Generation.Constraints...)
 	out.Generation.Capabilities = append([]agentplanning.CapabilityDescriptor(nil), s.Generation.Capabilities...)
-	out.Generation.OpenAPI.Bytes = append([]byte(nil), s.Generation.OpenAPI.Bytes...)
 	out.Binding = canonicalBindingContext(s.Binding)
 	out.Runtime = canonicalRuntimeContext(s.Runtime)
 	return out

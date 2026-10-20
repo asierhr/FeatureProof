@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 // EventType enumerates safe lineage transitions for a bounded replan cycle.
@@ -68,6 +69,21 @@ type ReplanJournal interface {
 	CompareAndAppend(context.Context, string, uint64, string, Event) (Event, bool, error)
 	Checkpoint(context.Context, string) (CycleCheckpoint, error)
 	SaveCheckpoint(context.Context, string, CycleCheckpoint) error
+	ClaimRun(context.Context, string, string, time.Time, time.Duration) (RunLease, bool, error)
+	RenewRun(context.Context, string, RunLease, time.Time, time.Duration) (RunLease, error)
+	ReleaseRun(context.Context, string, RunLease) error
+	OwnedEvents(context.Context, string, RunLease, time.Time) ([]Event, error)
+	OwnedCheckpoint(context.Context, string, RunLease, time.Time) (CycleCheckpoint, error)
+	OwnedSaveCheckpoint(context.Context, string, RunLease, time.Time, CycleCheckpoint) error
+	OwnedCompareAndAppend(context.Context, string, RunLease, time.Time, uint64, string, Event) (Event, bool, error)
+	ReserveInference(context.Context, string, RunLease, time.Time, uint64, CycleCheckpoint) error
+}
+
+// RunLease is the durable generation-fenced authority required before restoring budgets or invoking a model.
+type RunLease struct {
+	Owner      string    `json:"owner"`
+	Generation uint64    `json:"generation"`
+	LeaseUntil time.Time `json:"lease_until"`
 }
 
 // CycleCheckpoint keeps bounded safe model input, a decoded decision and confirmed results outside audit events.
@@ -89,6 +105,8 @@ type MemoryJournal struct {
 	mu          sync.Mutex
 	runs        map[string]*journalRun
 	checkpoints map[string][]byte
+	leases      map[string]RunLease
+	generations map[string]uint64
 }
 
 // journalRun owns one confirmed prefix and command fingerprint index.
@@ -99,17 +117,168 @@ type journalRun struct {
 
 // NewMemoryJournal starts isolated run logs without background work.
 func NewMemoryJournal() *MemoryJournal {
-	return &MemoryJournal{runs: map[string]*journalRun{}, checkpoints: map[string][]byte{}}
+	return &MemoryJournal{runs: map[string]*journalRun{}, checkpoints: map[string][]byte{}, leases: map[string]RunLease{}, generations: map[string]uint64{}}
 }
 
-// Checkpoint returns an isolated copy of the latest confirmed run-cycle recovery data.
-func (j *MemoryJournal) Checkpoint(ctx context.Context, runID string) (CycleCheckpoint, error) {
+// ClaimRun atomically grants one live owner a generation-fenced run lease.
+func (j *MemoryJournal) ClaimRun(ctx context.Context, runID, owner string, now time.Time, ttl time.Duration) (RunLease, bool, error) {
+	if ctx.Err() != nil || !safeEventID(runID) || !safeEventID(owner) || now.IsZero() || ttl <= 0 {
+		return RunLease{}, false, failure(CategoryInvalidInput, "lease", "claim")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	current := j.leases[runID]
+	if current.Owner != "" && current.LeaseUntil.After(now) {
+		return current, current.Owner == owner, nil
+	}
+	j.generations[runID]++
+	lease := RunLease{Owner: owner, Generation: j.generations[runID], LeaseUntil: now.Add(ttl)}
+	j.leases[runID] = lease
+	return lease, true, nil
+}
+
+// RenewRun extends only the exact unexpired generation currently stored for a run.
+func (j *MemoryJournal) RenewRun(ctx context.Context, runID string, lease RunLease, now time.Time, ttl time.Duration) (RunLease, error) {
+	if ctx.Err() != nil || ttl <= 0 {
+		return RunLease{}, failure(CategoryCancelled, "lease", "renew")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	current := j.leases[runID]
+	if current.Owner != lease.Owner || current.Generation != lease.Generation || !current.LeaseUntil.After(now) {
+		return RunLease{}, failure(CategoryIntegrity, "lease", "lost")
+	}
+	current.LeaseUntil = now.Add(ttl)
+	j.leases[runID] = current
+	return current, nil
+}
+
+// ReleaseRun clears only the exact generation owned by the caller.
+func (j *MemoryJournal) ReleaseRun(ctx context.Context, runID string, lease RunLease) error {
+	if ctx.Err() != nil {
+		return failure(CategoryCancelled, "lease", "release")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	current := j.leases[runID]
+	if current.Owner == "" {
+		return nil
+	}
+	if current.Owner != lease.Owner || current.Generation != lease.Generation {
+		return failure(CategoryIntegrity, "lease", "lost")
+	}
+	delete(j.leases, runID)
+	return nil
+}
+
+// validateLeaseLocked fences an operation against the exact live owner generation while the store lock is held.
+func (j *MemoryJournal) validateLeaseLocked(runID string, lease RunLease, now time.Time) error {
+	current := j.leases[runID]
+	if now.IsZero() || current.Owner != lease.Owner || current.Generation != lease.Generation || !current.LeaseUntil.After(now) {
+		return failure(CategoryIntegrity, "lease", "fenced")
+	}
+	return nil
+}
+
+// OwnedEvents reads a prefix only while the exact durable generation remains live.
+func (j *MemoryJournal) OwnedEvents(ctx context.Context, runID string, lease RunLease, now time.Time) ([]Event, error) {
+	if ctx.Err() != nil {
+		return nil, failure(CategoryCancelled, "journal", "context")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if err := j.validateLeaseLocked(runID, lease, now); err != nil {
+		return nil, err
+	}
+	run := j.runs[runID]
+	if run == nil {
+		return nil, nil
+	}
+	out := make([]Event, len(run.events))
+	for i, event := range run.events {
+		out[i] = cloneEvent(event)
+	}
+	return out, nil
+}
+
+// OwnedCheckpoint restores private state only for the current live generation.
+func (j *MemoryJournal) OwnedCheckpoint(ctx context.Context, runID string, lease RunLease, now time.Time) (CycleCheckpoint, error) {
 	if ctx.Err() != nil {
 		return CycleCheckpoint{}, failure(CategoryCancelled, "checkpoint", "context")
 	}
 	j.mu.Lock()
-	raw := append([]byte(nil), j.checkpoints[runID]...)
-	j.mu.Unlock()
+	defer j.mu.Unlock()
+	if err := j.validateLeaseLocked(runID, lease, now); err != nil {
+		return CycleCheckpoint{}, err
+	}
+	return decodeCheckpoint(j.checkpoints[runID])
+}
+
+// OwnedSaveCheckpoint validates the lease and checkpoint transition in the same critical section.
+func (j *MemoryJournal) OwnedSaveCheckpoint(ctx context.Context, runID string, lease RunLease, now time.Time, value CycleCheckpoint) error {
+	if ctx.Err() != nil {
+		return failure(CategoryCancelled, "checkpoint", "context")
+	}
+	raw, err := encodeCheckpoint(runID, value)
+	if err != nil {
+		return err
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if err := j.validateLeaseLocked(runID, lease, now); err != nil {
+		return err
+	}
+	if err := validateCheckpointRaw(j.checkpoints[runID], value); err != nil {
+		return err
+	}
+	j.checkpoints[runID] = append([]byte(nil), raw...)
+	return nil
+}
+
+// OwnedCompareAndAppend atomically fences and appends one event.
+func (j *MemoryJournal) OwnedCompareAndAppend(ctx context.Context, runID string, lease RunLease, now time.Time, expected uint64, key string, event Event) (Event, bool, error) {
+	if ctx.Err() != nil {
+		return Event{}, false, failure(CategoryCancelled, "journal", "context")
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if err := j.validateLeaseLocked(runID, lease, now); err != nil {
+		return Event{}, false, err
+	}
+	return j.compareAndAppendLocked(runID, expected, key, event)
+}
+
+// ReserveInference is the synchronous fencing point immediately before the external model effect.
+func (j *MemoryJournal) ReserveInference(ctx context.Context, runID string, lease RunLease, now time.Time, expected uint64, checkpoint CycleCheckpoint) error {
+	if ctx.Err() != nil {
+		return failure(CategoryCancelled, "inference", "context")
+	}
+	checkpoint.InferenceStarted = true
+	raw, err := encodeCheckpoint(runID, checkpoint)
+	if err != nil {
+		return err
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if err := j.validateLeaseLocked(runID, lease, now); err != nil {
+		return err
+	}
+	run := j.runs[runID]
+	if run == nil && expected == 0 {
+		run = &journalRun{keys: map[string][]byte{}}
+		j.runs[runID] = run
+	}
+	if run == nil || uint64(len(run.events)) != expected {
+		return failure(CategoryIntegrity, "inference", "revision")
+	}
+	if err := validateCheckpointRaw(j.checkpoints[runID], checkpoint); err != nil {
+		return err
+	}
+	j.checkpoints[runID] = append([]byte(nil), raw...)
+	return nil
+}
+
+func decodeCheckpoint(raw []byte) (CycleCheckpoint, error) {
 	if len(raw) == 0 {
 		return CycleCheckpoint{}, nil
 	}
@@ -120,6 +289,39 @@ func (j *MemoryJournal) Checkpoint(ctx context.Context, runID string) (CycleChec
 	return value, nil
 }
 
+func encodeCheckpoint(runID string, value CycleCheckpoint) ([]byte, error) {
+	if runID == "" || value.Cycle < 1 {
+		return nil, failure(CategoryInvalidInput, "checkpoint", "identity")
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, failure(CategoryInvalidInput, "checkpoint", "value")
+	}
+	return raw, nil
+}
+
+func validateCheckpointRaw(previousRaw []byte, value CycleCheckpoint) error {
+	if len(previousRaw) == 0 {
+		return nil
+	}
+	var previous CycleCheckpoint
+	if json.Unmarshal(previousRaw, &previous) != nil || !validCheckpointAdvance(previous, value) {
+		return failure(CategoryIntegrity, "checkpoint", "revision")
+	}
+	return nil
+}
+
+// Checkpoint returns an isolated copy of the latest confirmed run-cycle recovery data.
+func (j *MemoryJournal) Checkpoint(ctx context.Context, runID string) (CycleCheckpoint, error) {
+	if ctx.Err() != nil {
+		return CycleCheckpoint{}, failure(CategoryCancelled, "checkpoint", "context")
+	}
+	j.mu.Lock()
+	raw := append([]byte(nil), j.checkpoints[runID]...)
+	j.mu.Unlock()
+	return decodeCheckpoint(raw)
+}
+
 // SaveCheckpoint stores a defensive serialized copy before the corresponding audit event is appended.
 func (j *MemoryJournal) SaveCheckpoint(ctx context.Context, runID string, value CycleCheckpoint) error {
 	if ctx.Err() != nil {
@@ -128,17 +330,14 @@ func (j *MemoryJournal) SaveCheckpoint(ctx context.Context, runID string, value 
 	if runID == "" || value.Cycle < 1 {
 		return failure(CategoryInvalidInput, "checkpoint", "identity")
 	}
-	raw, err := json.Marshal(value)
+	raw, err := encodeCheckpoint(runID, value)
 	if err != nil {
-		return failure(CategoryInvalidInput, "checkpoint", "value")
+		return err
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	if previousRaw := j.checkpoints[runID]; len(previousRaw) != 0 {
-		var previous CycleCheckpoint
-		if json.Unmarshal(previousRaw, &previous) != nil || !validCheckpointAdvance(previous, value) {
-			return failure(CategoryIntegrity, "checkpoint", "revision")
-		}
+	if err := validateCheckpointRaw(j.checkpoints[runID], value); err != nil {
+		return err
 	}
 	j.checkpoints[runID] = append([]byte(nil), raw...)
 	return nil
@@ -191,6 +390,12 @@ func (j *MemoryJournal) CompareAndAppend(ctx context.Context, runID string, expe
 	if ctx.Err() != nil {
 		return Event{}, false, failure(CategoryCancelled, "journal", "context")
 	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.compareAndAppendLocked(runID, expected, key, event)
+}
+
+func (j *MemoryJournal) compareAndAppendLocked(runID string, expected uint64, key string, event Event) (Event, bool, error) {
 	if runID == "" || key == "" || event.RunID != runID || event.Version != 1 || event.Cycle < 0 {
 		return Event{}, false, failure(CategoryInvalidInput, "journal", "event")
 	}
@@ -200,8 +405,6 @@ func (j *MemoryJournal) CompareAndAppend(ctx context.Context, runID string, expe
 	if err != nil {
 		return Event{}, false, failure(CategoryInvalidInput, "journal", "event")
 	}
-	j.mu.Lock()
-	defer j.mu.Unlock()
 	run := j.runs[runID]
 	if run == nil {
 		run = &journalRun{keys: map[string][]byte{}}

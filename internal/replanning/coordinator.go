@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
@@ -15,6 +17,86 @@ import (
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 )
 
+// coordinatorOwnerSequence makes process-local owner labels unique without granting authority by itself.
+var coordinatorOwnerSequence atomic.Uint64
+
+// runLeaseContextKey keeps one immutable owner/generation token scoped to its Run invocation.
+type runLeaseContextKey struct{}
+
+// leaseFromContext returns the durable authority required by every journal transaction.
+func leaseFromContext(ctx context.Context) (RunLease, error) {
+	lease, ok := ctx.Value(runLeaseContextKey{}).(RunLease)
+	if !ok || lease.Owner == "" || lease.Generation == 0 {
+		return RunLease{}, failure(CategoryIntegrity, "lease", "missing")
+	}
+	return lease, nil
+}
+
+// ReplanClock supplies lease instants at the durable ownership boundary.
+type ReplanClock interface{ Now() time.Time }
+
+// ReplanWaiter provides a cancellable heartbeat and follower wait boundary.
+type ReplanWaiter interface {
+	Wait(context.Context, time.Duration) error
+}
+
+// OwnershipConfig fixes the durable lease, renewal cadence, store transaction and finalization windows at trusted composition time.
+type OwnershipConfig struct {
+	LeaseTTL              time.Duration
+	RenewInterval         time.Duration
+	StoreOperationTimeout time.Duration
+	FinalizeTimeout       time.Duration
+	Clock                 ReplanClock
+	Waiter                ReplanWaiter
+}
+
+// Validate proves without duration overflow that terminal read/write and renewal fit before lease expiry.
+func (c OwnershipConfig) Validate() error {
+	if c.Clock == nil || c.Waiter == nil || !validOwnershipEnvelope(c.LeaseTTL, c.RenewInterval, c.StoreOperationTimeout, c.FinalizeTimeout) {
+		return failure(CategoryInvalidInput, "cycle_owner", "configuration")
+	}
+	return nil
+}
+
+// validOwnershipEnvelope rejects unrepresentable sums before calculating the strict TTL bound.
+func validOwnershipEnvelope(ttl, renewInterval, storeOperationTimeout, finalizeTimeout time.Duration) bool {
+	if ttl <= 0 || renewInterval <= 0 || storeOperationTimeout <= 0 || finalizeTimeout <= 0 {
+		return false
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	if renewInterval > maxDuration-2 || storeOperationTimeout > (maxDuration-renewInterval)/2 {
+		return false
+	}
+	required := 2*storeOperationTimeout + renewInterval
+	return ttl > required && finalizeTimeout >= required && finalizeTimeout < ttl
+}
+
+// ProductionOwnershipConfig returns the explicit production lease envelope used by local durable composition.
+func ProductionOwnershipConfig() OwnershipConfig {
+	return OwnershipConfig{LeaseTTL: 30 * time.Second, RenewInterval: 5 * time.Second, StoreOperationTimeout: 10 * time.Second, FinalizeTimeout: 25 * time.Second, Clock: systemReplanClock{}, Waiter: timerReplanWaiter{}}
+}
+
+// systemReplanClock is the production wall clock used only for durable leases.
+type systemReplanClock struct{}
+
+// Now returns the current lease instant.
+func (systemReplanClock) Now() time.Time { return time.Now() }
+
+// timerReplanWaiter waits without detached work and always observes cancellation.
+type timerReplanWaiter struct{}
+
+// Wait blocks for one bounded ownership interval.
+func (timerReplanWaiter) Wait(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // StructuredModel performs one feature-9 session call after explicit replan admission.
 type StructuredModel interface {
 	InferStructured(context.Context, model.StructuredRequest) (model.StructuredResult, error)
@@ -22,28 +104,36 @@ type StructuredModel interface {
 
 // Coordinator owns one sequential bounded post-execution cycle and its confirmed lineage.
 type Coordinator struct {
-	run          *harness.Run
-	model        StructuredModel
-	summary      *SummaryBuilder
-	budgets      *BudgetController
-	journal      ReplanJournal
-	ledger       *AssertionLedger
-	fingerprints *FingerprintSet
-	fingerprint  func(context.Context, AdditionalBatch, int, func(int) error) (string, error)
-	preparer     ProposalPreparer
-	approval     ApprovalPort
-	executor     BatchExecutor
-	limits       Limits
-	base         revisionbinding.Binding
-	revision     RevisionGuard
+	run             *harness.Run
+	model           StructuredModel
+	summary         *SummaryBuilder
+	budgets         *BudgetController
+	journal         ReplanJournal
+	ledger          *AssertionLedger
+	fingerprints    *FingerprintSet
+	fingerprint     func(context.Context, AdditionalBatch, int, func(int) error) (string, error)
+	preparer        ProposalPreparer
+	approval        ApprovalPort
+	executor        BatchExecutor
+	limits          Limits
+	base            revisionbinding.Binding
+	revision        RevisionGuard
+	owner           string
+	leaseTTL        time.Duration
+	renewEvery      time.Duration
+	storeTimeout    time.Duration
+	finalizeTimeout time.Duration
+	clock           ReplanClock
+	waiter          ReplanWaiter
 }
 
 // NewCoordinator requires every boundary at trusted composition time.
-func NewCoordinator(run *harness.Run, session StructuredModel, summary *SummaryBuilder, budgets *BudgetController, journal ReplanJournal, ledger *AssertionLedger, fingerprints *FingerprintSet, preparer ProposalPreparer, approval ApprovalPort, executor BatchExecutor, limits Limits, base revisionbinding.Binding, revision RevisionGuard) (*Coordinator, error) {
-	if limits.Validate() != nil || run == nil || session == nil || summary == nil || budgets == nil || journal == nil || ledger == nil || fingerprints == nil || preparer == nil || approval == nil || executor == nil || revision == nil || base.Verify(context.Background()) != nil || base.RunID != run.ID {
+func NewCoordinator(run *harness.Run, session StructuredModel, summary *SummaryBuilder, budgets *BudgetController, journal ReplanJournal, ledger *AssertionLedger, fingerprints *FingerprintSet, preparer ProposalPreparer, approval ApprovalPort, executor BatchExecutor, limits Limits, base revisionbinding.Binding, revision RevisionGuard, ownership OwnershipConfig) (*Coordinator, error) {
+	if limits.Validate() != nil || ownership.Validate() != nil || run == nil || session == nil || summary == nil || budgets == nil || journal == nil || ledger == nil || fingerprints == nil || preparer == nil || approval == nil || executor == nil || revision == nil || base.Verify(context.Background()) != nil || base.RunID != run.ID {
 		return nil, failure(CategoryInvalidInput, "compose_coordinator", "dependencies")
 	}
-	return &Coordinator{run: run, model: session, summary: summary, budgets: budgets, journal: journal, ledger: ledger, fingerprints: fingerprints, fingerprint: FingerprintWithBudget, preparer: preparer, approval: approval, executor: executor, limits: limits, base: base, revision: revision}, nil
+	owner := fmt.Sprintf("replan-%d-%d", os.Getpid(), coordinatorOwnerSequence.Add(1))
+	return &Coordinator{run: run, model: session, summary: summary, budgets: budgets, journal: journal, ledger: ledger, fingerprints: fingerprints, fingerprint: FingerprintWithBudget, preparer: preparer, approval: approval, executor: executor, limits: limits, base: base, revision: revision, owner: owner, leaseTTL: ownership.LeaseTTL, renewEvery: ownership.RenewInterval, storeTimeout: ownership.StoreOperationTimeout, finalizeTimeout: ownership.FinalizeTimeout, clock: ownership.Clock, waiter: ownership.Waiter}, nil
 }
 
 // RunInput contains one already authorized initial batch and immutable contractual planning context.
@@ -70,13 +160,21 @@ func (c *Coordinator) Run(ctx context.Context, input RunInput) (out RunOutcome, 
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.limits.MaxDuration)
 	defer cancel()
+	ctx, lease, release, err := c.acquireRun(ctx)
+	if err != nil {
+		return RunOutcome{}, err
+	}
+	ctx = context.WithValue(ctx, runLeaseContextKey{}, lease)
+	defer release()
 	required := []DeclarationIdentity{}
 	defer func() {
 		if err != nil && ctx.Err() != nil {
 			out, err = c.recoverCancellation(ctx, required)
 		}
 	}()
-	prior, err := c.journal.Events(ctx, c.run.ID)
+	storeCtx, cancelStore := c.storeContext(ctx)
+	prior, err := c.journal.OwnedEvents(storeCtx, c.run.ID, lease, c.clock.Now())
+	cancelStore()
 	if err != nil {
 		return RunOutcome{}, failure(CategoryDependency, "run", "journal")
 	}
@@ -112,7 +210,9 @@ func (c *Coordinator) Run(ctx context.Context, input RunInput) (out RunOutcome, 
 	if !acceptableStatus || input.Generation.RunID != c.run.ID || len(input.Initial) == 0 {
 		return RunOutcome{}, failure(CategoryInvalidInput, "run", "initial")
 	}
-	checkpoint, err := c.journal.Checkpoint(ctx, c.run.ID)
+	storeCtx, cancelStore = c.storeContext(ctx)
+	checkpoint, err := c.journal.OwnedCheckpoint(storeCtx, c.run.ID, lease, c.clock.Now())
+	cancelStore()
 	if err != nil {
 		return RunOutcome{}, err
 	}
@@ -255,7 +355,7 @@ func (c *Coordinator) Run(ctx context.Context, input RunInput) (out RunOutcome, 
 			}
 			raw, digest = checkpoint.Summary, checkpoint.SummaryDigest
 		} else {
-			summaryInput := SummaryInput{RunID: c.run.ID, Cycle: cycle, ParentDecisionID: parent, Constraints: input.Constraints, Checks: confirmed, Remaining: c.budgets.Remaining(), SeenProposalFingerprints: seenFingerprints, PlanningConstraints: input.Generation.Constraints, OpenAPI: input.Generation.OpenAPI, Capabilities: input.Generation.Capabilities}
+			summaryInput := SummaryInput{RunID: c.run.ID, Cycle: cycle, ParentDecisionID: parent, Constraints: input.Constraints, Checks: confirmed, Remaining: c.budgets.Remaining(), SeenProposalFingerprints: seenFingerprints, PlanningConstraints: input.Generation.Constraints, Contract: input.Generation.Contract, Capabilities: input.Generation.Capabilities}
 			_, raw, digest, err = c.summary.Build(ctx, summaryInput)
 			if err != nil {
 				return c.terminal(ctx, sequence, cycle, parent, required, CategoryDependency, EventFailed)
@@ -280,6 +380,16 @@ func (c *Coordinator) Run(ctx context.Context, input RunInput) (out RunOutcome, 
 			if checkpoint.InferenceStarted {
 				return RunOutcome{}, failure(CategoryIntegrity, "run", "uncertain_inference")
 			}
+			lease, leaseErr := leaseFromContext(ctx)
+			if leaseErr != nil {
+				return RunOutcome{}, leaseErr
+			}
+			storeCtx, cancelStore := c.storeContext(ctx)
+			_, leaseErr = c.journal.OwnedCheckpoint(storeCtx, c.run.ID, lease, c.clock.Now())
+			cancelStore()
+			if leaseErr != nil {
+				return RunOutcome{}, leaseErr
+			}
 			if err := c.budgets.AdmitInference(ctx); err != nil {
 				return c.terminal(ctx, sequence, cycle, parent, required, CategoryBudget, EventTerminated, budgetErrorDimension(err))
 			}
@@ -287,10 +397,22 @@ func (c *Coordinator) Run(ctx context.Context, input RunInput) (out RunOutcome, 
 			if err != nil {
 				return c.terminal(ctx, sequence, cycle, parent, required, CategoryInvalidInput, EventFailed)
 			}
-			checkpoint.InferenceStarted = true
-			if err := c.saveCheckpoint(ctx, &checkpoint); err != nil {
-				return RunOutcome{}, err
+			checkpoint.Consumption = c.budgets.Snapshot()
+			storeCtx, cancelStore = c.storeContext(ctx)
+			reserveErr := c.journal.ReserveInference(storeCtx, c.run.ID, lease, c.clock.Now(), sequence, checkpoint)
+			cancelStore()
+			if reserveErr != nil {
+				// A post-commit error is deliberately fail-closed: reread only to classify it,
+				// but never risk a second external effect after an uncertain reservation.
+				storeCtx, cancelStore = c.storeContext(ctx)
+				persisted, readErr := c.journal.OwnedCheckpoint(storeCtx, c.run.ID, lease, c.clock.Now())
+				cancelStore()
+				if readErr == nil && persisted.InferenceStarted {
+					return RunOutcome{}, failure(CategoryIntegrity, "run", "uncertain_inference")
+				}
+				return RunOutcome{}, reserveErr
 			}
+			checkpoint.InferenceStarted = true
 			response, err := c.model.InferStructured(ctx, request)
 			if err != nil {
 				return c.terminal(ctx, sequence, cycle, parent, required, CategoryDependency, EventFailed)
@@ -547,6 +669,72 @@ func (c *Coordinator) Run(ctx context.Context, input RunInput) (out RunOutcome, 
 	}
 }
 
+// acquireRun waits for a durable generation fence before any checkpoint, budget, or model boundary.
+func (c *Coordinator) acquireRun(ctx context.Context) (context.Context, RunLease, func(), error) {
+	if c.owner == "" || (OwnershipConfig{LeaseTTL: c.leaseTTL, RenewInterval: c.renewEvery, StoreOperationTimeout: c.storeTimeout, FinalizeTimeout: c.finalizeTimeout, Clock: c.clock, Waiter: c.waiter}).Validate() != nil {
+		return nil, RunLease{}, nil, failure(CategoryInvalidInput, "cycle_owner", "configuration")
+	}
+	attemptOwner := fmt.Sprintf("%s-%d", c.owner, coordinatorOwnerSequence.Add(1))
+	for {
+		storeCtx, cancelStore := c.storeContext(ctx)
+		lease, won, err := c.journal.ClaimRun(storeCtx, c.run.ID, attemptOwner, c.clock.Now(), c.leaseTTL)
+		cancelStore()
+		if err != nil {
+			return nil, RunLease{}, nil, err
+		}
+		if won {
+			ownedCtx, cancelOwned := context.WithCancel(ctx)
+			heartbeatCtx, cancelHeartbeat := context.WithCancel(context.WithoutCancel(ctx))
+			heartbeatDone := make(chan struct{})
+			go c.renewRun(heartbeatCtx, cancelOwned, lease, heartbeatDone)
+			return ownedCtx, lease, func() {
+				cancelHeartbeat()
+				<-heartbeatDone
+				releaseCtx, cancelRelease := context.WithTimeout(context.WithoutCancel(ctx), c.storeTimeout)
+				defer cancelRelease()
+				_ = c.journal.ReleaseRun(releaseCtx, c.run.ID, lease)
+				cancelOwned()
+			}, nil
+		}
+		wait := 5 * time.Millisecond
+		if remaining := lease.LeaseUntil.Sub(c.clock.Now()); remaining > 0 && remaining < wait {
+			wait = remaining
+		}
+		if err := c.waiter.Wait(ctx, wait); err != nil {
+			return nil, RunLease{}, nil, failure(CategoryCancelled, "cycle_owner", "context")
+		}
+	}
+}
+
+// renewRun keeps one lease alive across blocking model, approval, and tool operations and cancels work on lease loss.
+func (c *Coordinator) renewRun(ctx context.Context, cancel context.CancelFunc, lease RunLease, done chan<- struct{}) {
+	defer close(done)
+	current := lease
+	for {
+		if err := c.waiter.Wait(ctx, c.renewEvery); err != nil {
+			return
+		}
+		storeCtx, cancelStore := c.storeContext(ctx)
+		renewed, err := c.journal.RenewRun(storeCtx, c.run.ID, current, c.clock.Now(), c.leaseTTL)
+		cancelStore()
+		if err != nil {
+			cancel()
+			return
+		}
+		current = renewed
+	}
+}
+
+// storeContext bounds every lease-owning store acquisition below the validated lease envelope.
+func (c *Coordinator) storeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, c.storeTimeout)
+}
+
+// finalizeContext preserves lease cleanup after caller cancellation within the validated ownership envelope.
+func (c *Coordinator) finalizeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), c.finalizeTimeout)
+}
+
 // assertionsEvent binds every newly confirmed ledger fact to its opaque audit identity in one CAS event.
 func assertionsEvent(runID string, cycle int, kind EventType, decisionID, batchID string, checks []ConfirmedCheck, facts []ConfirmedAssertion) Event {
 	ids := make([]string, len(facts))
@@ -599,7 +787,13 @@ func assertionFacts(runID string, checks []ConfirmedCheck) []ConfirmedAssertion 
 // saveCheckpoint records current global consumption alongside recoverable cycle data before audit confirmation.
 func (c *Coordinator) saveCheckpoint(ctx context.Context, checkpoint *CycleCheckpoint) error {
 	checkpoint.Consumption = c.budgets.Snapshot()
-	return c.journal.SaveCheckpoint(ctx, c.run.ID, *checkpoint)
+	lease, err := leaseFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	storeCtx, cancelStore := c.storeContext(ctx)
+	defer cancelStore()
+	return c.journal.OwnedSaveCheckpoint(storeCtx, c.run.ID, lease, c.clock.Now(), *checkpoint)
 }
 
 // sanitizedChecks stores only model-safe assertion values for later summary reconstruction.
@@ -667,8 +861,13 @@ func (c *Coordinator) toolCallsForEvidence(ctx context.Context, ids []string) ([
 
 // append confirms one CAS event after validating the entire prior prefix.
 func (c *Coordinator) append(ctx context.Context, expected uint64, event Event) (uint64, bool, error) {
-	event.BindingSHA256 = c.base.BindingSHA256
-	events, err := c.journal.Events(ctx, c.run.ID)
+	lease, err := leaseFromContext(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	storeCtx, cancelStore := c.storeContext(ctx)
+	events, err := c.journal.OwnedEvents(storeCtx, c.run.ID, lease, c.clock.Now())
+	cancelStore()
 	if err != nil {
 		return 0, false, failure(CategoryDependency, "journal", "read")
 	}
@@ -679,8 +878,16 @@ func (c *Coordinator) append(ctx context.Context, expected uint64, event Event) 
 	if projection.Sequence != expected {
 		return 0, false, failure(CategoryIntegrity, "journal", "revision")
 	}
+	return c.appendProjected(ctx, lease, expected, event, events)
+}
+
+// appendProjected commits one event after its caller has already validated the exact durable prefix.
+func (c *Coordinator) appendProjected(ctx context.Context, lease RunLease, expected uint64, event Event, events []Event) (uint64, bool, error) {
+	event.BindingSHA256 = c.base.BindingSHA256
 	key := fmt.Sprintf("%s:%d:%s", event.RunID, event.Cycle, event.Type)
-	confirmed, replayed, err := c.journal.CompareAndAppend(ctx, c.run.ID, expected, key, event)
+	storeCtx, cancelStore := c.storeContext(ctx)
+	confirmed, replayed, err := c.journal.OwnedCompareAndAppend(storeCtx, c.run.ID, lease, c.clock.Now(), expected, key, event)
+	cancelStore()
 	if err != nil {
 		return 0, false, err
 	}
@@ -711,7 +918,7 @@ func (c *Coordinator) terminal(ctx context.Context, sequence uint64, cycle int, 
 		}
 		event.BudgetDimension, event.BudgetUsed, event.BudgetLimit = c.exhaustedBudget(selected)
 	}
-	terminalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	terminalCtx, cancel := c.finalizeContext(ctx)
 	defer cancel()
 	if _, _, err := c.append(terminalCtx, sequence, event); err != nil {
 		return RunOutcome{}, err
@@ -781,11 +988,25 @@ func budgetErrorDimension(err error) string {
 
 // recoverCancellation projects the confirmed prefix and appends one detached terminal fact after a cancelled boundary.
 func (c *Coordinator) recoverCancellation(ctx context.Context, required []DeclarationIdentity) (RunOutcome, error) {
-	detached, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	detached, cancel := c.finalizeContext(ctx)
 	defer cancel()
-	events, err := c.journal.Events(detached, c.run.ID)
+	lease, leaseErr := leaseFromContext(detached)
+	if leaseErr != nil {
+		return RunOutcome{}, leaseErr
+	}
+	storeCtx, cancelStore := c.storeContext(detached)
+	events, err := c.journal.OwnedEvents(storeCtx, c.run.ID, lease, c.clock.Now())
+	cancelStore()
 	if err != nil {
-		return RunOutcome{}, failure(CategoryDependency, "cancel", "journal")
+		// A successor may already own the generation. An unfenced read is safe only
+		// to observe an already terminal prefix; this generation must never append.
+		confirmed, readErr := c.journal.Events(detached, c.run.ID)
+		if readErr == nil {
+			if terminal, projectErr := Project(detached, confirmed, c.limits.MaxEvents); projectErr == nil && terminal.Terminal {
+				return RunOutcome{Verdict: terminal.Verdict, Category: terminal.TerminalCategory, Cycles: terminal.Cycle, EvidenceIDs: append([]string(nil), terminal.TerminalEvidenceIDs...)}, nil
+			}
+		}
+		return RunOutcome{}, failure(CategoryIntegrity, "cancel", "lease_fenced")
 	}
 	p, err := Project(detached, events, c.limits.MaxEvents)
 	if err != nil {
@@ -797,7 +1018,7 @@ func (c *Coordinator) recoverCancellation(ctx context.Context, required []Declar
 	verdict := c.ledger.VerdictRequired(required)
 	evidenceIDs := ledgerEvidence(c.ledger.Entries())
 	event := Event{Version: 1, RunID: c.run.ID, Cycle: p.Cycle, Type: EventCancelled, DecisionID: p.DecisionID, Category: CategoryCancelled, Verdict: verdict, NewEvidenceIDs: evidenceIDs}
-	if _, _, err := c.append(detached, p.Sequence, event); err != nil {
+	if _, _, err := c.appendProjected(detached, lease, p.Sequence, event, events); err != nil {
 		return RunOutcome{}, err
 	}
 	if !c.run.Terminal() {

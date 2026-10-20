@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/openapi"
 )
 
 const promptVersion = "agentplanning-v1"
@@ -84,7 +85,11 @@ func (r *Runner) Run(ctx context.Context, suite Suite, criteria Criteria, source
 		if err != nil {
 			return RunResult{}, typedError(InvalidInput, "run", "generator", nil)
 		}
-		request := agentplanning.GenerationRequest{RunID: "eval-" + c.id, PlanID: "plan-" + c.id, Constraints: append([]agentplanning.Constraint(nil), c.constraints...), OpenAPI: c.openAPI, Capabilities: append([]agentplanning.CapabilityDescriptor(nil), c.descriptors...), Limits: c.limits}
+		contract, conversionErr := openapi.NeutralizeReducedContext(ctx, c.openAPI, "eval-fixture", digestBytes(c.openAPI.Bytes), "eval-policy-v1")
+		if conversionErr != nil {
+			return RunResult{}, conversionErr
+		}
+		request := agentplanning.GenerationRequest{RunID: "eval-" + c.id, PlanID: "plan-" + c.id, Constraints: append([]agentplanning.Constraint(nil), c.constraints...), Contract: contract, Capabilities: append([]agentplanning.CapabilityDescriptor(nil), c.descriptors...), Limits: c.limits}
 		result, genErr := generator.Generate(runCtx, request)
 		after := source.Snapshot()
 		caseResult := scoreCase(runCtx, c, result, genErr, capture, before, after)

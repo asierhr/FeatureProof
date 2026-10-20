@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/asierhr/featureProof/internal/openapi"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/planning"
 )
 
@@ -64,7 +64,7 @@ type CapabilityDescriptor struct {
 type GenerationRequest struct {
 	RunID, PlanID string
 	Constraints   []Constraint
-	OpenAPI       openapi.ReducedContext
+	Contract      contractcatalog.ReducedContext
 	Capabilities  []CapabilityDescriptor
 	Limits        Limits
 }
@@ -77,7 +77,7 @@ type ScenarioEntry struct {
 	Reason       string         `json:"reason,omitempty"`
 }
 
-// OperationReference binds an HTTP check to one exact retained OpenAPI operation.
+// OperationReference binds an HTTP check to one exact retained contract operation.
 type OperationReference struct {
 	Method string `json:"method"`
 	Path   string `json:"path"`
@@ -294,13 +294,13 @@ func (p PreparedPlan) Snapshot() PreparedSnapshot {
 // ProvenanceInput is the non-executable generation context that an approval boundary may verify against a prepared plan.
 type ProvenanceInput struct {
 	Constraints  []Constraint
-	OpenAPI      openapi.ReducedContext
+	Contract     contractcatalog.ReducedContext
 	Capabilities []CapabilityDescriptor
 }
 
 // MatchesProvenance proves that this plan was minted from the supplied generation inputs without exposing a forgeable token.
 func (p PreparedPlan) MatchesProvenance(input ProvenanceInput) bool {
-	want, err := generationProvenance(input.Constraints, input.OpenAPI, input.Capabilities)
+	want, err := generationProvenance(input.Constraints, input.Contract, input.Capabilities)
 	return err == nil && p.provenance != "" && p.provenance == want
 }
 

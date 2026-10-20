@@ -51,7 +51,7 @@ func PrepareAdditional(ctx context.Context, request GenerationRequest, checks []
 			return PreparedPlan{}, typedError(CategorySemanticRejection, "prepare_additional", "duplicate_check", nil)
 		}
 		fingerprints[fingerprint] = true
-		plan, err := materialize(check, snapshot.PlanID, snapshot.OpenAPI)
+		plan, err := materialize(check, snapshot.PlanID, snapshot.Contract)
 		if err != nil {
 			return PreparedPlan{}, err
 		}
@@ -79,7 +79,7 @@ func PrepareAdditional(ctx context.Context, request GenerationRequest, checks []
 			return PreparedPlan{}, typedError(CategoryPolicyDenial, "prepare_additional", field("checks", i), nil)
 		}
 	}
-	provenance, err := generationProvenance(snapshot.Constraints, snapshot.OpenAPI, snapshot.Capabilities)
+	provenance, err := generationProvenance(snapshot.Constraints, snapshot.Contract, snapshot.Capabilities)
 	if err != nil {
 		return PreparedPlan{}, typedError(CategoryInternal, "prepare_additional", "provenance", nil)
 	}

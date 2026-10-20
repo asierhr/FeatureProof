@@ -215,7 +215,11 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 		selection = githubpr.Selection{Alias: preview.Request.Selection.Alias, Secretless: preview.Request.Selection.Secretless, Value: preview.Request}
 	}
 	if os.Getenv("FEATUREPROOF_WORKFLOW_CONFIG") != "" {
-		workflowCLI, workflowErr := composeWorkflowCLI(ctx, io.Discard, io.Discard)
+		authorityAdapter, authorityErr := githubpr.NewRESTAdapter(githubpr.RESTConfig{BaseURL: "https://api.github.com", APIVersion: "2022-11-28", AppID: appID, Tokens: tokenSource, HTTP: httpClient, Clock: clock, MaxResponse: 1 << 20, MaxPages: 10, MaxChangedPaths: 1000})
+		if authorityErr != nil {
+			return nil, "", authorityErr
+		}
+		workflowCLI, workflowErr := composeWorkflowCLIWithGitHubAuthority(ctx, io.Discard, io.Discard, authorityAdapter)
 		if workflowErr != nil {
 			return nil, "", workflowErr
 		}
@@ -235,7 +239,7 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 		validation = validationworkflow.GitHubGateway{Service: workflowCLI.Service, Principal: workflowCLI.Principal, Commands: map[string]validationworkflow.StartCommand{workflowConfig.TargetAlias: command}}
 		selection = githubpr.Selection{Alias: workflowConfig.TargetAlias, Secretless: workflowConfig.TargetKind == "preview"}
 	}
-	config := githubpr.ProductionConfig{AppID: appID, BotID: botID, Permissions: githubpr.RequiredPermissions(), APIOrigin: "https://api.github.com", APIVersion: "2022-11-28", EvidenceOrigin: requiredEnv("FEATUREPROOF_EVIDENCE_ORIGIN"), StoreDir: filepath.Join(root, ".featureproof", "github-pr"), MaxWebhookBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxPages: 10, MaxAttempts: 4, RunTimeout: 30 * time.Minute, CloseTimeout: 10 * time.Second, LeaseTTL: 32 * time.Minute, PollInterval: 2 * time.Second, RetryMaxDuration: 2 * time.Minute, RetryMaxWait: time.Minute, RetryInitialBackoff: time.Second, RetryMaxBackoff: 30 * time.Second, Authorization: githubpr.AuthorizationConfig{Installations: map[int64]map[int64]bool{installation: {repository: true}}, Actors: map[int64]bool{actor: true}, Selections: map[string]githubpr.Selection{selection.Alias: selection}, Forks: map[int64]map[int64]bool{}}}
+	config := githubpr.ProductionConfig{AppID: appID, BotID: botID, Permissions: githubpr.RequiredPermissions(), APIOrigin: "https://api.github.com", APIVersion: "2022-11-28", EvidenceOrigin: requiredEnv("FEATUREPROOF_EVIDENCE_ORIGIN"), StoreDir: filepath.Join(root, ".featureproof", "github-pr"), MaxWebhookBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxPages: 10, MaxChangedPaths: 1000, MaxAttempts: 4, RunTimeout: 30 * time.Minute, CloseTimeout: 10 * time.Second, LeaseTTL: 32 * time.Minute, PollInterval: 2 * time.Second, RetryMaxDuration: 2 * time.Minute, RetryMaxWait: time.Minute, RetryInitialBackoff: time.Second, RetryMaxBackoff: 30 * time.Second, Authorization: githubpr.AuthorizationConfig{Installations: map[int64]map[int64]bool{installation: {repository: true}}, Actors: map[int64]bool{actor: true}, Selections: map[string]githubpr.Selection{selection.Alias: selection}, Forks: map[int64]map[int64]bool{}}}
 	runtime, err := githubpr.ComposeRuntime(ctx, config, githubpr.CompositionSecrets{WebhookSecret: secret}, githubpr.RuntimeDependencies{Credentials: tokenSource, HTTP: httpClient, Packages: externalagent.VerifiedPackageReader{}, Validation: validation, Clock: clock, Jitter: githubpr.RandomJitter{}, IDs: githubpr.RandomIDs{}})
 	if err != nil {
 		if closer, ok := validation.(interface{ Close(context.Context) error }); ok {

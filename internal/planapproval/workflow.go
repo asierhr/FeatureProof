@@ -541,7 +541,7 @@ func provenanceInput(snapshot ContractSnapshot) agentplanning.ProvenanceInput {
 	for i, capability := range snapshot.Capabilities {
 		capabilities[i] = agentplanning.CapabilityDescriptor{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
-	return agentplanning.ProvenanceInput{Constraints: append([]agentplanning.Constraint(nil), snapshot.Constraints...), OpenAPI: snapshot.OpenAPI, Capabilities: capabilities}
+	return agentplanning.ProvenanceInput{Constraints: append([]agentplanning.Constraint(nil), snapshot.Constraints...), Contract: snapshot.Contract, Capabilities: capabilities}
 }
 
 // transitionRun keeps the mutable harness aggregate aligned with the event-derived approval projection.
