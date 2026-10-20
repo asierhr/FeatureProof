@@ -436,7 +436,7 @@
           "Un contrato derivado no aprobado solo puede utilizarse para propuesta o análisis cuando la política lo permita y no sirve como única prueba determinista de conformidad",
           "Los tests cubren diff, conflicto, aprobación, rechazo, invalidación, exportación OpenAPI, escritura atómica, contrato parcial y ausencia de secretos"
         ],
-        "status": "pending"
+        "status": "in_progress"
     },
     {
         "id": 25,
