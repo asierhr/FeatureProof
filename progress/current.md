@@ -2364,3 +2364,23 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - El smoke final de `contractreview`, `contractcatalog`, `validationworkflow`,
   `githubpr` y `cmd/featureproof` pasa.
 - El leader cambia `generated-contract-review` de `in_progress` a `done`.
+
+## 2026-10-21 — Feature 25 `test-identities`, especificación iniciada
+
+- Rama creada: `feature-25-test-identities`, basada en la feature 24 completada.
+- Estado inicial comprobado: `pending`, `sdd: true`, sin otra feature
+  `in_progress` y con criterios de aceptación suficientes.
+- Se inicia `spec_author`; no se modificará código ni tests antes de la
+  aprobación humana de `requirements.md`, `design.md` y `tasks.md`.
+
+## 2026-10-21 — Feature 25, spec preparada
+
+- Creados `specs/test-identities/{requirements,design,tasks}.md` sin modificar
+  código productivo ni tests.
+- La spec define R1–R11 y T1–T13, con selección explícita de identidad,
+  resolución e inyección tardía, redacción cerrada, fallos operacionales,
+  revalidación y paridad CLI/API/MCP/GitHub.
+- El diseño conserva la convención de comentarios sistémicos para entidades,
+  funciones, métodos y helpers productivos o de test.
+- El leader cambia la feature de `pending` a `spec_ready`; queda detenida hasta
+  aprobación humana explícita.

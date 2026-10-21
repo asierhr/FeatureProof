@@ -453,7 +453,7 @@
           "Una identidad desconocida, no autorizada, sin credencial, expirada o incompatible detiene el paso sin abrir una conexión y no se clasifica como fallo funcional de la feature",
           "Los tests usan secretos canario y cubren selección, aislamiento entre identidades, credencial ausente, redacción, cancelación y prohibición de exposición al modelo"
         ],
-        "status": "pending"
+        "status": "spec_ready"
     },
     {
         "id": 26,
