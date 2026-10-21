@@ -2170,6 +2170,197 @@ REV-12 y REV-13 quedan corregidas. La autoridad GitHub completa se persiste en e
 La tercera revisión cerró REV-13 y la arquitectura durable de REV-12, pero reabrió T12/T13 porque `RESTAdapter.PullRequest` productivo todavía no leía los changed paths. En curso: lectura autenticada/paginada de `/repos/{owner}/{repo}/pulls/{number}/files`, doble observación de metadata para coherencia de head, límites explícitos y prueba vertical con el adapter real.
 
 REV-12 residual queda corregido. `RESTAdapter.PullRequest` obtiene la colección completa de files con credenciales de instalación, límites explícitos, validación estricta y metadata antes/después para impedir TOCTOU; ordena paths antes de sellar el snapshot. La prueba vertical con TLS real, stores reabiertos y otro owner demuestra que mutar solo changed paths con head estable produce cero `Approval.Decide`, `Consume` y tools. T12/T13 vuelven a completas; focales/repeticiones/race/vet/compile/cobertura/formato pasan y la feature continúa `in_progress` para review.
+
 - 2026-10-20T18:15:00+02:00 — Leader: inicia SDD de feature 24 `generated-contract-review` en `feature-24-generated-contract-review`, basada en el commit `3a89a7f` que consolida las features 21–23. Preflight correcto: estado `pending`, `sdd: true`, acceptance suficiente y ninguna feature activa. Se asigna al spec author; código y tests quedan prohibidos hasta aprobación humana.
 - 2026-10-20T18:30:00+02:00 — Spec author/Leader: feature 24 especificada en `specs/generated-contract-review/` con R1–R13 y T1–T13. La spec cubre diff estructural, decisiones totales/selectivas, approval binding e invalidación, autoridad acotada, export OpenAPI 3.1, publicación atómica y superficies compartidas. Pasa de `pending` a `spec_ready`; implementación detenida hasta aprobación humana explícita.
 - 2026-10-20T16:31:20+02:00 — User/Leader: spec de feature 24 aprobada explícitamente. Se registra la aprobación en requirements, pasa de `spec_ready` a `in_progress` y se autoriza al implementer a ejecutar T1–T13 en `feature-24-generated-contract-review`.
+- 2026-10-20 — Implementer feature 24: primera entrega T1–T13 completa en `internal/contractreview`, con diff, decisiones, store, fuente aprobada, exporter, publisher y adapters; focales/repeticiones/race/vet/compile pasan y coverage alcanza 85,0 %. Se solicita review independiente sin cambiar el estado.
+- 2026-10-20 — Leader: primera review de feature 24 rechazada con REV-1–REV-13 (12 blockers y 1 high). Los gates técnicos pasan, pero se reabren T2–T13 por integración productiva ausente, revalidación/baseline autoafirmada, diff no atómico, límites incompletos, export con pérdidas, elevación epistémica, publisher/store no robustos, idempotencia, redacción y binding GitHub/baseline incompletos. Feature permanece `in_progress`.
+- 2026-10-20 — Leader: segunda review de feature 24 rechazada. REV-2/7/11/13 quedan cerradas; REV-1/3/4/5/6/8/9/10/12 permanecen abiertos por superficies sin composición productiva, baseline previa sin revalidación, dependencias/selectividad defectuosas, provenance truncada, metadata OpenAPI mal localizada, publisher no portable/descriptor-relative, reconcile ambiguo, journal/root/locks y actor GitHub no autenticado. T2–T6, T8–T11 y T13 se reabren; feature sigue `in_progress`.
+- 2026-10-20 — Leader: tercera review de feature 24 rechazada. REV-2/3/4/5/7/11/13 quedan cerradas y builds Windows/Linux/Darwin pasan; REV-1/6/8/9/10/12 siguen abiertos por auth/schema de superficies, metadata OpenAPI localizada incompleta, operaciones aún path-based, ventana crash rename→marker, bounds/locks/lifecycle del store y cruce de PR/actor/resumen GitHub. T6 y T8–T13 se reabren; feature permanece `in_progress`.
+- 2026-10-21 — Leader: cuarta review de feature 24 rechazada. REV-2–REV-8 y REV-11–REV-12 quedan cerradas; persisten REV-1 (flags cruzadas y falta vertical listener real), REV-9 (temp parcial pre-sync irreconciliable), REV-10 (retry create idéntico puede devolver aggregate vacío) y REV-14 (runtime GitHub no posee/cierra handles del review service). T6/T9/T10/T12/T13 se reabren; feature sigue `in_progress`.
+- 2026-10-21 — Leader: quinta review de feature 24 rechazada. REV-1–REV-14 quedan cerradas; aparecen REV-15 (cancelación durante CAS no propagada) y REV-16 (dos exports idénticos concurrentes pueden divergir y dejar temp huérfano). T6/T9/T12/T13 se reabren; feature permanece `in_progress`.
+- 2026-10-21 — Leader: sexta review de feature 24 rechazada. REV-1–REV-14 permanecen cerradas; REV-15 persiste por clasificación `unavailable` tras cancelación post-sync, REV-16 por takeover temporal sin lease que puede truncar un writer vivo y aparece REV-17 por bloqueo del estrés concurrente en `intent_absent`. T6/T9/T12/T13 siguen abiertas; feature permanece `in_progress`.
+- 2026-10-20T16:40:00+02:00 — Implementer feature 24: preflight correcto en `feature-24-generated-contract-review`; spec aprobada y feature `in_progress`. Comienza T1 con el modelo versionado, canonicalización, límites y errores seguros; no se modifica `feature_list.json`.
+- 2026-10-20T17:20:00+02:00 — Implementer feature 24: T1–T4 completas con pruebas adversariales. El artefacto es canónico/inmutable, baseline falla cerrado, el diff distingue add/modify/remove/uncertain sin inferir ausencias parciales y el reducer aplica decisiones totales/selectivas con revisión CAS. `go test ./internal/contractreview -count=1` pasa; continúa T5.
+- 2026-10-20T18:10:00+02:00 — Implementer feature 24: T5 y T7 completas. El servicio aplica autorización, reloj confiable, revalidación durable e invalidación antes de decidir/exportar/usar; `ApprovedSource` entra por el Registry real de `contractcatalog`, añade autoridad humana y conserva lineage derived. T6 sigue abierta hasta completar adversarios filesystem/crash.
+- 2026-10-20T19:30:00+02:00 — Implementer feature 24: T6 y T8–T12 completas. Store local recupera ambas ordenaciones de crash checkpoint/journal, CAS concurrente e idempotencia; exporter genera OpenAPI 3.1 validado por el loader local; publisher aplica replace por digest y bloquea traversal/links; CLI/API/MCP/GitHub delegan al mismo servicio con head/changed-path binding. Focales de review/catalog/cmd pasan; comienza T13 y gates.
+- 2026-10-20T21:30:00+02:00 — Implementer feature 24: T13 completa y entrega `ready_for_review`. Focales afectados ×20, workflow/CLI ×20, race UCRT64 ×2, vet, compile global, formato y diff pasan. Coverage: contractreview 85.0 %, composición CLI nueva 87.7 %. La suite global solo reproduce el fallo ambiental histórico de symlink Windows sin privilegio. No se modifica `feature_list.json`.
+
+## 2026-10-20 - Feature 24 remediation after independent review
+
+- Independent review rejected the first implementation with REV-1..REV-13.
+- Reopened T2-T13. T1 remains closed because its original model evidence remains valid; manifests and limits are extended under T2-T5.
+- Current order: authoritative baseline and complete snapshot revalidation; atomic diff/decision; durable manifests, policy and export protocol; secure publisher/store; productive workflow/GitHub/API/MCP integration; adversarial gates.
+
+## 2026-10-20 — Feature 24 remediation complete
+
+- REV-1..REV-13 quedan corregidas con integración real en workflow, baseline
+  durable sin booleano autoafirmado, diff atómico, límites completos, exporter
+  explícito, autoridad aditiva, publication prepare/commit/reconcile, locks OS,
+  redacción ligada por digest y snapshot GitHub durable.
+- T1–T13 están completas. Focales, repetición ×10, race UCRT64, vet,
+  compile-only, cross-compile Linux, formato y diff pasan. Coverage:
+  `contractreview` 85,0 %, `contractcatalog` 85,3 % y
+  `validationworkflow` 85,6 %.
+- La global conserva únicamente el fallo histórico de symlink Windows sin
+  privilegio. Se solicita segunda review independiente; la feature permanece
+  `in_progress` y no se modifica `feature_list.json`.
+
+## 2026-10-20 — Feature 24, segunda remediación
+
+- Segunda review rechazada: REV-2/7/11/13 permanecen cerradas; se reabren T2–T6, T8–T11 y T13 para corregir REV-1/3/4/5/6/8/9/10/12.
+- Orden activo: autoridad/baseline/diff/límites; exporter/publisher/store; composición productiva API/MCP/GitHub; gates y trazabilidad.
+
+## 2026-10-20 — Feature 24, segunda remediación completa
+
+REV-1/3/4/5/6/8/9/10/12 quedan corregidas. API HTTP y MCP están compuestos en el ejecutable; GitHub autentica y traduce create/show/decide desde el webhook, mapea actor a principal y conserva esa identidad en artifact, binding y audit. Baselines derivadas revalidan recursivamente toda aprobación previa. Diff/projection cierran dependencias y ordenan allOf; provenance es agregado; exporter coloca auditoría en la unidad mínima. Publisher usa marker durable por intento y commits por descriptor de parent con builds Linux/Darwin/Windows; store admite journals >1 MiB y rechaza root swaps. Focales, ×10, race UCRT64, vet, compile-only, Darwin, formato y diff pasan; coverage contractreview 85,0 % y workflow 85,6 %. La global solo reproduce el symlink Windows histórico. T1–T13 completas; se solicita nueva review sin modificar feature_list.json.
+
+## 2026-10-20 — Feature 24, tercera remediación
+
+Tercera review rechazada: REV-2/3/4/5/7/11/13 permanecen cerradas; se reabren T6, T8–T12 y T13 para corregir autenticación/contratos productivos, metadata OpenAPI local, filesystem descriptor-relative, recovery de publisher/store y binding/publicación GitHub.
+
+## 2026-10-21 — Feature 24, tercera remediación completa
+
+REV-1/6/8/9/10/12 quedan corregidas. Las superficies productivas autentican y
+usan contratos cerrados; OpenAPI conserva metadata en la unidad mínima; publisher
+y store operan respecto de descriptores, con intención previa al commit y recovery
+de cada crash point. El store impone bounds y usa reservas/transiciones durables
+sin locks durante I/O; el runtime cierra handles. GitHub enlaza review y comando a
+la misma PR, atribuye al decisor y publica un resumen bot-owned idempotente.
+
+Evidencia: focales afectados y repetición ×10, create/CAS/multiproceso/recovery
+sin lock ×100, race UCRT64, vet, compile-only global, cross-build Windows/Linux/Darwin,
+formato y diff pasan. Cobertura: contractreview 85,0 % y validationworkflow
+85,6 %. La global conserva solo el symlink histórico de Windows sin privilegio.
+T1–T13 quedan completas; feature sigue `in_progress` para revisión independiente.
+
+## 2026-10-21 — Cuarta remediación iniciada
+
+- Reabiertas T6, T9, T10, T12 y T13 por REV-1, REV-9, REV-10 y REV-14.
+- Alcance: contrato cerrado por subcomando y vertical HTTP productiva; recuperación de crash antes de sync; idempotencia create con reserva idéntica; ownership y cierre de runtime GitHub.
+- Se mantienen fuera de alcance cambios a `feature_list.json` y se preservan REV-2–REV-8 y REV-11–REV-13.
+
+## 2026-10-21 — Feature 24, cuarta remediación completa
+
+REV-1/9/10/14 quedan corregidas. La CLI rechaza flags cruzadas y ausentes; la vertical API atraviesa el dispatcher y listener loopback productivos con bearer por request, códigos, store/export durable, restart y shutdown. El publisher persiste intención antes de escribir, reanuda temps parciales, recupera fallos de sync y cubre marker temp/commit y el límite Darwin link/unlink. El store publica reservas completas atómicamente y dos procesos con principal/key/digest/artifact idénticos reciben el mismo aggregate completo. El runtime GitHub posee y cierra el review service en success, error y recomposición.
+
+Evidencia: focal completo y repetición ×10 pasan; adversarios exactos multiproceso/concurrentes ×20; race UCRT64 afectado y contractreview ×5 pasan; vet, compile-only, cross-build Windows/Linux/Darwin, gofmt y diff pasan. Cobertura: contractreview 85,1 % y validationworkflow 85,6 %. La suite global conserva únicamente el fallo ambiental histórico de symlink Windows sin privilegio. T6/T9/T10/T12/T13 vuelven a completas; feature sigue `in_progress`, `feature_list.json` no se modifica y se solicita revisión independiente.
+
+## 2026-10-21 — Quinta remediación iniciada
+
+- Reabiertas T6, T9, T12 y T13 por REV-15 y REV-16.
+- Alcance: cancelación propagada entre reserva/journal/checkpoint sin sleeps ni contextos de fondo, y convergencia concurrente de publish/export con un único intent/marker/target/receipt.
+- REV-1–REV-14 se mantienen cerradas; `feature_list.json` no se modifica.
+
+## 2026-10-21 — Feature 24, quinta remediación completa
+
+REV-15 y REV-16 quedan corregidas. El store propaga cancelación por reserva,
+journal y checkpoint y permite retry convergente de toda frontera durable. El
+publisher coordina llamadas idénticas por una intención durable, limpia el temp
+del perdedor por descriptor y espera/reconcilia el marker, rename y target del
+ganador. El store observa la transición ganadora sin competir por journal o
+checkpoint, de modo que dos exports concurrentes retornan el mismo receipt.
+
+Evidencia: cancelaciones sincronizadas, convergencia publish/export ×50,
+focales afectados ×10, race UCRT64 de `contractreview` ×5, vet, compile-only,
+cross-build Windows/Linux/Darwin, formato y diff pasan. Cobertura:
+`contractreview` 85,0 % y `validationworkflow` 85,6 %. La global conserva el
+fallo ambiental de symlink Windows; un timeout transitorio ajeno en
+`goinspector` pasa focal ×10. T6/T9/T12/T13 vuelven a completas; feature sigue
+`in_progress` y `feature_list.json` no se modifica.
+
+## 2026-10-21 — Sexta remediación iniciada
+
+- Reabiertas T6, T9, T12 y T13 por los residuos REV-15/REV-16 y el nuevo REV-17.
+- Alcance: cancelación preservada durante encode/write/sync; ownership durable de publicación sin takeover temporal; pruebas concurrentes acotadas sin barreras que presupongan una rama.
+- REV-1–REV-14 permanecen cerradas y `feature_list.json` no se modifica.
+
+## 2026-10-21 — Feature 24, sexta remediación completa
+
+REV-15/16/17 quedan corregidas. Store conserva cancelación y `errors.Is` en
+encode, write y sync, detiene el commit posterior y recupera la reserva en el
+retry. Publisher reemplaza el takeover temporal por ownership durable de
+`AttemptID` mediante locks de proceso descriptor-relative: un follower jamás
+trunca el temp de un writer vivo y solo recupera tras release o muerte del
+owner. Las pruebas concurrentes usan estados reales, contexto y timeout, sin
+barreras dependientes de que ambos callers recorran la misma rama.
+
+Evidencia: conjunto exacto ×50, Service/export ×50, race focal ×5, focal
+completa ×10, race completo, vet, compile-only y cross-build Windows/Linux/
+Darwin pasan. Cobertura `contractreview` 85,0 % y `validationworkflow` 85,6 %.
+La global conserva únicamente el symlink Windows sin privilegio. T6/T9/T12/T13
+vuelven a completas; feature sigue `in_progress` y `feature_list.json` no cambia.
+
+## 2026-10-21 — Séptima remediación iniciada
+
+- Reabiertas T9, T12 y T13 por REV-18.
+- Alcance: revalidar cancelación tras adquirir ownership y antes de cleanup, rename o commit durante recovery; cubrir marker+temp preparado y la carrera release/cancel.
+- REV-1–REV-17 permanecen cerradas; `feature_list.json` no se modifica.
+
+## 2026-10-21 — Séptima revisión independiente
+
+- Veredicto `rejected`: REV-15, REV-16 y REV-17 quedan cerrados sin regresión.
+- Se abre REV-18: si cancelación y adquisición de ownership coinciden, el
+  follower puede entrar en `recoverPrepared` y publicar un target con el
+  contexto ya cancelado.
+- Se reabren T9, T12 y T13 hasta añadir la revalidación tras adquirir ownership,
+  antes de los efectos irreversibles y la prueba determinista de cancelación,
+  ausencia de target y retry convergente.
+
+## 2026-10-21 — Octava revisión independiente
+
+- Veredicto `rejected`: REV-18 queda cerrado mediante estrés y race.
+- Se abre REV-19: una cancelación en `directory_synced` permite que el flujo
+  normal, y una salida de colisión en recuperación, devuelvan éxito sin
+  revalidar el contexto al confirmar el resultado.
+- Se reabren T9, T12 y T13 hasta cubrir ambas salidas con cancelación tipada,
+  sin falso éxito y con retry idempotente.
+
+## 2026-10-21 — Feature 24, séptima remediación completa
+
+REV-18 queda corregida. El publisher revalida la cancelación justo después de
+adquirir ownership, incluido el retorno del checkpoint `ownership_acquired`, y
+en recovery antes de cleanup, espera/adopción, rename y confirmación. La prueba
+con marker+temp preparado demuestra `CategoryCancelled`, preserva
+`errors.Is(context.Canceled)`, no crea target y permite que un retry del mismo
+intento termine. La carrera simultánea release/cancel es acotada y no usa sleeps.
+
+Evidencia: pruebas REV-18 ×20, conjunto concurrente previo ×50, race focal ×5,
+recovery/crash ×10, focal afectada ×10, race afectado, vet, compile-only y
+cross-build Windows/Linux/Darwin pasan. Cobertura: `contractreview` 85,1 % y
+`validationworkflow` 85,6 %. `gofmt` y diff-check pasan. La global conserva solo
+el fallo ambiental conocido del symlink Windows sin privilegio. T9/T12/T13
+vuelven a completas; feature sigue `in_progress` y `feature_list.json` no cambia.
+
+## 2026-10-21 — Octava remediación iniciada
+
+- Reabiertas T9, T12 y T13 por REV-19.
+- Alcance: revalidar cancelación tras el sync/verify durable y antes de cada
+  confirmación exitosa del publisher, incluido collision recovery.
+- REV-1–REV-18 permanecen cerradas; `feature_list.json` no se modifica.
+
+## 2026-10-21 — Feature 24, octava remediación completa
+
+REV-19 queda corregida. El publisher comprueba cancelación después del sync y
+verify finales y antes de toda confirmación exitosa. Esto incluye el flujo
+normal, collision recovery tras cleanup+sync, recuperación por marker e
+`Inspect`. Una cancelación posterior al efecto durable devuelve
+`CategoryCancelled`, conserva `errors.Is(context.Canceled)` y deja que el retry
+del mismo `AttemptID` reconcilie un único target sin duplicar salida.
+
+Evidencia: escenarios REV-19 ×50 y race ×20; conjunto REV-15–REV-19 ×50 y race
+×5; recovery/crash ×10; focal afectada ×10 y race completo pasan. Vet,
+compile-only, cross-build Windows/Linux/Darwin, gofmt y diff-check pasan.
+Cobertura: `contractreview` 85,2 % y `validationworkflow` 85,6 %. La global solo
+reproduce el symlink Windows histórico sin privilegio. T9/T12/T13 vuelven a
+completas; feature sigue `in_progress` y `feature_list.json` no cambia.
+
+## 2026-10-21 — Novena revisión y cierre de Feature 24
+
+- Review independiente `approved`: REV-19 cerrado y REV-1–REV-18 sin regresión.
+- R1–R13 y T1–T13 quedan completos; cobertura final de `contractreview` 85,2 %
+  y `validationworkflow` 85,6 %.
+- El smoke final de `contractreview`, `contractcatalog`, `validationworkflow`,
+  `githubpr` y `cmd/featureproof` pasa.
+- El leader cambia `generated-contract-review` de `in_progress` a `done`.

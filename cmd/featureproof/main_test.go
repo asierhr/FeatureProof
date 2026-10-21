@@ -96,6 +96,21 @@ func TestWorkflowConfigurationRequiresExplicitSnakeCaseSelections(t *testing.T) 
 		t.Fatal("unknown workflow config field accepted")
 	}
 	delete(config, "unknown")
+	config["contract_review_id"] = strings.Repeat("a", 24)
+	write(config)
+	if _, err = loadWorkflowConfig(); err == nil {
+		t.Fatal("partial approved contract reference accepted")
+	}
+	config["contract_review_revision"] = uint64(2)
+	config["contract_review_digest"] = strings.Repeat("b", 64)
+	write(config)
+	loaded, err = loadWorkflowConfig()
+	if err != nil || loaded.ContractReviewRevision != 2 {
+		t.Fatalf("complete approved contract reference rejected: %#v %v", loaded, err)
+	}
+	delete(config, "contract_review_id")
+	delete(config, "contract_review_revision")
+	delete(config, "contract_review_digest")
 	config["contract_source"] = "unknown"
 	write(config)
 	if _, err = loadWorkflowConfig(); err == nil {
@@ -818,5 +833,65 @@ func TestConfiguredPreviewComposesInsideGitHubEntrypoint(t *testing.T) {
 	defer cancel()
 	if err = runtime.Close(closeCtx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestGitHubRuntimeOwnsProductReviewLifecycle proves failed composition, shutdown, and recomposition release real review store and publisher handles.
+func TestGitHubRuntimeOwnsProductReviewLifecycle(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"FEATUREPROOF_GITHUB_INSTALLATION_ID": "1", "FEATUREPROOF_GITHUB_REPOSITORY_ID": "42", "FEATUREPROOF_GITHUB_ACTOR_ID": "7",
+		"FEATUREPROOF_GITHUB_APP_ID": "8", "FEATUREPROOF_GITHUB_BOT_ID": "9", "FEATUREPROOF_GITHUB_WEBHOOK_SECRET": "0123456789abcdef",
+		"FEATUREPROOF_GITHUB_PRIVATE_KEY_PEM": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encoded})), "FEATUREPROOF_EVIDENCE_ORIGIN": "https://evidence.example.test",
+	} {
+		t.Setenv(name, value)
+	}
+	t.Setenv("FEATUREPROOF_CONTRACT_REVIEW_CONFIG", writeProductReviewConfig(t, root))
+	githubStore := filepath.Join(root, ".featureproof", "github-pr")
+	if err = os.MkdirAll(filepath.Dir(githubStore), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(githubStore, []byte("block store"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = composeGitHubRuntime(context.Background()); err == nil {
+		t.Fatal("blocked GitHub store unexpectedly composed")
+	}
+	if err = os.Remove(githubStore); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(root, ".featureproof", "contract-reviews"), filepath.Join(root, "exports")} {
+		if err = os.RemoveAll(path); err != nil {
+			t.Fatalf("failed composition leaked review handle for %s: %v", path, err)
+		}
+	}
+	for iteration := 0; iteration < 2; iteration++ {
+		if err = os.MkdirAll(filepath.Join(root, "exports"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		runtime, _, composeErr := composeGitHubRuntime(context.Background())
+		if composeErr != nil {
+			t.Fatal(composeErr)
+		}
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		closeErr := runtime.Close(closeCtx)
+		cancel()
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		for _, path := range []string{filepath.Join(root, ".featureproof", "contract-reviews"), filepath.Join(root, "exports")} {
+			if err = os.RemoveAll(path); err != nil {
+				t.Fatalf("iteration %d leaked review handle for %s: %v", iteration, path, err)
+			}
+		}
 	}
 }

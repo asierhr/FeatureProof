@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,6 +20,8 @@ type WebhookCommand struct {
 	InstallationID, RepositoryID, PullRequestNumber, ActorID int64
 	SelectionAlias                                           string
 	PayloadDigest                                            string
+	ReviewOperation, ReviewID, ReviewAction                  string
+	ReviewRevision                                           uint64
 }
 
 // WebhookResult is the replayable safe response recorded for a delivery.
@@ -34,10 +37,12 @@ type DeliveryStore interface {
 
 // WebhookHandler authenticates raw bytes before decoding and delegates admitted commands.
 type WebhookHandler struct {
-	Secret   []byte
-	MaxBody  int64
-	Store    DeliveryStore
-	Admit    func(context.Context, WebhookCommand) (string, error)
+	Secret  []byte
+	MaxBody int64
+	Store   DeliveryStore
+	Admit   func(context.Context, WebhookCommand) (string, error)
+	// Review routes authenticated contract-review commands independently of validation admission.
+	Review   func(context.Context, WebhookCommand) (string, error)
 	Owner    string
 	Clock    Clock
 	LeaseTTL time.Duration
@@ -85,7 +90,16 @@ func (h *WebhookHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		writeWebhookJSON(writer, WebhookResult{State: completed.State})
 		return
 	}
-	associationID, err := h.Admit(request.Context(), command)
+	var associationID string
+	admit := h.Admit
+	if command.ReviewOperation != "" {
+		admit = h.Review
+	}
+	if admit == nil {
+		err = &Error{Code: CodeUnauthorized, Operation: "review_unavailable"}
+	} else {
+		associationID, err = admit(request.Context(), command)
+	}
 	state := "accepted"
 	if err != nil {
 		state = "rejected"
@@ -148,13 +162,32 @@ func decodeCommand(deliveryID, event, payloadDigest string, body []byte) (Webhoo
 	if err := decoder.Decode(&payload); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return WebhookCommand{}, false, &Error{Code: CodeInvalid, Operation: "payload"}
 	}
-	if payload.Action != "created" || payload.Issue.PullRequest == nil || !normalizeCommand(payload.Comment.Body) {
+	reviewOperation, reviewID, reviewRevision, reviewAction, reviewCommand := parseReviewCommand(payload.Comment.Body)
+	if payload.Action != "created" || payload.Issue.PullRequest == nil || (!normalizeCommand(payload.Comment.Body) && !reviewCommand) {
 		return WebhookCommand{}, true, nil
 	}
 	if payload.Installation.ID <= 0 || payload.Repository.ID <= 0 || payload.Issue.Number <= 0 || payload.Comment.User.ID <= 0 {
 		return WebhookCommand{}, false, &Error{Code: CodeInvalid, Operation: "payload"}
 	}
-	return WebhookCommand{DeliveryID: deliveryID, Event: event, InstallationID: payload.Installation.ID, RepositoryID: payload.Repository.ID, PullRequestNumber: payload.Issue.Number, ActorID: payload.Comment.User.ID, SelectionAlias: "default", PayloadDigest: payloadDigest}, false, nil
+	return WebhookCommand{DeliveryID: deliveryID, Event: event, InstallationID: payload.Installation.ID, RepositoryID: payload.Repository.ID, PullRequestNumber: payload.Issue.Number, ActorID: payload.Comment.User.ID, SelectionAlias: "default", PayloadDigest: payloadDigest, ReviewOperation: reviewOperation, ReviewID: reviewID, ReviewRevision: reviewRevision, ReviewAction: reviewAction}, false, nil
+}
+
+// parseReviewCommand accepts only create, show and whole-decision commands with bounded safe identifiers.
+func parseReviewCommand(value string) (string, string, uint64, string, bool) {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) == 3 && fields[0] == "/featureproof" && fields[1] == "contract-review" && fields[2] == "create" {
+		return "create", "", 0, "", true
+	}
+	if len(fields) == 4 && fields[0] == "/featureproof" && fields[1] == "contract-review" && fields[2] == "show" && safeName.MatchString(fields[3]) {
+		return "show", fields[3], 0, "", true
+	}
+	if len(fields) == 6 && fields[0] == "/featureproof" && fields[1] == "contract-review" && fields[2] == "decide" && safeName.MatchString(fields[3]) && (fields[5] == "accept_all" || fields[5] == "reject_all") {
+		revision, err := strconv.ParseUint(fields[4], 10, 64)
+		if err == nil {
+			return "decide", fields[3], revision, fields[5], true
+		}
+	}
+	return "", "", 0, "", false
 }
 
 // writeWebhookError maps safe error categories to bounded HTTP responses.

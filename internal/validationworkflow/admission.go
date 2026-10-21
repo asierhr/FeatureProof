@@ -22,6 +22,11 @@ type ContractReducer interface {
 	Reduce(context.Context, string, specification.Specification) (contractcatalog.ReducedContext, error)
 }
 
+// ApprovedContractReducer consumes a current review projection when a workflow explicitly selects one.
+type ApprovedContractReducer interface {
+	ReduceApproved(context.Context, StartCommand, specification.Specification) (contractcatalog.ReducedContext, error)
+}
+
 // contractAuthorityKey identifies source authority placed in context only after trusted binding verification.
 type contractAuthorityKey struct{}
 
@@ -89,7 +94,16 @@ func (b TrustedAdmissionBuilder) Build(ctx context.Context, command StartCommand
 		}
 		contractContext = ContextWithContractAuthority(ctx, authority)
 	}
-	reduced, err := b.Contracts.Reduce(contractContext, command.ContractRef, spec)
+	var reduced contractcatalog.ReducedContext
+	if command.ApprovedContract != nil {
+		approved, ok := b.Contracts.(ApprovedContractReducer)
+		if !ok {
+			return AdmissionSnapshot{}, &Error{Code: CodeInvalid, Operation: "contract_review_reducer"}
+		}
+		reduced, err = approved.ReduceApproved(contractContext, command, spec)
+	} else {
+		reduced, err = b.Contracts.Reduce(contractContext, command.ContractRef, spec)
+	}
 	if err != nil {
 		var decision *contractcatalog.DecisionError
 		if errors.As(err, &decision) {

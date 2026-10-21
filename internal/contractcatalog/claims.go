@@ -53,7 +53,12 @@ func ClaimsForOperation(operation OperationDescriptor, provenance Provenance) []
 		response, field := operation.Responses[selector], "responses/"+selector
 		claims = append(claims, structuralClaim(ClaimResponse, field, response, provenance))
 		for _, header := range sortedHeaderKeys(response.Headers) {
-			claims = append(claims, structuralClaim(ClaimResponse, field+"/headers/"+header, response.Headers[header], provenance))
+			headerField := field + "/headers/" + header
+			claims = append(claims, structuralClaim(ClaimResponse, headerField, response.Headers[header], provenance))
+			claims = appendSchemaClaims(claims, headerField+"/schema", response.Headers[header].Schema, provenance)
+			for _, media := range sortedMediaKeys(response.Headers[header].Content) {
+				claims = appendSchemaClaims(claims, headerField+"/content/"+media+"/schema", response.Headers[header].Content[media].Schema, provenance)
+			}
 		}
 		for _, media := range sortedMediaKeys(response.Content) {
 			claims = appendSchemaClaims(claims, field+"/content/"+media+"/schema", response.Content[media].Schema, provenance)

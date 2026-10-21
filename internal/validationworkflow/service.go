@@ -20,22 +20,23 @@ type Config struct{ LeaseTTL, HeartbeatInterval, FinalizeTimeout, ApprovalTTL ti
 
 // Dependencies supplies the existing planning, execution, package and lifecycle boundaries.
 type Dependencies struct {
-	Admission     AdmissionBuilder
-	Generation    GenerationPort
-	Preparation   PreparationPort
-	Approval      ApprovalPort
-	Execution     ExecutionPort
-	Packages      PackageReader
-	Authorization AutoAuthorizationPolicy
-	Finalizer     Finalizer
-	Preview       PreviewPort
-	Store         WorkflowStore
-	Artifacts     PlanArtifactStore
-	Executables   ExecutablePlanStore
-	Clock         Clock
-	Waiter        Waiter
-	IDs           IDSource
-	Owner         string
+	Admission      AdmissionBuilder
+	Generation     GenerationPort
+	Preparation    PreparationPort
+	Approval       ApprovalPort
+	Execution      ExecutionPort
+	Packages       PackageReader
+	Authorization  AutoAuthorizationPolicy
+	Finalizer      Finalizer
+	Preview        PreviewPort
+	Store          WorkflowStore
+	Artifacts      PlanArtifactStore
+	Executables    ExecutablePlanStore
+	Clock          Clock
+	Waiter         Waiter
+	IDs            IDSource
+	Owner          string
+	ContractReview ApprovedContractAuthority
 }
 
 // Service is the shared application case use behind API, CLI, MCP and GitHub adapters.
@@ -65,6 +66,9 @@ func NewService(config Config, deps Dependencies) (*Service, error) {
 // Start performs side-effect-free preflight, durable admission and one confirmed generation attempt.
 func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView, error) {
 	if err := validateStart(command); err != nil {
+		return WorkflowView{}, err
+	}
+	if err := s.checkpointApprovedContract(ctx, command); err != nil {
 		return WorkflowView{}, err
 	}
 	snapshot, err := s.deps.Admission.Build(ctx, command)
@@ -214,6 +218,9 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 
 // revalidateGeneratedPlan reloads contract policy and planning authority after inference and before approval or execution.
 func (s *Service) revalidateGeneratedPlan(ctx context.Context, command StartCommand, expected AdmissionSnapshot, prepared agentplanning.PreparedPlan) error {
+	if err := s.checkpointApprovedContract(ctx, command); err != nil {
+		return err
+	}
 	current, err := s.deps.Admission.Build(ctx, command)
 	if err != nil || validateSnapshot(current, command) != nil {
 		return &Error{Code: CodeConflict, Operation: "admission_drift"}
@@ -293,6 +300,9 @@ func (s *Service) Decide(ctx context.Context, command DecisionCommand) (Workflow
 	snapshot, prepared, restoreErr := s.restorePrepared(ctx, record)
 	if restoreErr != nil {
 		return WorkflowView{}, restoreErr
+	}
+	if err = s.checkpointApprovedContract(ctx, record.Command); err != nil {
+		return WorkflowView{}, err
 	}
 	decision, decisionErr := s.deps.Approval.Decide(ctx, command, prepared, snapshot, artifactValue)
 	if decisionErr != nil {
@@ -566,6 +576,9 @@ func (s *Service) execute(ctx context.Context, record Record, snapshot Admission
 		return s.terminal(ctx, record, OutcomeInconclusive, "admission_drift")
 	}
 	snapshot, prepared = currentSnapshot, currentPrepared
+	if checkpointErr := s.checkpointApprovedContract(ctx, record.Command); checkpointErr != nil {
+		return s.terminal(ctx, record, OutcomeInconclusive, "contract_review_drift")
+	}
 	material, materialErr := s.deps.Executables.Load(ctx, record.Handle)
 	if materialErr != nil || verifyExecutableMaterial(record, snapshot, prepared, material) != nil {
 		return s.terminal(ctx, record, OutcomeError, "executable_integrity")
@@ -611,6 +624,28 @@ func (s *Service) execute(ctx context.Context, record Record, snapshot Admission
 		return Record{}, err
 	}
 	return s.terminal(ctx, record, projection.Outcome, "package_verified")
+}
+
+// checkpointApprovedContract resolves exact review authority and validates repository, commit and digest before approval or tools.
+func (s *Service) checkpointApprovedContract(ctx context.Context, command StartCommand) error {
+	if command.ApprovedContract == nil {
+		return nil
+	}
+	if s.deps.ContractReview == nil {
+		return &Error{Code: CodeInvalid, Operation: "contract_review_composition"}
+	}
+	reference := *command.ApprovedContract
+	if !safeID.MatchString(reference.ReviewID) || reference.ExpectedRevision == 0 || len(reference.ProjectionDigest) != 64 {
+		return &Error{Code: CodeInvalid, Operation: "contract_review"}
+	}
+	snapshot, err := s.deps.ContractReview.ResolveApproved(ctx, command.Principal, reference)
+	if err != nil {
+		return &Error{Code: CodeConflict, Operation: "contract_review_drift"}
+	}
+	if snapshot.Source.Digest != reference.ProjectionDigest || snapshot.Source.RepositoryID != command.RepositoryID || snapshot.Source.Revision != command.Revision {
+		return &Error{Code: CodeConflict, Operation: "contract_review_drift"}
+	}
+	return nil
 }
 
 // restorePrepared rebuilds current admission and revalidates private executable values after restart.

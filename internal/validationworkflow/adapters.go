@@ -124,7 +124,7 @@ func (c CLI) Run(ctx context.Context, args []string, output io.Writer) int {
 // parseStartCLI requires every explicit workflow selection and resolves target aliases from trusted catalogs.
 func parseStartCLI(args []string, profiles map[string]string, direct map[string]DirectTarget, previews map[string]PreviewTarget) (StartCommand, error) {
 	values := map[string]string{}
-	allowed := map[string]bool{"--spec": true, "--contract": true, "--provider": true, "--model": true, "--profile": true, "--runtime-profile": true, "--repository": true, "--revision": true, "--approval": true, "--idempotency-key": true, "--target": true, "--preview": true}
+	allowed := map[string]bool{"--spec": true, "--contract": true, "--provider": true, "--model": true, "--profile": true, "--runtime-profile": true, "--repository": true, "--revision": true, "--approval": true, "--idempotency-key": true, "--target": true, "--preview": true, "--review-id": true, "--review-revision": true, "--review-digest": true}
 	for index := 0; index < len(args); index += 2 {
 		if index+1 >= len(args) || !allowed[args[index]] || args[index+1] == "" || values[args[index]] != "" {
 			return StartCommand{}, &Error{Code: CodeInvalid, Operation: "cli_start"}
@@ -141,6 +141,13 @@ func parseStartCLI(args []string, profiles map[string]string, direct map[string]
 		return StartCommand{}, &Error{Code: CodeUnauthorized, Operation: "cli_profile"}
 	}
 	command := StartCommand{SpecificationRef: values["--spec"], ContractRef: values["--contract"], Provider: values["--provider"], Model: values["--model"], CompositionRef: compositionRef, RuntimeProfile: values["--runtime-profile"], RepositoryID: values["--repository"], Revision: values["--revision"], Approval: ApprovalMode(values["--approval"]), IdempotencyKey: values["--idempotency-key"]}
+	if values["--review-id"] != "" || values["--review-revision"] != "" || values["--review-digest"] != "" {
+		revision, ok := parseUint(values["--review-revision"])
+		if !ok || values["--review-id"] == "" || values["--review-digest"] == "" {
+			return StartCommand{}, &Error{Code: CodeInvalid, Operation: "cli_review"}
+		}
+		command.ApprovedContract = &ApprovedContractReference{ReviewID: values["--review-id"], ExpectedRevision: revision, ProjectionDigest: values["--review-digest"]}
+	}
 	directTarget, directOK := direct[values["--target"]]
 	previewTarget, previewOK := previews[values["--preview"]]
 	if directOK == previewOK {
@@ -335,7 +342,7 @@ func (m MCPServer) Handle(ctx context.Context, request MCPRequest) MCPResponse {
 			err = &Error{Code: CodeInvalid, Operation: "mcp"}
 		} else {
 			compositionRef, profileOK := m.AuthProfiles[input.AuthProfile]
-			command := StartCommand{Principal: m.Principal, IdempotencyKey: input.IdempotencyKey, SpecificationRef: input.SpecificationRef, ContractRef: input.ContractRef, Provider: input.Provider, Model: input.Model, CompositionRef: compositionRef, RuntimeProfile: input.RuntimeProfile, RepositoryID: input.RepositoryID, Revision: input.Revision, Approval: input.Approval}
+			command := StartCommand{Principal: m.Principal, IdempotencyKey: input.IdempotencyKey, SpecificationRef: input.SpecificationRef, ContractRef: input.ContractRef, Provider: input.Provider, Model: input.Model, CompositionRef: compositionRef, RuntimeProfile: input.RuntimeProfile, RepositoryID: input.RepositoryID, Revision: input.Revision, Approval: input.Approval, ApprovedContract: input.ApprovedContract}
 			direct, directOK := m.DirectTargets[input.TargetAlias]
 			preview, previewOK := m.PreviewTargets[input.PreviewAlias]
 			if !profileOK || len(compositionRef) != 64 || directOK == previewOK {
@@ -404,18 +411,19 @@ func (m MCPServer) Handle(ctx context.Context, request MCPRequest) MCPResponse {
 
 // mcpStartCommand accepts only aliases while composition supplies trusted target values.
 type mcpStartCommand struct {
-	IdempotencyKey   string       `json:"idempotency_key"`
-	SpecificationRef string       `json:"specification_ref"`
-	ContractRef      string       `json:"contract_ref"`
-	Provider         string       `json:"provider"`
-	Model            string       `json:"model"`
-	AuthProfile      string       `json:"auth_profile"`
-	RuntimeProfile   string       `json:"runtime_profile"`
-	RepositoryID     string       `json:"repository_id"`
-	Revision         string       `json:"revision"`
-	Approval         ApprovalMode `json:"approval"`
-	TargetAlias      string       `json:"target_alias,omitempty"`
-	PreviewAlias     string       `json:"preview_alias,omitempty"`
+	IdempotencyKey   string                     `json:"idempotency_key"`
+	SpecificationRef string                     `json:"specification_ref"`
+	ContractRef      string                     `json:"contract_ref"`
+	Provider         string                     `json:"provider"`
+	Model            string                     `json:"model"`
+	AuthProfile      string                     `json:"auth_profile"`
+	RuntimeProfile   string                     `json:"runtime_profile"`
+	RepositoryID     string                     `json:"repository_id"`
+	Revision         string                     `json:"revision"`
+	Approval         ApprovalMode               `json:"approval"`
+	TargetAlias      string                     `json:"target_alias,omitempty"`
+	PreviewAlias     string                     `json:"preview_alias,omitempty"`
+	ApprovedContract *ApprovedContractReference `json:"approved_contract,omitempty"`
 }
 
 // GitHubGateway maps an already authorized GitHub selection onto a complete configured workflow template.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"time"
 )
@@ -47,6 +48,10 @@ type RuntimeDependencies struct {
 	Clock       Clock
 	Jitter      Jitter
 	IDs         IDSource
+	// Review receives only commands authenticated and translated by the webhook boundary.
+	Review func(context.Context, WebhookCommand) (string, error)
+	// ReviewOwner transfers lifecycle ownership of the review service into the composed runtime.
+	ReviewOwner interface{ Close() error }
 }
 
 // Runtime owns the composed webhook boundary and its joinable coordinator.
@@ -54,11 +59,19 @@ type Runtime struct {
 	handler      http.Handler
 	coordinator  *Coordinator
 	validation   ValidationGateway
+	reviewOwner  interface{ Close() error }
 	closeTimeout time.Duration
 }
 
 // ComposeRuntime wires store, REST, retry, projection, publisher, coordinator, and webhook without leaking secrets downstream.
 func ComposeRuntime(ctx context.Context, config ProductionConfig, secrets CompositionSecrets, deps RuntimeDependencies) (*Runtime, error) {
+	owned := deps.ReviewOwner
+	committed := false
+	defer func() {
+		if !committed && owned != nil {
+			_ = owned.Close()
+		}
+	}()
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -90,8 +103,9 @@ func ComposeRuntime(ctx context.Context, config ProductionConfig, secrets Compos
 	if err != nil {
 		return nil, err
 	}
-	handler := &WebhookHandler{Secret: append([]byte(nil), secrets.WebhookSecret...), MaxBody: config.MaxWebhookBytes, Store: store, Admit: coordinator.Admit, Owner: owner, Clock: deps.Clock, LeaseTTL: config.LeaseTTL}
-	return &Runtime{handler: handler, coordinator: coordinator, validation: deps.Validation, closeTimeout: config.CloseTimeout}, nil
+	handler := &WebhookHandler{Secret: append([]byte(nil), secrets.WebhookSecret...), MaxBody: config.MaxWebhookBytes, Store: store, Admit: coordinator.Admit, Review: deps.Review, Owner: owner, Clock: deps.Clock, LeaseTTL: config.LeaseTTL}
+	committed = true
+	return &Runtime{handler: handler, coordinator: coordinator, validation: deps.Validation, reviewOwner: owned, closeTimeout: config.CloseTimeout}, nil
 }
 
 // Handler exposes only the authenticated webhook boundary to the HTTP server.
@@ -101,13 +115,15 @@ func (r *Runtime) Handler() http.Handler { return r.handler }
 func (r *Runtime) Close(ctx context.Context) error {
 	bounded, cancel := context.WithTimeout(ctx, r.closeTimeout)
 	defer cancel()
-	if err := r.coordinator.Close(bounded); err != nil {
-		return err
-	}
+	var closeErrors []error
+	closeErrors = append(closeErrors, r.coordinator.Close(bounded))
 	if closer, ok := r.validation.(interface{ Close(context.Context) error }); ok {
-		return closer.Close(bounded)
+		closeErrors = append(closeErrors, closer.Close(bounded))
 	}
-	return nil
+	if r.reviewOwner != nil {
+		closeErrors = append(closeErrors, r.reviewOwner.Close())
+	}
+	return errors.Join(closeErrors...)
 }
 
 // WallClock supplies production UTC time and cancelable timer waits.

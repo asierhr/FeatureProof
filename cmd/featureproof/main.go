@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agenteval"
+	"github.com/asierhr/featureProof/internal/contractreview"
 	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/localvalidation"
@@ -94,6 +95,11 @@ var processExit = os.Exit
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return runWithContext(ctx, args, stdin, stdout, stderr)
+}
+
+// runWithContext dispatches every product entrypoint under one caller-owned lifecycle for deterministic server shutdown.
+func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) >= 2 && args[0] == "eval" && args[1] == "agent" {
 		return agenteval.RunCommand(ctx, args[2:], stdout, stderr, productionEvalComposer{})
 	}
@@ -113,6 +119,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 0
 		}
 		return cli.Run(ctx, args[1:], stdout)
+	}
+	if len(args) > 1 && args[0] == "contract-review" {
+		if len(args) == 3 && args[1] == "mcp" && args[2] == "serve" {
+			return runContractReviewMCP(ctx, stdin, stdout)
+		}
+		if len(args) == 3 && args[1] == "api" && args[2] == "serve" {
+			return runContractReviewAPI(ctx)
+		}
+		return runContractReviewCommand(ctx, args[1:], stdout)
 	}
 	if isExternalAgentCommand(args) {
 		service, err := composeExternalAgentService()
@@ -192,6 +207,10 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 	if err != nil {
 		return nil, "", err
 	}
+	authorityAdapter, err := githubpr.NewRESTAdapter(githubpr.RESTConfig{BaseURL: "https://api.github.com", APIVersion: "2022-11-28", AppID: appID, Tokens: tokenSource, HTTP: httpClient, Clock: clock, MaxResponse: 1 << 20, MaxPages: 10, MaxChangedPaths: 1000})
+	if err != nil {
+		return nil, "", err
+	}
 	root, err := os.Getwd()
 	if err != nil {
 		return nil, "", err
@@ -215,15 +234,15 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 		selection = githubpr.Selection{Alias: preview.Request.Selection.Alias, Secretless: preview.Request.Selection.Secretless, Value: preview.Request}
 	}
 	if os.Getenv("FEATUREPROOF_WORKFLOW_CONFIG") != "" {
-		authorityAdapter, authorityErr := githubpr.NewRESTAdapter(githubpr.RESTConfig{BaseURL: "https://api.github.com", APIVersion: "2022-11-28", AppID: appID, Tokens: tokenSource, HTTP: httpClient, Clock: clock, MaxResponse: 1 << 20, MaxPages: 10, MaxChangedPaths: 1000})
-		if authorityErr != nil {
-			return nil, "", authorityErr
-		}
 		workflowCLI, workflowErr := composeWorkflowCLIWithGitHubAuthority(ctx, io.Discard, io.Discard, authorityAdapter)
 		if workflowErr != nil {
 			return nil, "", workflowErr
 		}
 		workflowConfig, workflowErr := loadWorkflowConfig()
+		if workflowErr != nil {
+			return nil, "", workflowErr
+		}
+		approvedContract, workflowErr := workflowConfig.approvedContractReference()
 		if workflowErr != nil {
 			return nil, "", workflowErr
 		}
@@ -235,12 +254,38 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 		} else {
 			return nil, "", errors.New("workflow target unavailable")
 		}
-		command := validationworkflow.StartCommand{Principal: workflowCLI.Principal, IdempotencyKey: "github-template", SpecificationRef: workflowConfig.SpecificationPath, ContractRef: workflowConfig.ContractPath, Provider: workflowConfig.Provider, Model: workflowConfig.Model, CompositionRef: workflowCLI.AuthProfiles[workflowConfig.AuthProfile], RuntimeProfile: workflowConfig.RuntimeProfile, RepositoryID: workflowConfig.RepositoryID, Revision: workflowConfig.CommitOID, Approval: validationworkflow.ApprovalRequired, Target: target}
+		command := validationworkflow.StartCommand{Principal: workflowCLI.Principal, IdempotencyKey: "github-template", SpecificationRef: workflowConfig.SpecificationPath, ContractRef: workflowConfig.ContractPath, Provider: workflowConfig.Provider, Model: workflowConfig.Model, CompositionRef: workflowCLI.AuthProfiles[workflowConfig.AuthProfile], RuntimeProfile: workflowConfig.RuntimeProfile, RepositoryID: workflowConfig.RepositoryID, Revision: workflowConfig.CommitOID, Approval: validationworkflow.ApprovalRequired, Target: target, ApprovedContract: approvedContract}
 		validation = validationworkflow.GitHubGateway{Service: workflowCLI.Service, Principal: workflowCLI.Principal, Commands: map[string]validationworkflow.StartCommand{workflowConfig.TargetAlias: command}}
 		selection = githubpr.Selection{Alias: workflowConfig.TargetAlias, Secretless: workflowConfig.TargetKind == "preview"}
 	}
+	var reviewHandler func(context.Context, githubpr.WebhookCommand) (string, error)
+	var reviewOwner interface{ Close() error }
+	if os.Getenv("FEATUREPROOF_CONTRACT_REVIEW_CONFIG") != "" {
+		reviewCLI, reviewErr := composeContractReviewCLI(ctx)
+		if reviewErr != nil {
+			return nil, "", reviewErr
+		}
+		reviewService, ok := reviewCLI.API.Service.(contractreview.Service)
+		if !ok {
+			_ = reviewCLI.Close()
+			return nil, "", errors.New("invalid contract review composition")
+		}
+		reviewService.GitHub = authorityAdapter
+		reviewCLI.API.Service = reviewService
+		candidateRef := os.Getenv("FEATUREPROOF_CONTRACT_REVIEW_CANDIDATE")
+		baselineRef := os.Getenv("FEATUREPROOF_CONTRACT_REVIEW_BASELINE")
+		if candidateRef == "" {
+			candidateRef = "candidate"
+		}
+		if baselineRef == "" {
+			baselineRef = "baseline"
+		}
+		gateway := contractreview.GitHubRuntimeGateway{API: reviewCLI.API, Authority: authorityAdapter, Principals: contractreview.StaticGitHubPrincipalAuthority{Principals: map[int64]string{actor: reviewCLI.API.Config.PrincipalID}}, CandidateRef: candidateRef, BaselineRef: baselineRef, Summaries: contractreview.DurableGitHubSummary{GitHub: authorityAdapter, BotID: botID, MaxPages: 10}}
+		reviewHandler = gateway.HandleReview
+		reviewOwner = reviewCLI
+	}
 	config := githubpr.ProductionConfig{AppID: appID, BotID: botID, Permissions: githubpr.RequiredPermissions(), APIOrigin: "https://api.github.com", APIVersion: "2022-11-28", EvidenceOrigin: requiredEnv("FEATUREPROOF_EVIDENCE_ORIGIN"), StoreDir: filepath.Join(root, ".featureproof", "github-pr"), MaxWebhookBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxPages: 10, MaxChangedPaths: 1000, MaxAttempts: 4, RunTimeout: 30 * time.Minute, CloseTimeout: 10 * time.Second, LeaseTTL: 32 * time.Minute, PollInterval: 2 * time.Second, RetryMaxDuration: 2 * time.Minute, RetryMaxWait: time.Minute, RetryInitialBackoff: time.Second, RetryMaxBackoff: 30 * time.Second, Authorization: githubpr.AuthorizationConfig{Installations: map[int64]map[int64]bool{installation: {repository: true}}, Actors: map[int64]bool{actor: true}, Selections: map[string]githubpr.Selection{selection.Alias: selection}, Forks: map[int64]map[int64]bool{}}}
-	runtime, err := githubpr.ComposeRuntime(ctx, config, githubpr.CompositionSecrets{WebhookSecret: secret}, githubpr.RuntimeDependencies{Credentials: tokenSource, HTTP: httpClient, Packages: externalagent.VerifiedPackageReader{}, Validation: validation, Clock: clock, Jitter: githubpr.RandomJitter{}, IDs: githubpr.RandomIDs{}})
+	runtime, err := githubpr.ComposeRuntime(ctx, config, githubpr.CompositionSecrets{WebhookSecret: secret}, githubpr.RuntimeDependencies{Credentials: tokenSource, HTTP: httpClient, Packages: externalagent.VerifiedPackageReader{}, Validation: validation, Clock: clock, Jitter: githubpr.RandomJitter{}, IDs: githubpr.RandomIDs{}, Review: reviewHandler, ReviewOwner: reviewOwner})
 	if err != nil {
 		if closer, ok := validation.(interface{ Close(context.Context) error }); ok {
 			_ = closer.Close(context.Background())

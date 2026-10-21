@@ -226,6 +226,9 @@ func validateSnapshot(ctx context.Context, v SourceSnapshot, req SourceRequest) 
 	if metrics.exceeds(req.Limits()) {
 		return typedError(CategoryLimitExceeded, "snapshot", nil)
 	}
+	if req.Kind() == "review-approved-v1" {
+		return validateApprovedReviewSnapshot(ctx, v, req)
+	}
 	reachableSchemes := map[string]SecurityScheme{}
 	operationKeys := map[OperationKey]bool{}
 	for i, op := range v.Operations {
@@ -297,6 +300,113 @@ func validateSnapshot(ctx context.Context, v SourceSnapshot, req SourceRequest) 
 		return typedError(CategoryInvalidSource, "security_schemes.reachability", nil)
 	}
 	return nil
+}
+
+// validateApprovedReviewSnapshot admits human approval lineage while preserving the original derived confidence and completeness.
+func validateApprovedReviewSnapshot(ctx context.Context, snapshot SourceSnapshot, req SourceRequest) error {
+	reachableSchemes := map[string]SecurityScheme{}
+	operationKeys := map[OperationKey]bool{}
+	for index, operation := range snapshot.Operations {
+		if err := ctx.Err(); err != nil {
+			return typedError(CategoryCancelled, "review_snapshot", err)
+		}
+		if err := validateProjection(operation, req.authority.Projection); err != nil {
+			return err
+		}
+		operationKeys[operation.Key] = true
+		if operation.Key.Method == "" || operation.Key.Path == "" || len(operation.Responses) == 0 || confidenceRank(operation.Confidence) == 0 || completenessRank(operation.Completeness) == 0 || !containsSourceClass(operation.Classes, ClassAuthoritative) || !containsReviewProvenance(operation.Provenance, snapshot.Source, operation.Confidence, operation.Completeness) || !containsOriginalProvenance(operation.Provenance, snapshot.Source) {
+			return typedError(CategoryInvalidSource, fmt.Sprintf("operations[%d]", index), nil)
+		}
+		expected := ClaimsForOperation(operation, operation.Provenance[0])
+		fingerprints := map[string]int{}
+		for _, claim := range expected {
+			fingerprints[string(claim.Kind)+"\x00"+claim.Field+"\x00"+claim.Fingerprint]++
+		}
+		if len(operation.Claims) != len(expected) {
+			return typedError(CategoryInvalidSource, "review_snapshot.claims", nil)
+		}
+		for _, claim := range operation.Claims {
+			identity := string(claim.Kind) + "\x00" + claim.Field + "\x00" + claim.Fingerprint
+			if fingerprints[identity] == 0 || confidenceRank(claim.Confidence) == 0 || completenessRank(claim.Completeness) == 0 || safeLocation(claim.Field, req.Limits().MaxLocationBytes) != claim.Field || !containsReviewProvenance(claim.Provenance, snapshot.Source, claim.Confidence, claim.Completeness) || !containsOriginalProvenance(claim.Provenance, snapshot.Source) {
+				return typedError(CategoryInvalidSource, "review_snapshot.claims", nil)
+			}
+			fingerprints[identity]--
+			if !validReviewProvenance(claim.Provenance, req.Limits().MaxLocationBytes) {
+				return typedError(CategoryInvalidSource, "review_snapshot.claims.provenance", nil)
+			}
+		}
+		if !validReviewProvenance(operation.Provenance, req.Limits().MaxLocationBytes) {
+			return typedError(CategoryInvalidSource, "review_snapshot.provenance", nil)
+		}
+		if err := collectReachableSecuritySchemes(operation, reachableSchemes); err != nil {
+			return err
+		}
+	}
+	for _, diagnostic := range snapshot.Diagnostics {
+		if safeLocation(diagnostic.Code, 64) != diagnostic.Code || diagnostic.SafeLocation != "" && safeLocation(diagnostic.SafeLocation, req.Limits().MaxLocationBytes) != diagnostic.SafeLocation {
+			return typedError(CategoryInvalidSource, "review_snapshot.diagnostics", nil)
+		}
+	}
+	for _, key := range snapshot.AffectedOperations {
+		if !operationKeys[key] {
+			return typedError(CategoryInvalidSource, "review_snapshot.affected_operations", nil)
+		}
+	}
+	declaredSchemes := map[string]SecurityScheme{}
+	for _, scheme := range snapshot.SecuritySchemes {
+		if scheme.Name == "" {
+			return typedError(CategoryInvalidSource, "review_snapshot.security_schemes.name", nil)
+		}
+		canonical := canonicalSecurityScheme(scheme)
+		if prior, exists := declaredSchemes[scheme.Name]; exists && !jsonEqual(prior, canonical) {
+			return typedError(CategoryInvalidSource, "review_snapshot.security_schemes.duplicate", nil)
+		}
+		declaredSchemes[scheme.Name] = canonical
+	}
+	if !jsonEqual(cloneSecuritySchemes(reachableSchemes), declaredSchemes) {
+		return typedError(CategoryInvalidSource, "review_snapshot.security_schemes.reachability", nil)
+	}
+	return nil
+}
+
+// containsSourceClass verifies that review authority is additive and never rewrites all source classes.
+func containsSourceClass(values []SourceClass, expected SourceClass) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
+}
+
+// containsReviewProvenance binds additive human authority to the exact approved projection identity without elevating epistemic fields.
+func containsReviewProvenance(values []Provenance, source SourceSummary, confidence Confidence, completeness Completeness) bool {
+	for _, value := range values {
+		if value.SourceID == source.ID && value.RepositoryID == source.RepositoryID && value.Revision == source.Revision && value.Class == source.Class && value.SourceDigest == source.Digest && value.AdapterVersion == source.AdapterVersion && value.Confidence == confidence && value.Completeness == completeness {
+			return true
+		}
+	}
+	return false
+}
+
+// containsOriginalProvenance proves approval authority augments rather than replaces the evidence lineage.
+func containsOriginalProvenance(values []Provenance, source SourceSummary) bool {
+	for _, value := range values {
+		if value.SourceID != source.ID {
+			return true
+		}
+	}
+	return false
+}
+
+// validReviewProvenance validates every retained original and approval lineage entry under the same closed safety rules.
+func validReviewProvenance(values []Provenance, maximumLocation int) bool {
+	for _, value := range values {
+		if value.SourceID == "" || value.RepositoryID == "" || value.Revision == "" || !validSourceClass(value.Class) || !validDigest(value.SourceDigest) || value.AdapterVersion == "" || confidenceRank(value.Confidence) == 0 || completenessRank(value.Completeness) == 0 || safeLocation(value.SafeLocation, maximumLocation) != value.SafeLocation {
+			return false
+		}
+	}
+	return len(values) > 0
 }
 
 // claimIdentity returns the exact material identity used to compare claimed and recomputed facts as a multiset.

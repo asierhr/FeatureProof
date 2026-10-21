@@ -21,6 +21,7 @@ import (
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/assertion"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
+	"github.com/asierhr/featureProof/internal/contractreview"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/githubpr"
@@ -43,32 +44,35 @@ import (
 
 // workflowConfig is the trusted local composition record; it contains references but no credential bytes.
 type workflowConfig struct {
-	Provider              string                                  `json:"provider"`
-	Model                 string                                  `json:"model"`
-	AuthProfile           string                                  `json:"auth_profile"`
-	ProfileStore          string                                  `json:"profile_store"`
-	RuntimeProfile        string                                  `json:"runtime_profile"`
-	SpecificationPath     string                                  `json:"specification_path"`
-	ContractPath          string                                  `json:"contract_path"`
-	ContractSource        string                                  `json:"contract_source,omitempty"`
-	ContractSources       []string                                `json:"contract_sources,omitempty"`
-	OpenAPIContractPath   string                                  `json:"openapi_contract_path,omitempty"`
-	RepositoryRoot        string                                  `json:"repository_root,omitempty"`
-	GoInspector           *workflowGoInspectorConfig              `json:"go_inspector,omitempty"`
-	SpringInspector       *workflowSpringInspectorConfig          `json:"spring_inspector,omitempty"`
-	RuntimeManifestPath   string                                  `json:"runtime_manifest_path"`
-	RepositoryID          string                                  `json:"repository_id"`
-	CommitOID             string                                  `json:"commit_oid"`
-	EnvironmentID         string                                  `json:"environment_id"`
-	AttestationRef        string                                  `json:"attestation_ref"`
-	TargetAlias           string                                  `json:"target_alias"`
-	TargetURL             string                                  `json:"target_url"`
-	TargetKind            string                                  `json:"target_kind"`
-	PolicyID              string                                  `json:"policy_id"`
-	AttestationValidUntil time.Time                               `json:"attestation_valid_until"`
-	AllowDisabledApproval bool                                    `json:"allow_disabled_approval"`
-	ContractSelections    map[string][]workflowOperationSelection `json:"contract_selections"`
-	ContractProjection    workflowProjectionConfig                `json:"contract_projection"`
+	Provider               string                                  `json:"provider"`
+	Model                  string                                  `json:"model"`
+	AuthProfile            string                                  `json:"auth_profile"`
+	ProfileStore           string                                  `json:"profile_store"`
+	RuntimeProfile         string                                  `json:"runtime_profile"`
+	SpecificationPath      string                                  `json:"specification_path"`
+	ContractPath           string                                  `json:"contract_path"`
+	ContractSource         string                                  `json:"contract_source,omitempty"`
+	ContractSources        []string                                `json:"contract_sources,omitempty"`
+	OpenAPIContractPath    string                                  `json:"openapi_contract_path,omitempty"`
+	RepositoryRoot         string                                  `json:"repository_root,omitempty"`
+	GoInspector            *workflowGoInspectorConfig              `json:"go_inspector,omitempty"`
+	SpringInspector        *workflowSpringInspectorConfig          `json:"spring_inspector,omitempty"`
+	RuntimeManifestPath    string                                  `json:"runtime_manifest_path"`
+	RepositoryID           string                                  `json:"repository_id"`
+	CommitOID              string                                  `json:"commit_oid"`
+	EnvironmentID          string                                  `json:"environment_id"`
+	AttestationRef         string                                  `json:"attestation_ref"`
+	TargetAlias            string                                  `json:"target_alias"`
+	TargetURL              string                                  `json:"target_url"`
+	TargetKind             string                                  `json:"target_kind"`
+	PolicyID               string                                  `json:"policy_id"`
+	AttestationValidUntil  time.Time                               `json:"attestation_valid_until"`
+	AllowDisabledApproval  bool                                    `json:"allow_disabled_approval"`
+	ContractSelections     map[string][]workflowOperationSelection `json:"contract_selections"`
+	ContractProjection     workflowProjectionConfig                `json:"contract_projection"`
+	ContractReviewID       string                                  `json:"contract_review_id,omitempty"`
+	ContractReviewRevision uint64                                  `json:"contract_review_revision,omitempty"`
+	ContractReviewDigest   string                                  `json:"contract_review_digest,omitempty"`
 }
 
 // workflowGoInspectorConfig carries the explicit trusted roots, PR impact, build selector, auth allowlist, and budgets for Go analysis.
@@ -174,7 +178,28 @@ func loadWorkflowConfig() (workflowConfig, error) {
 	if _, err := config.ContractProjection.policy(nil); err != nil {
 		return workflowConfig{}, errors.New("invalid workflow configuration")
 	}
+	if _, err := config.approvedContractReference(); err != nil {
+		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
 	return config, nil
+}
+
+// approvedContractReference validates the trusted all-or-none durable review selector used by CLI, MCP and GitHub starts.
+func (c workflowConfig) approvedContractReference() (*validationworkflow.ApprovedContractReference, error) {
+	absent := c.ContractReviewID == "" && c.ContractReviewRevision == 0 && c.ContractReviewDigest == ""
+	if absent {
+		return nil, nil
+	}
+	if len(c.ContractReviewID) != 24 || c.ContractReviewRevision == 0 || len(c.ContractReviewDigest) != 64 {
+		return nil, errors.New("invalid approved contract reference")
+	}
+	if _, err := hex.DecodeString(c.ContractReviewID); err != nil {
+		return nil, errors.New("invalid approved contract reference")
+	}
+	if _, err := hex.DecodeString(c.ContractReviewDigest); err != nil {
+		return nil, errors.New("invalid approved contract reference")
+	}
+	return &validationworkflow.ApprovedContractReference{ReviewID: c.ContractReviewID, ExpectedRevision: c.ContractReviewRevision, ProjectionDigest: c.ContractReviewDigest}, nil
 }
 
 // validContractSources requires a duplicate-free explicit list from the closed adapter registry.
@@ -314,6 +339,37 @@ func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr i
 		return nil, errors.New("invalid contract projection configuration")
 	}
 	contractReducer := workflowContractReducerFor(config, projection)
+	var approvedAuthority validationworkflow.ApprovedContractAuthority
+	if os.Getenv("FEATUREPROOF_CONTRACT_REVIEW_CONFIG") != "" {
+		reviewCLI, reviewErr := composeContractReviewCLI(ctx)
+		if reviewErr != nil {
+			return nil, reviewErr
+		}
+		reviewService, ok := reviewCLI.API.Service.(contractreview.Service)
+		if !ok {
+			return nil, errors.New("invalid contract review composition")
+		}
+		if githubAuthority != nil {
+			reviewService.GitHub = githubAuthority
+		}
+		authority := contractreview.WorkflowAuthority{Service: reviewService}
+		approvedAuthority = authority
+		rules := map[contractcatalog.ClaimKind]contractcatalog.ClaimRule{}
+		for _, kind := range []contractcatalog.ClaimKind{contractcatalog.ClaimOperationIdentity, contractcatalog.ClaimSchema, contractcatalog.ClaimSecurity, contractcatalog.ClaimResponse} {
+			rules[kind] = contractcatalog.ClaimRule{AllowedClasses: []contractcatalog.SourceClass{contractcatalog.ClassAuthoritative}, MinimumConfidence: map[contractcatalog.SourceClass]contractcatalog.Confidence{contractcatalog.ClassAuthoritative: contractcatalog.ConfidenceHigh}, RequiredCompleteness: contractcatalog.CompletenessComplete, Required: true}
+		}
+		policy, policyErr := contractcatalog.NewPolicy(contractcatalog.SufficiencyPolicy{ID: "workflow-approved-review", Version: contractcatalog.VersionV1, Claims: rules, ConflictTreatment: contractcatalog.ConflictDeny})
+		if policyErr != nil {
+			return nil, policyErr
+		}
+		selections := map[string][]contractcatalog.OperationKey{}
+		for constraint, values := range config.ContractSelections {
+			for _, value := range values {
+				selections[constraint] = append(selections[constraint], contractcatalog.OperationKey{Method: strings.ToUpper(value.Method), Path: value.Path})
+			}
+		}
+		contractReducer = validationworkflow.ApprovedReviewReducer{Authority: authority, Fallback: contractReducer, Policy: policy, CatalogLimits: contractcatalog.Limits{MaxSources: 32, MaxOperations: 4096, MaxClaims: 65536, MaxBytes: 2 << 20, MaxDepth: 64, MaxDiagnostics: 4096, MaxLocationBytes: 512}, ReductionLimits: contractcatalog.ReductionLimits{MaxBytes: 1 << 20, MaxOperations: 4096, MaxClaims: 65536, MaxDepth: 64, MaxDiagnostics: 4096}, ProjectionPolicy: projection, Selections: selections}
+	}
 	trustedAdmission := validationworkflow.TrustedAdmissionBuilder{Specifications: workflowSpecLoader{path: config.SpecificationPath}, Contracts: contractReducer, Bindings: workflowBindingVerifier{config: config, binding: bindingContext}, Catalog: workflowCatalog{profile: config.RuntimeProfile, runtime: runtimeContext, descriptors: []agentplanning.CapabilityDescriptor{capability}}, Config: validationworkflow.AdmissionConfig{Provider: config.Provider, Model: config.Model, CompositionRef: compositionRef, Limits: agentplanning.Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 128, MaxCapabilities: 16, MaxChecks: 384, MaxStepsPerCheck: 64, MaxAssertionsPerStep: 64, MaxMissingItems: 32, MaxValidationWork: 100000}}}
 	var admission validationworkflow.AdmissionBuilder = trustedAdmission
 	if githubAuthority != nil {
@@ -350,7 +406,7 @@ func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr i
 		return nil, err
 	}
 	wallClock := githubpr.WallClock{}
-	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Preview: previewPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner})
+	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Preview: previewPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority})
 	if err != nil {
 		return nil, err
 	}

@@ -155,6 +155,14 @@ type StartCommand struct {
 	Approval                                                 ApprovalMode
 	Target                                                   TargetSelection
 	GitHubAuthority                                          *GitHubAuthorityReference
+	ApprovedContract                                         *ApprovedContractReference
+}
+
+// ApprovedContractReference binds workflow admission and execution to one current human-approved projection.
+type ApprovedContractReference struct {
+	ReviewID         string `json:"review_id"`
+	ExpectedRevision uint64 `json:"expected_revision"`
+	ProjectionDigest string `json:"projection_digest"`
 }
 
 // AdmissionSnapshot is an immutable, secret-free model and execution snapshot produced before admission.
@@ -295,6 +303,11 @@ type Record struct {
 // AdmissionBuilder performs all validation and external observation before a durable handle exists.
 type AdmissionBuilder interface {
 	Build(context.Context, StartCommand) (AdmissionSnapshot, error)
+}
+
+// ApprovedContractAuthority revalidates and projects one durable contract review at workflow checkpoints.
+type ApprovedContractAuthority interface {
+	ResolveApproved(context.Context, string, ApprovedContractReference) (contractcatalog.SourceSnapshot, error)
 }
 
 // GenerationPort invokes the existing validated planning pipeline exactly once per confirmed attempt.

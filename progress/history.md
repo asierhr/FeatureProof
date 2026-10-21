@@ -527,3 +527,27 @@ Bitácora append-only de features completadas.
   composición y autoridad superan 85 %.
 - Limitación del host: `go test ./...` conserva únicamente el subtest histórico
   de symlink de `localvalidation`, que Windows no puede crear sin privilegio.
+
+## 2026-10-21 — generated-contract-review
+
+- Estado final: `done`.
+- Resultado: revisión versionada de catálogos derivados frente a una baseline
+  aprobada, con diff estructural canónico, decisiones humanas totales o
+  selectivas y proyección aprobada ligada a repositorio, commit, fuentes,
+  analizadores, decisiones y digests.
+- Exportación: OpenAPI 3.1 determinista con procedencia, confianza, completitud,
+  conflictos y omisiones; publicación local atómica con overwrite condicionado,
+  ownership multiproceso, recuperación de crash e idempotencia por `AttemptID`.
+- Integración: servicio compartido por CLI, API, MCP y GitHub; los catálogos no
+  aprobados permanecen proposal-only y el workflow revalida autoridad antes de
+  aprobar y ejecutar.
+- Spec aprobada por el usuario el `2026-10-20T16:31:20+02:00`.
+- Tasks T1–T13 completas; R1–R13 y REV-1–REV-19 trazados en
+  `progress/generated-contract-review/{implementation,review}.md`.
+- Review independiente aprobada en la novena revisión. Pasan REV-19 ×500 y race
+  ×100, REV-15–REV-19 ×50 y race ×5, recovery/crash ×10, paquetes afectados,
+  vet, compile-only y builds Windows/Linux/macOS.
+- Coverage: `internal/contractreview` 85,2 % e
+  `internal/validationworkflow` 85,6 %.
+- Limitación del host: la suite global conserva únicamente el subtest histórico
+  de symlink de `localvalidation`, que Windows no puede crear sin privilegio.
