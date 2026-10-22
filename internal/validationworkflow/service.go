@@ -13,6 +13,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/localvalidation"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // Config bounds workflow leases, heartbeat cadence and independent finalization work.
@@ -226,11 +227,17 @@ func (s *Service) revalidateGeneratedPlan(ctx context.Context, command StartComm
 		return &Error{Code: CodeConflict, Operation: "admission_drift"}
 	}
 	current.Generation.RunID, current.Generation.PlanID = expected.Generation.RunID, expected.Generation.PlanID
-	unchanged := current.SpecificationDigest == expected.SpecificationDigest && current.ContractDigest == expected.ContractDigest && current.CatalogDigest == expected.CatalogDigest && current.ContractPolicyDigest == expected.ContractPolicyDigest && current.RevisionDigest == expected.RevisionDigest && current.RuntimeDigest == expected.RuntimeDigest && current.Provider == expected.Provider && current.Model == expected.Model
+	if command.Target.Preview != nil {
+		current.Binding.Target = expected.Binding.Target
+		current.TargetDigest = expected.TargetDigest
+	}
+	currentContextDigest, currentContextErr := canonicalContextDigest(current)
+	expectedContextDigest, expectedContextErr := canonicalContextDigest(expected)
+	unchanged := currentContextErr == nil && expectedContextErr == nil && currentContextDigest == expectedContextDigest && current.SpecificationDigest == expected.SpecificationDigest && current.ContractDigest == expected.ContractDigest && current.CatalogDigest == expected.CatalogDigest && current.ContractPolicyDigest == expected.ContractPolicyDigest && current.RevisionDigest == expected.RevisionDigest && current.RuntimeDigest == expected.RuntimeDigest && current.Provider == expected.Provider && current.Model == expected.Model
 	if command.Target.Direct != nil {
 		unchanged = unchanged && current.TargetDigest == expected.TargetDigest
 	}
-	if !unchanged || !prepared.MatchesProvenance(agentplanning.ProvenanceInput{Constraints: current.Generation.Constraints, Contract: current.Generation.Contract, Capabilities: current.Generation.Capabilities}) {
+	if !unchanged || !prepared.MatchesProvenance(agentplanning.ProvenanceInput{Constraints: current.Generation.Constraints, Contract: current.Generation.Contract, Capabilities: current.Generation.Capabilities, Identities: current.Generation.Identities}) {
 		return &Error{Code: CodeConflict, Operation: "admission_drift"}
 	}
 	return nil
@@ -793,7 +800,7 @@ func validateStart(command StartCommand) error {
 func validateSnapshot(snapshot AdmissionSnapshot, command StartCommand) error {
 	revisionDigest, targetDigest, bindingErr := bindingDigests(snapshot.Binding)
 	runtimeDigest, runtimeErr := runtimeContextDigest(snapshot.Runtime)
-	if bindingErr != nil || runtimeErr != nil || revisionDigest != snapshot.RevisionDigest || targetDigest != snapshot.TargetDigest || runtimeDigest != snapshot.RuntimeDigest || !validBindingContext(snapshot.Binding, command) || !validRuntimeContext(snapshot.Runtime, command.RuntimeProfile) || len(snapshot.SpecificationDigest) != 64 || len(snapshot.ContractDigest) != 64 || snapshot.Generation.Contract.Validate() != nil || snapshot.CatalogDigest != snapshot.Generation.Contract.CatalogDigest() || snapshot.ContractPolicyDigest != snapshot.Generation.Contract.PolicyDigest() || len(snapshot.RevisionDigest) != 64 || len(snapshot.TargetDigest) != 64 || len(snapshot.RuntimeDigest) != 64 || snapshot.Provider != command.Provider || snapshot.Model != command.Model || len(snapshot.Generation.Constraints) == 0 || len(snapshot.Generation.Capabilities) == 0 {
+	if bindingErr != nil || runtimeErr != nil || testidentity.ValidateDescriptors(snapshot.Generation.Identities) != nil || revisionDigest != snapshot.RevisionDigest || targetDigest != snapshot.TargetDigest || runtimeDigest != snapshot.RuntimeDigest || !validBindingContext(snapshot.Binding, command) || !validRuntimeContext(snapshot.Runtime, command.RuntimeProfile) || len(snapshot.SpecificationDigest) != 64 || len(snapshot.ContractDigest) != 64 || snapshot.Generation.Contract.Validate() != nil || snapshot.CatalogDigest != snapshot.Generation.Contract.CatalogDigest() || snapshot.ContractPolicyDigest != snapshot.Generation.Contract.PolicyDigest() || len(snapshot.RevisionDigest) != 64 || len(snapshot.TargetDigest) != 64 || len(snapshot.RuntimeDigest) != 64 || snapshot.Provider != command.Provider || snapshot.Model != command.Model || len(snapshot.Generation.Constraints) == 0 || len(snapshot.Generation.Capabilities) == 0 {
 		return &Error{Code: CodeInvalid, Operation: "snapshot"}
 	}
 	return nil

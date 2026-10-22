@@ -70,6 +70,7 @@ func New(config Config) (*Tool, error) {
 		maxRequestBody: config.MaxRequestBodyBytes, maxResponseHead: config.MaxResponseHeaderBytes,
 		maxResponseBody: config.MaxResponseBodyBytes, resolver: config.Resolver, dialer: config.Dialer,
 		clock: config.Clock, withTimeout: config.WithTimeout,
+		authentication: config.Authentication, targetID: config.Target.ID,
 	}, nil
 }
 

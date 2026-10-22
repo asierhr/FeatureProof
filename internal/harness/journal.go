@@ -10,32 +10,34 @@ import (
 type EventType string
 
 const (
-	EventRunCreated           EventType = "run_created"
-	EventPlanningStarted      EventType = "planning_started"
-	EventDecisionReceived     EventType = "model_decision_received"
-	EventCallValidated        EventType = "tool_call_validated"
-	EventPolicyEvaluated      EventType = "policy_evaluated"
-	EventBudgetReserved       EventType = "budget_reserved"
-	EventExecutionStarted     EventType = "tool_execution_started"
-	EventExecutionFinished    EventType = "tool_execution_finished"
-	EventEvidencePersisted    EventType = "evidence_persisted"
-	EventCallRejected         EventType = "tool_call_rejected"
-	EventRetryScheduled       EventType = "retry_scheduled"
-	EventAssertionEvaluated   EventType = "assertion_evaluated"
-	EventVerdictCalculated    EventType = "verdict_calculated"
-	EventRunCompleted         EventType = "run_completed"
-	EventRunInconclusive      EventType = "run_inconclusive"
-	EventRunFailed            EventType = "run_failed"
-	EventRunCancelled         EventType = "run_cancelled"
-	EventPlanValidated        EventType = "plan_validated"
-	EventPlanExecutionStart   EventType = "plan_execution_started"
-	EventPlanCompleted        EventType = "plan_completed"
-	EventPlanStepStarted      EventType = "plan_step_started"
-	EventPlanInputResolved    EventType = "plan_step_input_resolved"
-	EventPlanStepCompleted    EventType = "plan_step_completed"
-	EventPlanStepBlocked      EventType = "plan_step_blocked"
-	EventBindingConfirmed     EventType = "binding_confirmed"
-	EventPlanBindingConfirmed EventType = "plan_binding_confirmed"
+	EventRunCreated        EventType = "run_created"
+	EventPlanningStarted   EventType = "planning_started"
+	EventDecisionReceived  EventType = "model_decision_received"
+	EventCallValidated     EventType = "tool_call_validated"
+	EventPolicyEvaluated   EventType = "policy_evaluated"
+	EventBudgetReserved    EventType = "budget_reserved"
+	EventExecutionStarted  EventType = "tool_execution_started"
+	EventExecutionFinished EventType = "tool_execution_finished"
+	// EventIdentityAttemptTerminal records one payload-free terminal category for every authenticated attempt, including pre-network rejection.
+	EventIdentityAttemptTerminal EventType = "identity_attempt_terminal"
+	EventEvidencePersisted       EventType = "evidence_persisted"
+	EventCallRejected            EventType = "tool_call_rejected"
+	EventRetryScheduled          EventType = "retry_scheduled"
+	EventAssertionEvaluated      EventType = "assertion_evaluated"
+	EventVerdictCalculated       EventType = "verdict_calculated"
+	EventRunCompleted            EventType = "run_completed"
+	EventRunInconclusive         EventType = "run_inconclusive"
+	EventRunFailed               EventType = "run_failed"
+	EventRunCancelled            EventType = "run_cancelled"
+	EventPlanValidated           EventType = "plan_validated"
+	EventPlanExecutionStart      EventType = "plan_execution_started"
+	EventPlanCompleted           EventType = "plan_completed"
+	EventPlanStepStarted         EventType = "plan_step_started"
+	EventPlanInputResolved       EventType = "plan_step_input_resolved"
+	EventPlanStepCompleted       EventType = "plan_step_completed"
+	EventPlanStepBlocked         EventType = "plan_step_blocked"
+	EventBindingConfirmed        EventType = "binding_confirmed"
+	EventPlanBindingConfirmed    EventType = "plan_binding_confirmed"
 )
 
 // RejectReason is the stable machine-readable cause for refusing model-proposed work.
@@ -52,22 +54,26 @@ const (
 
 // Event is one ordered, append-only fact associated with a validation run.
 type Event struct {
-	Sequence      int
-	Type          EventType
-	RunID         string
-	BindingSHA256 string
-	PlanSHA256    string
-	PlanID        string
-	StepID        string
-	ConstraintID  string
-	Step          int
-	ToolCallID    string
-	Reason        RejectReason
-	Detail        string
-	Status        string
-	EvidenceIDs   []string
-	BlockingCause []EventBlockingCause
-	Truncations   []EventTruncation
+	Sequence               int
+	Type                   EventType
+	RunID                  string
+	BindingSHA256          string
+	PlanSHA256             string
+	PlanID                 string
+	StepID                 string
+	ConstraintID           string
+	Step                   int
+	ToolCallID             string
+	Reason                 RejectReason
+	Detail                 string
+	Status                 string
+	EvidenceIDs            []string
+	BlockingCause          []EventBlockingCause
+	Truncations            []EventTruncation
+	IdentityID             string
+	OperationBindingSHA256 string
+	Attempt                int
+	OutcomeCategory        string
 }
 
 // EventTruncation records only safe size and path facts needed to audit evidence limitation.

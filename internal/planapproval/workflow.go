@@ -8,6 +8,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/harness"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // ApprovalWorkflow coordinates staging and human decisions while never owning an executor or tool handle.
@@ -541,7 +542,7 @@ func provenanceInput(snapshot ContractSnapshot) agentplanning.ProvenanceInput {
 	for i, capability := range snapshot.Capabilities {
 		capabilities[i] = agentplanning.CapabilityDescriptor{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
-	return agentplanning.ProvenanceInput{Constraints: append([]agentplanning.Constraint(nil), snapshot.Constraints...), Contract: snapshot.Contract, Capabilities: capabilities}
+	return agentplanning.ProvenanceInput{Constraints: append([]agentplanning.Constraint(nil), snapshot.Constraints...), Contract: snapshot.Contract, Capabilities: capabilities, Identities: testidentity.CloneDescriptors(snapshot.Identities)}
 }
 
 // transitionRun keeps the mutable harness aggregate aligned with the event-derived approval projection.

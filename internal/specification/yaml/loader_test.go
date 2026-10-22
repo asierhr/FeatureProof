@@ -107,14 +107,15 @@ func TestLoadRejectsUnknownAndDuplicateKeys(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsUnsupportedVersionWithReceivedAndSupported proves future envelopes are rejected before their members are interpreted.
 func TestLoadRejectsUnsupportedVersionWithReceivedAndSupported(t *testing.T) {
-	body := "version: 2\nfuture_field: true\n"
+	body := "version: 3\nfuture_field: true\n"
 	got, err := specyaml.Load(context.Background(), writeSpec(t, body))
 	var versionErr *specification.UnsupportedVersionError
 	if !errors.Is(err, specification.ErrUnsupportedVersion) || !errors.As(err, &versionErr) {
 		t.Fatalf("Load() = %#v, %v", got, err)
 	}
-	if versionErr.Received != 2 || !reflect.DeepEqual(versionErr.Supported, []int{1}) {
+	if versionErr.Received != 3 || !reflect.DeepEqual(versionErr.Supported, []int{1, 2}) {
 		t.Fatalf("UnsupportedVersionError = %#v", versionErr)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 
 	"github.com/asierhr/featureProof/internal/contractcatalog"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // provenanceCapability excludes executable validators while preserving every descriptor field used during generation.
@@ -26,10 +27,11 @@ type provenanceEnvelope struct {
 		Retained                               []contractcatalog.RetainedOperation
 	}
 	Capabilities []provenanceCapability
+	Identities   []testidentity.Descriptor
 }
 
 // generationProvenance hashes the exact immutable generation inputs without retaining callbacks or credentials.
-func generationProvenance(constraints []Constraint, reduced contractcatalog.ReducedContext, capabilities []CapabilityDescriptor) (string, error) {
+func generationProvenance(constraints []Constraint, reduced contractcatalog.ReducedContext, capabilities []CapabilityDescriptor, identities []testidentity.Descriptor) (string, error) {
 	envelope := provenanceEnvelope{Version: 1, Constraints: append([]Constraint(nil), constraints...)}
 	envelope.Contract.MediaType, envelope.Contract.Untrusted = reduced.MediaType(), reduced.Untrusted()
 	envelope.Contract.CatalogDigest, envelope.Contract.PolicyDigest = reduced.CatalogDigest(), reduced.PolicyDigest()
@@ -40,6 +42,7 @@ func generationProvenance(constraints []Constraint, reduced contractcatalog.Redu
 	for i, capability := range capabilities {
 		envelope.Capabilities[i] = provenanceCapability{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
+	envelope.Identities = cloneIdentityDescriptors(identities)
 	raw, err := json.Marshal(envelope)
 	if err != nil {
 		return "", err

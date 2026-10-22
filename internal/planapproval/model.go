@@ -9,6 +9,7 @@ import (
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/harness"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // Action is the closed set of decisions a trusted approval surface may submit.
@@ -38,13 +39,15 @@ const (
 type InvalidationReason string
 
 const (
-	ReasonConstraintsEdited         InvalidationReason = "constraints_edited"
-	ReasonRegenerationRequested     InvalidationReason = "regeneration_requested"
-	ReasonPlanChanged               InvalidationReason = "plan_changed"
-	ReasonTargetChanged             InvalidationReason = "target_changed"
-	ReasonConstraintsChanged        InvalidationReason = "constraints_changed"
-	ReasonContractChanged           InvalidationReason = "contract_context_changed"
-	ReasonCapabilitiesChanged       InvalidationReason = "capabilities_changed"
+	ReasonConstraintsEdited     InvalidationReason = "constraints_edited"
+	ReasonRegenerationRequested InvalidationReason = "regeneration_requested"
+	ReasonPlanChanged           InvalidationReason = "plan_changed"
+	ReasonTargetChanged         InvalidationReason = "target_changed"
+	ReasonConstraintsChanged    InvalidationReason = "constraints_changed"
+	ReasonContractChanged       InvalidationReason = "contract_context_changed"
+	ReasonCapabilitiesChanged   InvalidationReason = "capabilities_changed"
+	// ReasonIdentitiesChanged invalidates approval when safe authorization descriptors drift.
+	ReasonIdentitiesChanged         InvalidationReason = "identities_changed"
 	ReasonRuntimeChanged            InvalidationReason = "runtime_changed"
 	ReasonGenerationContractChanged InvalidationReason = "generation_contract_changed"
 )
@@ -127,6 +130,7 @@ type ContractSnapshot struct {
 	Constraints        []agentplanning.Constraint
 	Contract           contractcatalog.ReducedContext
 	Capabilities       []CapabilitySnapshot
+	Identities         []testidentity.Descriptor
 	Runtime            RuntimeSnapshot
 	GenerationContract GenerationContractSnapshot
 }

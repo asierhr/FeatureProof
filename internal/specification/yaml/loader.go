@@ -15,7 +15,8 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-var supportedVersions = []int{1}
+// supportedVersions drives safe diagnostics after version-first dispatch without implying cross-version defaults.
+var supportedVersions = []int{1, 2}
 var errorLocationPattern = regexp.MustCompile(`line ([0-9]+)(: column ([0-9]+))?`)
 
 // documentV1 is the adapter-owned representation of the complete YAML v1 contract.
@@ -25,6 +26,39 @@ type documentV1 struct {
 	Target      targetV1       `yaml:"target"`
 	Constraints []constraintV1 `yaml:"constraints"`
 	Limits      limitsV1       `yaml:"limits"`
+}
+
+// documentV2 is the strict YAML contract that adds non-secret test identity declarations to v1 fields.
+type documentV2 struct {
+	Version     int            `yaml:"version"`
+	Feature     featureV1      `yaml:"feature"`
+	Target      targetV1       `yaml:"target"`
+	Constraints []constraintV1 `yaml:"constraints"`
+	Limits      limitsV1       `yaml:"limits"`
+	Identities  []identityV2   `yaml:"identities"`
+}
+
+// identityV2 keeps opaque references and authorization metadata inside the adapter until domain validation succeeds.
+type identityV2 struct {
+	ID            string        `yaml:"id"`
+	TargetID      string        `yaml:"target_id"`
+	CredentialRef string        `yaml:"credential_ref"`
+	Mechanism     mechanismV2   `yaml:"mechanism"`
+	Operations    []operationV2 `yaml:"operations"`
+}
+
+// mechanismV2 represents the closed authentication union without any credential value member.
+type mechanismV2 struct {
+	Type               string   `yaml:"type"`
+	Name               string   `yaml:"name,omitempty"`
+	SensitiveJSONPaths []string `yaml:"sensitive_json_paths,omitempty"`
+}
+
+// operationV2 is one exact non-secret permission in an identity declaration.
+type operationV2 struct {
+	Capability string `yaml:"capability"`
+	Method     string `yaml:"method"`
+	Path       string `yaml:"path"`
 }
 
 // featureV1 isolates YAML field names from the internal Feature entity.
@@ -53,7 +87,7 @@ type limitsV1 struct {
 	MaxRetries   int `yaml:"max_retries"`
 }
 
-// Load reads and validates one version 1 YAML specification from path.
+// Load reads, dispatches, and validates one supported YAML specification without reinterpretation between versions.
 func Load(ctx context.Context, path string) (specification.Specification, error) {
 	if err := ctx.Err(); err != nil {
 		return specification.Specification{}, err
@@ -77,21 +111,36 @@ func Load(ctx context.Context, path string) (specification.Specification, error)
 	if err != nil {
 		return specification.Specification{}, err
 	}
-	if version != 1 {
+	if version != 1 && version != 2 {
 		return specification.Specification{}, &specification.UnsupportedVersionError{Received: version, Supported: append([]int(nil), supportedVersions...)}
 	}
-	if err := checkMapping(root, "", rootFields); err != nil {
+	fields := rootFieldsV1
+	if version == 2 {
+		fields = rootFieldsV2
+	}
+	if err := checkMapping(root, "", fields); err != nil {
 		return specification.Specification{}, err
 	}
-	if err := checkV1Fields(root); err != nil {
+	if err := checkCommonFields(root); err != nil {
 		return specification.Specification{}, err
 	}
-
-	var external documentV1
-	if err := root.Decode(&external); err != nil {
-		return specification.Specification{}, syntaxError(err, root.Line, root.Column)
+	var internal specification.Specification
+	if version == 1 {
+		var external documentV1
+		if err := root.Decode(&external); err != nil {
+			return specification.Specification{}, syntaxError(err, root.Line, root.Column)
+		}
+		internal = translateV1(external)
+	} else {
+		if err := checkV2Identities(root); err != nil {
+			return specification.Specification{}, err
+		}
+		var external documentV2
+		if err := root.Decode(&external); err != nil {
+			return specification.Specification{}, syntaxError(err, root.Line, root.Column)
+		}
+		internal = translateV2(external)
 	}
-	internal := translate(external)
 	if err := specification.Validate(internal); err != nil {
 		return specification.Specification{}, err
 	}
@@ -147,8 +196,14 @@ func syntaxError(cause error, line, column int) error {
 	return &specification.ValidationError{Category: specification.CategorySyntax, Line: line, Column: column, Cause: fmt.Errorf("decode YAML: %w", cause)}
 }
 
-var rootFields = map[string]struct{}{
+// rootFieldsV1 is the closed top-level schema accepted for legacy specifications.
+var rootFieldsV1 = map[string]struct{}{
 	"version": {}, "feature": {}, "target": {}, "constraints": {}, "limits": {},
+}
+
+// rootFieldsV2 extends the closed top-level schema with test identity declarations.
+var rootFieldsV2 = map[string]struct{}{
+	"version": {}, "feature": {}, "target": {}, "constraints": {}, "limits": {}, "identities": {},
 }
 
 // checkMapping validates mapping shape, duplicate keys, and the allowed field set.
@@ -165,7 +220,7 @@ func checkMapping(node *yaml.Node, path string, allowed map[string]struct{}) err
 		}
 		diagnosticFields := allowed
 		if diagnosticFields == nil && path == "" {
-			diagnosticFields = rootFields
+			diagnosticFields = rootFieldsV2
 		}
 		if _, trusted := diagnosticFields[key.Value]; trusted {
 			field = key.Value
@@ -279,8 +334,8 @@ func versionOf(root *yaml.Node) (int, error) {
 	return 0, &specification.ValidationError{Category: specification.CategoryRequired, Field: "version"}
 }
 
-// checkV1Fields validates the complete YAML node shape and scalar types for v1.
-func checkV1Fields(root *yaml.Node) error {
+// checkCommonFields validates the YAML fields shared by v1 and v2 before adapter translation.
+func checkCommonFields(root *yaml.Node) error {
 	if err := requireKeys(root, "", "version", "feature", "target", "constraints", "limits"); err != nil {
 		return err
 	}
@@ -350,8 +405,90 @@ func checkV1Fields(root *yaml.Node) error {
 	return nil
 }
 
-// translate removes all YAML-specific representation and returns internal entities.
-func translate(external documentV1) specification.Specification {
+// checkV2Identities validates the complete identity node shape before any potentially secret-looking value is decoded.
+func checkV2Identities(root *yaml.Node) error {
+	if err := requireKeys(root, "", "identities"); err != nil {
+		return err
+	}
+	identities := mappingValue(root, "identities")
+	if err := requireKind(identities, yaml.SequenceNode, "identities"); err != nil {
+		return err
+	}
+	for i, identity := range identities.Content {
+		path := fmt.Sprintf("identities[%d]", i)
+		if err := requireKind(identity, yaml.MappingNode, path); err != nil {
+			return err
+		}
+		if err := checkMapping(identity, path, map[string]struct{}{"id": {}, "target_id": {}, "credential_ref": {}, "mechanism": {}, "operations": {}}); err != nil {
+			return err
+		}
+		if err := requireKeys(identity, path, "id", "target_id", "credential_ref", "mechanism", "operations"); err != nil {
+			return err
+		}
+		if err := checkStringFields(identity, path, "id", "target_id", "credential_ref"); err != nil {
+			return err
+		}
+		mechanism := mappingValue(identity, "mechanism")
+		if err := requireKind(mechanism, yaml.MappingNode, path+".mechanism"); err != nil {
+			return err
+		}
+		if err := checkMapping(mechanism, path+".mechanism", map[string]struct{}{"type": {}, "name": {}, "sensitive_json_paths": {}}); err != nil {
+			return err
+		}
+		if err := requireKeys(mechanism, path+".mechanism", "type"); err != nil {
+			return err
+		}
+		if err := requireString(mappingValue(mechanism, "type"), path+".mechanism.type"); err != nil {
+			return err
+		}
+		if name := mappingValue(mechanism, "name"); name != nil {
+			if err := requireString(name, path+".mechanism.name"); err != nil {
+				return err
+			}
+		}
+		if paths := mappingValue(mechanism, "sensitive_json_paths"); paths != nil {
+			if err := checkStringSequence(paths, path+".mechanism.sensitive_json_paths"); err != nil {
+				return err
+			}
+		}
+		operations := mappingValue(identity, "operations")
+		if err := requireKind(operations, yaml.SequenceNode, path+".operations"); err != nil {
+			return err
+		}
+		for j, operation := range operations.Content {
+			opPath := fmt.Sprintf("%s.operations[%d]", path, j)
+			if err := requireKind(operation, yaml.MappingNode, opPath); err != nil {
+				return err
+			}
+			if err := checkMapping(operation, opPath, map[string]struct{}{"capability": {}, "method": {}, "path": {}}); err != nil {
+				return err
+			}
+			if err := requireKeys(operation, opPath, "capability", "method", "path"); err != nil {
+				return err
+			}
+			if err := checkStringFields(operation, opPath, "capability", "method", "path"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkStringSequence enforces a sequence of explicit strings for non-secret redaction selectors.
+func checkStringSequence(node *yaml.Node, field string) error {
+	if err := requireKind(node, yaml.SequenceNode, field); err != nil {
+		return err
+	}
+	for i, item := range node.Content {
+		if err := requireString(item, fmt.Sprintf("%s[%d]", field, i)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// translateV1 removes all YAML-specific representation while preserving the original identity-free contract.
+func translateV1(external documentV1) specification.Specification {
 	constraints := make([]specification.Constraint, len(external.Constraints))
 	for index, constraint := range external.Constraints {
 		constraints[index] = specification.Constraint{ID: constraint.ID, Description: constraint.Description, TargetID: constraint.TargetID}
@@ -363,4 +500,18 @@ func translate(external documentV1) specification.Specification {
 		Constraints: constraints,
 		Limits:      specification.Limits{MaxSteps: external.Limits.MaxSteps, MaxToolCalls: external.Limits.MaxToolCalls, MaxRetries: external.Limits.MaxRetries},
 	}
+}
+
+// translateV2 builds independent internal identity entities without retaining YAML adapter objects.
+func translateV2(external documentV2) specification.Specification {
+	base := translateV1(documentV1{Version: external.Version, Feature: external.Feature, Target: external.Target, Constraints: external.Constraints, Limits: external.Limits})
+	base.Identities = make([]specification.TestIdentity, len(external.Identities))
+	for i, identity := range external.Identities {
+		operations := make([]specification.AuthorizedOperation, len(identity.Operations))
+		for j, operation := range identity.Operations {
+			operations[j] = specification.AuthorizedOperation{Capability: operation.Capability, Method: operation.Method, Path: operation.Path}
+		}
+		base.Identities[i] = specification.TestIdentity{ID: identity.ID, TargetID: identity.TargetID, CredentialRef: identity.CredentialRef, Mechanism: specification.AuthenticationMechanism{Type: identity.Mechanism.Type, Name: identity.Mechanism.Name, SensitiveJSONPaths: append([]string(nil), identity.Mechanism.SensitiveJSONPaths...)}, Operations: operations}
+	}
+	return base
 }

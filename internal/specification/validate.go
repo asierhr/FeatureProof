@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/asierhr/featureProof/internal/jsonpath"
 )
 
 // Category is a stable validation error classification.
@@ -138,7 +140,7 @@ func Validate(spec Specification) error {
 	if spec.Version == 0 {
 		return validationError(CategoryRequired, "version", nil)
 	}
-	if spec.Version != 1 {
+	if spec.Version != 1 && spec.Version != 2 {
 		return validationError(CategoryInvalidValue, "version", nil)
 	}
 	if err := validID(spec.Feature.ID, "feature.id"); err != nil {
@@ -189,5 +191,158 @@ func Validate(spec Specification) error {
 	if spec.Limits.MaxRetries < 0 {
 		return validationError(CategoryInvalidValue, "limits.max_retries", nil)
 	}
+	if spec.Version == 1 {
+		if len(spec.Identities) != 0 {
+			return validationError(CategoryUnknownField, "identities", nil)
+		}
+		return nil
+	}
+	if err := validateIdentities(spec); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateIdentities proves every v2 identity is unique, target-bound, non-secret, and limited to complete operations.
+func validateIdentities(spec Specification) error {
+	seenIDs := make(map[string]struct{}, len(spec.Identities))
+	for i, identity := range spec.Identities {
+		prefix := fmt.Sprintf("identities[%d]", i)
+		if err := validID(identity.ID, prefix+".id"); err != nil {
+			return err
+		}
+		if _, exists := seenIDs[identity.ID]; exists {
+			return validationError(CategoryDuplicateID, prefix+".id", nil)
+		}
+		seenIDs[identity.ID] = struct{}{}
+		if identity.TargetID != spec.Target.ID {
+			return validationError(CategoryUnknownReference, prefix+".target_id", nil)
+		}
+		if !opaqueCredentialReference(identity.CredentialRef) {
+			return validationError(CategoryInvalidValue, prefix+".credential_ref", nil)
+		}
+		if err := validateMechanism(identity.Mechanism, prefix+".mechanism"); err != nil {
+			return err
+		}
+		if len(identity.Operations) == 0 {
+			return validationError(CategoryRequired, prefix+".operations", nil)
+		}
+		seenOperations := map[string]struct{}{}
+		for j, operation := range identity.Operations {
+			path := fmt.Sprintf("%s.operations[%d]", prefix, j)
+			if operation.Capability != "http.request" {
+				return validationError(CategoryInvalidValue, path+".capability", nil)
+			}
+			if !validHTTPMethod(operation.Method) {
+				return validationError(CategoryInvalidValue, path+".method", nil)
+			}
+			if !validOperationTemplate(operation.Path) {
+				return validationError(CategoryInvalidValue, path+".path", nil)
+			}
+			key := operation.Capability + "\x00" + operation.Method + "\x00" + operation.Path
+			if _, exists := seenOperations[key]; exists {
+				return validationError(CategoryDuplicateID, path, nil)
+			}
+			seenOperations[key] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// opaqueCredentialReference accepts only identifier-shaped composition keys and rejects paths, URLs, and environment syntax.
+func opaqueCredentialReference(value string) bool {
+	return identifierPattern.MatchString(value) && !strings.ContainsAny(value, "/\\:$")
+}
+
+// validateMechanism enforces the closed bearer/header/cookie union and non-secret configuration.
+func validateMechanism(mechanism AuthenticationMechanism, field string) error {
+	switch mechanism.Type {
+	case "bearer":
+		if mechanism.Name != "" {
+			return validationError(CategoryInvalidValue, field+".name", nil)
+		}
+	case "header", "cookie":
+		if !validHTTPToken(mechanism.Name) {
+			return validationError(CategoryInvalidValue, field+".name", nil)
+		}
+		lower := strings.ToLower(mechanism.Name)
+		if mechanism.Type == "header" && reservedAuthenticationHeader(lower) {
+			return validationError(CategoryInvalidValue, field+".name", nil)
+		}
+	default:
+		return validationError(CategoryInvalidValue, field+".type", nil)
+	}
+	seenPaths := map[string]bool{}
+	for i, path := range mechanism.SensitiveJSONPaths {
+		tokens, err := jsonpath.Parse(path)
+		if err != nil || len(tokens) == 0 {
+			return validationError(CategoryInvalidValue, fmt.Sprintf("%s.sensitive_json_paths[%d]", field, i), nil)
+		}
+		canonical := jsonpath.Join(tokens)
+		if seenPaths[canonical] {
+			return validationError(CategoryDuplicateID, fmt.Sprintf("%s.sensitive_json_paths[%d]", field, i), nil)
+		}
+		seenPaths[canonical] = true
+	}
+	return nil
+}
+
+// validHTTPMethod accepts canonical token methods so authorization comparisons cannot disagree on normalization.
+func validHTTPMethod(value string) bool {
+	return value != "" && value == strings.ToUpper(value) && validHTTPToken(value)
+}
+
+// validHTTPToken implements the ASCII token grammar used by safe header, cookie, and method names.
+func validHTTPToken(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("!#$%&'*+-.^_`|~", r)) {
+			return false
+		}
+	}
+	return true
+}
+
+// reservedAuthenticationHeader blocks caller-controlled authentication, framing, and hop-by-hop header names.
+func reservedAuthenticationHeader(name string) bool {
+	switch name {
+	case "authorization", "cookie", "set-cookie", "proxy-authorization", "connection", "keep-alive", "transfer-encoding", "upgrade", "host", "content-length", "te", "trailer":
+		return true
+	default:
+		return false
+	}
+}
+
+// validOperationTemplate accepts absolute segment templates while rejecting traversal, ambiguous escapes, and duplicate parameters.
+func validOperationTemplate(path string) bool {
+	if path == "/" {
+		return true
+	}
+	if path == "" || path[0] != '/' || strings.ContainsAny(path, "?#\\") || strings.Contains(path, "//") || strings.Contains(path, "%") {
+		return false
+	}
+	seen := map[string]struct{}{}
+	for _, segment := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+		if segment == "." || segment == ".." || segment == "" {
+			return false
+		}
+		if strings.HasPrefix(segment, "{") || strings.HasSuffix(segment, "}") {
+			if len(segment) < 3 || segment[0] != '{' || segment[len(segment)-1] != '}' || strings.Contains(segment[1:len(segment)-1], "{") {
+				return false
+			}
+			name := segment[1 : len(segment)-1]
+			if !identifierPattern.MatchString(name) {
+				return false
+			}
+			if _, exists := seen[name]; exists {
+				return false
+			}
+			seen[name] = struct{}{}
+		} else if strings.ContainsAny(segment, "{}") {
+			return false
+		}
+	}
+	return true
 }

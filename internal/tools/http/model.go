@@ -10,6 +10,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/specification"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 const toolName = "http.request"
@@ -50,6 +51,7 @@ type Config struct {
 	Dialer                    Dialer
 	Clock                     Clock
 	WithTimeout               TimeoutFactory
+	Authentication            *testidentity.Transport
 }
 
 // ConfigError reports a constructor rejection before a network capability can be registered.
@@ -151,6 +153,8 @@ type Tool struct {
 	dialer           Dialer
 	clock            Clock
 	withTimeout      TimeoutFactory
+	authentication   *testidentity.Transport
+	targetID         string
 }
 
 var (

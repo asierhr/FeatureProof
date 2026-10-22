@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // DecisionKind identifies the structured actions the model may request from the harness.
@@ -18,8 +20,11 @@ const (
 // ToolCall is the model-proposed request that must pass every control boundary.
 type ToolCall struct {
 	ID, Tool, ConstraintID string
+	RunID                  string
+	Attempt                int
 	Input                  map[string]any
 	IdempotencyKey         string
+	IdentityBinding        *testidentity.Binding
 }
 
 // Assertion defines the deterministic comparison applied to persisted tool output.

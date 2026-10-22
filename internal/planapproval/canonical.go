@@ -8,6 +8,7 @@ import (
 	"reflect"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // planEnvelope is the versioned public semantic projection of an opaque prepared plan.
@@ -37,6 +38,7 @@ type canonicalContext struct {
 	Constraints  any                        `json:"constraints"`
 	Contract     any                        `json:"contract"`
 	Capabilities []CapabilitySnapshot       `json:"capabilities"`
+	Identities   []testidentity.Descriptor  `json:"identities,omitempty"`
 	Runtime      RuntimeSnapshot            `json:"runtime"`
 	Generation   GenerationContractSnapshot `json:"generation"`
 }
@@ -54,7 +56,7 @@ type canonicalContract struct {
 
 // contextFingerprints retains category hashes so stale decisions can report a structural reason only.
 type contextFingerprints struct {
-	All, Target, Constraints, Contract, Capabilities, Runtime, Generation string
+	All, Target, Constraints, Contract, Capabilities, Identities, Runtime, Generation string
 }
 
 // fingerprintPlan hashes the complete immutable plan semantics after enforcing traversal budgets.
@@ -94,14 +96,18 @@ func fingerprintContext(ctx context.Context, snapshot ContractSnapshot, limits L
 		return contextFingerprints{}, err
 	}
 	contractValue := canonicalContract{MediaType: snapshot.Contract.MediaType(), Untrusted: snapshot.Contract.Untrusted(), Bytes: snapshot.Contract.Bytes(), Omissions: snapshot.Contract.Omissions(), CatalogDigest: snapshot.Contract.CatalogDigest(), PolicyDigest: snapshot.Contract.PolicyDigest(), Retained: snapshot.Contract.RetainedOperations()}
-	all := canonicalContext{Target: snapshot.Target, Constraints: snapshot.Constraints, Contract: contractValue, Capabilities: snapshot.Capabilities, Runtime: snapshot.Runtime, Generation: snapshot.GenerationContract}
+	identities, identityErr := testidentity.CanonicalDescriptors(snapshot.Identities)
+	if identityErr != nil {
+		return contextFingerprints{}, typedError(CategoryInvalidInput, "fingerprint_context", "identities", nil)
+	}
+	all := canonicalContext{Target: snapshot.Target, Constraints: snapshot.Constraints, Contract: contractValue, Capabilities: snapshot.Capabilities, Identities: identities, Runtime: snapshot.Runtime, Generation: snapshot.GenerationContract}
 	parts := []struct {
 		value  any
 		target *string
 	}{
 		{contextEnvelope{Version: 1, Context: all}, nil},
 		{snapshot.Target, nil}, {snapshot.Constraints, nil}, {contractValue, nil},
-		{snapshot.Capabilities, nil}, {snapshot.Runtime, nil}, {snapshot.GenerationContract, nil},
+		{snapshot.Capabilities, nil}, {identities, nil}, {snapshot.Runtime, nil}, {snapshot.GenerationContract, nil},
 	}
 	values := make([]string, len(parts))
 	for i := range parts {
@@ -111,12 +117,12 @@ func fingerprintContext(ctx context.Context, snapshot ContractSnapshot, limits L
 		}
 		values[i] = hash
 	}
-	return contextFingerprints{All: values[0], Target: values[1], Constraints: values[2], Contract: values[3], Capabilities: values[4], Runtime: values[5], Generation: values[6]}, nil
+	return contextFingerprints{All: values[0], Target: values[1], Constraints: values[2], Contract: values[3], Capabilities: values[4], Identities: values[5], Runtime: values[6], Generation: values[7]}, nil
 }
 
 // validateContext rejects incomplete or unbounded snapshots before a request can become visible.
 func validateContext(snapshot ContractSnapshot, limits Limits) error {
-	if snapshot.Target.ID == "" || snapshot.Target.BaseURL == "" || len(snapshot.Constraints) == 0 || snapshot.Contract.Validate() != nil || len(snapshot.Capabilities) == 0 || snapshot.Runtime.PolicyVersion == "" || snapshot.GenerationContract.ProtocolVersion == "" || snapshot.GenerationContract.PromptVersion == "" {
+	if snapshot.Target.ID == "" || snapshot.Target.BaseURL == "" || len(snapshot.Constraints) == 0 || snapshot.Contract.Validate() != nil || len(snapshot.Capabilities) == 0 || testidentity.ValidateDescriptors(snapshot.Identities) != nil || snapshot.Runtime.PolicyVersion == "" || snapshot.GenerationContract.ProtocolVersion == "" || snapshot.GenerationContract.PromptVersion == "" {
 		return typedError(CategoryInvalidInput, "validate_context", "context", nil)
 	}
 	if len(snapshot.Constraints) > limits.MaxConstraints {
@@ -219,6 +225,9 @@ func staleReason(staged, currentPlan string, stagedContext, currentContext conte
 	}
 	if stagedContext.Capabilities != currentContext.Capabilities {
 		return ReasonCapabilitiesChanged
+	}
+	if stagedContext.Identities != currentContext.Identities {
+		return ReasonIdentitiesChanged
 	}
 	if stagedContext.Runtime != currentContext.Runtime {
 		return ReasonRuntimeChanged

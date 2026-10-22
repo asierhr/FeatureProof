@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,40 +40,143 @@ import (
 	"github.com/asierhr/featureProof/internal/specification"
 	specyaml "github.com/asierhr/featureProof/internal/specification/yaml"
 	"github.com/asierhr/featureProof/internal/springinspector"
+	"github.com/asierhr/featureProof/internal/testidentity"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 )
 
 // workflowConfig is the trusted local composition record; it contains references but no credential bytes.
 type workflowConfig struct {
-	Provider               string                                  `json:"provider"`
-	Model                  string                                  `json:"model"`
-	AuthProfile            string                                  `json:"auth_profile"`
-	ProfileStore           string                                  `json:"profile_store"`
-	RuntimeProfile         string                                  `json:"runtime_profile"`
-	SpecificationPath      string                                  `json:"specification_path"`
-	ContractPath           string                                  `json:"contract_path"`
-	ContractSource         string                                  `json:"contract_source,omitempty"`
-	ContractSources        []string                                `json:"contract_sources,omitempty"`
-	OpenAPIContractPath    string                                  `json:"openapi_contract_path,omitempty"`
-	RepositoryRoot         string                                  `json:"repository_root,omitempty"`
-	GoInspector            *workflowGoInspectorConfig              `json:"go_inspector,omitempty"`
-	SpringInspector        *workflowSpringInspectorConfig          `json:"spring_inspector,omitempty"`
-	RuntimeManifestPath    string                                  `json:"runtime_manifest_path"`
-	RepositoryID           string                                  `json:"repository_id"`
-	CommitOID              string                                  `json:"commit_oid"`
-	EnvironmentID          string                                  `json:"environment_id"`
-	AttestationRef         string                                  `json:"attestation_ref"`
-	TargetAlias            string                                  `json:"target_alias"`
-	TargetURL              string                                  `json:"target_url"`
-	TargetKind             string                                  `json:"target_kind"`
-	PolicyID               string                                  `json:"policy_id"`
-	AttestationValidUntil  time.Time                               `json:"attestation_valid_until"`
-	AllowDisabledApproval  bool                                    `json:"allow_disabled_approval"`
-	ContractSelections     map[string][]workflowOperationSelection `json:"contract_selections"`
-	ContractProjection     workflowProjectionConfig                `json:"contract_projection"`
-	ContractReviewID       string                                  `json:"contract_review_id,omitempty"`
-	ContractReviewRevision uint64                                  `json:"contract_review_revision,omitempty"`
-	ContractReviewDigest   string                                  `json:"contract_review_digest,omitempty"`
+	Provider                      string                                  `json:"provider"`
+	Model                         string                                  `json:"model"`
+	AuthProfile                   string                                  `json:"auth_profile"`
+	ProfileStore                  string                                  `json:"profile_store"`
+	RuntimeProfile                string                                  `json:"runtime_profile"`
+	SpecificationPath             string                                  `json:"specification_path"`
+	ContractPath                  string                                  `json:"contract_path"`
+	ContractSource                string                                  `json:"contract_source,omitempty"`
+	ContractSources               []string                                `json:"contract_sources,omitempty"`
+	OpenAPIContractPath           string                                  `json:"openapi_contract_path,omitempty"`
+	RepositoryRoot                string                                  `json:"repository_root,omitempty"`
+	GoInspector                   *workflowGoInspectorConfig              `json:"go_inspector,omitempty"`
+	SpringInspector               *workflowSpringInspectorConfig          `json:"spring_inspector,omitempty"`
+	RuntimeManifestPath           string                                  `json:"runtime_manifest_path"`
+	RepositoryID                  string                                  `json:"repository_id"`
+	CommitOID                     string                                  `json:"commit_oid"`
+	EnvironmentID                 string                                  `json:"environment_id"`
+	AttestationRef                string                                  `json:"attestation_ref"`
+	TargetAlias                   string                                  `json:"target_alias"`
+	TargetURL                     string                                  `json:"target_url"`
+	TargetKind                    string                                  `json:"target_kind"`
+	PolicyID                      string                                  `json:"policy_id"`
+	AttestationValidUntil         time.Time                               `json:"attestation_valid_until"`
+	AllowDisabledApproval         bool                                    `json:"allow_disabled_approval"`
+	ContractSelections            map[string][]workflowOperationSelection `json:"contract_selections"`
+	ContractProjection            workflowProjectionConfig                `json:"contract_projection"`
+	ContractReviewID              string                                  `json:"contract_review_id,omitempty"`
+	ContractReviewRevision        uint64                                  `json:"contract_review_revision,omitempty"`
+	ContractReviewDigest          string                                  `json:"contract_review_digest,omitempty"`
+	IdentityCredentialEnvironment map[string]string                       `json:"identity_credential_environment,omitempty"`
+	IdentityObservationTimeoutMS  int                                     `json:"identity_observation_timeout_ms,omitempty"`
+}
+
+// workflowEnvironmentCredentialResolver resolves one composition-mapped environment entry only at the terminal authenticated attempt.
+type workflowEnvironmentCredentialResolver struct {
+	reference, environment string
+}
+
+// workflowCredentialResolverFactory is the composition-owned port that creates one late resolver for each trusted reference mapping.
+type workflowCredentialResolverFactory func(reference, environment string) testidentity.CredentialResolver
+
+// workflowCompositionOptions carries productive ports and startup recovery behavior without exposing them to workflow input.
+type workflowCompositionOptions struct {
+	githubAuthority           validationworkflow.GitHubPullRequestAuthority
+	credentialResolverFactory workflowCredentialResolverFactory
+	recoverPending            bool
+}
+
+// Resolve copies late-bound material into an attempt-owned lease without exposing its environment location outside composition.
+func (r workflowEnvironmentCredentialResolver) Resolve(ctx context.Context, request testidentity.ResolutionRequest) (testidentity.CredentialLease, error) {
+	if err := ctx.Err(); err != nil {
+		return testidentity.CredentialLease{}, err
+	}
+	if request.CredentialReference != r.reference {
+		return testidentity.CredentialLease{}, errors.New("credential resolver mismatch")
+	}
+	value, ok := os.LookupEnv(r.environment)
+	if !ok || value == "" {
+		return testidentity.CredentialLease{}, errors.New("credential unavailable")
+	}
+	return testidentity.NewCredentialLease([]byte(value), request.Mechanism, time.Time{}, nil), nil
+}
+
+// newWorkflowEnvironmentCredentialResolver creates the default resolver that reads its trusted environment location only during Resolve.
+func newWorkflowEnvironmentCredentialResolver(reference, environment string) testidentity.CredentialResolver {
+	return workflowEnvironmentCredentialResolver{reference: reference, environment: environment}
+}
+
+// workflowIdentityObserver confirms terminal observation synchronously without publishing credential-adjacent data.
+type workflowIdentityObserver struct{}
+
+// Observe honors the composition-owned bound and leaves durable safe attempt facts to the existing runner journal.
+func (workflowIdentityObserver) Observe(ctx context.Context, _ testidentity.AttemptRecord) error {
+	return ctx.Err()
+}
+
+// composeWorkflowIdentities validates every opaque reference against one trusted late environment resolver before model construction.
+func composeWorkflowIdentities(spec specification.Specification, config workflowConfig) (map[string]testidentity.CredentialResolver, testidentity.Observer, time.Duration, error) {
+	return composeWorkflowIdentitiesWithFactory(spec, config, newWorkflowEnvironmentCredentialResolver)
+}
+
+// composeWorkflowIdentitiesWithFactory validates the exact reference set and delegates resolver construction to the trusted composition port.
+func composeWorkflowIdentitiesWithFactory(spec specification.Specification, config workflowConfig, factory workflowCredentialResolverFactory) (map[string]testidentity.CredentialResolver, testidentity.Observer, time.Duration, error) {
+	if len(spec.Identities) == 0 {
+		if len(config.IdentityCredentialEnvironment) != 0 || config.IdentityObservationTimeoutMS != 0 {
+			return nil, nil, 0, errors.New("unexpected identity composition")
+		}
+		return nil, nil, 0, nil
+	}
+	references := make(map[string]struct{}, len(spec.Identities))
+	for _, identity := range spec.Identities {
+		references[identity.CredentialRef] = struct{}{}
+	}
+	if factory == nil || config.IdentityObservationTimeoutMS <= 0 || len(config.IdentityCredentialEnvironment) != len(references) {
+		return nil, nil, 0, errors.New("identity composition unavailable")
+	}
+	resolvers := make(map[string]testidentity.CredentialResolver, len(references))
+	for reference := range references {
+		environment := config.IdentityCredentialEnvironment[reference]
+		if environment == "" || strings.ContainsAny(environment, "=\x00") {
+			return nil, nil, 0, errors.New("identity composition unavailable")
+		}
+		resolvers[reference] = factory(reference, environment)
+		if resolvers[reference] == nil {
+			return nil, nil, 0, errors.New("identity composition unavailable")
+		}
+	}
+	return resolvers, workflowIdentityObserver{}, time.Duration(config.IdentityObservationTimeoutMS) * time.Millisecond, nil
+}
+
+// workflowIdentityCompositionDigest binds safe resolver mappings and observation bounds without reading or hashing credential material.
+func workflowIdentityCompositionDigest(config workflowConfig) string {
+	keys := make([]string, 0, len(config.IdentityCredentialEnvironment))
+	for reference := range config.IdentityCredentialEnvironment {
+		keys = append(keys, reference)
+	}
+	sort.Strings(keys)
+	values := []string{strconv.Itoa(config.IdentityObservationTimeoutMS)}
+	for _, reference := range keys {
+		values = append(values, reference, config.IdentityCredentialEnvironment[reference])
+	}
+	return workflowDigest(values...)
+}
+
+// workflowEffectiveRedaction seals one identity-augmented policy and manifest configuration shared by planning, approval, and execution.
+func workflowEffectiveRedaction(spec specification.Specification, manifest *planmanifest.Manifest) (*evidence.Policy, error) {
+	if manifest == nil {
+		return nil, errors.New("runtime manifest unavailable")
+	}
+	manifest.Redaction = evidence.AugmentAuthenticationConfig(manifest.Redaction, spec.Identities)
+	return evidence.NewPolicy(manifest.Redaction)
 }
 
 // workflowGoInspectorConfig carries the explicit trusted roots, PR impact, build selector, auth allowlist, and budgets for Go analysis.
@@ -227,11 +331,16 @@ func containsContractSource(values []string, expected string) bool {
 // composeWorkflowCLI resolves OAuth and filesystem references only in the executable composition root.
 // feature22:coverage composeWorkflowCLI
 func composeWorkflowCLI(ctx context.Context, stdout, stderr io.Writer) (*validationworkflow.CLI, error) {
-	return composeWorkflowCLIWithGitHubAuthority(ctx, stdout, stderr, nil)
+	return composeWorkflowCLIWithOptions(ctx, stdout, stderr, workflowCompositionOptions{credentialResolverFactory: newWorkflowEnvironmentCredentialResolver, recoverPending: true})
 }
 
 // composeWorkflowCLIWithGitHubAuthority additionally binds a composition-owned PR refresher for durable GitHub decisions.
 func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr io.Writer, githubAuthority validationworkflow.GitHubPullRequestAuthority) (*validationworkflow.CLI, error) {
+	return composeWorkflowCLIWithOptions(ctx, stdout, stderr, workflowCompositionOptions{githubAuthority: githubAuthority, credentialResolverFactory: newWorkflowEnvironmentCredentialResolver, recoverPending: true})
+}
+
+// composeWorkflowCLIWithOptions constructs the shared productive service graph from trusted ports and optionally runs startup recovery.
+func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer, options workflowCompositionOptions) (*validationworkflow.CLI, error) {
 	config, err := loadWorkflowConfig()
 	if err != nil {
 		return nil, err
@@ -262,7 +371,11 @@ func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr i
 	if err != nil {
 		return nil, err
 	}
-	redaction, err := evidence.NewPolicy(manifest.Redaction)
+	identityResolvers, identityObserver, identityObservationTimeout, err := composeWorkflowIdentitiesWithFactory(spec, config, options.credentialResolverFactory)
+	if err != nil {
+		return nil, err
+	}
+	redaction, err := workflowEffectiveRedaction(spec, &manifest)
 	if err != nil {
 		return nil, err
 	}
@@ -301,6 +414,7 @@ func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr i
 	}
 	assertions := assertion.DefinitionValidator{Policy: redaction}
 	runtimeDeps := localvalidation.DefaultDependencies(root, stdout, stderr)
+	runtimeDeps.CredentialResolvers, runtimeDeps.IdentityObserver, runtimeDeps.IdentityObservationTimeout = identityResolvers, identityObserver, identityObservationTimeout
 	capability, err := localvalidation.BuildHTTPPlanningCapability(spec, manifest, config.TargetURL, runtimeDeps)
 	if err != nil {
 		return nil, err
@@ -333,7 +447,7 @@ func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr i
 	if err != nil {
 		return nil, err
 	}
-	compositionRef := workflowDigest("composition", config.Provider, config.Model, config.AuthProfile)
+	compositionRef := workflowDigest("composition", config.Provider, config.Model, config.AuthProfile, workflowIdentityCompositionDigest(config))
 	projection, err := config.ContractProjection.policy(manifest.Redaction.AdditionalHeaders)
 	if err != nil {
 		return nil, errors.New("invalid contract projection configuration")
@@ -349,8 +463,8 @@ func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr i
 		if !ok {
 			return nil, errors.New("invalid contract review composition")
 		}
-		if githubAuthority != nil {
-			reviewService.GitHub = githubAuthority
+		if options.githubAuthority != nil {
+			reviewService.GitHub = options.githubAuthority
 		}
 		authority := contractreview.WorkflowAuthority{Service: reviewService}
 		approvedAuthority = authority
@@ -372,8 +486,8 @@ func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr i
 	}
 	trustedAdmission := validationworkflow.TrustedAdmissionBuilder{Specifications: workflowSpecLoader{path: config.SpecificationPath}, Contracts: contractReducer, Bindings: workflowBindingVerifier{config: config, binding: bindingContext}, Catalog: workflowCatalog{profile: config.RuntimeProfile, runtime: runtimeContext, descriptors: []agentplanning.CapabilityDescriptor{capability}}, Config: validationworkflow.AdmissionConfig{Provider: config.Provider, Model: config.Model, CompositionRef: compositionRef, Limits: agentplanning.Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 128, MaxCapabilities: 16, MaxChecks: 384, MaxStepsPerCheck: 64, MaxAssertionsPerStep: 64, MaxMissingItems: 32, MaxValidationWork: 100000}}}
 	var admission validationworkflow.AdmissionBuilder = trustedAdmission
-	if githubAuthority != nil {
-		admission = validationworkflow.GitHubRefreshingAdmission{Next: trustedAdmission, Authority: githubAuthority}
+	if options.githubAuthority != nil {
+		admission = validationworkflow.GitHubRefreshingAdmission{Next: trustedAdmission, Authority: options.githubAuthority}
 	}
 	storeRoot := filepath.Join(root, ".featureproof", "workflows")
 	store, err := validationworkflow.OpenLocalStore(storeRoot)
@@ -410,8 +524,10 @@ func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr i
 	if err != nil {
 		return nil, err
 	}
-	if err = service.Recover(ctx); err != nil {
-		return nil, err
+	if options.recoverPending {
+		if err = service.Recover(ctx); err != nil {
+			return nil, err
+		}
 	}
 	cli := &validationworkflow.CLI{Service: service, Principal: current.Uid, AuthProfiles: map[string]string{config.AuthProfile: compositionRef}, DirectTargets: map[string]validationworkflow.DirectTarget{}, PreviewTargets: map[string]validationworkflow.PreviewTarget{}}
 	if config.TargetKind == "direct" {
@@ -805,9 +921,19 @@ type workflowAutoPolicy struct{ allowed bool }
 // workflowApprovalSanitizer adapts the evidence sanitizer's metadata-bearing result to planapproval.
 type workflowApprovalSanitizer struct{ inner evidence.Sanitizer }
 
-// Sanitize returns only the treated value while keeping truncation metadata private to composition.
+// Sanitize normalizes typed approval values into JSON data and returns only the treated projection while keeping truncation metadata private to composition.
 func (s workflowApprovalSanitizer) Sanitize(ctx context.Context, value any) (any, error) {
-	treated, err := s.inner.Sanitize(ctx, value)
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var compatible any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err = decoder.Decode(&compatible); err != nil {
+		return nil, err
+	}
+	treated, err := s.inner.Sanitize(ctx, compatible)
 	if err != nil {
 		return nil, err
 	}

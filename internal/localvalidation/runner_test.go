@@ -183,8 +183,8 @@ func TestRunCommandReportsSafeTypedValidationDiagnostics(t *testing.T) {
 	for _, scenario := range []struct {
 		name, mutateSpec, mutatePlan, target, expected string
 	}{
-		{name: "specification", mutateSpec: "version: 2", target: "http://127.0.0.1:1", expected: "category=unsupported_version field=version"},
-		{name: "manifest", mutatePlan: `"version":2`, target: "http://127.0.0.1:1", expected: "category=unsupported_version field=version"},
+		{name: "specification", mutateSpec: "version: 3", target: "http://127.0.0.1:1", expected: "category=unsupported_version field=version"},
+		{name: "manifest", mutatePlan: `"version":3`, target: "http://127.0.0.1:1", expected: "category=unsupported_version field=version"},
 		{name: "redaction", mutatePlan: `"additional_sensitive_headers":["X-Secret","X-Secret"]`, target: "http://127.0.0.1:1", expected: "category=invalid_redaction_config field=additional_sensitive_headers[1]"},
 		{name: "http", target: "http://user:CANARY@127.0.0.1:1", expected: "category=invalid_http_config field=target.base_url"},
 		{name: "planning", mutatePlan: `"operator":"BAD"`, target: "http://127.0.0.1:1", expected: "category=invalid_value field=steps[0].assertions[0].definition.operator"},

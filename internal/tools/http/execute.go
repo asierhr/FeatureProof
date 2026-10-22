@@ -21,11 +21,21 @@ import (
 	"unicode/utf8"
 
 	"github.com/asierhr/featureProof/internal/harness"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 var errResponseHeaderLimit = errors.New("response header limit exceeded")
 var errRequestHeaderLimit = errors.New("request header limit exceeded")
 var errRequestHeaderMeasured = errors.New("request header measurement complete")
+
+// dnsStageError preserves resolver retry hints while allowing Execute to retain its stable dns category after late authentication.
+type dnsStageError struct{ cause error }
+
+// Error returns a fixed safe diagnostic instead of resolver-controlled text.
+func (e *dnsStageError) Error() string { return "HTTP DNS resolution failed" }
+
+// Unwrap preserves the resolver cause for standard transient network classification.
+func (e *dnsStageError) Unwrap() error { return e.cause }
 
 // requestHeaderCounter measures the HTTP/1.1 header block while stopping before body bytes are copied.
 type requestHeaderCounter struct {
@@ -124,24 +134,45 @@ func (t *Tool) Execute(parent context.Context, call harness.ToolCall) (harness.T
 	defer cancel()
 	started := t.clock.Now()
 	baseResult := emptyResult()
-	addresses, err := t.resolve(operation)
-	if err != nil {
-		baseResult.DurationMS = durationMillis(started, t.clock.Now())
-		if parent.Err() != nil || operation.Err() != nil {
-			return classifiedContextError(parent, operation, err, baseResult)
-		}
-		return operationFailure("dns", transientNetworkError(err), err, baseResult)
-	}
-	transport := t.transport(addresses)
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport}
-	client.CheckRedirect = t.redirectPolicy(addresses)
 	request, err := t.request(operation, input)
 	if err != nil {
 		baseResult.DurationMS = durationMillis(started, t.clock.Now())
 		return operationFailure("encode", false, err, baseResult)
 	}
-	response, exchangeErr := client.Do(request)
+	network := func(outbound *http.Request) (*http.Response, error) {
+		addresses, resolveErr := t.resolve(operation)
+		if resolveErr != nil {
+			return nil, &dnsStageError{cause: resolveErr}
+		}
+		transport := t.transport(addresses)
+		defer transport.CloseIdleConnections()
+		targetRedirectPolicy := t.redirectPolicy(addresses)
+		identityRedirectPolicy := func(request *http.Request, via []*http.Request) error {
+			if call.IdentityBinding != nil {
+				if t.authentication == nil {
+					return &testidentity.Error{Category: testidentity.CategoryInternal, Phase: "redirect", Field: "identity"}
+				}
+				redirectOperation := testidentity.Operation{Capability: toolName, TargetID: t.targetID, Method: request.Method, Path: request.URL.Path}
+				if identityErr := t.authentication.Revalidate(*call.IdentityBinding, redirectOperation); identityErr != nil {
+					return identityErr
+				}
+			}
+			return targetRedirectPolicy(request, via)
+		}
+		client := &http.Client{Transport: transport, CheckRedirect: identityRedirectPolicy}
+		return client.Do(outbound)
+	}
+	var response *http.Response
+	var exchangeErr error
+	if call.IdentityBinding != nil {
+		if t.authentication == nil {
+			return operationFailure("identity_unavailable", false, nil, baseResult)
+		}
+		concrete := testidentity.Operation{Capability: toolName, TargetID: t.targetID, Method: input.method, Path: request.URL.Path}
+		response, exchangeErr = t.authentication.Exchange(operation, *call.IdentityBinding, concrete, request, call.RunID, "", call.Attempt, network)
+	} else {
+		response, exchangeErr = network(request)
+	}
 	baseResult.DurationMS = durationMillis(started, t.clock.Now())
 	if exchangeErr != nil {
 		if response != nil && response.Body != nil {
@@ -149,6 +180,14 @@ func (t *Tool) Execute(parent context.Context, call harness.ToolCall) (harness.T
 		}
 		if parent.Err() != nil || operation.Err() != nil {
 			return classifiedContextError(parent, operation, exchangeErr, baseResult)
+		}
+		var identityErr *testidentity.Error
+		if errors.As(exchangeErr, &identityErr) {
+			return operationFailure("identity_"+string(identityErr.Category), false, identityErr, baseResult)
+		}
+		var dnsErr *dnsStageError
+		if errors.As(exchangeErr, &dnsErr) {
+			return operationFailure("dns", transientNetworkError(dnsErr.cause), dnsErr, baseResult)
 		}
 		category, transient := classifyExchangeError(exchangeErr)
 		return operationFailure(category, transient, exchangeErr, baseResult)

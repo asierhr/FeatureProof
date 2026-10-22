@@ -9,6 +9,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/harness"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // Project reconstructs the only authoritative approval state from a strict confirmed event prefix.
@@ -144,7 +145,7 @@ func validSHA256(value string) bool {
 // validInvalidationReason limits recovery to the reason vocabulary specified by approval protocol v1.
 func validInvalidationReason(reason InvalidationReason) bool {
 	switch reason {
-	case ReasonConstraintsEdited, ReasonRegenerationRequested, ReasonPlanChanged, ReasonTargetChanged, ReasonConstraintsChanged, ReasonContractChanged, ReasonCapabilitiesChanged, ReasonRuntimeChanged, ReasonGenerationContractChanged:
+	case ReasonConstraintsEdited, ReasonRegenerationRequested, ReasonPlanChanged, ReasonTargetChanged, ReasonConstraintsChanged, ReasonContractChanged, ReasonCapabilitiesChanged, ReasonIdentitiesChanged, ReasonRuntimeChanged, ReasonGenerationContractChanged:
 		return true
 	default:
 		return false
@@ -161,6 +162,7 @@ func cloneContext(snapshot ContractSnapshot) ContractSnapshot {
 	out := snapshot
 	out.Constraints = append([]agentplanning.Constraint(nil), snapshot.Constraints...)
 	out.Capabilities = append([]CapabilitySnapshot(nil), snapshot.Capabilities...)
+	out.Identities = testidentity.CloneDescriptors(snapshot.Identities)
 	out.Runtime.Limits = make(map[string]int, len(snapshot.Runtime.Limits))
 	for key, value := range snapshot.Runtime.Limits {
 		out.Runtime.Limits[key] = value

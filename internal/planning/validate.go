@@ -124,6 +124,12 @@ func (v *Validator) validateStep(step PlanStep, position int, index map[string]i
 	if step.Input == nil {
 		return planError(ErrorRequired, path+".input", nil)
 	}
+	if step.IdentityBinding != nil {
+		binding := step.IdentityBinding
+		if step.Tool != "http.request" || binding.IdentityID == "" || binding.Operation.Capability != step.Tool || binding.Operation.TargetID == "" || binding.Operation.Method == "" || binding.Operation.Path == "" || len(binding.Digest) != 64 {
+			return planError(ErrorInvalidValue, path+".identity_binding", nil)
+		}
+	}
 	if err := validateInputMap(step.Input, path+".input", index); err != nil {
 		return err
 	}

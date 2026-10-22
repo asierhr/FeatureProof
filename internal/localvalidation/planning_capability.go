@@ -31,7 +31,7 @@ func BuildHTTPPlanningCapability(spec specification.Specification, manifest plan
 // planningInputValue converts a validated planning union into the executable tool validator's JSON-shaped input.
 func planningInputValue(value planning.InputValue) any {
 	if value.Literal != nil {
-		return value.Literal
+		return value.Literal.Value
 	}
 	if value.Reference != nil {
 		raw, _ := json.Marshal(value.Reference)

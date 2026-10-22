@@ -232,6 +232,24 @@ func TestFunctionalEventRequiresConfirmedPlanBinding(t *testing.T) {
 	}
 }
 
+// TestApprovedPlanBindingRetainsItsOpaqueReferenceDuringPublication proves canonical journal verification accepts the exact consumed approval grant.
+func TestApprovedPlanBindingRetainsItsOpaqueReferenceDuringPublication(t *testing.T) {
+	binding := testBinding(t)
+	plan, err := revisionbinding.NewApprovedPlanBinding(context.Background(), binding, 1, strings.Repeat("d", 64), "approval:0123456789abcdef0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := []harness.Event{
+		{Sequence: 1, Type: harness.EventRunCreated, RunID: binding.RunID, BindingSHA256: binding.BindingSHA256},
+		{Sequence: 2, Type: harness.EventBindingConfirmed, RunID: binding.RunID, BindingSHA256: binding.BindingSHA256},
+		{Sequence: 3, Type: harness.EventPlanBindingConfirmed, RunID: binding.RunID, BindingSHA256: binding.BindingSHA256, PlanSHA256: plan.PlanSHA256},
+		{Sequence: 4, Type: harness.EventRunCompleted, RunID: binding.RunID, BindingSHA256: binding.BindingSHA256, Status: string(ResultPassed)},
+	}
+	if err = verifyBoundSequence(context.Background(), binding, []revisionbinding.PlanBinding{plan}, events, ResultPassed); err != nil {
+		t.Fatalf("approved binding rejected: %v", err)
+	}
+}
+
 // TestEventReferencedForeignEvidencePreventsBundleCommit verifies records
 // referenced only by journal events, including intermediate attempts.
 func TestEventReferencedForeignEvidencePreventsBundleCommit(t *testing.T) {

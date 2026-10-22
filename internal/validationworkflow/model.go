@@ -13,6 +13,7 @@ import (
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // ContractVersion identifies the public workflow API and adapter contract.
@@ -179,6 +180,7 @@ func (s AdmissionSnapshot) Clone() AdmissionSnapshot {
 	out := s
 	out.Generation.Constraints = append([]agentplanning.Constraint(nil), s.Generation.Constraints...)
 	out.Generation.Capabilities = append([]agentplanning.CapabilityDescriptor(nil), s.Generation.Capabilities...)
+	out.Generation.Identities = testidentity.CloneDescriptors(s.Generation.Identities)
 	out.Binding = canonicalBindingContext(s.Binding)
 	out.Runtime = canonicalRuntimeContext(s.Runtime)
 	return out

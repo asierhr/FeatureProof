@@ -2393,3 +2393,311 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
   de `spec_ready` a `in_progress`.
 - Se autoriza al implementer a ejecutar T1–T13 en orden; el estado `done`
   seguirá reservado al leader tras review independiente aprobada.
+
+## 2026-10-22 — Feature 25, primera revisión independiente
+
+- Veredicto `rejected`; se reabren las tareas afectadas por REV-1–REV-8.
+- Bloqueos: binding omitido con inputs referenciados, policy no reevaluada por
+  retry, composición productiva sin resolvers, lease sin liberar en error,
+  observer terminal no acotado y snapshot de identidades no sellado.
+- Además debe unificarse la política efectiva de redacción antes de planning y
+  corregirse el gate de formato/comentarios antes de volver a review.
+
+## 2026-10-22 — Feature 25, segunda revisión independiente
+
+- Veredicto `rejected`: REV-1/2/4/5/6/7/8 quedan cerrados; REV-3 sigue abierto.
+- Se abren REV-9–REV-11: el retry reserva budget antes de policy, los rechazos
+  pre-red carecen de evento terminal de identidad y composición exige
+  incorrectamente una entrada por identidad en vez de por referencia única.
+- Se reabren T10–T13 hasta demostrar paridad terminal y recovery/redelivery
+  reales, corregir orden/contabilidad y completar auditoría segura.
+
+## 2026-10-22 — Feature 25, tercera revisión independiente
+
+- Veredicto `rejected`: REV-9–REV-11 quedan cerrados y REV-1/2/4–8 siguen
+  cerrados; REV-3 permanece abierto por evidencia incompleta.
+- Se abre REV-12: rotación real y journal append-only están probados por
+  separado, pero falta una vertical que demuestre ambas propiedades juntas.
+- Se reabren T9–T13 para medir llamadas reales a `Resolve`, comparar errores en
+  las cuatro superficies, ejecutar `Service.Recover` y trazar la rotación sin
+  persistir referencias ni canarios.
+
+## 2026-10-22 — Feature 25, cuarta revisión independiente
+
+- Veredicto `rejected`: REV-3 y REV-12 quedan cerrados; REV-1–REV-12 ya no
+  conservan defectos abiertos en sus alcances originales.
+- Se abren REV-13 y REV-14 en la frontera durable: el package reader debe
+  verificar ID/digest/ordinal/categoría de eventos de identidad contra el plan
+  sellado y faltan comentarios sistémicos en dos helpers modificados.
+- Se reabren T9, T12 y T13 con alcance exclusivo en validación fail-closed de
+  packages manipulados, comentarios y gates.
+
+## 2026-10-22 — Feature 25, quinta revisión independiente
+
+- Veredicto `rejected`: REV-14 queda cerrado y REV-13 se sustituye por REV-15.
+- El reader aún acepta terminal ausente o extra contiguo y campos aislados de
+  identidad en eventos incompatibles, incluso con package rehasheado.
+- Se mantienen reabiertas T9, T12 y T13 hasta modelar el tuple completo por
+  evento/step y exigir cardinalidad exacta entre intentos y terminales.
+
+## 2026-10-22 — Feature 25, sexta revisión independiente
+
+- Veredicto `rejected`: REV-15 queda cerrado para tuple y cardinalidad.
+- Se abre REV-16: el reader necesita una fase por step+attempt para impedir
+  terminal antes de ejecución, éxito sin ejecución, eventos posteriores al
+  terminal y contradicción entre finished y outcome terminal.
+- T9, T12 y T13 permanecen reabiertas con alcance exclusivo en la máquina de
+  estados durable y sus adversarios rehasheados.
+
+## 2026-10-22 — Feature 25, séptima revisión independiente
+
+- Veredicto `rejected`: REV-16 queda cerrado.
+- Se abre REV-17: una cancelación tras `budget_reserved` o el marker de retry
+  puede impedir `execution_started` y dejar el intento sin terminal; el reader
+  tampoco admite todavía ese terminal cancelado legítimo.
+- T9, T12 y T13 siguen reabiertas para corregir productor y reader en ambas
+  fronteras, con cero tool/resolver/red posterior.
+
+## 2026-10-22 — Feature 25, octava revisión independiente
+
+- Veredicto `rejected`: REV-17 queda cerrado.
+- Se abre REV-18: si los appends de policy, budget o retry devuelven
+  cancel/deadline antes de confirmar, el executor retorna sin reconciliar el
+  terminal del intento afectado.
+- T9, T12 y T13 siguen reabiertas hasta aplicar cierre acotado según el último
+  prefijo durable y probar cancel/deadline en intento inicial y retry.
+
+## 2026-10-22 — Feature 25, novena revisión y cierre
+
+- Review independiente `approved`: REV-18 queda cerrado y REV-1–REV-17
+  permanecen cerrados sin regresión.
+- R1–R11 y T1–T13 quedan completos; los appends pre-I/O reconciliaron
+  cancel/deadline con terminal único, prefijo durable exacto y cero efectos
+  posteriores.
+- El smoke final de los paquetes afectados y la matriz durable de
+  `localvalidation` pasan.
+- El leader cambia `test-identities` de `in_progress` a `done`.
+
+## 2026-10-22 — Feature 25, implementación T1–T2
+
+- T1 completa: el dominio admite specification v2 con identidades, mecanismos cerrados, referencias opacas y permisos HTTP exactos; v1 permanece sin identidades.
+- T2 completa: el loader despacha v1/v2 antes de interpretar campos, rechaza secretos inline, duplicados y tipos ambiguos sin mostrar valores.
+- Evidencia: `go test ./internal/specification/... -count=1` pasa.
+
+## 2026-10-22 — Feature 25, implementación T3–T7
+
+- T3–T4 completas: catálogo inmutable, matching estructural y descriptores
+  mínimos alimentan agent planning; la selección explícita queda en provenance
+  y no admite identidades inventadas ni referencias privadas.
+- T5–T7 completas: plan/manifest v2, executor guard, leases y transporte tardío
+  revalidan por intento, inyectan sobre clones y liberan material una vez.
+- La integración HTTP impide resolver o abrir red ante binding inválido y
+  revalida cada redirect contra la operación sellada antes del siguiente hop.
+- Evidencia: suites focales de `testidentity`, `agentplanning`, `planning`,
+  `planmanifest` y `tools/http` pasan, incluida concurrencia con canarios.
+
+## 2026-10-22 — Feature 25, implementación T8–T12
+
+- T8 completa: la redacción añade headers y JSON paths de autenticación de
+  forma monotónica y falla cerrada ante valores no clasificables.
+- T9–T10 completas: journal y proyección conservan solo ID/digest/categoría;
+  composición exige un resolver exacto por referencia y vuelve a resolver en
+  cada intento sin persistir leases.
+- T11–T12 completas: CLI, API, MCP y GitHub rechazan campos secretos o de
+  composición; la prueba vertical escanea todos los archivos durables y no
+  encuentra canarios ni referencias opacas.
+- Evidencia: pruebas focales repetidas, race y servidor HTTP real local pasan;
+  `testidentity` alcanza 90,7 % de cobertura, specification 95,5 %, YAML 87,3 %
+  y los demás paquetes afectados medidos permanecen por encima del 85 %.
+
+## 2026-10-22 — Feature 25, implementación completa
+
+- T1–T13 quedan completas con trazabilidad R1–R11 en
+  `progress/test-identities/implementation.md`.
+- Pasan gofmt, compile-only, vet, suites focales ×20, validation workflow ×20,
+  localvalidation focal ×10, race focal y cross-build Windows/Linux/Darwin.
+- La suite global conserva únicamente el fallo ambiental histórico al crear un
+  symlink en Windows sin privilegio; todos los demás paquetes pasan.
+- El diff no modifica `feature_list.json`, no marca la feature como `done` y no
+  incorpora trabajo de feature 26. Se solicita review independiente.
+
+## 2026-10-22 — Feature 25, primera remediación iniciada
+
+- Review independiente rechazada con REV-1–REV-8.
+- Se reabren T3–T13 para cerrar autorización dinámica fail-closed, policy por
+  retry, composición productiva, ownership de leases, observación acotada,
+  snapshots sellados, policy de redacción única y gates canónicos.
+- T1–T2 permanecen completas: R1 no fue invalidada por la review.
+
+## 2026-10-22 — Feature 25, primera remediación completa
+
+- REV-1–REV-8 corregidas: manifests dinámicos fallan cerrados, policy e identidad
+  se reevalúan por intento y la composición productiva se valida antes del
+  modelo con resolución tardía.
+- Lease+error/cancel libera exactamente una vez; observer terminal usa bound
+  configurado y no deja trabajo detached.
+- Identidades quedan deep-copied, canónicas y selladas en admission, approval,
+  recovery y pre-I/O; una única redaction policy efectiva rige planning y
+  ejecución.
+- Paridad vertical CLI/API/MCP/GitHub verificada contra el mismo contrato de
+  binding; restart y ausencia de resolver fallan cerrados sin material durable.
+- T3–T13 vuelven a completas con focales ×20, race UCRT64, coverage >=85 % del
+  alcance nuevo/modificado, vet, compile, cross-build, gofmt y diff-check.
+- La única limitación global continúa siendo el symlink histórico de Windows
+  sin privilegio. Se solicita nueva review independiente.
+
+## 2026-10-22 — Feature 25, segunda remediación iniciada
+
+- Segunda review rechazada con alcance cerrado REV-3 y REV-9–REV-11; se reabren T10–T13.
+- Se preservan REV-1/2/4/5/6/7/8 y T1–T9; no se tocará `feature_list.json` ni feature 26.
+- Trabajo pendiente: terminales reales en cuatro superficies y recovery/redelivery, reserva atómica de retry tras policy, eventos terminales de identidad pre-red y cobertura exacta de referencias únicas compartidas.
+
+## 2026-10-22 — Feature 25, segunda remediación completa
+
+- REV-3 queda cerrada con una vertical productiva terminal sobre API, CLI, MCP
+  y GitHub: todas conservan identity/binding/outcome/código y exactamente una
+  inferencia, resolución autenticada y llamada de red.
+- Redelivery terminal no repite modelo, resolución ni red. Un workflow pendiente
+  se recupera tras recrear `Service` y composición y usa material resuelto de
+  nuevo después del restart; composición ausente corta antes del modelo.
+- REV-9 mueve la reserva atómica retry+tool-call después de revalidar identidad
+  y policy. Allow→deny, drift y cancelación de policy no consumen retry/tool-call
+  ni alcanzan resolver/red.
+- REV-10 añade un terminal seguro por intento autenticado, incluso drift,
+  policy, budget, credencial y cancelación inicial o de retry, con correlación
+  completa y categorías cerradas sin texto externo.
+- REV-11 valida el conjunto exacto de referencias únicas: comparte resolver
+  cuando corresponde y rechaza mappings faltantes o sobrantes.
+- La vertical detectó y corrigió tres límites productivos: conversión de
+  literales al validador HTTP, normalización JSON previa al sanitizer de
+  aprobación y canonicalización de bindings con referencia de aprobación.
+- T10–T13 vuelven a completas. Pasan focales repetidos, race UCRT64, gofmt,
+  compile-only, vet, cross-build Linux/Darwin, cobertura del alcance y
+  `git diff --check`. La suite global mantiene únicamente el fallo histórico
+  de symlink sin privilegio en Windows.
+### 2026-10-22 — Feature 25 tercera remediación en curso
+
+- Reabiertas T9–T13 para cerrar REV-3 y REV-12.
+- Trabajo limitado a instrumentación del resolver productivo, paridad de fallo de identidad, recovery explícito y rotación histórica unida al journal.
+
+## 2026-10-22 — Feature 25, tercera remediación completa
+
+- REV-3 queda cerrado con un puerto productivo de factory y un spy que cuenta
+  llamadas reales a `CredentialResolver.Resolve`; éxito y fallo de credencial
+  recorren API, CLI, MCP y GitHub con binding, outcome, categoría, código propio
+  y contadores exactos.
+- Redelivery conserva una sola resolución/red; el restart recrea composición y
+  `Service`, invoca `Service.Recover` explícitamente sin efectos y completa la
+  aprobación con resolver y material frescos.
+- REV-12 queda cerrado con dos runs productivos y credenciales rotadas: cada run
+  resuelve una vez, conserva identity ID/digest, escribe un terminal ordinal 1
+  `success`, no altera el journal previo y excluye canarios y credential ref de
+  journal, evidence, report, artifact y filesystem durable.
+- T9–T13 vuelven a completas. Pasan focales ×20, race UCRT64, compile-only,
+  vet, cross-build Linux/Darwin, gofmt y diff-check. La suite global conserva
+  únicamente el fallo histórico de symlink sin privilegio en Windows.
+
+## 2026-10-22 — Feature 25, cuarta remediación en curso
+
+- Reabiertas T9, T12 y T13 para cerrar REV-13/REV-14 en la frontera durable.
+- Se validarán los hechos terminales contra el step sellado, secuencia ordinal
+  y vocabulario cerrado incluso tras rehash completo de un package manipulado.
+
+## 2026-10-22 — Feature 25, cuarta remediación completa
+
+- REV-13 cerrado: la topología durable conserva identity ID y operation-binding
+  digest por step; el reader exige presencia conjunta, coincidencia exacta,
+  ordinal positivo/contiguo, categoría allowlisted y tipos de evento compatibles.
+- Doce adversarios regeneran inventario y manifest tras alterar individualmente
+  ID, digest, attempt, categoría o tipo de evento; todos fallan por integridad y
+  el package productivo normal continúa verificándose offline.
+- REV-14 cerrado con comentarios sistémicos en `validatePlanTopology`,
+  `validatePackageEvents` y todos los símbolos añadidos/modificados.
+- T9, T12 y T13 vuelven a completas; cobertura directa: topology 89,3 %, events
+  86,0 % y validadores de vocabulario 100 %.
+
+## 2026-10-22 — Feature 25, quinta remediación en curso
+
+- Reabiertas T9, T12 y T13 para cerrar REV-15.
+- El reader modelará contratos explícitos por tipo/step y correlacionará cada
+  intento observado con exactamente un terminal, incluidos campos aislados.
+
+## 2026-10-22 — Feature 25, quinta remediación completa
+
+- REV-15 cerrado: cada tipo durable declara si identity ID, digest, attempt y
+  outcome son obligatorios o prohibidos según el step sea autenticado.
+- El reader correlaciona intentos observados con terminales y exige al final
+  exactamente uno por intento; rechaza terminal ausente, extra contiguo y
+  cualquiera de los cuatro campos aislado en eventos ajenos.
+- Los seis adversarios exactos de review regeneran inventario/manifest y fallan
+  por integridad; productor normal, retry, rechazo y rotación se conservan.
+- T9, T12 y T13 vuelven a completas. La frontera modificada alcanza 88,6 % en
+  `validatePackageEvents` y 100 % en vocabularios auxiliares.
+
+## 2026-10-22 — Feature 25, sexta remediación en curso
+
+- Reabiertas T9, T12 y T13 para cerrar REV-16.
+- Se añadirá una máquina durable por step+attempt que vincule fases únicas,
+  categoría de execution-finished y terminal, sin aceptar hechos posteriores.
+
+## 2026-10-22 — Feature 25, sexta remediación completa
+
+- REV-16 cerrado: el package reader mantiene una fase durable por step+attempt,
+  exige policy/budget/start/finish en orden y hace concordar finished con el
+  terminal de ejecución.
+- Cancelación y rechazos pre-I/O conservan rutas cerradas explícitas; retry solo
+  abre tras un predecesor transient y ningún hecho compatible sigue al terminal.
+- Los tres adversarios exactos rehasheados y seis mutaciones adicionales de
+  fase fallan por integridad; productor normal, retry, cancel y rechazos válidos
+  permanecen aceptados.
+- T9, T12 y T13 vuelven a completas. Pasan focales ×20, race UCRT64,
+  compile-only, vet, regresiones, cross-build Linux/Darwin, gofmt y diff-check;
+  `validatePackageEvents` alcanza 89,7 % y la máquina auxiliar 100 %.
+- La suite global mantiene únicamente el fallo histórico de symlink de Windows
+  por falta de privilegio; `feature_list.json` no fue modificado.
+
+## 2026-10-22 — Feature 25, séptima remediación en curso
+
+- Reabiertas T9, T12 y T13 para cerrar REV-17.
+- El productor reconciliará cancelación tras budget/retry y append cancelado de
+  execution-started con un terminal único bajo contexto de cierre acotado.
+- El reader admitirá esos prefijos cancelados sin relajar orden, concordancia ni
+  cierre de las demás rutas durables.
+
+## 2026-10-22 — Feature 25, séptima remediación completa
+
+- REV-17 cerrado: el executor revalida cancelación tras budget y retry marker,
+  y reconcilia fallos cancel/deadline de execution-started antes de cualquier
+  tool, resolver o red posterior.
+- Cada intento recibe un único terminal cancelled con contexto de cierre
+  acotado; un fallo de ese cierre conserva ambas causas con `errors.Join`.
+- El reader acepta cancelación tras policy+budget y policy+budget+retry y sigue
+  rechazando cualquier fase posterior al terminal.
+- Tests deterministas cubren intento inicial, retry, append cancelado y
+  secuencias bound completas; pasan repetidos y bajo race UCRT64.
+- T9, T12 y T13 vuelven a completas. Compile-only, vet, cross-build, gofmt,
+  diff-check y cobertura pasan; la suite global solo conserva el symlink
+  histórico de Windows sin privilegio. `feature_list.json` permanece intacto.
+
+## 2026-10-22 — Feature 25, octava remediación en curso
+
+- Reabiertas T9, T12 y T13 para cerrar REV-18 de forma sistemática.
+- Policy, budget, retry y execution-started compartirán reconciliación acotada
+  de cancel/deadline según el último prefijo durable confirmado.
+- Se probarán cancelación y deadline por append en intentos iniciales y retry,
+  incluida la causalidad cuando también falla el terminal.
+
+## 2026-10-22 — Feature 25, octava remediación completa
+
+- REV-18 cerrado sistemáticamente: todos los appends pre-I/O de identidad usan
+  una reconciliación común para cancel/deadline con timeout de cierre.
+- El terminal cancelled refleja exactamente el último prefijo confirmado:
+  vacío, policy o policy+budget; retry añade su marker solo si fue confirmado.
+- Cancel y deadline se prueban en policy/budget iniciales y de retry, retry
+  marker y execution-started, con un terminal, orden exacto y cero efectos
+  tool/resolver/red posteriores; también se conserva el doble error de cierre.
+- El reader acepta siete secuencias bound legítimas y sigue bloqueando fases
+  posteriores. T9, T12 y T13 vuelven a completas.
+- Focales ×30, race ×5, coverage, compile-only, vet, cross-build, gofmt y
+  diff-check pasan. La suite global solo reproduce el symlink histórico de
+  Windows sin privilegio; `feature_list.json` permanece intacto.

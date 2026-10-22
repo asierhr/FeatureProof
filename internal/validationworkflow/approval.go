@@ -7,6 +7,7 @@ import (
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/planapproval"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // PlanApprovalBridge adapts the existing approval workflow and one-use execution gate.
@@ -166,7 +167,7 @@ func approvalContext(snapshot AdmissionSnapshot, artifact PlanArtifact) planappr
 	for i, capability := range snapshot.Generation.Capabilities {
 		capabilities[i] = planapproval.CapabilitySnapshot{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
-	return planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: snapshot.TargetDigest, BaseURL: "https://target.invalid/"}, Constraints: append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...), Contract: snapshot.Generation.Contract, Capabilities: capabilities, Runtime: planapproval.RuntimeSnapshot{PolicyVersion: snapshot.RuntimeDigest, Limits: map[string]int{"checks": snapshot.Generation.Limits.MaxChecks, "steps": snapshot.Generation.Limits.MaxStepsPerCheck}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: artifact.ProtocolVersion, PromptVersion: artifact.PromptVersion, Provider: artifact.Provider, Model: artifact.Model}}
+	return planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: snapshot.TargetDigest, BaseURL: "https://target.invalid/"}, Constraints: append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...), Contract: snapshot.Generation.Contract, Capabilities: capabilities, Identities: testidentity.CloneDescriptors(snapshot.Generation.Identities), Runtime: planapproval.RuntimeSnapshot{PolicyVersion: snapshot.RuntimeDigest, Limits: map[string]int{"checks": snapshot.Generation.Limits.MaxChecks, "steps": snapshot.Generation.Limits.MaxStepsPerCheck}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: artifact.ProtocolVersion, PromptVersion: artifact.PromptVersion, Provider: artifact.Provider, Model: artifact.Model}}
 }
 
 // projectApprovalView maps the existing sanitized view while retaining workflow artifact bindings.

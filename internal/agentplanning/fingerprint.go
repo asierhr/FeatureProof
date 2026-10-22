@@ -32,6 +32,7 @@ type canonicalCheck struct {
 	PathParams   any                 `json:"path_params,omitempty"`
 	Steps        []string            `json:"steps"`
 	Evidence     []canonicalEvidence `json:"evidence"`
+	IdentityID   string              `json:"identity_id,omitempty"`
 }
 
 // checkFingerprint hashes a bounded canonical graph independent of decorative IDs and nonsemantic ordering.
@@ -109,7 +110,7 @@ func checkFingerprint(check CandidateCheck, work *validationWork) (string, error
 	if err != nil {
 		return "", err
 	}
-	canonical := canonicalCheck{ConstraintID: check.ConstraintID, Scenario: check.Scenario, Capability: check.Capability, Operation: check.Operation, PathParams: pathParams, Steps: stepColors, Evidence: evidence}
+	canonical := canonicalCheck{ConstraintID: check.ConstraintID, Scenario: check.Scenario, Capability: check.Capability, Operation: check.Operation, PathParams: pathParams, Steps: stepColors, Evidence: evidence, IdentityID: check.IdentityID}
 	encoded, err := json.Marshal(canonical)
 	if err != nil {
 		return "", typedError(CategorySemanticRejection, "fingerprint", "check", nil)

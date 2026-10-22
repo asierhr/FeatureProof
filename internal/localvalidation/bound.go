@@ -82,7 +82,13 @@ func verifyBoundSequence(ctx context.Context, binding revisionbinding.Binding, p
 	planIndex := 0
 	terminalSeen := false
 	for n, plan := range plans {
-		canonical, err := revisionbinding.NewPlanBinding(ctx, binding, n+1, plan.PlanSHA256, plan.Mode, true)
+		var canonical revisionbinding.PlanBinding
+		var err error
+		if plan.Mode == "approved" {
+			canonical, err = revisionbinding.NewApprovedPlanBinding(ctx, binding, n+1, plan.PlanSHA256, plan.ApprovalReference)
+		} else {
+			canonical, err = revisionbinding.NewPlanBinding(ctx, binding, n+1, plan.PlanSHA256, plan.Mode, true)
+		}
 		if err != nil || canonical != plan {
 			return &revisionbinding.Error{Category: revisionbinding.BindingIntegrity, Phase: "plans"}
 		}

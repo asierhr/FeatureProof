@@ -10,11 +10,13 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/specification"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // Error identifies a safe manifest category and field path without echoing document values.
@@ -49,10 +51,11 @@ type HTTPConfig struct {
 
 // Manifest is the validated, decoder-independent input used to compose a local run.
 type Manifest struct {
-	Version   int
-	HTTP      HTTPConfig
-	Redaction evidence.Config
-	Plans     []planning.ValidationPlan
+	Version    int
+	HTTP       HTTPConfig
+	Redaction  evidence.Config
+	Plans      []planning.ValidationPlan
+	Identities *testidentity.Catalog
 }
 
 // document is the adapter-owned root of the JSON v1 contract.
@@ -111,6 +114,7 @@ type step struct {
 	Input      map[string]input       `json:"input"`
 	Assertions []assertionDeclaration `json:"assertions"`
 	DependsOn  []string               `json:"depends_on"`
+	IdentityID string                 `json:"identity_id,omitempty"`
 }
 
 // assertionDeclaration carries an assertion-engine definition through the adapter.
@@ -190,7 +194,7 @@ func decodeStrictValue(raw []byte, target any) error {
 	return nil
 }
 
-// Load reads one strict JSON v1 document and validates its relation to the specification before effects.
+// Load reads one strict versioned JSON document and validates identity bindings against the trusted specification before effects.
 func Load(ctx context.Context, path string, spec specification.Specification) (Manifest, error) {
 	if err := ctx.Err(); err != nil {
 		return Manifest{}, err
@@ -213,8 +217,11 @@ func Load(ctx context.Context, path string, spec specification.Specification) (M
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return Manifest{}, &Error{Category: "trailing_data", Field: "$", Cause: err}
 	}
-	if doc.Version != 1 {
+	if doc.Version != 1 && doc.Version != 2 {
 		return Manifest{}, &Error{Category: "unsupported_version", Field: "version"}
+	}
+	if spec.Version != 0 && doc.Version != spec.Version {
+		return Manifest{}, &Error{Category: "invalid_relation", Field: "version"}
 	}
 	if err := validateRuntime(doc.Runtime); err != nil {
 		return Manifest{}, err
@@ -223,6 +230,13 @@ func Load(ctx context.Context, path string, spec specification.Specification) (M
 		return Manifest{}, &Error{Category: "invalid_relation", Field: "plans"}
 	}
 	plans := make([]planning.ValidationPlan, len(doc.Plans))
+	var identities *testidentity.Catalog
+	if doc.Version == 2 {
+		identities, err = testidentity.NewCatalog(spec.Identities)
+		if err != nil {
+			return Manifest{}, &Error{Category: "invalid_relation", Field: "identities", Cause: err}
+		}
+	}
 	planIDs := map[string]bool{}
 	for n, external := range doc.Plans {
 		if planIDs[external.ID] {
@@ -237,10 +251,64 @@ func Load(ctx context.Context, path string, spec specification.Specification) (M
 			return Manifest{}, err
 		}
 		plans[n] = translated
+		if doc.Version == 1 {
+			for stepIndex, externalStep := range external.Steps {
+				if externalStep.IdentityID != "" {
+					return Manifest{}, &Error{Category: "unknown_field", Field: fmt.Sprintf("plans[%d].steps[%d].identity_id", n, stepIndex)}
+				}
+			}
+		} else if err := bindManifestIdentities(identities, &plans[n], external, spec.Target.ID, n); err != nil {
+			return Manifest{}, err
+		}
 	}
 	h := doc.Runtime.HTTP
 	r := doc.Runtime.Redaction
-	return Manifest{Version: 1, HTTP: HTTPConfig{h.AllowedMethods, h.AllowedRequestHeaders, h.AllowedResponseHeaders, h.FollowRedirectsForMethods, *h.MaxRedirects, *h.TimeoutMS, *h.MaxURLBytes, *h.MaxRequestHeaderBytes, *h.MaxRequestBodyBytes, *h.MaxResponseHeaderBytes, *h.MaxResponseBodyBytes}, Redaction: evidence.Config{MaxBodyBytes: *r.MaxBodyBytes, AdditionalHeaders: r.AdditionalHeaders, SensitiveJSONPaths: r.SensitiveJSONPaths, ModelSensitiveJSONPaths: r.ModelSensitiveJSONPaths}, Plans: plans}, nil
+	return Manifest{Version: doc.Version, HTTP: HTTPConfig{h.AllowedMethods, h.AllowedRequestHeaders, h.AllowedResponseHeaders, h.FollowRedirectsForMethods, *h.MaxRedirects, *h.TimeoutMS, *h.MaxURLBytes, *h.MaxRequestHeaderBytes, *h.MaxRequestBodyBytes, *h.MaxResponseHeaderBytes, *h.MaxResponseBodyBytes}, Redaction: evidence.Config{MaxBodyBytes: *r.MaxBodyBytes, AdditionalHeaders: r.AdditionalHeaders, SensitiveJSONPaths: r.SensitiveJSONPaths, ModelSensitiveJSONPaths: r.ModelSensitiveJSONPaths}, Plans: plans, Identities: identities}, nil
+}
+
+// bindManifestIdentities derives sealed bindings from resolved literal operations and rejects missing or implicit authenticated selection.
+func bindManifestIdentities(catalog *testidentity.Catalog, plan *planning.ValidationPlan, external plan, targetID string, planIndex int) error {
+	for i := range plan.Steps {
+		step := &plan.Steps[i]
+		method, methodOK := literalString(step.Input["method"])
+		path, pathOK := literalString(step.Input["path"])
+		if step.Tool != "http.request" {
+			continue
+		}
+		if !methodOK {
+			return &Error{Category: "invalid_relation", Field: fmt.Sprintf("plans[%d].steps[%d].input.method", planIndex, i)}
+		}
+		if !pathOK {
+			return &Error{Category: "invalid_relation", Field: fmt.Sprintf("plans[%d].steps[%d].input.path", planIndex, i)}
+		}
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		operation := testidentity.Operation{Capability: step.Tool, TargetID: targetID, Method: method, Path: path}
+		identityID := external.Steps[i].IdentityID
+		applicable := catalog.Descriptors(operation)
+		if identityID == "" {
+			if len(applicable) > 0 {
+				return &Error{Category: "required", Field: fmt.Sprintf("plans[%d].steps[%d].identity_id", planIndex, i)}
+			}
+			continue
+		}
+		binding, err := catalog.Bind(identityID, operation)
+		if err != nil {
+			return &Error{Category: "invalid_relation", Field: fmt.Sprintf("plans[%d].steps[%d].identity_id", planIndex, i), Cause: err}
+		}
+		step.IdentityBinding = &binding
+	}
+	return nil
+}
+
+// literalString extracts a resolved scalar manifest value without interpreting references or other union members.
+func literalString(value planning.InputValue) (string, bool) {
+	if value.Literal == nil {
+		return "", false
+	}
+	text, ok := value.Literal.Value.(string)
+	return text, ok
 }
 
 // validateRuntime enforces explicit configuration and the v1 single-tool policy.

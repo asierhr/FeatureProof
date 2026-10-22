@@ -4,6 +4,8 @@ package planning
 import (
 	"fmt"
 	"reflect"
+
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // ValidationPlan groups the ordered steps that collect evidence for one constraint.
@@ -15,11 +17,12 @@ type ValidationPlan struct {
 
 // PlanStep declares one registered capability, its structured input, assertions, and explicit predecessors.
 type PlanStep struct {
-	ID         string                 `json:"id"`
-	Tool       string                 `json:"tool"`
-	Input      map[string]InputValue  `json:"input"`
-	Assertions []AssertionDeclaration `json:"assertions"`
-	DependsOn  []string               `json:"depends_on,omitempty"`
+	ID              string                 `json:"id"`
+	Tool            string                 `json:"tool"`
+	Input           map[string]InputValue  `json:"input"`
+	Assertions      []AssertionDeclaration `json:"assertions"`
+	DependsOn       []string               `json:"depends_on,omitempty"`
+	IdentityBinding *testidentity.Binding  `json:"identity_binding,omitempty"`
 }
 
 // InputValue is one node in an input tree and has exactly one literal, object, array, or reference representation.
@@ -218,6 +221,10 @@ func clonePlan(plan ValidationPlan) ValidationPlan {
 	out := ValidationPlan{ID: plan.ID, ConstraintID: plan.ConstraintID, Steps: make([]PlanStep, len(plan.Steps))}
 	for i, step := range plan.Steps {
 		out.Steps[i] = PlanStep{ID: step.ID, Tool: step.Tool, Input: cloneInputMap(step.Input), DependsOn: append([]string(nil), step.DependsOn...), Assertions: make([]AssertionDeclaration, len(step.Assertions))}
+		if step.IdentityBinding != nil {
+			binding := *step.IdentityBinding
+			out.Steps[i].IdentityBinding = &binding
+		}
 		for j, assertion := range step.Assertions {
 			definition := make(map[string]any, len(assertion.Definition))
 			for key, value := range assertion.Definition {

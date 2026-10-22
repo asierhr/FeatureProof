@@ -12,10 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 	"github.com/asierhr/featureProof/internal/specification"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 func twoBatchPackageFixture(t *testing.T) string {
@@ -331,6 +333,535 @@ func rewriteManifest(t *testing.T, dir string, binding string) {
 	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// identityPackageFixture publishes one successful authenticated package through the real local runner.
+func identityPackageFixture(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(server.Close)
+	specPath, planPath := writeIdentityInputs(t)
+	root := t.TempDir()
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	deps := DefaultDependencies(root, stdout, stderr)
+	commit := strings.Repeat("a", 40)
+	deps.RevisionResolver = fakeRevision{revisionbinding.Revision{RepositoryID: "repo", CommitOID: commit}}
+	deps.EnvironmentAttestor = fakeAttestation{revisionbinding.Attestation{EnvironmentID: "preview", RepositoryID: "repo", CommitOID: commit, Reference: "proof", ValidUntil: time.Unix(10000, 0), Verified: true}}
+	deps.SafeProjector, deps.Clock, deps.IDs, deps.Waiter, deps.FinalizeTimeout = fixtureProjector{}, &testClock{next: time.Unix(100, 0)}, &testIDs{}, testWaiter{}, 10*time.Second
+	deps.CredentialResolvers = map[string]testidentity.CredentialResolver{"cred_customer": &localCredentialResolver{}}
+	deps.IdentityObserver = &localIdentityObserver{}
+	runner, err := NewRunner(context.Background(), Request{SpecPath: specPath, PlanPath: planPath, Target: server.URL, RepositoryID: "repo", Revision: "main", EnvironmentID: "preview"}, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := runner.Run(context.Background()); code != 0 {
+		t.Fatalf("identity package code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	return filepath.Join(root, ".featureproof", "runs", "id-1")
+}
+
+// mutateIdentityPackageEvents rewrites one journal semantically and regenerates its trusted inventory so only reader validation can reject it.
+func mutateIdentityPackageEvents(t *testing.T, dir string, mutate func([]map[string]any) []map[string]any) {
+	t.Helper()
+	path := filepath.Join(dir, "events.jsonl")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Split(bytes.TrimSpace(raw), []byte{'\n'})
+	events := make([]map[string]any, len(lines))
+	for i, line := range lines {
+		if err = json.Unmarshal(line, &events[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events = mutate(events)
+	var encoded bytes.Buffer
+	for i, event := range events {
+		event["sequence"] = i + 1
+		line, marshalErr := json.Marshal(event)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		encoded.Write(line)
+		encoded.WriteByte('\n')
+	}
+	if err = os.WriteFile(path, encoded.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var index PackageIndex
+	indexRaw, err := os.ReadFile(filepath.Join(dir, "package.json"))
+	if err != nil || json.Unmarshal(indexRaw, &index) != nil {
+		t.Fatal("invalid package index")
+	}
+	rewriteManifest(t, dir, index.Binding.BindingSHA256)
+}
+
+// identityTerminalIndex locates the unique normal terminal identity fact used by durable mutation tests.
+func identityTerminalIndex(t *testing.T, events []map[string]any) int {
+	t.Helper()
+	for i, event := range events {
+		if event["type"] == string(harness.EventIdentityAttemptTerminal) {
+			return i
+		}
+	}
+	t.Fatal("identity terminal event missing")
+	return -1
+}
+
+// identityEventIndex locates one expected productive event type for compatible-field adversaries.
+func identityEventIndex(t *testing.T, events []map[string]any, kind harness.EventType) int {
+	t.Helper()
+	for i, event := range events {
+		if event["type"] == string(kind) {
+			return i
+		}
+	}
+	t.Fatalf("identity event %s missing", kind)
+	return -1
+}
+
+// copyIdentityPackageFixture isolates each adversarial mutation from the single productively generated source package.
+func copyIdentityPackageFixture(t *testing.T, source string) string {
+	t.Helper()
+	destination := filepath.Join(t.TempDir(), "package")
+	if err := filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0700)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, raw, 0600)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return destination
+}
+
+// TestOfflinePackageRejectsRehashedIdentityEventTampering proves inventory rehash cannot legitimize false durable identity facts.
+func TestOfflinePackageRejectsRehashedIdentityEventTampering(t *testing.T) {
+	source := identityPackageFixture(t)
+	tests := []struct {
+		name   string
+		mutate func([]map[string]any) []map[string]any
+	}{
+		{name: "missing identity id", mutate: func(events []map[string]any) []map[string]any {
+			delete(events[identityTerminalIndex(t, events)], "identity_id")
+			return events
+		}},
+		{name: "mismatched identity id", mutate: func(events []map[string]any) []map[string]any {
+			events[identityTerminalIndex(t, events)]["identity_id"] = "other"
+			return events
+		}},
+		{name: "missing binding digest", mutate: func(events []map[string]any) []map[string]any {
+			delete(events[identityTerminalIndex(t, events)], "operation_binding_sha256")
+			return events
+		}},
+		{name: "mismatched binding digest", mutate: func(events []map[string]any) []map[string]any {
+			events[identityTerminalIndex(t, events)]["operation_binding_sha256"] = strings.Repeat("b", 64)
+			return events
+		}},
+		{name: "zero attempt", mutate: func(events []map[string]any) []map[string]any {
+			events[identityTerminalIndex(t, events)]["attempt"] = 0
+			return events
+		}},
+		{name: "repeated attempt", mutate: func(events []map[string]any) []map[string]any {
+			return duplicateIdentityTerminal(t, events, 1)
+		}},
+		{name: "discontinuous attempt", mutate: func(events []map[string]any) []map[string]any {
+			return duplicateIdentityTerminal(t, events, 3)
+		}},
+		{name: "arbitrary category", mutate: func(events []map[string]any) []map[string]any {
+			events[identityTerminalIndex(t, events)]["outcome_category"] = "CANARY-ARBITRARY"
+			return events
+		}},
+		{name: "identity fields on unrelated event", mutate: func(events []map[string]any) []map[string]any {
+			terminal := events[identityTerminalIndex(t, events)]
+			events[0]["identity_id"] = terminal["identity_id"]
+			events[0]["operation_binding_sha256"] = terminal["operation_binding_sha256"]
+			events[0]["attempt"] = 1
+			events[0]["outcome_category"] = "success"
+			return events
+		}},
+		{name: "started event mismatched identity", mutate: func(events []map[string]any) []map[string]any {
+			events[identityEventIndex(t, events, harness.EventExecutionStarted)]["identity_id"] = "other"
+			return events
+		}},
+		{name: "started event category", mutate: func(events []map[string]any) []map[string]any {
+			events[identityEventIndex(t, events, harness.EventExecutionStarted)]["outcome_category"] = "success"
+			return events
+		}},
+		{name: "finished event arbitrary category", mutate: func(events []map[string]any) []map[string]any {
+			events[identityEventIndex(t, events, harness.EventExecutionFinished)]["outcome_category"] = "CANARY-ARBITRARY"
+			return events
+		}},
+		{name: "missing sole terminal", mutate: func(events []map[string]any) []map[string]any {
+			index := identityTerminalIndex(t, events)
+			return append(events[:index], events[index+1:]...)
+		}},
+		{name: "extra contiguous terminal", mutate: func(events []map[string]any) []map[string]any {
+			return duplicateIdentityTerminal(t, events, 2)
+		}},
+		{name: "attempt only on unrelated event", mutate: func(events []map[string]any) []map[string]any {
+			events[0]["attempt"] = 1
+			return events
+		}},
+		{name: "outcome only on unrelated event", mutate: func(events []map[string]any) []map[string]any {
+			events[0]["outcome_category"] = "success"
+			return events
+		}},
+		{name: "finished event missing binding with arbitrary category", mutate: func(events []map[string]any) []map[string]any {
+			event := events[identityEventIndex(t, events, harness.EventExecutionFinished)]
+			delete(event, "identity_id")
+			delete(event, "operation_binding_sha256")
+			event["outcome_category"] = "CANARY-ARBITRARY"
+			return events
+		}},
+		{name: "started event missing tuple", mutate: func(events []map[string]any) []map[string]any {
+			event := events[identityEventIndex(t, events, harness.EventExecutionStarted)]
+			delete(event, "identity_id")
+			delete(event, "operation_binding_sha256")
+			delete(event, "attempt")
+			return events
+		}},
+		{name: "terminal success before execution", mutate: func(events []map[string]any) []map[string]any {
+			terminalIndex := identityTerminalIndex(t, events)
+			terminal := events[terminalIndex]
+			events = append(events[:terminalIndex], events[terminalIndex+1:]...)
+			startedIndex := identityEventIndex(t, events, harness.EventExecutionStarted)
+			events = append(events, nil)
+			copy(events[startedIndex+1:], events[startedIndex:])
+			events[startedIndex] = terminal
+			return events
+		}},
+		{name: "execution removed before success", mutate: func(events []map[string]any) []map[string]any {
+			filtered := events[:0]
+			for _, event := range events {
+				kind := event["type"]
+				if kind != string(harness.EventExecutionStarted) && kind != string(harness.EventExecutionFinished) {
+					filtered = append(filtered, event)
+				}
+			}
+			return filtered
+		}},
+		{name: "terminal contradicts successful finish", mutate: func(events []map[string]any) []map[string]any {
+			events[identityTerminalIndex(t, events)]["outcome_category"] = "permanent"
+			return events
+		}},
+		{name: "compatible event after terminal", mutate: func(events []map[string]any) []map[string]any {
+			started := copyIdentityEvent(t, events[identityEventIndex(t, events, harness.EventExecutionStarted)])
+			terminalIndex := identityTerminalIndex(t, events)
+			events = append(events, nil)
+			copy(events[terminalIndex+2:], events[terminalIndex+1:])
+			events[terminalIndex+1] = started
+			return events
+		}},
+		{name: "budget before policy", mutate: func(events []map[string]any) []map[string]any {
+			policyIndex := identityEventIndex(t, events, harness.EventPolicyEvaluated)
+			budgetIndex := identityEventIndex(t, events, harness.EventBudgetReserved)
+			events[policyIndex], events[budgetIndex] = events[budgetIndex], events[policyIndex]
+			return events
+		}},
+		{name: "finished before started", mutate: func(events []map[string]any) []map[string]any {
+			startedIndex := identityEventIndex(t, events, harness.EventExecutionStarted)
+			finishedIndex := identityEventIndex(t, events, harness.EventExecutionFinished)
+			events[startedIndex], events[finishedIndex] = events[finishedIndex], events[startedIndex]
+			return events
+		}},
+		{name: "duplicate policy phase", mutate: func(events []map[string]any) []map[string]any {
+			policyIndex := identityEventIndex(t, events, harness.EventPolicyEvaluated)
+			events = append(events, nil)
+			copy(events[policyIndex+2:], events[policyIndex+1:])
+			events[policyIndex+1] = copyIdentityEvent(t, events[policyIndex])
+			return events
+		}},
+		{name: "retry marker on initial attempt", mutate: func(events []map[string]any) []map[string]any {
+			startedIndex := identityEventIndex(t, events, harness.EventExecutionStarted)
+			retry := copyIdentityEvent(t, events[startedIndex])
+			retry["type"] = string(harness.EventRetryScheduled)
+			events = append(events, nil)
+			copy(events[startedIndex+1:], events[startedIndex:])
+			events[startedIndex] = retry
+			return events
+		}},
+		{name: "later attempt opens before predecessor terminal", mutate: func(events []map[string]any) []map[string]any {
+			budgetIndex := identityEventIndex(t, events, harness.EventBudgetReserved)
+			policy := copyIdentityEvent(t, events[identityEventIndex(t, events, harness.EventPolicyEvaluated)])
+			policy["attempt"] = 2
+			events = append(events, nil)
+			copy(events[budgetIndex+2:], events[budgetIndex+1:])
+			events[budgetIndex+1] = policy
+			return events
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := copyIdentityPackageFixture(t, source)
+			mutateIdentityPackageEvents(t, dir, test.mutate)
+			if _, err := ReadPackage(context.Background(), dir); !IsPackageError(err, "binding_integrity") {
+				t.Fatalf("tampered identity journal accepted: %v", err)
+			}
+		})
+	}
+}
+
+// duplicateIdentityTerminal inserts a copied terminal fact with a controlled invalid ordinal before later journal events.
+func duplicateIdentityTerminal(t *testing.T, events []map[string]any, attempt int) []map[string]any {
+	t.Helper()
+	index := identityTerminalIndex(t, events)
+	duplicate := copyIdentityEvent(t, events[index])
+	duplicate["attempt"] = attempt
+	events = append(events, nil)
+	copy(events[index+2:], events[index+1:])
+	events[index+1] = duplicate
+	return events
+}
+
+// copyIdentityEvent deep-copies one JSON-shaped event so adversarial insertions cannot mutate their source phase.
+func copyIdentityEvent(t *testing.T, event map[string]any) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var duplicate map[string]any
+	if json.Unmarshal(raw, &duplicate) != nil {
+		t.Fatal("identity event copy failed")
+	}
+	return duplicate
+}
+
+// TestOfflinePackageAcceptsBoundIdentityEvents proves the normal producer vocabulary survives strict offline verification.
+func TestOfflinePackageAcceptsBoundIdentityEvents(t *testing.T) {
+	dir := identityPackageFixture(t)
+	index, err := ReadPackage(context.Background(), dir)
+	if err != nil || index.Status != ResultPassed {
+		t.Fatalf("identity package index=%#v err=%v", index, err)
+	}
+}
+
+// TestIdentityTerminalStandaloneVocabulary covers the closed pre-I/O categories accepted without execution events.
+func TestIdentityTerminalStandaloneVocabulary(t *testing.T) {
+	for _, category := range []string{"cancelled", "composition_unavailable", "identity_drift", "policy_error"} {
+		if !identityTerminalMayStandAlone(category) {
+			t.Fatalf("standalone category %q rejected", category)
+		}
+	}
+	for _, category := range []string{"success", "policy_denied", "budget_denied", "CANARY-ARBITRARY"} {
+		if identityTerminalMayStandAlone(category) {
+			t.Fatalf("non-standalone category %q accepted", category)
+		}
+	}
+	if identityTerminalMayStandAlone("success") {
+		t.Fatal("execution or arbitrary category accepted as standalone")
+	}
+}
+
+// identityPhaseTestEvent describes one durable phase transition exercised without package serialization noise.
+type identityPhaseTestEvent struct {
+	kind     harness.EventType
+	attempt  int
+	category string
+}
+
+// assertIdentityPhaseSequence proves a complete authenticated attempt follows the reader's closed phase machine.
+func assertIdentityPhaseSequence(t *testing.T, events []identityPhaseTestEvent) *packageIdentityAttemptState {
+	t.Helper()
+	state := &packageIdentityAttemptState{}
+	for _, event := range events {
+		accepted := false
+		switch event.kind {
+		case harness.EventPolicyEvaluated:
+			accepted = state.observePolicy()
+		case harness.EventBudgetReserved:
+			accepted = state.observeBudget()
+		case harness.EventRetryScheduled:
+			accepted = state.observeRetry(event.attempt)
+		case harness.EventExecutionStarted:
+			accepted = state.observeStarted(event.attempt)
+		case harness.EventExecutionFinished:
+			accepted = state.observeFinished(event.category)
+		case harness.EventIdentityAttemptTerminal:
+			accepted = state.observeTerminal(event.category)
+		}
+		if !accepted {
+			t.Fatalf("phase %s attempt=%d category=%q rejected", event.kind, event.attempt, event.category)
+		}
+	}
+	if !state.terminal {
+		t.Fatal("phase sequence did not close the attempt")
+	}
+	return state
+}
+
+// TestIdentityAttemptPhaseMachineAcceptsValidPaths protects retry, cancellation, and pre-I/O rejection contracts.
+func TestIdentityAttemptPhaseMachineAcceptsValidPaths(t *testing.T) {
+	t.Run("transient first attempt", func(t *testing.T) {
+		assertIdentityPhaseSequence(t, []identityPhaseTestEvent{
+			{kind: harness.EventPolicyEvaluated, attempt: 1},
+			{kind: harness.EventBudgetReserved, attempt: 1},
+			{kind: harness.EventExecutionStarted, attempt: 1},
+			{kind: harness.EventExecutionFinished, attempt: 1, category: "transient"},
+			{kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "transient"},
+		})
+	})
+	t.Run("successful retry", func(t *testing.T) {
+		assertIdentityPhaseSequence(t, []identityPhaseTestEvent{
+			{kind: harness.EventPolicyEvaluated, attempt: 2},
+			{kind: harness.EventBudgetReserved, attempt: 2},
+			{kind: harness.EventRetryScheduled, attempt: 2},
+			{kind: harness.EventExecutionStarted, attempt: 2},
+			{kind: harness.EventExecutionFinished, attempt: 2},
+			{kind: harness.EventIdentityAttemptTerminal, attempt: 2, category: "success"},
+		})
+	})
+	for _, test := range []struct {
+		name   string
+		events []identityPhaseTestEvent
+	}{
+		{name: "cancel before policy", events: []identityPhaseTestEvent{{kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "cancelled"}}},
+		{name: "cancel after policy", events: []identityPhaseTestEvent{{kind: harness.EventPolicyEvaluated, attempt: 1}, {kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "cancelled"}}},
+		{name: "cancel after budget", events: []identityPhaseTestEvent{{kind: harness.EventPolicyEvaluated, attempt: 1}, {kind: harness.EventBudgetReserved, attempt: 1}, {kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "cancelled"}}},
+		{name: "cancel after retry marker", events: []identityPhaseTestEvent{{kind: harness.EventPolicyEvaluated, attempt: 2}, {kind: harness.EventBudgetReserved, attempt: 2}, {kind: harness.EventRetryScheduled, attempt: 2}, {kind: harness.EventIdentityAttemptTerminal, attempt: 2, category: "cancelled"}}},
+		{name: "cancel during execution", events: []identityPhaseTestEvent{{kind: harness.EventPolicyEvaluated, attempt: 1}, {kind: harness.EventBudgetReserved, attempt: 1}, {kind: harness.EventExecutionStarted, attempt: 1}, {kind: harness.EventExecutionFinished, attempt: 1, category: "cancelled"}, {kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "cancelled"}}},
+		{name: "permanent execution failure", events: []identityPhaseTestEvent{{kind: harness.EventPolicyEvaluated, attempt: 1}, {kind: harness.EventBudgetReserved, attempt: 1}, {kind: harness.EventExecutionStarted, attempt: 1}, {kind: harness.EventExecutionFinished, attempt: 1, category: "permanent"}, {kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "permanent"}}},
+		{name: "credential rejection", events: []identityPhaseTestEvent{{kind: harness.EventPolicyEvaluated, attempt: 1}, {kind: harness.EventBudgetReserved, attempt: 1}, {kind: harness.EventExecutionStarted, attempt: 1}, {kind: harness.EventExecutionFinished, attempt: 1, category: "permanent"}, {kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "credential_rejected"}}},
+		{name: "composition unavailable", events: []identityPhaseTestEvent{{kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "composition_unavailable"}}},
+		{name: "identity drift", events: []identityPhaseTestEvent{{kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "identity_drift"}}},
+		{name: "policy error", events: []identityPhaseTestEvent{{kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "policy_error"}}},
+		{name: "policy denied", events: []identityPhaseTestEvent{{kind: harness.EventPolicyEvaluated, attempt: 1}, {kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "policy_denied"}}},
+		{name: "budget denied", events: []identityPhaseTestEvent{{kind: harness.EventPolicyEvaluated, attempt: 1}, {kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "budget_denied"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) { assertIdentityPhaseSequence(t, test.events) })
+	}
+}
+
+// TestIdentityAttemptPhaseMachineRejectsEventsAfterTerminal proves terminal closure blocks every compatible phase.
+func TestIdentityAttemptPhaseMachineRejectsEventsAfterTerminal(t *testing.T) {
+	state := assertIdentityPhaseSequence(t, []identityPhaseTestEvent{{kind: harness.EventIdentityAttemptTerminal, attempt: 1, category: "cancelled"}})
+	if state.observePolicy() || state.observeBudget() || state.observeRetry(2) || state.observeStarted(1) || state.observeFinished("") || state.observeTerminal("cancelled") {
+		t.Fatal("phase accepted after terminal closure")
+	}
+}
+
+// TestIdentityAttemptOrderingRequiresClosedTransientPredecessor proves a retry cannot open out of ordinal order.
+func TestIdentityAttemptOrderingRequiresClosedTransientPredecessor(t *testing.T) {
+	step := packageStepKey{constraint: "plan", step: "step"}
+	next := map[packageStepKey]int{}
+	last := map[packageStepKey]string{}
+	if !identityAttemptIsCurrent(next, last, step, 1) || identityAttemptIsCurrent(next, last, step, 2) {
+		t.Fatal("initial attempt ordering is not fail-closed")
+	}
+	next[step] = 1
+	last[step] = "permanent"
+	if identityAttemptIsCurrent(next, last, step, 2) {
+		t.Fatal("retry opened after a non-transient outcome")
+	}
+	last[step] = "transient"
+	if !identityAttemptIsCurrent(next, last, step, 2) {
+		t.Fatal("retry rejected after its transient predecessor closed")
+	}
+}
+
+// TestValidatePackageEventsAcceptsCancelledPreIOPrefixes proves complete package journals accept every legitimate initial and retry cancellation prefix.
+func TestValidatePackageEventsAcceptsCancelledPreIOPrefixes(t *testing.T) {
+	for _, test := range []struct {
+		name, prefix string
+		retry        bool
+	}{
+		{name: "initial empty", prefix: "empty"},
+		{name: "initial policy", prefix: "policy"},
+		{name: "initial budget", prefix: "budget"},
+		{name: "retry empty", prefix: "empty", retry: true},
+		{name: "retry policy", prefix: "policy", retry: true},
+		{name: "retry budget", prefix: "budget", retry: true},
+		{name: "retry marker", prefix: "retry", retry: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, index, topology := cancelledIdentityPackageEventFixture(t, test.retry, test.prefix)
+			if err := validatePackageEvents(context.Background(), raw, index, topology, nil, nil); err != nil {
+				t.Fatalf("valid cancelled package prefix rejected: %v\n%s", err, raw)
+			}
+		})
+	}
+}
+
+// cancelledIdentityPackageEventFixture builds a fully bound terminal journal ending after the selected confirmed pre-I/O prefix.
+func cancelledIdentityPackageEventFixture(t *testing.T, retry bool, prefix string) ([]byte, PackageIndex, packagePlanTopology) {
+	t.Helper()
+	binding := testBindingForRun(t, "run")
+	planBinding, err := revisionbinding.NewPlanBinding(context.Background(), binding, 1, strings.Repeat("d", 64), "approval_not_required", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityID, identityDigest := "customer", strings.Repeat("e", 64)
+	stepKey := packageStepKey{"plan", "step"}
+	topology := packagePlanTopology{
+		stepBatches:        map[packageStepKey]int{stepKey: 1},
+		planSteps:          map[packageStepKey]bool{stepKey: true},
+		planConstraints:    map[string]string{"plan": "constraint"},
+		identityByPlanStep: map[packageStepKey]packageIdentityExpectation{stepKey: {identityID: identityID, operationBindingSHA256: identityDigest}},
+	}
+	events := []eventArtifact{
+		{Type: string(harness.EventRunCreated), RunID: binding.RunID, BindingSHA256: binding.BindingSHA256},
+		{Type: string(harness.EventBindingConfirmed), RunID: binding.RunID, BindingSHA256: binding.BindingSHA256},
+		{Type: string(harness.EventPlanBindingConfirmed), RunID: binding.RunID, BindingSHA256: binding.BindingSHA256, PlanSHA256: planBinding.PlanSHA256},
+	}
+	// appendAttemptEvent adds one phase with the exact tuple contract expected for its event type.
+	appendAttemptEvent := func(kind harness.EventType, attempt int, category string, includeIdentity bool) {
+		event := eventArtifact{Type: string(kind), RunID: binding.RunID, BindingSHA256: binding.BindingSHA256, PlanID: "plan", ConstraintID: "constraint", StepID: "step", ToolCallID: "plan:step", Attempt: attempt, OutcomeCategory: category}
+		if includeIdentity {
+			event.IdentityID, event.OperationBindingSHA256 = identityID, identityDigest
+		}
+		events = append(events, event)
+	}
+	if retry {
+		appendAttemptEvent(harness.EventPolicyEvaluated, 1, "", false)
+		appendAttemptEvent(harness.EventBudgetReserved, 1, "", false)
+		appendAttemptEvent(harness.EventExecutionStarted, 1, "", true)
+		appendAttemptEvent(harness.EventExecutionFinished, 1, "transient", true)
+		appendAttemptEvent(harness.EventIdentityAttemptTerminal, 1, "transient", true)
+	}
+	attempt := 1
+	if retry {
+		attempt = 2
+	}
+	if prefix != "empty" {
+		appendAttemptEvent(harness.EventPolicyEvaluated, attempt, "", false)
+	}
+	if prefix == "budget" || prefix == "retry" {
+		appendAttemptEvent(harness.EventBudgetReserved, attempt, "", false)
+	}
+	if prefix == "retry" {
+		appendAttemptEvent(harness.EventRetryScheduled, attempt, "", true)
+	}
+	appendAttemptEvent(harness.EventIdentityAttemptTerminal, attempt, "cancelled", true)
+	events = append(events, eventArtifact{Type: string(harness.EventRunCancelled), RunID: binding.RunID, BindingSHA256: binding.BindingSHA256, Status: string(ResultCancelled)})
+	var raw bytes.Buffer
+	for index, event := range events {
+		event.Sequence = index + 1
+		encoded, marshalErr := json.Marshal(event)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		raw.Write(encoded)
+		raw.WriteByte('\n')
+	}
+	index := PackageIndex{Binding: binding, PlanBindings: []revisionbinding.PlanBinding{planBinding}, Status: ResultCancelled}
+	return raw.Bytes(), index, topology
 }
 
 func failedPackageFixture(t *testing.T) string {
@@ -903,7 +1434,7 @@ func TestOfflinePackageRejectsForgedReportTopologyAndReferences(t *testing.T) {
 			node["evidence_ids"] = []any{"ghost"}
 		}},
 		{"report missing plan", "report.json", "binding_integrity", func(m map[string]any) { m["plan_bindings"] = []any{} }},
-		{"plan wrong version", "plan.json", "invalid_schema", func(m map[string]any) { m["version"] = 2 }},
+		{"plan wrong version", "plan.json", "invalid_schema", func(m map[string]any) { m["version"] = 3 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := failedPackageFixture(t)

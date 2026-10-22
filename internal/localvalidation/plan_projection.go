@@ -20,11 +20,13 @@ type PlanProjection struct {
 
 // StepProjection preserves executable structure while replacing every literal with a redaction marker.
 type StepProjection struct {
-	ID         string                `json:"id"`
-	Tool       string                `json:"tool"`
-	Input      map[string]any        `json:"input"`
-	Assertions []AssertionProjection `json:"assertions"`
-	DependsOn  []string              `json:"depends_on"`
+	ID                     string                `json:"id"`
+	Tool                   string                `json:"tool"`
+	Input                  map[string]any        `json:"input"`
+	Assertions             []AssertionProjection `json:"assertions"`
+	DependsOn              []string              `json:"depends_on"`
+	IdentityID             string                `json:"identity_id,omitempty"`
+	OperationBindingSHA256 string                `json:"operation_binding_sha256,omitempty"`
 }
 
 // AssertionProjection preserves assertion identity and operators without expected literal values.
@@ -51,7 +53,11 @@ func ProjectPlans(plans []planning.ValidationPlan, commitmentKeys ...[]byte) []P
 			for assertionIndex, declaration := range step.Assertions {
 				assertions[assertionIndex] = AssertionProjection{ID: declaration.ID, Definition: projectAssertionDefinition(declaration.Definition, commitmentLocation(planIndex, stepIndex, "assertion", fmt.Sprint(assertionIndex)), key)}
 			}
-			out[planIndex].Steps[stepIndex] = StepProjection{ID: step.ID, Tool: step.Tool, Input: input, Assertions: assertions, DependsOn: append([]string(nil), step.DependsOn...)}
+			projected := StepProjection{ID: step.ID, Tool: step.Tool, Input: input, Assertions: assertions, DependsOn: append([]string(nil), step.DependsOn...)}
+			if step.IdentityBinding != nil {
+				projected.IdentityID, projected.OperationBindingSHA256 = step.IdentityBinding.IdentityID, step.IdentityBinding.Digest
+			}
+			out[planIndex].Steps[stepIndex] = projected
 		}
 	}
 	return out

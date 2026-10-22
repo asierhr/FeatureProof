@@ -12,6 +12,7 @@ import (
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/model"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // planningInstructions establish the model-facing protocol and keep every catalog fragment inside the inert data boundary.
@@ -110,7 +111,7 @@ func (g *Generator) Generate(ctx context.Context, request GenerationRequest) (re
 			record.Category = categoryOf(mapped)
 			return Result{}, mapped
 		}
-		plan, materializeErr := materialize(check, snapshot.PlanID, snapshot.Contract)
+		plan, materializeErr := materialize(check, snapshot.PlanID, snapshot.Contract, snapshot.Identities)
 		if materializeErr != nil {
 			record.Category = categoryOf(materializeErr)
 			return Result{}, materializeErr
@@ -167,7 +168,7 @@ func (g *Generator) Generate(ctx context.Context, request GenerationRequest) (re
 		record.Category = CategoryPolicyDenial
 		return Result{}, typedError(CategoryPolicyDenial, "policy", field("checks", denied), nil)
 	}
-	provenance, provenanceErr := generationProvenance(snapshot.Constraints, snapshot.Contract, snapshot.Capabilities)
+	provenance, provenanceErr := generationProvenance(snapshot.Constraints, snapshot.Contract, snapshot.Capabilities, snapshot.Identities)
 	if provenanceErr != nil {
 		record.Category = CategoryInternal
 		return Result{}, typedError(CategoryInternal, "provenance", "generation_context", nil)
@@ -224,21 +225,23 @@ func snapshotRequest(ctx context.Context, request GenerationRequest) (requestSna
 	if err != nil {
 		return requestSnapshot{}, nil, err
 	}
-	return requestSnapshot{GenerationRequest: GenerationRequest{RunID: request.RunID, PlanID: request.PlanID, Constraints: constraints, Contract: request.Contract, Capabilities: append([]CapabilityDescriptor(nil), request.Capabilities...), Limits: limits}}, catalog, nil
+	identities := cloneIdentityDescriptors(request.Identities)
+	return requestSnapshot{GenerationRequest: GenerationRequest{RunID: request.RunID, PlanID: request.PlanID, Constraints: constraints, Contract: request.Contract, Capabilities: append([]CapabilityDescriptor(nil), request.Capabilities...), Identities: identities, Limits: limits}}, catalog, nil
 }
 
 // modelInput is the only untrusted data envelope sent to the planning model.
 type modelInput struct {
-	Label        string                 `json:"label"`
-	PlanID       string                 `json:"plan_id"`
-	Constraints  []Constraint           `json:"constraints"`
-	Contract     json.RawMessage        `json:"contract"`
-	Capabilities []capabilityProjection `json:"capabilities"`
+	Label        string                    `json:"label"`
+	PlanID       string                    `json:"plan_id"`
+	Constraints  []Constraint              `json:"constraints"`
+	Contract     json.RawMessage           `json:"contract"`
+	Capabilities []capabilityProjection    `json:"capabilities"`
+	Identities   []testidentity.Descriptor `json:"identities,omitempty"`
 }
 
 // marshalModelInput serializes bounded untrusted data without privileged instructions or handles.
 func marshalModelInput(request requestSnapshot, catalog *CapabilityCatalog) ([]byte, error) {
-	payload, err := json.Marshal(modelInput{Label: "untrusted_data", PlanID: request.PlanID, Constraints: request.Constraints, Contract: json.RawMessage(request.Contract.Bytes()), Capabilities: catalog.projections()})
+	payload, err := json.Marshal(modelInput{Label: "untrusted_data", PlanID: request.PlanID, Constraints: request.Constraints, Contract: json.RawMessage(request.Contract.Bytes()), Capabilities: catalog.projections(), Identities: cloneIdentityDescriptors(request.Identities)})
 	if err != nil || int64(len(payload)) > request.Limits.MaxInputBytes {
 		return nil, typedError(CategoryLimitExceeded, "preflight", "input_bytes", nil)
 	}
@@ -404,6 +407,9 @@ func validateCheck(check CandidateCheck, request requestSnapshot, scenario Scena
 		if err := scanStructuredMap(work, check.PathParams, 0, "semantic"); err != nil {
 			return err
 		}
+		if err := validateIdentitySelection(check, request); err != nil {
+			return err
+		}
 	} else if check.Operation != nil || len(check.PathParams) != 0 {
 		return typedError(CategorySemanticRejection, "semantic", "operation", nil)
 	}
@@ -477,7 +483,7 @@ func retainedOperation(context contractcatalog.ReducedContext, constraintID stri
 }
 
 // materialize derives trusted HTTP method/path fields and returns an existing planning plan shape.
-func materialize(check CandidateCheck, planID string, context contractcatalog.ReducedContext) (planning.ValidationPlan, error) {
+func materialize(check CandidateCheck, planID string, context contractcatalog.ReducedContext, identities []testidentity.Descriptor) (planning.ValidationPlan, error) {
 	steps := make([]planning.PlanStep, len(check.Steps))
 	for i, step := range check.Steps {
 		steps[i] = cloneStep(step)
@@ -494,12 +500,83 @@ func materialize(check CandidateCheck, planID string, context contractcatalog.Re
 		if err != nil {
 			return planning.ValidationPlan{}, err
 		}
+		var binding *testidentity.Binding
+		if check.IdentityID != "" {
+			descriptor, exists := identityDescriptor(identities, check.IdentityID)
+			if !exists {
+				return planning.ValidationPlan{}, typedError(CategoryUnknownContextReference, "materialize", "identity_id", nil)
+			}
+			selected, bindErr := testidentity.BindDescriptor(descriptor, testidentity.Operation{Capability: check.Capability, TargetID: descriptorTarget(descriptor, check.Capability, check.Operation.Method, check.Operation.Path), Method: strings.ToUpper(operation.Key.Method), Path: path})
+			if bindErr != nil {
+				return planning.ValidationPlan{}, typedError(CategorySemanticRejection, "materialize", "identity_id", nil)
+			}
+			binding = &selected
+		}
 		for i := range steps {
 			steps[i].Input["method"] = planning.InputValue{Literal: &planning.LiteralValue{Value: strings.ToUpper(operation.Key.Method)}}
 			steps[i].Input["path"] = planning.InputValue{Literal: &planning.LiteralValue{Value: path}}
+			if binding != nil {
+				copyBinding := *binding
+				steps[i].IdentityBinding = &copyBinding
+			}
 		}
 	}
 	return planning.ValidationPlan{ID: planID + ":" + check.ID, ConstraintID: check.ConstraintID, Steps: steps}, nil
+}
+
+// validateIdentitySelection requires explicit selection exactly when safe descriptors authorize the retained operation.
+func validateIdentitySelection(check CandidateCheck, request requestSnapshot) error {
+	applicable := map[string]testidentity.Descriptor{}
+	for _, descriptor := range request.Identities {
+		for _, operation := range descriptor.Operations {
+			if operation.Capability == check.Capability && operation.Method == check.Operation.Method && operation.Path == check.Operation.Path {
+				applicable[descriptor.ID] = descriptor
+			}
+		}
+	}
+	if len(applicable) == 0 {
+		if check.IdentityID != "" {
+			return typedError(CategoryUnknownContextReference, "semantic", "identity_id", nil)
+		}
+		return nil
+	}
+	if check.IdentityID == "" {
+		return typedError(CategorySemanticRejection, "semantic", "identity_id", nil)
+	}
+	if _, exists := applicable[check.IdentityID]; !exists {
+		return typedError(CategoryUnknownContextReference, "semantic", "identity_id", nil)
+	}
+	return nil
+}
+
+// identityDescriptor returns an isolated safe descriptor by exact case-sensitive identifier.
+func identityDescriptor(descriptors []testidentity.Descriptor, identityID string) (testidentity.Descriptor, bool) {
+	for _, descriptor := range descriptors {
+		if descriptor.ID == identityID {
+			return descriptor, true
+		}
+	}
+	return testidentity.Descriptor{}, false
+}
+
+// descriptorTarget obtains the target sealed into the exact descriptor operation used for binding.
+func descriptorTarget(descriptor testidentity.Descriptor, capability, method, path string) string {
+	for _, operation := range descriptor.Operations {
+		if operation.Capability == capability && operation.Method == method && operation.Path == path {
+			return operation.TargetID
+		}
+	}
+	return ""
+}
+
+// cloneIdentityDescriptors deep-copies model-facing operations and imposes no access to private catalog state.
+func cloneIdentityDescriptors(descriptors []testidentity.Descriptor) []testidentity.Descriptor {
+	out := make([]testidentity.Descriptor, len(descriptors))
+	for i, descriptor := range descriptors {
+		out[i] = descriptor
+		out[i].Operations = append([]testidentity.Operation(nil), descriptor.Operations...)
+	}
+	return out
 }
 
 // expandPath validates exact path bindings against retained parameter schemas and escapes each value as one segment.

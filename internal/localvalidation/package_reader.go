@@ -17,6 +17,7 @@ import (
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 )
 
+// packagePlanDocument decodes the public redacted plan projection without granting execution authority.
 type packagePlanDocument struct {
 	Version            int             `json:"version"`
 	PlanArtifactSHA256 string          `json:"plan_artifact_sha256,omitempty"`
@@ -25,11 +26,13 @@ type packagePlanDocument struct {
 		ID           string `json:"id"`
 		ConstraintID string `json:"constraint_id"`
 		Steps        []struct {
-			ID         string          `json:"id"`
-			Tool       string          `json:"tool"`
-			Input      json.RawMessage `json:"input"`
-			Assertions json.RawMessage `json:"assertions"`
-			DependsOn  []string        `json:"depends_on"`
+			ID                     string          `json:"id"`
+			Tool                   string          `json:"tool"`
+			Input                  json.RawMessage `json:"input"`
+			Assertions             json.RawMessage `json:"assertions"`
+			DependsOn              []string        `json:"depends_on"`
+			IdentityID             string          `json:"identity_id,omitempty"`
+			OperationBindingSHA256 string          `json:"operation_binding_sha256,omitempty"`
 		} `json:"steps"`
 	} `json:"plans"`
 }
@@ -373,18 +376,27 @@ func containsEvidencePath(ids map[string]string, path string) bool {
 }
 
 type packageStepKey struct{ constraint, step string }
-type packagePlanTopology struct {
-	stepBatches     map[packageStepKey]int
-	planSteps       map[packageStepKey]bool
-	planConstraints map[string]string
+
+// packageIdentityExpectation is the safe identity selection sealed into one public plan step.
+type packageIdentityExpectation struct {
+	identityID, operationBindingSHA256 string
 }
 
+// packagePlanTopology indexes plan ownership and sealed identity expectations for cross-document verification.
+type packagePlanTopology struct {
+	stepBatches        map[packageStepKey]int
+	planSteps          map[packageStepKey]bool
+	planConstraints    map[string]string
+	identityByPlanStep map[packageStepKey]packageIdentityExpectation
+}
+
+// validatePlanTopology validates the public plan/report graph and preserves each step identity binding for journal verification.
 func validatePlanTopology(plan packagePlanDocument, report reportArtifact) (packagePlanTopology, error) {
-	if plan.Version != 0 && plan.Version != 1 {
+	if plan.Version != 0 && plan.Version != 1 && plan.Version != 2 {
 		return packagePlanTopology{}, &PackageError{Category: "invalid_schema", Path: "plan.json"}
 	}
 	known := map[string]map[string]bool{}
-	topology := packagePlanTopology{stepBatches: map[packageStepKey]int{}, planSteps: map[packageStepKey]bool{}, planConstraints: map[string]string{}}
+	topology := packagePlanTopology{stepBatches: map[packageStepKey]int{}, planSteps: map[packageStepKey]bool{}, planConstraints: map[string]string{}, identityByPlanStep: map[packageStepKey]packageIdentityExpectation{}}
 	planIDs := map[string]bool{}
 	for i, batch := range plan.Plans {
 		if !revisionbinding.ValidID(batch.ID) || !revisionbinding.ValidID(batch.ConstraintID) || planIDs[batch.ID] {
@@ -399,9 +411,16 @@ func validatePlanTopology(plan packagePlanDocument, report reportArtifact) (pack
 			if !revisionbinding.ValidID(step.ID) || known[batch.ConstraintID][step.ID] {
 				return packagePlanTopology{}, &PackageError{Category: "invalid_schema", Path: "plan.json"}
 			}
+			if (step.IdentityID == "") != (step.OperationBindingSHA256 == "") || step.IdentityID != "" && (!revisionbinding.ValidID(step.IdentityID) || len(step.OperationBindingSHA256) != 64) {
+				return packagePlanTopology{}, &PackageError{Category: "invalid_schema", Path: "plan.json"}
+			}
 			known[batch.ConstraintID][step.ID] = true
 			topology.stepBatches[packageStepKey{batch.ConstraintID, step.ID}] = i + 1
-			topology.planSteps[packageStepKey{batch.ID, step.ID}] = true
+			key := packageStepKey{batch.ID, step.ID}
+			topology.planSteps[key] = true
+			if step.IdentityID != "" {
+				topology.identityByPlanStep[key] = packageIdentityExpectation{identityID: step.IdentityID, operationBindingSHA256: step.OperationBindingSHA256}
+			}
 		}
 	}
 	for _, constraint := range report.Constraints {
@@ -632,12 +651,16 @@ func validSafeValue(value SafeValue) bool {
 	return false
 }
 
+// validatePackageEvents verifies cross-document references and fail-closed identity facts before replaying the bound sequence.
 func validatePackageEvents(ctx context.Context, raw []byte, index PackageIndex, topology packagePlanTopology, known map[string]string, records map[string]evidence.Record) error {
 	lines := bytes.Split(bytes.TrimSpace(raw), []byte{'\n'})
 	if len(lines) < 3 {
 		return &PackageError{Category: "broken_reference", Path: "events.jsonl"}
 	}
 	events := make([]harness.Event, 0, len(lines))
+	nextIdentityAttempt := map[packageStepKey]int{}
+	identityAttempts := map[packageIdentityAttemptKey]*packageIdentityAttemptState{}
+	lastIdentityCategory := map[packageStepKey]string{}
 	for i, line := range lines {
 		var event eventArtifact
 		if err := decodePackageJSON(line, "events.jsonl", &event); err != nil {
@@ -663,13 +686,92 @@ func validatePackageEvents(ctx context.Context, raw []byte, index PackageIndex, 
 		if event.ToolCallID != "" && (event.StepID == "" || event.ToolCallID != event.PlanID+":"+event.StepID) {
 			return &PackageError{Category: "broken_reference", Path: "events.jsonl"}
 		}
+		stepKey := packageStepKey{event.PlanID, event.StepID}
+		expectedIdentity, identityStep := topology.identityByPlanStep[stepKey]
+		hasIdentityID := event.IdentityID != ""
+		hasIdentityDigest := event.OperationBindingSHA256 != ""
+		hasAttempt := event.Attempt != 0
+		hasOutcome := event.OutcomeCategory != ""
+		attemptKey := packageIdentityAttemptKey{step: stepKey, attempt: event.Attempt}
+		switch harness.EventType(event.Type) {
+		case harness.EventIdentityAttemptTerminal:
+			if !identityStep || !hasIdentityID || !hasIdentityDigest || !hasAttempt || !hasOutcome || event.Attempt <= 0 || !validIdentityTerminalCategory(event.OutcomeCategory) || event.IdentityID != expectedIdentity.identityID || event.OperationBindingSHA256 != expectedIdentity.operationBindingSHA256 {
+				return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+			}
+			next := nextIdentityAttempt[stepKey] + 1
+			state := identityAttemptState(identityAttempts, attemptKey)
+			if !identityAttemptIsCurrent(nextIdentityAttempt, lastIdentityCategory, stepKey, event.Attempt) || !state.observeTerminal(event.OutcomeCategory) {
+				return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+			}
+			nextIdentityAttempt[stepKey] = next
+			lastIdentityCategory[stepKey] = event.OutcomeCategory
+		case harness.EventExecutionStarted, harness.EventRetryScheduled:
+			if !hasAttempt || hasOutcome || identityStep && (!hasIdentityID || !hasIdentityDigest || event.Attempt <= 0 || event.IdentityID != expectedIdentity.identityID || event.OperationBindingSHA256 != expectedIdentity.operationBindingSHA256) || !identityStep && (hasIdentityID || hasIdentityDigest) {
+				return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+			}
+			if identityStep {
+				if !identityAttemptIsCurrent(nextIdentityAttempt, lastIdentityCategory, stepKey, event.Attempt) {
+					return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+				}
+				state := identityAttemptState(identityAttempts, attemptKey)
+				valid := false
+				if harness.EventType(event.Type) == harness.EventExecutionStarted {
+					valid = state.observeStarted(event.Attempt)
+				} else {
+					valid = state.observeRetry(event.Attempt)
+				}
+				if !valid {
+					return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+				}
+			}
+		case harness.EventExecutionFinished:
+			if !hasAttempt || !validIdentityExecutionCategory(event.OutcomeCategory) || identityStep && (!hasIdentityID || !hasIdentityDigest || event.Attempt <= 0 || event.IdentityID != expectedIdentity.identityID || event.OperationBindingSHA256 != expectedIdentity.operationBindingSHA256) || !identityStep && (hasIdentityID || hasIdentityDigest) {
+				return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+			}
+			if identityStep {
+				if !identityAttemptIsCurrent(nextIdentityAttempt, lastIdentityCategory, stepKey, event.Attempt) {
+					return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+				}
+				if !identityAttemptState(identityAttempts, attemptKey).observeFinished(event.OutcomeCategory) {
+					return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+				}
+			}
+		case harness.EventPolicyEvaluated, harness.EventBudgetReserved:
+			if !hasAttempt || event.Attempt <= 0 || hasIdentityID || hasIdentityDigest || hasOutcome {
+				return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+			}
+			if identityStep {
+				if !identityAttemptIsCurrent(nextIdentityAttempt, lastIdentityCategory, stepKey, event.Attempt) {
+					return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+				}
+				state := identityAttemptState(identityAttempts, attemptKey)
+				valid := false
+				if harness.EventType(event.Type) == harness.EventPolicyEvaluated {
+					valid = state.observePolicy()
+				} else {
+					valid = state.observeBudget()
+				}
+				if !valid {
+					return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+				}
+			}
+		default:
+			if hasIdentityID || hasIdentityDigest || hasAttempt || hasOutcome {
+				return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+			}
+		}
 		for _, id := range event.EvidenceIDs {
 			record := records[id]
 			if record.PlanID != event.PlanID || record.StepID != event.StepID || (event.ToolCallID != "" && record.ToolCallID != event.ToolCallID) {
 				return &PackageError{Category: "broken_reference", Path: "events.jsonl"}
 			}
 		}
-		events = append(events, harness.Event{Sequence: event.Sequence, Type: harness.EventType(event.Type), RunID: event.RunID, BindingSHA256: event.BindingSHA256, PlanSHA256: event.PlanSHA256, Status: event.Status})
+		events = append(events, harness.Event{Sequence: event.Sequence, Type: harness.EventType(event.Type), RunID: event.RunID, BindingSHA256: event.BindingSHA256, PlanSHA256: event.PlanSHA256, Status: event.Status, IdentityID: event.IdentityID, OperationBindingSHA256: event.OperationBindingSHA256, Attempt: event.Attempt, OutcomeCategory: event.OutcomeCategory})
+	}
+	for _, state := range identityAttempts {
+		if !state.terminal {
+			return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
+		}
 	}
 	if err := verifyBoundSequence(ctx, index.Binding, index.PlanBindings, events, index.Status); err != nil {
 		if ctx.Err() != nil {
@@ -678,4 +780,134 @@ func validatePackageEvents(ctx context.Context, raw []byte, index PackageIndex, 
 		return &PackageError{Category: "binding_integrity", Path: "events.jsonl"}
 	}
 	return nil
+}
+
+// packageIdentityAttemptKey correlates one authenticated step attempt across compatible durable event types.
+type packageIdentityAttemptKey struct {
+	step    packageStepKey
+	attempt int
+}
+
+// packageIdentityAttemptState models the only accepted durable phase path for one authenticated attempt.
+type packageIdentityAttemptState struct {
+	policy           bool
+	budget           bool
+	retryScheduled   bool
+	started          bool
+	finished         bool
+	terminal         bool
+	finishedCategory string
+}
+
+// identityAttemptState returns the stable phase state for an authenticated step attempt.
+func identityAttemptState(states map[packageIdentityAttemptKey]*packageIdentityAttemptState, key packageIdentityAttemptKey) *packageIdentityAttemptState {
+	state := states[key]
+	if state == nil {
+		state = &packageIdentityAttemptState{}
+		states[key] = state
+	}
+	return state
+}
+
+// identityAttemptIsCurrent prevents a later attempt from opening before the prior transient attempt has closed.
+func identityAttemptIsCurrent(next map[packageStepKey]int, last map[packageStepKey]string, step packageStepKey, attempt int) bool {
+	return attempt == next[step]+1 && (attempt == 1 || last[step] == "transient")
+}
+
+// observePolicy accepts a unique policy observation before all later attempt phases.
+func (s *packageIdentityAttemptState) observePolicy() bool {
+	if s.terminal || s.policy || s.budget || s.retryScheduled || s.started || s.finished {
+		return false
+	}
+	s.policy = true
+	return true
+}
+
+// observeBudget accepts a unique budget reservation after policy and before execution phases.
+func (s *packageIdentityAttemptState) observeBudget() bool {
+	if s.terminal || !s.policy || s.budget || s.retryScheduled || s.started || s.finished {
+		return false
+	}
+	s.budget = true
+	return true
+}
+
+// observeRetry accepts the retry marker only for a later attempt after its policy and budget checks.
+func (s *packageIdentityAttemptState) observeRetry(attempt int) bool {
+	if s.terminal || attempt <= 1 || !s.policy || !s.budget || s.retryScheduled || s.started || s.finished {
+		return false
+	}
+	s.retryScheduled = true
+	return true
+}
+
+// observeStarted accepts a unique execution start after policy and budget, and after the marker for a retry attempt.
+func (s *packageIdentityAttemptState) observeStarted(attempt int) bool {
+	if s.terminal || !s.policy || !s.budget || attempt > 1 && !s.retryScheduled || s.started || s.finished {
+		return false
+	}
+	s.started = true
+	return true
+}
+
+// observeFinished accepts a unique execution finish after start and preserves its outcome for terminal concordance.
+func (s *packageIdentityAttemptState) observeFinished(category string) bool {
+	if s.terminal || !s.started || s.finished || !validIdentityExecutionCategory(category) {
+		return false
+	}
+	s.finished = true
+	s.finishedCategory = category
+	return true
+}
+
+// observeTerminal closes an attempt only when its durable phases support the declared terminal category.
+func (s *packageIdentityAttemptState) observeTerminal(category string) bool {
+	if s.terminal {
+		return false
+	}
+	valid := false
+	switch category {
+	case "success":
+		valid = s.finished && s.finishedCategory == ""
+	case "transient":
+		valid = s.finished && s.finishedCategory == string(harness.ErrorTransient)
+	case "permanent", "credential_rejected":
+		valid = s.finished && s.finishedCategory == string(harness.ErrorPermanent)
+	case "cancelled":
+		valid = s.finished && s.finishedCategory == "cancelled" || !s.started && !s.finished && (!s.policy && !s.budget && !s.retryScheduled || s.policy && !s.budget && !s.retryScheduled || s.policy && s.budget)
+	case "composition_unavailable", "identity_drift", "policy_error":
+		valid = !s.policy && !s.budget && !s.retryScheduled && !s.started && !s.finished
+	case "policy_denied", "budget_denied":
+		valid = s.policy && !s.budget && !s.retryScheduled && !s.started && !s.finished
+	}
+	if !valid {
+		return false
+	}
+	s.terminal = true
+	return true
+}
+
+// identityTerminalMayStandAlone identifies pre-I/O rejections whose terminal fact is itself the only durable attempt observation.
+func identityTerminalMayStandAlone(category string) bool {
+	switch category {
+	case "cancelled", "composition_unavailable", "identity_drift", "policy_error":
+		return true
+	default:
+		return false
+	}
+}
+
+// validIdentityTerminalCategory limits durable terminal facts to categories emitted by the authenticated executor.
+func validIdentityTerminalCategory(category string) bool {
+	switch category {
+	case "success", "transient", "permanent", "credential_rejected", "cancelled", "composition_unavailable", "identity_drift", "policy_error", "policy_denied", "budget_denied":
+		return true
+	default:
+		return false
+	}
+}
+
+// validIdentityExecutionCategory limits execution-finished metadata to the tool error vocabulary used before terminal reduction.
+func validIdentityExecutionCategory(category string) bool {
+	return category == "" || category == string(harness.ErrorTransient) || category == string(harness.ErrorPermanent) || category == "cancelled"
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // contextCapability is the executable-free capability identity included in the canonical admission context.
@@ -36,6 +37,7 @@ type artifactContext struct {
 	Constraints                                                                                                           []agentplanning.Constraint
 	Contract                                                                                                              contextContract
 	Capabilities                                                                                                          []contextCapability
+	Identities                                                                                                            []testidentity.Descriptor `json:"identities,omitempty"`
 	Limits                                                                                                                agentplanning.Limits
 }
 
@@ -69,6 +71,10 @@ func canonicalContextDigest(snapshot AdmissionSnapshot) (string, error) {
 		capabilities[index] = contextCapability{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
 	openAPISum := sha256.Sum256(snapshot.Generation.Contract.Bytes())
+	identities, identityErr := testidentity.CanonicalDescriptors(snapshot.Generation.Identities)
+	if identityErr != nil {
+		return "", &Error{Code: CodeInvalid, Operation: "identity_context"}
+	}
 	return safeDigest(artifactContext{
 		SpecificationDigest:  snapshot.SpecificationDigest,
 		ContractDigest:       snapshot.ContractDigest,
@@ -84,6 +90,7 @@ func canonicalContextDigest(snapshot AdmissionSnapshot) (string, error) {
 		Constraints:          append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...),
 		Contract:             contextContract{MediaType: snapshot.Generation.Contract.MediaType(), Untrusted: snapshot.Generation.Contract.Untrusted(), BytesSHA256: hex.EncodeToString(openAPISum[:]), Omissions: snapshot.Generation.Contract.Omissions()},
 		Capabilities:         capabilities,
+		Identities:           identities,
 		Limits:               snapshot.Generation.Limits,
 	})
 }

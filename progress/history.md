@@ -551,3 +551,32 @@ Bitácora append-only de features completadas.
   `internal/validationworkflow` 85,6 %.
 - Limitación del host: la suite global conserva únicamente el subtest histórico
   de symlink de `localvalidation`, que Windows no puede crear sin privilegio.
+
+## 2026-10-22 — test-identities
+
+- Estado final: `done`.
+- Resultado: specification v2 con identidades de prueba, referencias opacas,
+  mecanismos bearer/header/cookie y permisos exactos por target, método y path;
+  v1 conserva su contrato estricto sin identidades implícitas.
+- Seguridad: el modelo, plan, policy, journal, evidence y reportes reciben solo
+  descriptores y bindings no secretos. El material se resuelve por intento y se
+  inyecta únicamente en el transporte HTTP autorizado, con redirects,
+  redacción monotónica y liberación acotada.
+- Ejecución: identity/target/policy/budget se revalidan antes de cada intento;
+  retries, cancelación y appends pre-I/O conservan terminales auditables únicos.
+  El package reader verifica tuple, cardinalidad, orden y outcome contra el plan
+  sellado y rechaza packages rehasheados semánticamente inválidos.
+- Integración: CLI, API, MCP y GitHub comparten composición productiva, códigos,
+  binding y outcomes en éxito y error; redelivery y `Service.Recover` usan
+  resolución fresca sin duplicar efectos.
+- Spec aprobada por el usuario el `2026-10-22T15:27:02+02:00`.
+- Tasks T1–T13 completas; R1–R11 y REV-1–REV-18 trazados en
+  `progress/test-identities/{implementation,review}.md`.
+- Review independiente aprobada en la novena revisión. Pasan focales repetidos,
+  race UCRT64, vet, compile-only, diff-check y builds Windows/Linux/macOS.
+- Cobertura afectada: `testidentity` 91,9 %, `tools/http` 91,1 %,
+  `agentplanning` 87,3 %, `planning` 88,5 %, `planmanifest` 91,8 %,
+  `specification` 95,5 %, `specification/yaml` 87,3 %, `evidence` 90,2 % y
+  `validationworkflow` 85,6 %; conjunto medido 88,3 %.
+- Limitación del host: la suite global conserva únicamente el subtest histórico
+  de symlink de `localvalidation`, que Windows no puede crear sin privilegio.

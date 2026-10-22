@@ -137,9 +137,10 @@ func TestUnsupportedVersionErrorReportsContract(t *testing.T) {
 	}
 }
 
+// TestValidateRejectsKnownButUnsupportedInternalVersion keeps unknown future contracts outside domain interpretation.
 func TestValidateRejectsKnownButUnsupportedInternalVersion(t *testing.T) {
 	spec := validSpecification()
-	spec.Version = 2
+	spec.Version = 3
 	if !errors.Is(Validate(spec), ErrInvalidValue) {
 		t.Fatalf("Validate() error = %v", Validate(spec))
 	}

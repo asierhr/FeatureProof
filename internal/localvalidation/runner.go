@@ -22,6 +22,7 @@ import (
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 	"github.com/asierhr/featureProof/internal/specification"
 	specyaml "github.com/asierhr/featureProof/internal/specification/yaml"
+	"github.com/asierhr/featureProof/internal/testidentity"
 	"github.com/asierhr/featureProof/internal/tools"
 	httptool "github.com/asierhr/featureProof/internal/tools/http"
 )
@@ -102,22 +103,25 @@ type SafeProjectionBuilder interface {
 
 // RuntimeDependencies isolates time, identity, network, filesystem and output for hermetic runs.
 type RuntimeDependencies struct {
-	Root                string
-	Clock               harness.Clock
-	IDs                 harness.IDGenerator
-	Waiter              harness.Waiter
-	Resolver            httptool.Resolver
-	Dialer              httptool.Dialer
-	WithTimeout         httptool.TimeoutFactory
-	FinalizeTimeout     time.Duration
-	PublisherFactory    func(string, string) (*Publisher, error)
-	PolicyFactory       func() harness.Policy
-	EvidenceFactory     func(*Publisher) (evidence.Store, error)
-	Evaluator           planning.StepAssertionEvaluator
-	RevisionResolver    revisionbinding.RevisionResolver
-	EnvironmentAttestor revisionbinding.EnvironmentAttestor
-	SafeProjector       SafeProjectionBuilder
-	Stdout, Stderr      io.Writer
+	Root                       string
+	Clock                      harness.Clock
+	IDs                        harness.IDGenerator
+	Waiter                     harness.Waiter
+	Resolver                   httptool.Resolver
+	Dialer                     httptool.Dialer
+	WithTimeout                httptool.TimeoutFactory
+	FinalizeTimeout            time.Duration
+	PublisherFactory           func(string, string) (*Publisher, error)
+	PolicyFactory              func() harness.Policy
+	EvidenceFactory            func(*Publisher) (evidence.Store, error)
+	Evaluator                  planning.StepAssertionEvaluator
+	RevisionResolver           revisionbinding.RevisionResolver
+	EnvironmentAttestor        revisionbinding.EnvironmentAttestor
+	SafeProjector              SafeProjectionBuilder
+	Stdout, Stderr             io.Writer
+	CredentialResolvers        map[string]testidentity.CredentialResolver
+	IdentityObserver           testidentity.Observer
+	IdentityObservationTimeout time.Duration
 }
 
 // Runner owns one prevalidated deterministic invocation and its replaceable runtime boundaries.
@@ -129,6 +133,7 @@ type Runner struct {
 	policy          harness.Policy
 	sanitizer       evidence.Sanitizer
 	redactionPolicy *evidence.Policy
+	identities      *testidentity.Catalog
 	deps            RuntimeDependencies
 	selection       revisionbinding.Selection
 	revision        revisionbinding.Revision
@@ -144,6 +149,20 @@ type constraintCatalog map[string]bool
 
 // HasConstraint exposes exact specification IDs to planning validation.
 func (c constraintCatalog) HasConstraint(id string) bool { return c[id] }
+
+// credentialRouter dispatches an opaque reference only to its composition-registered resolver and never falls back across identities.
+type credentialRouter struct {
+	resolvers map[string]testidentity.CredentialResolver
+}
+
+// Resolve delegates one attempt to the exact configured reference while returning a value-free failure for missing routes.
+func (r credentialRouter) Resolve(ctx context.Context, request testidentity.ResolutionRequest) (testidentity.CredentialLease, error) {
+	resolver := r.resolvers[request.CredentialReference]
+	if resolver == nil {
+		return testidentity.CredentialLease{}, errors.New("credential resolver unavailable")
+	}
+	return resolver.Resolve(ctx, request)
+}
 
 // NewRunner loads and validates every input and configuration before generating an ID or touching the run directory.
 func NewRunner(ctx context.Context, request Request, deps RuntimeDependencies) (*Runner, error) {
@@ -191,7 +210,8 @@ func NewPreparedRunner(ctx context.Context, request PreparedRequest, deps Runtim
 // newRunner is the single deterministic composition path shared by explicit and generated plans.
 func newRunner(ctx context.Context, spec specification.Specification, manifest planmanifest.Manifest, target, repositoryID, revisionRef, environmentID string, deps RuntimeDependencies) (*Runner, error) {
 	spec.Target.BaseURL = target
-	redactionPolicy, err := evidence.NewPolicy(manifest.Redaction)
+	redactionConfig := evidence.AugmentAuthenticationConfig(manifest.Redaction, spec.Identities)
+	redactionPolicy, err := evidence.NewPolicy(redactionConfig)
 	if err != nil {
 		return nil, safeError("validate redaction", err)
 	}
@@ -211,7 +231,27 @@ func newRunner(ctx context.Context, spec specification.Specification, manifest p
 		}
 	}
 	h := manifest.HTTP
-	httpTool, err := httptool.New(httptool.Config{Target: spec.Target, AllowedMethods: h.AllowedMethods, AllowedRequestHeaders: h.AllowedRequestHeaders, AllowedResponseHeaders: h.AllowedResponseHeaders, FollowRedirectsForMethods: h.FollowRedirectsForMethods, MaxRedirects: h.MaxRedirects, Timeout: h.Timeout(), MaxURLBytes: h.MaxURLBytes, MaxRequestHeaderBytes: h.MaxRequestHeaderBytes, MaxRequestBodyBytes: h.MaxRequestBodyBytes, MaxResponseHeaderBytes: h.MaxResponseHeaderBytes, MaxResponseBodyBytes: h.MaxResponseBodyBytes, Resolver: deps.Resolver, Dialer: deps.Dialer, Clock: deps.Clock, WithTimeout: deps.WithTimeout})
+	var identities *testidentity.Catalog
+	var authentication *testidentity.Transport
+	if len(spec.Identities) > 0 {
+		identities, err = testidentity.NewCatalog(spec.Identities)
+		if err != nil {
+			return nil, safeError("validate identities", err)
+		}
+		if deps.IdentityObserver == nil {
+			return nil, safeError("compose identities", &planmanifest.Error{Category: "required", Field: "identity_observer"})
+		}
+		for _, identity := range spec.Identities {
+			if deps.CredentialResolvers[identity.CredentialRef] == nil {
+				return nil, safeError("compose identities", &planmanifest.Error{Category: "required", Field: "credential_resolver"})
+			}
+		}
+		authentication, err = testidentity.NewTransport(testidentity.TransportConfig{Catalog: identities, Resolver: credentialRouter{resolvers: deps.CredentialResolvers}, Clock: deps.Clock, Observer: deps.IdentityObserver, ObservationTimeout: deps.IdentityObservationTimeout, MaxHeaderBytes: h.MaxRequestHeaderBytes})
+		if err != nil {
+			return nil, safeError("compose identities", err)
+		}
+	}
+	httpTool, err := httptool.New(httptool.Config{Target: spec.Target, AllowedMethods: h.AllowedMethods, AllowedRequestHeaders: h.AllowedRequestHeaders, AllowedResponseHeaders: h.AllowedResponseHeaders, FollowRedirectsForMethods: h.FollowRedirectsForMethods, MaxRedirects: h.MaxRedirects, Timeout: h.Timeout(), MaxURLBytes: h.MaxURLBytes, MaxRequestHeaderBytes: h.MaxRequestHeaderBytes, MaxRequestBodyBytes: h.MaxRequestBodyBytes, MaxResponseHeaderBytes: h.MaxResponseHeaderBytes, MaxResponseBodyBytes: h.MaxResponseBodyBytes, Resolver: deps.Resolver, Dialer: deps.Dialer, Clock: deps.Clock, WithTimeout: deps.WithTimeout, Authentication: authentication})
 	if err != nil {
 		return nil, safeError("validate HTTP runtime", err)
 	}
@@ -241,7 +281,7 @@ func newRunner(ctx context.Context, spec specification.Specification, manifest p
 	if runPolicy == nil {
 		return nil, fmt.Errorf("policy factory returned nil")
 	}
-	return &Runner{spec: spec, manifest: manifest, validated: validated, registry: registry, policy: runPolicy, sanitizer: evidence.NewSanitizer(redactionPolicy), redactionPolicy: redactionPolicy, deps: deps, selection: selection, revision: revision, attestation: attestation, approvalMode: "approval_not_required"}, nil
+	return &Runner{spec: spec, manifest: manifest, validated: validated, registry: registry, policy: runPolicy, sanitizer: evidence.NewSanitizer(redactionPolicy), redactionPolicy: redactionPolicy, identities: identities, deps: deps, selection: selection, revision: revision, attestation: attestation, approvalMode: "approval_not_required"}, nil
 }
 
 // Run executes constraints sequentially, publishes a terminal bundle when possible, and returns the public exit code.
@@ -339,7 +379,7 @@ func (r *Runner) Run(ctx context.Context) int {
 			break
 		}
 		planBindings = append(planBindings, planBinding)
-		executor, buildErr := planning.NewPlanExecutor(planning.ExecutorConfig{Run: shared}, planning.ExecutorDependencies{Registry: r.registry, Policy: r.policy, Evidence: store, Journal: journal, Sanitizer: r.sanitizer, Clock: r.deps.Clock, IDs: r.deps.IDs, Waiter: r.deps.Waiter, Evaluator: r.deps.Evaluator})
+		executor, buildErr := planning.NewPlanExecutor(planning.ExecutorConfig{Run: shared, TerminalAppendTimeout: r.deps.FinalizeTimeout}, planning.ExecutorDependencies{Registry: r.registry, Policy: r.policy, Evidence: store, Journal: journal, Sanitizer: r.sanitizer, Clock: r.deps.Clock, IDs: r.deps.IDs, Waiter: r.deps.Waiter, Evaluator: r.deps.Evaluator, Identities: r.identities})
 		if buildErr != nil {
 			operational = buildErr
 			status = ResultError
@@ -479,7 +519,7 @@ func (contextWaiter) Wait(ctx context.Context, duration time.Duration) error {
 
 // DefaultDependencies binds production OS/network boundaries while keeping them replaceable in tests.
 func DefaultDependencies(root string, stdout, stderr io.Writer) RuntimeDependencies {
-	return RuntimeDependencies{Root: root, Clock: systemClock{}, IDs: randomIDs{}, Waiter: contextWaiter{}, Resolver: net.DefaultResolver, Dialer: &net.Dialer{}, WithTimeout: context.WithTimeout, FinalizeTimeout: 5 * time.Second, PublisherFactory: NewPublisher, PolicyFactory: func() harness.Policy {
+	return RuntimeDependencies{Root: root, Clock: systemClock{}, IDs: randomIDs{}, Waiter: contextWaiter{}, Resolver: net.DefaultResolver, Dialer: &net.Dialer{}, WithTimeout: context.WithTimeout, FinalizeTimeout: 5 * time.Second, IdentityObservationTimeout: 5 * time.Second, PublisherFactory: NewPublisher, PolicyFactory: func() harness.Policy {
 		return &policy.Static{Decisions: map[string]harness.PolicyDecision{"http.request": {Allowed: true, Reason: "manifest_allowlist"}}}
 	}, EvidenceFactory: func(publisher *Publisher) (evidence.Store, error) { return publisher.EvidenceStore() }, Evaluator: assertion.Engine{}, Stdout: stdout, Stderr: stderr}
 }

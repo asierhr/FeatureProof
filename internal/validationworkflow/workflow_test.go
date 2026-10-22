@@ -803,7 +803,7 @@ func TestAdmissionFailsClosedAtEveryBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	builder, specs, _, _, _ = makeBuilder()
-	specs.spec.Version = 2
+	specs.spec.Version = 3
 	if _, err := builder.Build(context.Background(), command); !IsCode(err, CodeInvalid) {
 		t.Fatal(err)
 	}

@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/asierhr/featureProof/internal/jsonpath"
+	"github.com/asierhr/featureProof/internal/specification"
 )
 
 // Redacted is the fixed non-secret marker used by every evidence view.
@@ -54,6 +55,9 @@ type Policy struct {
 }
 
 var defaultHeaders = []string{"Authorization", "Cookie", "Set-Cookie", "Proxy-Authorization"}
+
+// defaultAuthenticationPaths covers conventional credential-shaped response fields before identity-specific augmentation.
+var defaultAuthenticationPaths = []string{"/body/token", "/body/cookie", "/body/password", "/body/api_key", "/body/authorization"}
 var headerName = regexp.MustCompile(`^[!#$%&'*+.^_` + "`" + `|~0-9A-Za-z-]+$`)
 
 // NewPolicy validates and freezes all limits, header names, and JSON paths before effects.
@@ -100,6 +104,47 @@ func NewPolicy(config Config) (*Policy, error) {
 		}
 	}
 	return p, nil
+}
+
+// AugmentAuthenticationConfig monotonically adds declared auth headers and response-body selectors without credential references or values.
+func AugmentAuthenticationConfig(config Config, identities []specification.TestIdentity) Config {
+	out := config
+	out.AdditionalHeaders = append([]string(nil), config.AdditionalHeaders...)
+	out.SensitiveJSONPaths = monotonicPaths(defaultAuthenticationPaths, config.SensitiveJSONPaths)
+	headers := map[string]bool{}
+	for _, name := range append(append([]string(nil), defaultHeaders...), out.AdditionalHeaders...) {
+		headers[strings.ToLower(name)] = true
+	}
+	paths := map[string]bool{}
+	for _, path := range out.SensitiveJSONPaths {
+		paths[path] = true
+	}
+	for _, identity := range identities {
+		if identity.Mechanism.Type == "header" && !headers[strings.ToLower(identity.Mechanism.Name)] {
+			out.AdditionalHeaders = append(out.AdditionalHeaders, identity.Mechanism.Name)
+			headers[strings.ToLower(identity.Mechanism.Name)] = true
+		}
+		for _, path := range identity.Mechanism.SensitiveJSONPaths {
+			if !paths[path] {
+				out.SensitiveJSONPaths = append(out.SensitiveJSONPaths, path)
+				paths[path] = true
+			}
+		}
+	}
+	return out
+}
+
+// monotonicPaths combines mandatory and configured selectors while preserving first declaration order.
+func monotonicPaths(required, configured []string) []string {
+	out := make([]string, 0, len(required)+len(configured))
+	seen := map[string]bool{}
+	for _, path := range append(append([]string(nil), required...), configured...) {
+		if !seen[path] {
+			seen[path] = true
+			out = append(out, path)
+		}
+	}
+	return out
 }
 
 // compilePaths validates paths and rejects exact duplicates while preserving declaration order.

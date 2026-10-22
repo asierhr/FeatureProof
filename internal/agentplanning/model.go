@@ -9,6 +9,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // DecisionKind identifies the two terminal results allowed by planning protocol v1.
@@ -66,6 +67,7 @@ type GenerationRequest struct {
 	Constraints   []Constraint
 	Contract      contractcatalog.ReducedContext
 	Capabilities  []CapabilityDescriptor
+	Identities    []testidentity.Descriptor
 	Limits        Limits
 }
 
@@ -99,6 +101,7 @@ type CandidateCheck struct {
 	PathParams   map[string]any        `json:"path_params,omitempty"`
 	Steps        []planning.PlanStep   `json:"steps"`
 	Evidence     []EvidenceRequirement `json:"evidence"`
+	IdentityID   string                `json:"identity_id,omitempty"`
 }
 
 // CandidatePlan is the complete untrusted plan branch of protocol v1.
@@ -296,11 +299,12 @@ type ProvenanceInput struct {
 	Constraints  []Constraint
 	Contract     contractcatalog.ReducedContext
 	Capabilities []CapabilityDescriptor
+	Identities   []testidentity.Descriptor
 }
 
 // MatchesProvenance proves that this plan was minted from the supplied generation inputs without exposing a forgeable token.
 func (p PreparedPlan) MatchesProvenance(input ProvenanceInput) bool {
-	want, err := generationProvenance(input.Constraints, input.Contract, input.Capabilities)
+	want, err := generationProvenance(input.Constraints, input.Contract, input.Capabilities, input.Identities)
 	return err == nil && p.provenance != "" && p.provenance == want
 }
 

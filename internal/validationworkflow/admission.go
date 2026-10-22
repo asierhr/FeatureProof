@@ -10,6 +10,7 @@ import (
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/specification"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
 // SpecificationLoader loads and validates one authorized specification reference without model effects.
@@ -151,7 +152,17 @@ func (b TrustedAdmissionBuilder) Build(ctx context.Context, command StartCommand
 	for i, constraint := range spec.Constraints {
 		constraints[i] = agentplanning.Constraint{ID: constraint.ID, Description: constraint.Description}
 	}
-	return AdmissionSnapshot{SpecificationDigest: specDigest, ContractDigest: contractDigest, CatalogDigest: reduced.CatalogDigest(), ContractPolicyDigest: reduced.PolicyDigest(), RevisionDigest: revisionDigest, TargetDigest: targetDigest, RuntimeDigest: runtimeDigest, Provider: command.Provider, Model: command.Model, Binding: binding, Runtime: runtime, Generation: agentplanning.GenerationRequest{Constraints: constraints, Contract: reduced, Capabilities: append([]agentplanning.CapabilityDescriptor(nil), descriptors...), Limits: b.Config.Limits}}, nil
+	identityCatalog, err := testidentity.NewCatalog(spec.Identities)
+	if err != nil {
+		return AdmissionSnapshot{}, &Error{Code: CodeInvalid, Operation: "identities"}
+	}
+	retained := reduced.RetainedOperations()
+	operations := make([]testidentity.Operation, 0, len(retained))
+	for _, item := range retained {
+		operations = append(operations, testidentity.Operation{Capability: "http.request", TargetID: spec.Target.ID, Method: item.Operation.Key.Method, Path: item.Operation.Key.Path})
+	}
+	identityDescriptors := identityCatalog.DescriptorsFor(operations)
+	return AdmissionSnapshot{SpecificationDigest: specDigest, ContractDigest: contractDigest, CatalogDigest: reduced.CatalogDigest(), ContractPolicyDigest: reduced.PolicyDigest(), RevisionDigest: revisionDigest, TargetDigest: targetDigest, RuntimeDigest: runtimeDigest, Provider: command.Provider, Model: command.Model, Binding: binding, Runtime: runtime, Generation: agentplanning.GenerationRequest{Constraints: constraints, Contract: reduced, Capabilities: append([]agentplanning.CapabilityDescriptor(nil), descriptors...), Identities: identityDescriptors, Limits: b.Config.Limits}}, nil
 }
 
 // validBindingContext rejects partial or caller-substituted source, target and attestation objects.
@@ -169,7 +180,7 @@ func validBindingContext(value BindingContext, command StartCommand) bool {
 
 // validRuntimeContext rejects partial effective runtime objects before any inference.
 func validRuntimeContext(value RuntimeContext, profile string) bool {
-	return value.Profile == profile && value.ManifestVersion == 1 && value.Registry.Version != "" && len(value.Registry.Tools) > 0 && value.Schema.Version != "" && value.Schema.ReferenceVersion != "" && len(value.Schema.Fields) > 0 && value.Validator.Tool != "" && value.Validator.ToolVersion != "" && value.Validator.AssertionEngine != "" && value.Validator.AssertionVersion != "" && value.Policy.ID != "" && len(value.Policy.AllowedTools) > 0 && value.Policy.Reason != "" && validNetworkContext(value.Network)
+	return value.Profile == profile && (value.ManifestVersion == 1 || value.ManifestVersion == 2) && value.Registry.Version != "" && len(value.Registry.Tools) > 0 && value.Schema.Version != "" && value.Schema.ReferenceVersion != "" && len(value.Schema.Fields) > 0 && value.Validator.Tool != "" && value.Validator.ToolVersion != "" && value.Validator.AssertionEngine != "" && value.Validator.AssertionVersion != "" && value.Policy.ID != "" && len(value.Policy.AllowedTools) > 0 && value.Policy.Reason != "" && validNetworkContext(value.Network)
 }
 
 // validNetworkContext rejects policy IDs without their effective target rules.
@@ -179,7 +190,7 @@ func validNetworkContext(value NetworkContext) bool {
 
 // validateSpecification enforces minimal semantic completeness independently from YAML syntax.
 func validateSpecification(spec specification.Specification) error {
-	if spec.Version != 1 || spec.Feature.ID == "" || len(spec.Constraints) == 0 || spec.Limits.MaxSteps <= 0 || spec.Limits.MaxToolCalls <= 0 || spec.Limits.MaxRetries < 0 {
+	if (spec.Version != 1 && spec.Version != 2) || spec.Feature.ID == "" || len(spec.Constraints) == 0 || spec.Limits.MaxSteps <= 0 || spec.Limits.MaxToolCalls <= 0 || spec.Limits.MaxRetries < 0 {
 		return &Error{Code: CodeInvalid, Operation: "specification"}
 	}
 	seen := map[string]bool{}

@@ -9,6 +9,30 @@ type Specification struct {
 	Target      Target
 	Constraints []Constraint
 	Limits      Limits
+	Identities  []TestIdentity
+}
+
+// AuthenticationMechanism declares how the terminal HTTP boundary injects one credential without carrying its value.
+type AuthenticationMechanism struct {
+	Type               string
+	Name               string
+	SensitiveJSONPaths []string
+}
+
+// AuthorizedOperation restricts a test identity to one exact capability, method, and structural path template.
+type AuthorizedOperation struct {
+	Capability string
+	Method     string
+	Path       string
+}
+
+// TestIdentity is the trusted non-secret declaration that binds an opaque credential reference to exact operations.
+type TestIdentity struct {
+	ID            string
+	TargetID      string
+	CredentialRef string
+	Mechanism     AuthenticationMechanism
+	Operations    []AuthorizedOperation
 }
 
 // Feature identifies and describes the functionality under validation.

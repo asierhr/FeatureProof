@@ -243,7 +243,7 @@ func (p *Publisher) writeEvents(events []harness.Event) error {
 	writer := bufio.NewWriter(&b)
 	encoder := json.NewEncoder(writer)
 	for _, event := range events {
-		encoded := eventArtifact{Sequence: event.Sequence, Type: string(event.Type), RunID: event.RunID, BindingSHA256: event.BindingSHA256, PlanSHA256: event.PlanSHA256, PlanID: event.PlanID, StepID: event.StepID, ConstraintID: event.ConstraintID, Step: event.Step, ToolCallID: event.ToolCallID, Reason: string(event.Reason), Detail: event.Detail, Status: event.Status, EvidenceIDs: event.EvidenceIDs, BlockingCauses: event.BlockingCause, Truncations: event.Truncations}
+		encoded := eventArtifact{Sequence: event.Sequence, Type: string(event.Type), RunID: event.RunID, BindingSHA256: event.BindingSHA256, PlanSHA256: event.PlanSHA256, PlanID: event.PlanID, StepID: event.StepID, ConstraintID: event.ConstraintID, Step: event.Step, ToolCallID: event.ToolCallID, Reason: string(event.Reason), Detail: event.Detail, Status: event.Status, EvidenceIDs: event.EvidenceIDs, BlockingCauses: event.BlockingCause, Truncations: event.Truncations, IdentityID: event.IdentityID, OperationBindingSHA256: event.OperationBindingSHA256, Attempt: event.Attempt, OutcomeCategory: event.OutcomeCategory}
 		if err := encoder.Encode(encoded); err != nil {
 			return err
 		}
@@ -256,22 +256,26 @@ func (p *Publisher) writeEvents(events []harness.Event) error {
 
 // eventArtifact defines the stable snake-case journal representation without changing the core event contract.
 type eventArtifact struct {
-	Sequence       int                          `json:"sequence"`
-	Type           string                       `json:"type"`
-	RunID          string                       `json:"run_id"`
-	BindingSHA256  string                       `json:"binding_sha256,omitempty"`
-	PlanSHA256     string                       `json:"plan_sha256,omitempty"`
-	PlanID         string                       `json:"plan_id,omitempty"`
-	StepID         string                       `json:"step_id,omitempty"`
-	ConstraintID   string                       `json:"constraint_id,omitempty"`
-	Step           int                          `json:"step,omitempty"`
-	ToolCallID     string                       `json:"tool_call_id,omitempty"`
-	Reason         string                       `json:"reason,omitempty"`
-	Detail         string                       `json:"detail,omitempty"`
-	Status         string                       `json:"status,omitempty"`
-	EvidenceIDs    []string                     `json:"evidence_ids,omitempty"`
-	BlockingCauses []harness.EventBlockingCause `json:"blocking_causes,omitempty"`
-	Truncations    []harness.EventTruncation    `json:"truncations,omitempty"`
+	Sequence               int                          `json:"sequence"`
+	Type                   string                       `json:"type"`
+	RunID                  string                       `json:"run_id"`
+	BindingSHA256          string                       `json:"binding_sha256,omitempty"`
+	PlanSHA256             string                       `json:"plan_sha256,omitempty"`
+	PlanID                 string                       `json:"plan_id,omitempty"`
+	StepID                 string                       `json:"step_id,omitempty"`
+	ConstraintID           string                       `json:"constraint_id,omitempty"`
+	Step                   int                          `json:"step,omitempty"`
+	ToolCallID             string                       `json:"tool_call_id,omitempty"`
+	Reason                 string                       `json:"reason,omitempty"`
+	Detail                 string                       `json:"detail,omitempty"`
+	Status                 string                       `json:"status,omitempty"`
+	EvidenceIDs            []string                     `json:"evidence_ids,omitempty"`
+	BlockingCauses         []harness.EventBlockingCause `json:"blocking_causes,omitempty"`
+	Truncations            []harness.EventTruncation    `json:"truncations,omitempty"`
+	IdentityID             string                       `json:"identity_id,omitempty"`
+	OperationBindingSHA256 string                       `json:"operation_binding_sha256,omitempty"`
+	Attempt                int                          `json:"attempt,omitempty"`
+	OutcomeCategory        string                       `json:"outcome_category,omitempty"`
 }
 
 // runArtifact is the compact terminal metadata document and excludes detailed assertion payloads.

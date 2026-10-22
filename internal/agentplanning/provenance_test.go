@@ -5,7 +5,7 @@ import "testing"
 // TestPreparedPlanProvenanceBindsGenerationInputs proves the opaque seal accepts only the exact feature 10 input snapshot.
 func TestPreparedPlanProvenanceBindsGenerationInputs(t *testing.T) {
 	input := ProvenanceInput{Constraints: []Constraint{{ID: "c", Description: "original"}}, Contract: generationContract(t, "/pets"), Capabilities: []CapabilityDescriptor{{Name: "http.request", Class: "http", Description: "request", Effects: true, Idempotent: true}}}
-	seal, err := generationProvenance(input.Constraints, input.Contract, input.Capabilities)
+	seal, err := generationProvenance(input.Constraints, input.Contract, input.Capabilities, input.Identities)
 	if err != nil {
 		t.Fatal(err)
 	}

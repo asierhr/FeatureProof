@@ -5,11 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/harness"
+	"github.com/asierhr/featureProof/internal/testidentity"
 )
+
+// defaultTerminalAppendTimeout bounds cancellation reconciliation when callers do not provide a tighter durable-close interval.
+const defaultTerminalAppendTimeout = 5 * time.Second
 
 // StepEvaluation carries the deterministic step outcome and complete auditable assertion trees.
 type StepEvaluation struct {
@@ -27,23 +32,30 @@ type TruncationAwareEvaluator interface {
 	EvaluateWithTruncation(context.Context, PlanStep, any, []evidence.Truncation, []string) (StepEvaluation, error)
 }
 
+// IdentityGuard revalidates a sealed non-secret binding against the current catalog immediately before authorization and I/O.
+type IdentityGuard interface {
+	Revalidate(testidentity.Binding, testidentity.Operation) error
+}
+
 // ExecutorDependencies contains every replaceable boundary used during deterministic plan execution.
 type ExecutorDependencies struct {
-	Registry  harness.Registry
-	Policy    harness.Policy
-	Evidence  evidence.Store
-	Journal   harness.Journal
-	Sanitizer evidence.Sanitizer
-	Clock     harness.Clock
-	IDs       harness.IDGenerator
-	Waiter    harness.Waiter
-	Evaluator StepAssertionEvaluator
+	Registry   harness.Registry
+	Policy     harness.Policy
+	Evidence   evidence.Store
+	Journal    harness.Journal
+	Sanitizer  evidence.Sanitizer
+	Clock      harness.Clock
+	IDs        harness.IDGenerator
+	Waiter     harness.Waiter
+	Evaluator  StepAssertionEvaluator
+	Identities IdentityGuard
 }
 
 // ExecutorConfig identifies the run aggregate and retry timing owned by one plan execution.
 type ExecutorConfig struct {
-	Run        *harness.Run
-	RetryDelay time.Duration
+	Run                   *harness.Run
+	RetryDelay            time.Duration
+	TerminalAppendTimeout time.Duration
 }
 
 // PlanExecutor owns all mutable step state while traversing one validated plan sequentially.
@@ -67,6 +79,9 @@ func NewPlanExecutor(config ExecutorConfig, dependencies ExecutorDependencies) (
 	}
 	if !dependencies.Sanitizer.Configured() {
 		return nil, fmt.Errorf("validated evidence sanitizer is required")
+	}
+	if config.TerminalAppendTimeout <= 0 {
+		config.TerminalAppendTimeout = defaultTerminalAppendTimeout
 	}
 	return &PlanExecutor{config: config, deps: dependencies}, nil
 }
@@ -139,38 +154,98 @@ func (e *PlanExecutor) executeStep(ctx context.Context, plan ValidationPlan, ste
 	if err := spec.Validate(input); err != nil {
 		return e.completeInconclusive(ctx, plan, step, nil, ErrorInvalidValue, "input")
 	}
-	call := harness.ToolCall{ID: plan.ID + ":" + step.ID, Tool: step.Tool, ConstraintID: plan.ConstraintID, Input: input}
-	decision, err := e.deps.Policy.Evaluate(ctx, e.config.Run, call)
-	if err != nil {
-		if cancellation(ctx, err) {
-			return StepResult{}, cancellationCause(ctx, err)
+	call := harness.ToolCall{ID: plan.ID + ":" + step.ID, Tool: step.Tool, ConstraintID: plan.ConstraintID, Input: input, IdentityBinding: step.IdentityBinding}
+	if step.IdentityBinding != nil {
+		if e.deps.Identities == nil {
+			return e.completeIdentityInconclusive(ctx, plan, step, call, 1, nil, ErrorResolutionFailed, "identity.composition", "composition_unavailable")
 		}
-		return StepResult{}, fmt.Errorf("evaluate policy for step %s: %w", step.ID, err)
-	}
-	if err := e.append(ctx, plan, harness.Event{Type: harness.EventPolicyEvaluated, StepID: step.ID, ToolCallID: call.ID, Detail: decision.Reason}); err != nil {
-		return StepResult{}, err
-	}
-	if !decision.Allowed {
-		return e.completeInconclusive(ctx, plan, step, nil, ErrorInvalidValue, "policy")
-	}
-	if !e.config.Run.ReserveToolCall() {
-		return e.completeInconclusive(ctx, plan, step, nil, ErrorInvalidValue, "budget.tool_calls")
-	}
-	if err := e.append(ctx, plan, harness.Event{Type: harness.EventBudgetReserved, StepID: step.ID, ToolCallID: call.ID}); err != nil {
-		return StepResult{}, err
+		operation, operationErr := concreteIdentityOperation(step.Tool, step.IdentityBinding.Operation.TargetID, input)
+		if operationErr != nil || e.deps.Identities.Revalidate(*step.IdentityBinding, operation) != nil {
+			return e.completeIdentityInconclusive(ctx, plan, step, call, 1, nil, ErrorResolutionFailed, "identity.binding", "identity_drift")
+		}
 	}
 	evidenceIDs := []string{}
 	attempt := 1
 	for {
+		if err := ctx.Err(); err != nil {
+			if journalErr := e.appendIdentityTerminal(ctx, plan, step, call, attempt, "cancelled"); journalErr != nil {
+				return StepResult{}, errors.Join(err, journalErr)
+			}
+			return StepResult{}, err
+		}
+		if step.IdentityBinding != nil {
+			operation, operationErr := concreteIdentityOperation(step.Tool, step.IdentityBinding.Operation.TargetID, input)
+			if operationErr != nil || e.deps.Identities.Revalidate(*step.IdentityBinding, operation) != nil {
+				return e.completeIdentityInconclusive(ctx, plan, step, call, attempt, evidenceIDs, ErrorResolutionFailed, "identity.drift", "identity_drift")
+			}
+		}
+		call.RunID, call.Attempt = e.config.Run.ID, attempt
+		decision, policyErr := e.deps.Policy.Evaluate(ctx, e.config.Run, call)
+		if policyErr != nil {
+			if cancellation(ctx, policyErr) {
+				cancelErr := cancellationCause(ctx, policyErr)
+				if journalErr := e.appendIdentityTerminal(ctx, plan, step, call, attempt, "cancelled"); journalErr != nil {
+					return StepResult{}, errors.Join(cancelErr, journalErr)
+				}
+				return StepResult{}, cancelErr
+			}
+			if journalErr := e.appendIdentityTerminal(ctx, plan, step, call, attempt, "policy_error"); journalErr != nil {
+				return StepResult{}, errors.Join(policyErr, journalErr)
+			}
+			return StepResult{}, fmt.Errorf("evaluate policy for step %s attempt %d: %w", step.ID, attempt, policyErr)
+		}
+		if err := e.appendIdentityPreIO(ctx, plan, step, call, attempt, harness.Event{Type: harness.EventPolicyEvaluated, StepID: step.ID, ToolCallID: call.ID, Detail: decision.Reason, Attempt: attempt}); err != nil {
+			return StepResult{}, err
+		}
+		if !decision.Allowed {
+			return e.completeIdentityInconclusive(ctx, plan, step, call, attempt, evidenceIDs, ErrorInvalidValue, "policy", "policy_denied")
+		}
+		if err := ctx.Err(); err != nil {
+			if journalErr := e.appendIdentityTerminal(ctx, plan, step, call, attempt, "cancelled"); journalErr != nil {
+				return StepResult{}, errors.Join(err, journalErr)
+			}
+			return StepResult{}, err
+		}
+		retryReserved := false
+		if attempt == 1 {
+			if !e.config.Run.ReserveToolCall() {
+				return e.completeIdentityInconclusive(ctx, plan, step, call, attempt, evidenceIDs, ErrorInvalidValue, "budget.tool_calls", "budget_denied")
+			}
+		} else {
+			if _, reserved := e.config.Run.ReserveRetryToolCall(); !reserved {
+				return e.completeIdentityInconclusive(ctx, plan, step, call, attempt, evidenceIDs, ErrorInvalidValue, "retry.budget", "budget_denied")
+			}
+			retryReserved = true
+		}
+		if err := e.appendIdentityPreIO(ctx, plan, step, call, attempt, harness.Event{Type: harness.EventBudgetReserved, StepID: step.ID, ToolCallID: call.ID, Attempt: attempt}); err != nil {
+			return StepResult{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return StepResult{}, e.closeCancelledIdentityAttempt(ctx, plan, step, call, attempt, err)
+		}
+		if retryReserved {
+			identityID, bindingDigest := safeIdentityAudit(step.IdentityBinding)
+			if err := e.appendIdentityPreIO(ctx, plan, step, call, attempt, harness.Event{Type: harness.EventRetryScheduled, StepID: step.ID, ToolCallID: call.ID, IdentityID: identityID, OperationBindingSHA256: bindingDigest, Attempt: attempt}); err != nil {
+				return StepResult{}, err
+			}
+			if err := ctx.Err(); err != nil {
+				return StepResult{}, e.closeCancelledIdentityAttempt(ctx, plan, step, call, attempt, err)
+			}
+		}
 		started := e.deps.Clock.Now()
-		if err := e.append(ctx, plan, harness.Event{Type: harness.EventExecutionStarted, StepID: step.ID, ToolCallID: call.ID}); err != nil {
+		identityID, bindingDigest := safeIdentityAudit(step.IdentityBinding)
+		if err := e.appendIdentityPreIO(ctx, plan, step, call, attempt, harness.Event{Type: harness.EventExecutionStarted, StepID: step.ID, ToolCallID: call.ID, IdentityID: identityID, OperationBindingSHA256: bindingDigest, Attempt: attempt}); err != nil {
 			return StepResult{}, err
 		}
 		toolResult, executeErr := spec.Tool.Execute(ctx, call)
 		duration := e.deps.Clock.Now().Sub(started)
 		if cancellation(ctx, executeErr) {
 			cancelErr := cancellationCause(ctx, executeErr)
-			if journalErr := e.append(context.WithoutCancel(ctx), plan, harness.Event{Type: harness.EventExecutionFinished, StepID: step.ID, ToolCallID: call.ID}); journalErr != nil {
+			identityID, bindingDigest := safeIdentityAudit(step.IdentityBinding)
+			if journalErr := e.append(context.WithoutCancel(ctx), plan, harness.Event{Type: harness.EventExecutionFinished, StepID: step.ID, ToolCallID: call.ID, IdentityID: identityID, OperationBindingSHA256: bindingDigest, Attempt: attempt, OutcomeCategory: "cancelled"}); journalErr != nil {
+				return StepResult{}, errors.Join(cancelErr, journalErr)
+			}
+			if journalErr := e.appendIdentityTerminal(ctx, plan, step, call, attempt, "cancelled"); journalErr != nil {
 				return StepResult{}, errors.Join(cancelErr, journalErr)
 			}
 			return StepResult{}, cancelErr
@@ -178,7 +253,10 @@ func (e *PlanExecutor) executeStep(ctx context.Context, plan ValidationPlan, ste
 		if executeErr != nil && toolResult.ErrorClass == harness.ErrorNone {
 			toolResult.ErrorClass = harness.ErrorPermanent
 		}
-		if err := e.append(ctx, plan, harness.Event{Type: harness.EventExecutionFinished, StepID: step.ID, ToolCallID: call.ID}); err != nil {
+		if err := e.append(ctx, plan, harness.Event{Type: harness.EventExecutionFinished, StepID: step.ID, ToolCallID: call.ID, IdentityID: identityID, OperationBindingSHA256: bindingDigest, Attempt: attempt, OutcomeCategory: string(toolResult.ErrorClass)}); err != nil {
+			return StepResult{}, err
+		}
+		if err := e.appendIdentityTerminal(ctx, plan, step, call, attempt, identityToolOutcome(toolResult)); err != nil {
 			return StepResult{}, err
 		}
 		sanitizedInput, sanitizeErr := e.deps.Sanitizer.Sanitize(ctx, input)
@@ -239,20 +317,87 @@ func (e *PlanExecutor) executeStep(ctx context.Context, plan ValidationPlan, ste
 		if !safe {
 			return e.completeInconclusive(ctx, plan, step, evidenceIDs, ErrorResolutionFailed, "retry.unsafe")
 		}
-		if _, reserved := e.config.Run.ReserveRetryToolCall(); !reserved {
-			return e.completeInconclusive(ctx, plan, step, evidenceIDs, ErrorInvalidValue, "retry.budget")
-		}
-		if err := e.append(ctx, plan, harness.Event{Type: harness.EventRetryScheduled, StepID: step.ID, ToolCallID: call.ID}); err != nil {
-			return StepResult{}, err
-		}
 		if err := e.deps.Waiter.Wait(ctx, e.config.RetryDelay); err != nil {
 			return StepResult{}, cancellationCause(ctx, err)
 		}
-		if err := e.append(ctx, plan, harness.Event{Type: harness.EventBudgetReserved, StepID: step.ID, ToolCallID: call.ID}); err != nil {
-			return StepResult{}, err
-		}
 		attempt++
 	}
+}
+
+// identityToolOutcome reduces authenticated tool results to the closed terminal audit vocabulary.
+func identityToolOutcome(result harness.ToolResult) string {
+	if result.ErrorClass == harness.ErrorNone {
+		return "success"
+	}
+	if errorValue, ok := result.Output["error"].(map[string]any); ok {
+		if category, ok := errorValue["category"].(string); ok && strings.HasPrefix(category, "identity_") {
+			return "credential_rejected"
+		}
+	}
+	if result.ErrorClass == harness.ErrorTransient {
+		return "transient"
+	}
+	return "permanent"
+}
+
+// appendIdentityTerminal writes one safe terminal fact under a fresh bounded close context and ignores public steps.
+func (e *PlanExecutor) appendIdentityTerminal(ctx context.Context, plan ValidationPlan, step PlanStep, call harness.ToolCall, attempt int, category string) error {
+	if step.IdentityBinding == nil {
+		return nil
+	}
+	identityID, bindingDigest := safeIdentityAudit(step.IdentityBinding)
+	event := harness.Event{Type: harness.EventIdentityAttemptTerminal, StepID: step.ID, ToolCallID: call.ID, IdentityID: identityID, OperationBindingSHA256: bindingDigest, Attempt: attempt, OutcomeCategory: category}
+	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.config.TerminalAppendTimeout)
+	defer cancel()
+	return e.append(closeCtx, plan, event)
+}
+
+// closeCancelledIdentityAttempt preserves the cancellation cause while reconciling the authenticated attempt exactly once.
+func (e *PlanExecutor) closeCancelledIdentityAttempt(ctx context.Context, plan ValidationPlan, step PlanStep, call harness.ToolCall, attempt int, cause error) error {
+	if terminalErr := e.appendIdentityTerminal(ctx, plan, step, call, attempt, "cancelled"); terminalErr != nil {
+		return errors.Join(cause, terminalErr)
+	}
+	return cause
+}
+
+// appendIdentityPreIO reconciles cancellation from any pre-I/O journal append against the last confirmed durable prefix.
+func (e *PlanExecutor) appendIdentityPreIO(ctx context.Context, plan ValidationPlan, step PlanStep, call harness.ToolCall, attempt int, event harness.Event) error {
+	if err := e.append(ctx, plan, event); err != nil {
+		if cancellation(ctx, err) {
+			return e.closeCancelledIdentityAttempt(ctx, plan, step, call, attempt, cancellationCause(ctx, err))
+		}
+		return err
+	}
+	return nil
+}
+
+// completeIdentityInconclusive confirms the authenticated attempt rejection before the ordinary terminal step projection.
+func (e *PlanExecutor) completeIdentityInconclusive(ctx context.Context, plan ValidationPlan, step PlanStep, call harness.ToolCall, attempt int, evidenceIDs []string, resultCategory ErrorCategory, path, auditCategory string) (StepResult, error) {
+	if err := e.appendIdentityTerminal(ctx, plan, step, call, attempt, auditCategory); err != nil {
+		return StepResult{}, err
+	}
+	return e.completeInconclusive(ctx, plan, step, evidenceIDs, resultCategory, path)
+}
+
+// concreteIdentityOperation extracts only the already resolved method and path needed for exact identity revalidation.
+func concreteIdentityOperation(capability, targetID string, input map[string]any) (testidentity.Operation, error) {
+	method, methodOK := input["method"].(string)
+	path, pathOK := input["path"].(string)
+	if capability != "http.request" || !methodOK || !pathOK {
+		return testidentity.Operation{}, fmt.Errorf("identity operation is incomplete")
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return testidentity.Operation{Capability: capability, TargetID: targetID, Method: method, Path: path}, nil
+}
+
+// safeIdentityAudit projects only identity ID and binding digest into append-only events.
+func safeIdentityAudit(binding *testidentity.Binding) (string, string) {
+	if binding == nil {
+		return "", ""
+	}
+	return binding.IdentityID, binding.Digest
 }
 
 // planEventTruncations projects treated size metadata into payload-free journal facts.
