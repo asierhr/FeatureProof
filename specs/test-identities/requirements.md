@@ -327,8 +327,8 @@ firmas, OAuth interactivo e inyección en bodies requerirán specs posteriores.
 ## Aprobación humana
 
 ```yaml
-approved_by: null
-approved_at: null
+approved_by: user
+approved_at: 2026-10-22T15:27:02+02:00
 ```
 
 La implementación no puede comenzar hasta que una persona revise y apruebe

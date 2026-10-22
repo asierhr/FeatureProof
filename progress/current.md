@@ -2384,3 +2384,12 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
   funciones, métodos y helpers productivos o de test.
 - El leader cambia la feature de `pending` a `spec_ready`; queda detenida hasta
   aprobación humana explícita.
+
+## 2026-10-22 — Feature 25, spec aprobada
+
+- El usuario aprueba explícitamente la spec al solicitar continuar con la
+  implementación.
+- Se registra la aprobación en `requirements.md` y el leader cambia la feature
+  de `spec_ready` a `in_progress`.
+- Se autoriza al implementer a ejecutar T1–T13 en orden; el estado `done`
+  seguirá reservado al leader tras review independiente aprobada.
