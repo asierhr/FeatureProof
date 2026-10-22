@@ -2701,3 +2701,32 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Focales ×30, race ×5, coverage, compile-only, vet, cross-build, gofmt y
   diff-check pasan. La suite global solo reproduce el symlink histórico de
   Windows sin privilegio; `feature_list.json` permanece intacto.
+
+## 2026-10-22 — Feature 26 `fixture-api`, especificación iniciada
+
+- Rama creada: `feature-26-fixture-api`, basada en la feature 25 completada.
+- Estado comprobado: `pending`, `sdd: true`, sin otra feature `in_progress` y
+  con criterios de aceptación suficientes.
+- La feature depende de las identidades seguras ya implementadas; se inicia
+  `spec_author` y no se tocará código ni tests antes de aprobación humana.
+
+## 2026-10-22 — Feature 26, spec preparada
+
+- Creados `specs/fixture-api/{requirements,design,tasks}.md` sin modificar
+  código productivo ni tests.
+- La spec define R1–R13 y T1–T14: contrato v3, bindings de contrato/identidad,
+  grafo y captures, cleanup intent durable, orden inverso, scope y budgets
+  propios, recovery, reporte separado y paridad de superficies.
+- El diseño mantiene fuera de alcance los flujos funcionales de feature 27 y
+  exige comentarios sistémicos en todo símbolo nuevo o modificado.
+- El leader cambia `fixture-api` de `pending` a `spec_ready`; el workflow queda
+  detenido hasta aprobación humana explícita.
+
+## 2026-10-22 — Feature 26, spec aprobada
+
+- El usuario aprueba explícitamente la spec al solicitar continuar con la
+  implementación.
+- Se registra la aprobación en `requirements.md` y el leader cambia
+  `fixture-api` de `spec_ready` a `in_progress`.
+- Se autoriza al implementer a ejecutar T1–T14; el cierre seguirá condicionado
+  a trazabilidad completa, gates y review independiente.

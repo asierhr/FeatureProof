@@ -470,7 +470,7 @@
           "Un fallo de preparación impide ejecutar escenarios dependientes y un fallo de cleanup queda registrado como incidencia operativa sin fabricar un veredicto funcional",
           "Los tests cubren create, referencias de outputs, varias identidades, limpieza correcta, fallo intermedio, cancelación, retry, cleanup parcial y ausencia de secretos"
         ],
-        "status": "pending"
+        "status": "in_progress"
     },
     {
         "id": 27,
