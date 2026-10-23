@@ -488,7 +488,7 @@
           "El informe reconstruye el orden completo de preparación, acciones, observaciones, assertions y limpieza con sus referencias de evidencia",
           "Los tests cubren un flujo positivo, autorización entre dos usuarios, estado posterior, fallo funcional, dependencia bloqueada, cancelación y limpieza garantizada"
         ],
-        "status": "pending"
+        "status": "in_progress"
     },
     {
         "id": 28,

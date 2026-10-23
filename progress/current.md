@@ -2813,6 +2813,27 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - El smoke final del leader pasa en fixture, localvalidation, validationworkflow, specification/YAML y cmd/featureproof.
 - El leader cambia feature 26 de `in_progress` a `done`; feature 27 permanece `pending`.
 
+## 2026-10-23 — Feature 27 `functional-flow-validation`, especificación iniciada
+
+- Rama creada: `feature-27-functional-flow-validation`, basada en feature 26 completada.
+- Preflight correcto: feature 27 está `pending`, usa SDD, tiene criterios de aceptación suficientes y no existe otra feature `in_progress`.
+- La feature depende del lifecycle de fixtures, identidades, contratos, policy y budgets ya disponibles en feature 26.
+- Se inicia `spec_author`; no se modificará código productivo ni tests antes de aprobación humana explícita.
+
+## 2026-10-23 — Feature 27, spec preparada
+
+- Creados `specs/functional-flow-validation/{requirements,design,tasks}.md` sin modificar código productivo ni tests.
+- La spec define R1–R15 y T1–T16: contrato `FunctionalFlow/v1`, bindings exactos, referencias tipadas, observaciones pre/post, ledger determinista, replanning monotónico, recovery, cleanup separado, package reconstruible y paridad de superficies.
+- No quedan decisiones abiertas ni excepciones arquitectónicas; la implementación de features 28/29 y nuevas herramientas permanece fuera de alcance.
+- El leader cambia feature 27 de `pending` a `spec_ready`; el workflow queda detenido hasta aprobación humana explícita.
+
+## 2026-10-23 — Feature 27, spec aprobada
+
+- El usuario aprueba explícitamente la spec al solicitar continuar con la implementación.
+- Se registra `approved_by: user` y `approved_at: 2026-10-23T09:21:17+02:00` en requirements.
+- El leader cambia feature 27 de `spec_ready` a `in_progress` y autoriza T1–T16.
+- El cierre seguirá condicionado a trazabilidad R1–R15, gates completos y review independiente.
+
 ## 2026-10-22 — fixture-api remediation checkpoint 2
 
 - REV-1: el composition root productivo crea `fixture.WorkflowAdapter` con lifecycle/store/HTTP/identidad/evidence/journal/scopes reales y lo inyecta en el mismo `validationworkflow.Service`; prueba vertical v3 completa API/CLI/MCP/GitHub verde.
