@@ -14,6 +14,7 @@ import (
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/localvalidation"
+	"github.com/asierhr/featureProof/internal/projectmemory"
 	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
@@ -42,6 +43,26 @@ type Dependencies struct {
 	Fixtures        FixtureLifecyclePort
 	FixturePackages FixturePackageWriter
 	FunctionalFlow  FunctionalFlowExecutionPort
+	Memory          ProjectMemoryPort
+	MemoryObserver  ProjectMemoryObservationPort
+}
+
+// ProjectMemorySelection is the trusted planning projection and its exact historical seal.
+type ProjectMemorySelection struct {
+	Descriptors []projectmemory.AgentMemoryDescriptor
+	Binding     projectmemory.MemoryBinding
+	Authority   projectmemory.QueryAuthority
+}
+
+// ProjectMemoryPort prepares and revalidates one immutable selection without caller-supplied authority.
+type ProjectMemoryPort interface {
+	Prepare(context.Context, string, string) (ProjectMemorySelection, error)
+	Revalidate(context.Context, projectmemory.MemoryBinding, projectmemory.QueryAuthority) (projectmemory.BindingStatus, error)
+}
+
+// ProjectMemoryObservationPort converts only a verified terminal package into an idempotent observation.
+type ProjectMemoryObservationPort interface {
+	ObserveTerminal(context.Context, PackageProjection, string, string, string) error
 }
 
 // Service is the shared application case use behind API, CLI, MCP and GitHub adapters.
@@ -73,7 +94,21 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	if err := validateStart(command); err != nil {
 		return WorkflowView{}, err
 	}
+	if command.MemoryBinding != nil || command.MemoryAuthority != nil || len(command.MemoryDescriptors) != 0 {
+		return WorkflowView{}, &Error{Code: CodeUnauthorized, Operation: "memory_claim"}
+	}
+	if s.deps.Memory != nil {
+		selection, memoryErr := s.deps.Memory.Prepare(ctx, command.RepositoryID, command.Revision)
+		if memoryErr != nil {
+			return WorkflowView{}, mapBoundaryError(ctx, "memory_prepare", memoryErr)
+		}
+		command.MemoryBinding, command.MemoryAuthority = &selection.Binding, &selection.Authority
+		command.MemoryDescriptors = append([]projectmemory.AgentMemoryDescriptor(nil), selection.Descriptors...)
+	}
 	if err := s.checkpointApprovedContract(ctx, command); err != nil {
+		return WorkflowView{}, err
+	}
+	if err := s.checkpointMemory(ctx, command); err != nil {
 		return WorkflowView{}, err
 	}
 	snapshot, err := s.deps.Admission.Build(ctx, command)
@@ -199,6 +234,13 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	if err != nil {
 		return WorkflowView{}, err
 	}
+	if command.MemoryBinding != nil {
+		artifact.MemoryBindingDigest = command.MemoryBinding.Digest
+		artifact.ArtifactSHA256, err = artifactDigest(artifact)
+		if err != nil {
+			return WorkflowView{}, err
+		}
+	}
 	material := ExecutableMaterial{Version: ArtifactVersion, WorkflowID: handle, ArtifactSHA256: artifact.ArtifactSHA256, ContextDigest: artifact.ContextDigest, RevisionDigest: artifact.RevisionDigest, TargetDigest: artifact.TargetDigest, Snapshot: result.Prepared.Snapshot(), CommitmentKey: commitmentKey}
 	if err = s.deps.Executables.Commit(workCtx, handle, material); err != nil {
 		return WorkflowView{}, err
@@ -233,6 +275,9 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		return WorkflowView{}, err
 	}
 	if command.Approval == ApprovalRequired {
+		if err = s.checkpointMemory(workCtx, command); err != nil {
+			return WorkflowView{}, err
+		}
 		approvalView, approvalErr := s.deps.Approval.Stage(workCtx, *result.Prepared, snapshot, artifact, record.FunctionalFlowApproval)
 		if approvalErr != nil {
 			return WorkflowView{}, approvalErr
@@ -270,6 +315,9 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 // revalidateGeneratedPlan reloads contract policy and planning authority after inference and before approval or execution.
 func (s *Service) revalidateGeneratedPlan(ctx context.Context, command StartCommand, expected AdmissionSnapshot, prepared agentplanning.PreparedPlan) error {
 	if err := s.checkpointApprovedContract(ctx, command); err != nil {
+		return err
+	}
+	if err := s.checkpointMemory(ctx, command); err != nil {
 		return err
 	}
 	current, err := s.deps.Admission.Build(ctx, command)
@@ -362,6 +410,9 @@ func (s *Service) Decide(ctx context.Context, command DecisionCommand) (Workflow
 		return WorkflowView{}, restoreErr
 	}
 	if err = s.checkpointApprovedContract(ctx, record.Command); err != nil {
+		return WorkflowView{}, err
+	}
+	if err = s.checkpointMemory(ctx, record.Command); err != nil {
 		return WorkflowView{}, err
 	}
 	decision, decisionErr := s.deps.Approval.Decide(ctx, command, prepared, snapshot, artifactValue, record.FunctionalFlowApproval)
@@ -659,6 +710,9 @@ func (s *Service) execute(ctx context.Context, record Record, snapshot Admission
 	if checkpointErr := s.checkpointApprovedContract(ctx, record.Command); checkpointErr != nil {
 		return s.terminal(ctx, record, OutcomeInconclusive, "contract_review_drift")
 	}
+	if checkpointErr := s.checkpointMemory(ctx, record.Command); checkpointErr != nil {
+		return s.terminal(ctx, record, OutcomeInconclusive, "memory_binding_drift")
+	}
 	material, materialErr := s.deps.Executables.Load(ctx, record.Handle)
 	if materialErr != nil || verifyExecutableMaterial(record, snapshot, prepared, material) != nil {
 		return s.terminal(ctx, record, OutcomeError, "executable_integrity")
@@ -813,6 +867,21 @@ func (s *Service) checkpointApprovedContract(ctx context.Context, command StartC
 	return nil
 }
 
+// checkpointMemory blocks approval and external I/O when an optional historical memory selection has drifted.
+func (s *Service) checkpointMemory(ctx context.Context, command StartCommand) error {
+	if command.MemoryBinding == nil && command.MemoryAuthority == nil {
+		return nil
+	}
+	if command.MemoryBinding == nil || command.MemoryAuthority == nil || s.deps.Memory == nil {
+		return &Error{Code: CodeInvalid, Operation: "memory_composition"}
+	}
+	status, err := s.deps.Memory.Revalidate(ctx, *command.MemoryBinding, *command.MemoryAuthority)
+	if err != nil || !status.Valid {
+		return &Error{Code: CodeConflict, Operation: "memory_binding_drift"}
+	}
+	return nil
+}
+
 // restorePrepared rebuilds current admission and revalidates private executable values after restart.
 func (s *Service) restorePrepared(ctx context.Context, record Record) (AdmissionSnapshot, agentplanning.PreparedPlan, error) {
 	snapshot, err := s.deps.Admission.Build(ctx, record.Command)
@@ -957,6 +1026,11 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 		record, saveErr = s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: "functional_flow_package_finalized", ArtifactSHA256: record.Artifact.ArtifactSHA256})
 		if saveErr != nil {
 			return Record{}, saveErr
+		}
+	}
+	if record.FunctionalFlowAdmitted && record.Package != nil && s.deps.MemoryObserver != nil {
+		if observeErr := s.deps.MemoryObserver.ObserveTerminal(cleanupCtx, *record.Package, record.RepositoryID, record.Revision, record.Principal); observeErr != nil {
+			return Record{}, &Error{Code: CodeUnavailable, Operation: "memory_observation_pending"}
 		}
 	}
 	if record.Command.Target.Preview != nil && s.deps.Preview != nil {

@@ -167,6 +167,36 @@ func TestWebhookIgnoresNonExactCommands(t *testing.T) {
 	}
 }
 
+// TestMemoryWebhookCommandsRequireExactOperationAndCoordinates proves free-form comments cannot widen the memory action.
+func TestMemoryWebhookCommandsRequireExactOperationAndCoordinates(t *testing.T) {
+	valid := []struct {
+		command   string
+		operation string
+	}{
+		{command: "/featureproof memory query", operation: "query"},
+		{command: "/featureproof memory approve memory-1 2 3 decision-1", operation: "approve"},
+		{command: "/featureproof memory invalidate memory-1 2 3 decision-1", operation: "invalidate"},
+	}
+	for _, testCase := range valid {
+		operation, _, _, _, _, ok := parseMemoryCommand(testCase.command)
+		if !ok || operation != testCase.operation {
+			t.Fatalf("command %q parsed as %q ok=%v", testCase.command, operation, ok)
+		}
+	}
+	invalid := []string{
+		"/featureproof memory observe memory-1 2 3 evidence-1",
+		"/featureproof memory approve memory-1 2 3",
+		"/featureproof memory approve memory-1 2 3 decision-1 trailing",
+		"/featureproof memory approve ../memory 2 3 decision-1",
+		"/featureproof memory invalidate memory-1 NaN 3 decision-1",
+	}
+	for _, command := range invalid {
+		if _, _, _, _, _, ok := parseMemoryCommand(command); ok {
+			t.Fatalf("non-exact command accepted: %q", command)
+		}
+	}
+}
+
 // TestStoreCASReplayRecoveryAndIntents traces R3 and R11 durable state transitions.
 func TestStoreCASReplayRecoveryAndIntents(t *testing.T) {
 	store := testStore(t)

@@ -39,6 +39,7 @@ import (
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/previewenv"
+	"github.com/asierhr/featureProof/internal/projectmemory"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 	"github.com/asierhr/featureProof/internal/specification"
 	specyaml "github.com/asierhr/featureProof/internal/specification/yaml"
@@ -587,7 +588,19 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if err != nil {
 		return nil, err
 	}
-	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Preview: previewPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort})
+	var memoryPort validationworkflow.ProjectMemoryPort
+	var memoryObserver validationworkflow.ProjectMemoryObservationPort
+	if projectMemoryConfigured() {
+		memoryComposition, memoryErr := composeProjectMemory()
+		if memoryErr != nil {
+			return nil, memoryErr
+		}
+		memoryPackages := filepath.Join(storeRoot, "functional-flow", "packages")
+		memoryComposition.Service.Evidence = workflowMemoryEvidence{project: os.Getenv("FEATUREPROOF_MEMORY_PROJECT"), repository: config.RepositoryID, packageRoot: memoryPackages}
+		integration := workflowProjectMemory{service: memoryComposition.Service, authority: memoryComposition.HumanAuthority, observerPrincipal: memoryComposition.ObserverPrincipal, packages: memoryPackages}
+		memoryPort, memoryObserver = integration, integration
+	}
+	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Preview: previewPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, Memory: memoryPort, MemoryObserver: memoryObserver})
 	if err != nil {
 		return nil, err
 	}
@@ -604,6 +617,19 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	}
 	return cli, nil
 }
+
+// projectMemoryConfigured enables workflow memory only when composition configuration is intentionally present.
+func projectMemoryConfigured() bool {
+	for _, name := range []string{"FEATUREPROOF_MEMORY_ROOT", "FEATUREPROOF_MEMORY_INTEGRITY_KEY", "FEATUREPROOF_MEMORY_PROJECT", "FEATUREPROOF_MEMORY_PRINCIPAL"} {
+		if os.Getenv(name) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// compile-time ownership check keeps the shared service behind the planning and workflow consumer ports.
+var _ agentplanning.ProjectMemoryReader = (*projectmemory.Service)(nil)
 
 // cloneWorkflowAliases detaches trusted remote selections before exposing them to adapter composition.
 func cloneWorkflowAliases(source map[string]string) map[string]string {

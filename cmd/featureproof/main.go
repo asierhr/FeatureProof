@@ -23,6 +23,7 @@ import (
 	"github.com/asierhr/featureProof/internal/model/openai"
 	"github.com/asierhr/featureProof/internal/model/openai/oauth"
 	"github.com/asierhr/featureProof/internal/previewenv"
+	"github.com/asierhr/featureProof/internal/projectmemory"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 )
 
@@ -100,6 +101,23 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 // runWithContext dispatches every product entrypoint under one caller-owned lifecycle for deterministic server shutdown.
 func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 3 && args[0] == "memory" && args[1] == "mcp" && args[2] == "serve" {
+		return runProjectMemoryMCP(ctx, stdin, stdout)
+	}
+	if len(args) == 3 && args[0] == "memory" && args[1] == "api" && args[2] == "serve" {
+		return runProjectMemoryAPI(ctx)
+	}
+	if len(args) >= 2 && args[0] == "memory" {
+		composition, err := composeProjectMemory()
+		if err != nil {
+			return 3
+		}
+		raw, err := io.ReadAll(io.LimitReader(stdin, int64(projectmemory.DefaultLimits().MaxDocumentBytes)+1))
+		if err != nil {
+			return 2
+		}
+		return composition.CLI.Run(ctx, projectmemory.SurfaceOperation(args[1]), raw, stdout)
+	}
 	if len(args) >= 2 && args[0] == "eval" && args[1] == "agent" {
 		return agenteval.RunCommand(ctx, args[2:], stdout, stderr, productionEvalComposer{})
 	}
@@ -260,6 +278,15 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 	}
 	var reviewHandler func(context.Context, githubpr.WebhookCommand) (string, error)
 	var reviewOwner interface{ Close() error }
+	var memoryHandler func(context.Context, githubpr.WebhookCommand) (string, error)
+	if projectMemoryConfigured() {
+		memoryComposition, memoryErr := composeProjectMemory()
+		if memoryErr != nil {
+			return nil, "", memoryErr
+		}
+		memoryHandler = projectMemoryGitHubHandler(memoryComposition)
+	}
+	var contractHandler func(context.Context, githubpr.WebhookCommand) (string, error)
 	if os.Getenv("FEATUREPROOF_CONTRACT_REVIEW_CONFIG") != "" {
 		reviewCLI, reviewErr := composeContractReviewCLI(ctx)
 		if reviewErr != nil {
@@ -281,8 +308,19 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 			baselineRef = "baseline"
 		}
 		gateway := contractreview.GitHubRuntimeGateway{API: reviewCLI.API, Authority: authorityAdapter, Principals: contractreview.StaticGitHubPrincipalAuthority{Principals: map[int64]string{actor: reviewCLI.API.Config.PrincipalID}}, CandidateRef: candidateRef, BaselineRef: baselineRef, Summaries: contractreview.DurableGitHubSummary{GitHub: authorityAdapter, BotID: botID, MaxPages: 10}}
-		reviewHandler = gateway.HandleReview
+		contractHandler = gateway.HandleReview
 		reviewOwner = reviewCLI
+	}
+	if memoryHandler != nil || contractHandler != nil {
+		reviewHandler = func(handlerContext context.Context, command githubpr.WebhookCommand) (string, error) {
+			if command.MemoryOperation != "" && memoryHandler != nil {
+				return memoryHandler(handlerContext, command)
+			}
+			if command.ReviewOperation != "" && contractHandler != nil {
+				return contractHandler(handlerContext, command)
+			}
+			return "", &githubpr.Error{Code: githubpr.CodeUnauthorized, Operation: "command_unavailable"}
+		}
 	}
 	config := githubpr.ProductionConfig{AppID: appID, BotID: botID, Permissions: githubpr.RequiredPermissions(), APIOrigin: "https://api.github.com", APIVersion: "2022-11-28", EvidenceOrigin: requiredEnv("FEATUREPROOF_EVIDENCE_ORIGIN"), StoreDir: filepath.Join(root, ".featureproof", "github-pr"), MaxWebhookBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxPages: 10, MaxChangedPaths: 1000, MaxAttempts: 4, RunTimeout: 30 * time.Minute, CloseTimeout: 10 * time.Second, LeaseTTL: 32 * time.Minute, PollInterval: 2 * time.Second, RetryMaxDuration: 2 * time.Minute, RetryMaxWait: time.Minute, RetryInitialBackoff: time.Second, RetryMaxBackoff: 30 * time.Second, Authorization: githubpr.AuthorizationConfig{Installations: map[int64]map[int64]bool{installation: {repository: true}}, Actors: map[int64]bool{actor: true}, Selections: map[string]githubpr.Selection{selection.Alias: selection}, Forks: map[int64]map[int64]bool{}}}
 	runtime, err := githubpr.ComposeRuntime(ctx, config, githubpr.CompositionSecrets{WebhookSecret: secret}, githubpr.RuntimeDependencies{Credentials: tokenSource, HTTP: httpClient, Packages: externalagent.VerifiedPackageReader{}, Validation: validation, Clock: clock, Jitter: githubpr.RandomJitter{}, IDs: githubpr.RandomIDs{}, Review: reviewHandler, ReviewOwner: reviewOwner})

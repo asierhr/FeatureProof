@@ -22,6 +22,8 @@ type WebhookCommand struct {
 	PayloadDigest                                            string
 	ReviewOperation, ReviewID, ReviewAction                  string
 	ReviewRevision                                           uint64
+	MemoryOperation, MemoryID, MemoryDecisionID              string
+	MemoryExpectedSequence, MemoryExpectedVersion            uint64
 }
 
 // WebhookResult is the replayable safe response recorded for a delivery.
@@ -92,7 +94,7 @@ func (h *WebhookHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	}
 	var associationID string
 	admit := h.Admit
-	if command.ReviewOperation != "" {
+	if command.ReviewOperation != "" || command.MemoryOperation != "" {
 		admit = h.Review
 	}
 	if admit == nil {
@@ -163,13 +165,30 @@ func decodeCommand(deliveryID, event, payloadDigest string, body []byte) (Webhoo
 		return WebhookCommand{}, false, &Error{Code: CodeInvalid, Operation: "payload"}
 	}
 	reviewOperation, reviewID, reviewRevision, reviewAction, reviewCommand := parseReviewCommand(payload.Comment.Body)
-	if payload.Action != "created" || payload.Issue.PullRequest == nil || (!normalizeCommand(payload.Comment.Body) && !reviewCommand) {
+	memoryOperation, memoryID, memorySequence, memoryVersion, memoryDecision, memoryCommand := parseMemoryCommand(payload.Comment.Body)
+	if payload.Action != "created" || payload.Issue.PullRequest == nil || (!normalizeCommand(payload.Comment.Body) && !reviewCommand && !memoryCommand) {
 		return WebhookCommand{}, true, nil
 	}
 	if payload.Installation.ID <= 0 || payload.Repository.ID <= 0 || payload.Issue.Number <= 0 || payload.Comment.User.ID <= 0 {
 		return WebhookCommand{}, false, &Error{Code: CodeInvalid, Operation: "payload"}
 	}
-	return WebhookCommand{DeliveryID: deliveryID, Event: event, InstallationID: payload.Installation.ID, RepositoryID: payload.Repository.ID, PullRequestNumber: payload.Issue.Number, ActorID: payload.Comment.User.ID, SelectionAlias: "default", PayloadDigest: payloadDigest, ReviewOperation: reviewOperation, ReviewID: reviewID, ReviewRevision: reviewRevision, ReviewAction: reviewAction}, false, nil
+	return WebhookCommand{DeliveryID: deliveryID, Event: event, InstallationID: payload.Installation.ID, RepositoryID: payload.Repository.ID, PullRequestNumber: payload.Issue.Number, ActorID: payload.Comment.User.ID, SelectionAlias: "default", PayloadDigest: payloadDigest, ReviewOperation: reviewOperation, ReviewID: reviewID, ReviewRevision: reviewRevision, ReviewAction: reviewAction, MemoryOperation: memoryOperation, MemoryID: memoryID, MemoryExpectedSequence: memorySequence, MemoryExpectedVersion: memoryVersion, MemoryDecisionID: memoryDecision}, false, nil
+}
+
+// parseMemoryCommand accepts only exact query and human transition commands with bounded identifiers.
+func parseMemoryCommand(value string) (string, string, uint64, uint64, string, bool) {
+	fields := strings.Fields(strings.TrimSpace(value))
+	if len(fields) == 3 && fields[0] == "/featureproof" && fields[1] == "memory" && fields[2] == "query" {
+		return "query", "", 0, 0, "", true
+	}
+	if len(fields) == 7 && fields[0] == "/featureproof" && fields[1] == "memory" && (fields[2] == "approve" || fields[2] == "invalidate") && safeName.MatchString(fields[3]) && safeName.MatchString(fields[6]) {
+		sequence, sequenceErr := strconv.ParseUint(fields[4], 10, 64)
+		version, versionErr := strconv.ParseUint(fields[5], 10, 64)
+		if sequenceErr == nil && versionErr == nil {
+			return fields[2], fields[3], sequence, version, fields[6], true
+		}
+	}
+	return "", "", 0, 0, "", false
 }
 
 // parseReviewCommand accepts only create, show and whole-decision commands with bounded safe identifiers.

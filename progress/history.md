@@ -635,3 +635,30 @@ Bitácora append-only de features completadas.
 - Cobertura statement-weighted multiplataforma del diff productivo:
   2674/3137 statements (85,2407 %), reproducible con
   `python scripts/feature27_coverage.py`.
+
+## 2026-10-23 — validated-project-memory
+
+- Estado final: `done`.
+- Resultado: contrato `ProjectMemory/v1` estricto para recuerdos versionados,
+  scopes run/revisión/proyecto, procedencia, autoridad, sensibilidad, validez,
+  evidencia y transiciones auditables.
+- Persistencia: journal autenticado, snapshots e índice derivados, CAS,
+  idempotencia, receipts y recovery durable. El filesystem usa traversal por
+  handles, no-follow, identidad efectiva, publicación atómica y hardening
+  específico de Windows/Unix.
+- Integridad: un `MonotonicWitness` externo, durable y no replayable impide
+  rollback coordinado. El protocolo staging → CAS witness → journal/proyecciones
+  converge antes y después del punto de avance sin duplicar eventos ni efectos.
+- Integración: planning consume query y binding confiables; validation workflow
+  revalida antes de aprobación/I/O; functional flow observa evidencia terminal.
+  CLI, API, MCP y GitHub comparten el mismo servicio y store con autoridades
+  separadas para humano, observer y reconciler.
+- Spec aprobada por el usuario el `2026-10-23T13:23:48+02:00`.
+- Tasks T1–T16 completas; R1–R15 y REV-1–REV-17 trazados en
+  `progress/validated-project-memory/{implementation,review}.md`.
+- Review independiente aprobada en la decimotercera revisión. Pasan smoke de
+  witness/recovery/rollback/CAS, vet, compile-only, suite global, race global,
+  runtime Linux, cross-build Linux/Darwin y matrices adversarias.
+- Cobertura statement-weighted multiplataforma del diff productivo:
+  2027/2359 statements (85,926240 %), reproducible con
+  `python scripts/feature28_coverage.py verify`.

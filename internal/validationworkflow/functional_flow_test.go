@@ -22,6 +22,7 @@ import (
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/policy"
+	"github.com/asierhr/featureProof/internal/projectmemory"
 	"github.com/asierhr/featureProof/internal/testidentity"
 	"github.com/asierhr/featureProof/internal/tools"
 )
@@ -1670,16 +1671,21 @@ func TestFunctionalFlowVerticalParityAcrossRealWorkflowSurfaces(t *testing.T) {
 		}
 		return result
 	}
-	newSurface := func(t *testing.T) (*Service, *flowExecutionPortFake) {
+	newSurface := func(t *testing.T) (*Service, *flowExecutionPortFake, *workflowMemoryObserver) {
 		t.Helper()
 		service, _, _, _, _ := workflowFixture(t, validPlanResponse())
 		flow := &flowExecutionPortFake{}
+		binding := projectmemory.MemoryBinding{Version: projectmemory.ContractVersion, ProjectID: "project-1", RepositoryID: "repo-1", CommitOID: strings.Repeat("a", 40), QueryDigest: strings.Repeat("b", 64), Digest: strings.Repeat("c", 64)}
+		authority := projectmemory.QueryAuthority{ProjectID: "project-1", Scope: projectmemory.Scope{Kind: projectmemory.ScopeRevision, RepositoryID: "repo-1", CommitOID: strings.Repeat("a", 40)}}
+		memory := &workflowMemoryPort{valid: true, selection: ProjectMemorySelection{Binding: binding, Authority: authority}}
+		observer := &workflowMemoryObserver{}
 		service.deps.FunctionalFlow = flow
-		return service, flow
+		service.deps.Memory, service.deps.MemoryObserver = memory, observer
+		return service, flow, observer
 	}
 	results := make([]WorkflowResult, 0, 4)
 	t.Run("api", func(t *testing.T) {
-		service, flow := newSurface(t)
+		service, flow, observer := newSurface(t)
 		command := validCommand()
 		command.IdempotencyKey = "flow-api"
 		command.FunctionalFlow = &FunctionalFlowSelection{ArtifactID: artifactID}
@@ -1694,9 +1700,12 @@ func TestFunctionalFlowVerticalParityAcrossRealWorkflowSurfaces(t *testing.T) {
 		if len(flow.selections) != 1 || flow.selections[0].ArtifactID != artifactID {
 			t.Fatalf("selection=%#v", flow.selections)
 		}
+		if observer.calls != 1 {
+			t.Fatalf("terminal memory observations=%d", observer.calls)
+		}
 	})
 	t.Run("cli", func(t *testing.T) {
-		service, flow := newSurface(t)
+		service, flow, observer := newSurface(t)
 		direct := validCommand().Target.Direct
 		cli := CLI{Service: service, Principal: "user-1", AuthProfiles: map[string]string{"profile": strings.Repeat("8", 64)}, DirectTargets: map[string]DirectTarget{"target-1": *direct}}
 		args := []string{"start", "--spec", "spec-1", "--contract", "contract-1", "--provider", "fake", "--model", "selected", "--profile", "profile", "--runtime-profile", "runtime-1", "--repository", "repo-1", "--revision", strings.Repeat("a", 40), "--approval", "required", "--idempotency-key", "flow-cli", "--target", "target-1", "--flow-artifact", artifactID}
@@ -1716,9 +1725,12 @@ func TestFunctionalFlowVerticalParityAcrossRealWorkflowSurfaces(t *testing.T) {
 		if len(flow.selections) != 1 || flow.selections[0].ArtifactID != artifactID {
 			t.Fatalf("selection=%#v", flow.selections)
 		}
+		if observer.calls != 1 {
+			t.Fatalf("terminal memory observations=%d", observer.calls)
+		}
 	})
 	t.Run("mcp", func(t *testing.T) {
-		service, flow := newSurface(t)
+		service, flow, observer := newSurface(t)
 		direct := validCommand().Target.Direct
 		server := MCPServer{Service: service, Principal: "user-1", AuthProfiles: map[string]string{"profile": strings.Repeat("8", 64)}, DirectTargets: map[string]DirectTarget{"target-1": *direct}, FlowAliases: map[string]string{"approved": artifactID}}
 		arguments := `{"idempotency_key":"flow-mcp","specification_ref":"spec-1","contract_ref":"contract-1","provider":"fake","model":"selected","auth_profile":"profile","runtime_profile":"runtime-1","repository_id":"repo-1","revision":"` + strings.Repeat("a", 40) + `","approval":"required","target_alias":"target-1","flow_alias":"approved"}`
@@ -1735,9 +1747,12 @@ func TestFunctionalFlowVerticalParityAcrossRealWorkflowSurfaces(t *testing.T) {
 		if len(flow.selections) != 1 || flow.selections[0].ArtifactID != artifactID {
 			t.Fatalf("selection=%#v", flow.selections)
 		}
+		if observer.calls != 1 {
+			t.Fatalf("terminal memory observations=%d", observer.calls)
+		}
 	})
 	t.Run("github", func(t *testing.T) {
-		service, flow := newSurface(t)
+		service, flow, observer := newSurface(t)
 		command := validCommand()
 		command.IdempotencyKey = "template"
 		command.FunctionalFlow = &FunctionalFlowSelection{ArtifactID: artifactID}
@@ -1765,6 +1780,9 @@ func TestFunctionalFlowVerticalParityAcrossRealWorkflowSurfaces(t *testing.T) {
 		}
 		if len(flow.selections) != 1 || flow.selections[0].ArtifactID != artifactID {
 			t.Fatalf("selection=%#v", flow.selections)
+		}
+		if observer.calls != 1 {
+			t.Fatalf("terminal memory observations=%d", observer.calls)
 		}
 	})
 	if len(results) != 4 {

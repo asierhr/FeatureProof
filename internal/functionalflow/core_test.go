@@ -9,6 +9,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/projectmemory"
 	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
@@ -516,6 +517,12 @@ func TestFlowPackageReconstructsFullOrderedLifecycle(t *testing.T) {
 	rebuilt, err := Reconstruct(pkg)
 	if err != nil || digestValue(rebuilt) != digestValue(result) {
 		t.Fatalf("rebuilt=%#v err=%v", rebuilt, err)
+	}
+	observer := &recordingProjectMemoryObserver{}
+	candidate := projectmemory.Candidate{ContractVersion: projectmemory.ContractVersion, ProjectID: "project-1", Scope: projectmemory.Scope{Kind: projectmemory.ScopeRevision, RepositoryID: "repo-1", CommitOID: strings.Repeat("a", 40)}}
+	observed, err := ObserveProjectMemory(context.Background(), observer, pkg, projectmemory.ObservationInput{Principal: "principal", ID: "flow-observation", IdempotencyKey: "flow-observation", Candidate: candidate})
+	if err != nil || observed.State != projectmemory.StateObserved || observer.input.FunctionalResultDigest != digestValue(result) || len(observer.input.Candidate.Evidence) != 2 || observer.input.Candidate.Evidence[0].RunID != pkg.RunID {
+		t.Fatalf("verified package observation=%#v input=%#v err=%v", observed, observer.input, err)
 	}
 	clonePackage := func(source Package) Package {
 		raw, _ := json.Marshal(source)

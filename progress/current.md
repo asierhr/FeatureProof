@@ -3097,3 +3097,367 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Mutaciones MAC-válidas y reencadenadas de evidence ID, assertion ref, record digest y terminal, además de stores reales con binding/content/step/revision divergentes, fallan con workflow pending, cero replay, cero Stage durable y cero cleanup. Promoción nominal, CAS y concurrent recovery permanecen verdes.
 - Compile-only, vet, focales ×3, suite global, race global UCRT64 y cross-build Linux/Darwin pasan. Coverage del diff: 2674/3137 = 85,2407 %.
 - T11–T13/T15/T16 vuelven a completas; `feature_list.json` permanece intacto y se solicita séptima revisión independiente.
+
+## 2026-10-23 — Feature 28, implementación inicial completa
+
+- T1–T16 ejecutadas sobre `internal/projectmemory`: contrato v1 estricto e inmutable, scopes y lifecycle con autoridad, procedencia/evidencia/staleness, secret gate, proyecciones seguras y servicio compartido.
+- El adapter local bajo el root configurado publica journal autenticado append-only, snapshot e índice atómicos; aplica CAS/idempotencia, locks OS Windows/Unix, recovery y defensas de paths, links, reparse points y hardlinks.
+- Query estructural aplica filtros antes de orden/conflictos/truncado; bindings históricos sellan versiones exactas y `WorkflowGuard` revalida drift antes de pasos privilegiados. Proposals del agente y observations de functional flow no elevan autoridad ni modifican resultados funcionales.
+- La Surface versionada es común para CLI/API/MCP/GitHub tras mapping externo del principal; no acepta keys, paths ni autoridad cruda. No se implementó selección por rol, ranking ni context assembly de feature 29.
+- Gates iniciales: focal ×10, suite global, compile-only, vet, race focal/global con UCRT64 y cross-compile Linux/Darwin pasan. Coverage host statement-weighted: 837/984 = 85,0610 % (gate conservador incluyendo 25 statements Unix como no cubiertos; host Windows 837/959 = 87,2784 %).
+- `feature_list.json` permanece intacto; se prepara `progress/validated-project-memory/implementation.md` para revisión independiente.
+
+## 2026-10-23 — Feature 28, primera revisión rechazada
+
+- El reviewer registra REV-1..REV-8; la feature permanece `in_progress`.
+- Bloqueantes: proposals amplían scope/provenance, query limita antes de ordenar/conflictos, no hay integración productiva real, evidence no se revalida, journal truncable/trailing no autenticado y filesystem vulnerable a TOCTOU/replace no atómico.
+- También deben cerrarse el binding exacto de scope y la trazabilidad con pruebas reales.
+- Se reabren T1–T16 para remediación; `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 28, segunda revisión rechazada
+
+- REV-1, REV-2, REV-4 y REV-7 quedan cerrados; REV-3/5/6/8 siguen parciales.
+- REV-9..REV-12 exigen composición real en workflow, ancla externa al root mutable, handles/no-follow en todos los objetos y autoridad de transición separada por actor/acción.
+- Se reabren T3–T16 para remediación; la feature continúa `in_progress`.
+
+## Feature 28 review remediation — 2026-10-23
+
+- Reabiertas T1–T16 tras REV-1..REV-8.
+- En curso: contratos server-owned, query pre-limit, evidencia revalidada, binding verificable, journal/ancla, hardening e integraciones verticales.
+
+
+## Feature 28 review remediation complete — 2026-10-23
+
+- REV-1..REV-8 remediadas con acceptance tests reales y trazabilidad actualizada.
+- Integración real: agentplanning, functionalflow, validationworkflow, composition root y CLI/API/MCP/GitHub.
+- Runtime tests Windows/Linux, cross-build Darwin, focal x10, global, vet y race global pasan.
+- Coverage diff productivo multiplataforma: 1181/1338 = 88.2661%.
+- T1–T16 cerradas de nuevo; listo para segunda review.
+
+## 2026-10-23 — Feature 28 segunda remediación
+
+- Segunda review rechazada: se reabren T3–T16 para REV-9..REV-12 y cierres completos de REV-3/5/6/8.
+- Orden de trabajo: authority/commands y composición vertical; registry externa y filesystem boundaries; acceptance matrices, coverage y gates.
+- feature_list.json permanece reservado al leader y no se modifica.
+
+## 2026-10-23 — Feature 28, segunda remediación completada
+
+- REV-9 queda cerrado con un único `projectmemory.Service` compuesto en el
+  workflow productivo: planning obtiene query y binding confiables, el workflow
+  persiste y revalida antes de approval/I/O y functional flow observa únicamente
+  un package terminal verificado. CLI, API, MCP y GitHub recorren esa vertical.
+- REV-10 queda cerrado con un registry autenticado en un trust root externo al
+  root mutable. Borrado total del root, journal ausente, borrado de proyecciones
+  y rollback coordinado fallan cerrados y conservan receipts tras reinicio.
+- REV-11 queda cerrado con handles de directorio, no-follow/reparse, identidad
+  efectiva, validación de hardlinks y DACL Windows, replace atómico y swaps
+  deterministas en locks, reads, temporales, sync y publicación. Las matrices
+  pasan en Windows y Linux; Darwin se valida por cross-build.
+- REV-12 queda cerrado al separar observer, human y reconciler/configuration:
+  `observed` requiere evidence verificada, las decisiones humanas usan
+  `DecisionID`, expiry conserva autoridad de reconciler y GitHub exige la acción
+  exacta para cada operación/target.
+- T3–T16 vuelven a completas. Pasan gofmt, vet, compile-only, focales repetidos,
+  suite global, race focal/global, runtime Linux y cross-build Linux/Darwin.
+  Coverage statement-weighted del diff productivo desde `9c8aa34`:
+  1464/1705 = 85,865103 %. `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 28, tercera remediación iniciada
+
+- La tercera review rechaza REV-9/REV-11/REV-12 y abre REV-13/REV-14; se reabren T6–T16.
+- En curso: enrutar API/MCP/GitHub por entrypoints productivos; traversal handle-relative de todos los ancestros y source identity hasta replace; authorities separadas por rol; autoridad monotónica independiente contra rollback coordinado; allowlists de query server-side.
+- T16 añadirá un gate de coverage versionado y reproducible que fusiona Windows/Linux sin doble conteo. `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 28, cuarta remediación completada
+
+- REV-9 queda cerrado con rutas productivas CLI/API/MCP/GitHub que comparten una
+  única composición, principal, service y store; los acceptance tests entran por
+  el dispatcher, servidor HTTP, stream MCP y webhook GitHub firmado.
+- REV-11 queda cerrado con traversal handle-relative no-follow desde cada root,
+  identidades fijadas de `v1`/`projects`/project, enumeración por handle, source
+  temporal retenido hasta replace y revalidación de la ruta efectiva en cada
+  checkpoint. Las matrices de swaps pasan en Windows y Linux.
+- REV-12/REV-14 quedan cerrados con authorities, principals y actor kinds
+  separados por rol, denegación cruzada y policy de query server-side que el
+  request solo puede estrechar.
+- REV-13 queda cerrado mediante un ledger monotónico autenticado externo al
+  journal, proyecciones y registry restaurables; el rollback coordinado antiguo
+  falla en restart y no permite reutilizar receipts.
+- El gate versionado fusiona perfiles Windows/Linux por statement block sin
+  doble conteo y obtiene `1858/2185 = 85,034325 %`. Pasan gofmt, diff-check, vet,
+  compile-only, suite global, race global, runtime Linux y cross-builds
+  Linux/Darwin. T6–T16 vuelven a completas; `feature_list.json` sigue intacto.
+
+## 2026-10-23 — Feature 28, quinta remediación iniciada
+
+- La cuarta review mantiene abiertos REV-13 y REV-15; se reabren T6, T8, T15 y T16.
+- En curso: manifest independiente para distinguir bootstrap virgen de ledger borrado, matrices de deletion/corruption/rollback/crash y cobertura reproducible con margen estable.
+- feature_list.json permanece reservado al leader y no se modifica.
+
+## 2026-10-23 — Feature 28, quinta remediación completada
+
+- REV-13 queda cerrado con un manifest HMAC externo publicado en generación cero
+  antes del primer append. Bootstrap virgen, deletion después de historia,
+  corrupción, rollback y crash quedan distinguidos sin reconstruir autoridad
+  eliminada ni reutilizar receipts.
+- El probe exacto restaura journal/snapshot/index/registry de seq1 tras confirmar
+  seq2, elimina el ledger y verifica que restart y redelivery de approve fallan
+  cerrados, sin recreación del ledger.
+- REV-15 queda cerrado con perfiles regenerados desde cero y coverage del diff
+  productivo Windows/Linux de `1941/2266 = 85,657546 %`.
+- Pasan gofmt, auditoría de comentarios, vet, compile-only, focal repetido, suite
+  global, race global, runtime Linux, cross-builds Linux/Darwin, coverage gate y
+  diff-check. T6/T8/T15/T16 vuelven a completas; `feature_list.json` sigue intacto.
+
+## 2026-10-23 — Feature 28, sexta remediación iniciada
+
+- La quinta review cierra REV-15 y mantiene REV-13: ledger y manifest HMAC son
+  replayables si se restauran juntos con el estado mutable.
+- Se reabren T5, T6, T8, T15 y T16 para sustituir esos archivos por un puerto de
+  witness monotónico externo con read exacto, bootstrap explícito y
+  compare-and-advance atómico.
+- La composición productiva exigirá una autoridad durable configurada y fallará
+  si no puede demostrar esa garantía; no habrá fallback ni reconstrucción desde
+  journal, registry o projections. `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 28, sexta remediación completada
+
+- REV-13 queda cerrado mediante `MonotonicWitness`: una autoridad externa con
+  read exacto, bootstrap explícito create-once y compare-and-advance atómico.
+  Ledger y manifest locales se eliminaron; el store no puede escribir,
+  reconstruir ni restaurar el head monotónico.
+- El rollback conjunto de journal/snapshot/index/registry a seq1 contra witness
+  seq2 falla en restart y redelivery sin reutilizar receipt. También pasan las
+  matrices missing/unavailable/behind/ahead/replay, crash antes/después del CAS,
+  restart con la misma autoridad, CAS concurrente y protocolo HTTP estricto.
+- La composición exige witness HTTPS, credential y la garantía explícita
+  `linearizable-durable-nonreplayable-v1`; configuración incompleta o replayable
+  falla sin fallback local.
+- Coverage final del diff: `1879/2199 = 85,447931 %`, 9 statements sobre el
+  mínimo entero de 1870. Los perfiles Windows se regeneraron desde cero y se
+  combinaron con los bloques exclusivamente Unix de la ejecución Linux previa;
+  WSL no pudo reiniciarse al cierre por `ERROR_NO_SYSTEM_RESOURCES`, después de
+  haber pasado el runtime Linux sobre la implementación Unix final.
+- Pasan vet, compile-only, focal x3, suite global, race global, cross-builds
+  Linux/Darwin, coverage gate y diff-check. T5/T6/T8/T15/T16 vuelven a completas
+  y `feature_list.json` sigue intacto.
+
+## 2026-10-23 — Feature 28, séptima remediación iniciada
+
+- La sexta review cierra el witness monotónico externo y abre solo REV-16: el
+  journal definitivo no puede sincronizarse antes de un CAS que todavía puede
+  fallar.
+- Se reabren T8, T15 y T16 para introducir staging autenticado durable, ligar su
+  identidad opaca al witness y recuperar exactamente commits cuyo CAS avanzó
+  antes de materializar journal/proyecciones, sin repetir efectos externos ni
+  receipts.
+- Se preserva R9: los fallos anteriores al avance dejan journal/head intactos y
+  los posteriores convergen desde el staging verificado. `feature_list.json`
+  permanece intacto.
+
+## 2026-10-23 — Feature 28, séptima remediación completada
+
+- REV-16 queda cerrado con protocolo prepare→CAS witness→materialize: el staging
+  exclusivo se autentica y sincroniza antes del CAS, el witness conserva solo el
+  digest opaco y el journal definitivo nunca se sincroniza antes de confirmar el
+  avance.
+- Fallos pre-CAS dejan journal/head byte-for-byte intactos; crashes post-CAS se
+  recuperan desde el pending exacto sin reconsultar efectos ni duplicar receipts.
+  Missing, tamper, hardlink/symlink/swap, mismatch, partial append y publicación
+  incompleta fallan cerrados o convergen según la matriz aprobada.
+- Pasan focal projectmemory ×3, suite global, vet, compile-only, race global
+  serial, cross-build Linux/Darwin, pruebas del gate de cobertura y diff-check.
+  Las dos flakes de temporización observadas bajo race paralelo pasaron aisladas
+  ×3 y no reaparecieron en la global serial.
+- Cobertura del diff productivo: `2624/3068 = 85,528031 %`, 16 statements sobre
+  el mínimo entero. Perfiles Windows r7 frescos más bloques Unix de la última
+  ejecución Linux; los fuentes Unix no cambiaron y el reintento WSL quedó
+  bloqueado por `ERROR_NO_SYSTEM_RESOURCES`. T8/T15/T16 vuelven a completas,
+  los temporales se retiraron y `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 28, octava remediación iniciada
+
+- La séptima review abre solo REV-17 documental/evidencia; T16 se reabre sin
+  cambiar el comportamiento del runtime.
+- Se corregirá el protocolo descrito en design, la trazabilidad a nombres y
+  subtests reales y el gate de cobertura para ligar cada perfil por hash al
+  source final y rechazar perfiles stale, mixed o duplicados.
+- La cifra objetivo fresca verificada por reviewer es `2027/2359 = 85,926240 %`;
+  se regenerarán todos los perfiles desde el source final antes de publicarla.
+
+## 2026-10-23 — Feature 28, octava remediación completada
+
+- REV-17 queda cerrado documentalmente: design describe el protocolo durable
+  entregado y no conserva la decisión rechazada de bloqueo pre-CAS.
+- La trazabilidad cita únicamente los tests top-level reales y las rutas exactas
+  de subtests bajo `TestWitnessCrashBoundariesAndConcurrentCAS`; el comando
+  `go test -run` documentado reproduce la matriz relevante.
+- El gate liga cada perfil por SHA-256 al hash del conjunto de fuentes Go
+  productivos cambiados. Rechaza source stale, perfil mixed/tampered/desplazado,
+  nombres/hashes duplicados y conserva una sola copia de common blocks válidos.
+- Los tres perfiles Windows r8 y el perfil Linux r8 se regeneraron desde el mismo
+  source final. El binario Linux ejecutó en WSL con focal 86,8 %; coverage exacta
+  `2027/2359 = 85,926240 %` y 21 statements de margen sobre el mínimo entero.
+- Pasan los seis tests del gate, focal jerárquico ×3, focal projectmemory ×3,
+  vet, compile-only, suite global serial, cross-build Linux/Darwin, formato y
+  diff-check. T16 vuelve a completa, temporales retirados y `feature_list.json`
+  permanece intacto.
+
+## 2026-10-23 — Feature 28, novena remediación iniciada
+
+- La octava review mantiene abierto solo REV-17: `--write-manifest` podía ligar a
+  posteriori perfiles arbitrarios al source actual. T16 se reabre.
+- El gate se convertirá en runner: captura source pre/post, ejecuta el comando
+  controlado y publica profile+sidecar únicamente como resultado indivisible.
+  Linux ligará source, test binary y perfil mediante attestations del build y del
+  runner, sin ruta pública para certificar evidencia preexistente.
+
+## 2026-10-23 — Feature 28, novena remediación completada
+
+- REV-17 queda cerrado con runners indivisibles. Se eliminó `--write-manifest`:
+  ningún comando acepta un perfil preexistente para producir su sidecar.
+- Cada runner host captura source SHA-256 antes/después, escribe el coverprofile
+  solo en un path temporal controlado y publica profile+sidecar sellado tras exit
+  cero. Interrupted run o source drift no publican evidencia aceptable.
+- `build-linux` liga source+binary; el runner Linux verifica el binary antes y
+  después, ejecuta el test y emite profile+attestation con hashes de source,
+  binary, build attestation y profile. El host vuelve a verificar toda la cadena.
+- Los probes cubren A→profile→B con intento de recertificar/validar, replacement
+  de profile y sidecar, missing sidecar, interrupción, source drift durante el
+  comando, binary mismatch, replay, mixed, duplicate y common-block dedupe.
+- Cuatro perfiles r9 frescos reproducen `2027/2359 = 85,926240 %`; Linux focal
+  `86,8 %`. Gate tests, shell syntax, focal ×3, suite global serial, vet,
+  compile-only, cross-build Linux/Darwin, formato y diff-check pasan. T16 vuelve
+  a completa; temporales retirados y `feature_list.json` intacto.
+
+## 2026-10-23 — Feature 28, décima remediación iniciada
+
+- REV-17 continúa abierto: sidecars con checksum público no acreditan el momento
+  de generación. T16 se reabre y se elimina ese diseño.
+- El gate expondrá únicamente `verify`, sin rutas, comandos, manifests ni
+  evidencia externa. Las cuatro recetas quedan hardcoded y se ejecutan dentro de
+  un temp privado; el mismo proceso mide y elimina sus artefactos.
+- Linux será obligatorio: build, transferencia, hash pre/post, ejecución WSL y
+  lectura del perfil pertenecen a la misma operación. Sin WSL el gate falla y no
+  existe fallback a perfiles stale.
+
+## 2026-10-23 — Feature 28, décima remediación completada
+
+- REV-17 queda cerrado mediante `feature28_coverage.py verify`, único comando
+  aceptado. No hay opciones de profile, command, manifest, sidecar o input.
+- El gate crea un temp privado exclusivo, captura source hash, ejecuta tres
+  recetas Windows hardcoded, compila Linux, valida el binary antes/después de
+  transferirlo y ejecutarlo en WSL, recupera el profile, revalida source/perfiles,
+  mide y elimina host+Linux temps en el mismo proceso.
+- Los probes niegan opciones externas, prueban que stale/posthoc/duplicate se
+  ignoran, y fuerzan source drift, interruption, binary replacement y profile
+  replacement. Todo falla cerrado sin evidencia residual; common blocks frescos
+  se deduplican una sola vez.
+- La ejecución real obligatoria con WSL devuelve `2027/2359 = 85,926240 %` y
+  limpia su temp. Unit probes, focal ×3, suite global serial, vet, compile-only,
+  cross-build Linux/Darwin, formato y diff-check pasan. T16 vuelve a completa y
+  `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 28, undécima remediación iniciada
+
+- REV-17 mantiene un TOCTOU en el gate: digest y merge reabrían paths. T16 se
+  reabre sin cambios al producto.
+- Profiles y binary Linux se leerán una sola vez por handle no-follow, con
+  identidad/tipo/link/límite verificados; parser, merge y transferencia usarán
+  exclusivamente esos buffers inmutables.
+- Source se sellará antes de generar, tras cargar buffers y al terminar measure;
+  probes deterministas cubrirán swap post-load, drift durante measure,
+  truncation, oversize y duplicate bytes.
+
+## 2026-10-23 — Feature 28, undécima remediación checkpoint
+
+- Profiles se abren una vez por handle no-follow y parser/merge consumen solo
+  buffers inmutables acotados. El binary Linux se transfiere desde su único
+  buffer y el runner remoto conserva la identidad abierta para hash pre,
+  ejecución y hash post, sin validate-then-reopen.
+- Ocho probes del gate pasan: swap post-load/pre-merge, swap del binary, source
+  drift durante measure, truncation, oversize, duplicate bytes, interrupción y
+  rechazo de inputs/evidencia externa.
+- Vet, compile-only, focal projectmemory ×3, suite global, race global serial y
+  cross-builds Linux/Darwin pasan. La ejecución real del gate continúa pendiente:
+  WSL/HCS falla al crear cualquier VM con `ERROR_NO_SYSTEM_RESOURCES`; Docker no
+  dispone de engine y no hay Podman/QEMU/Lima local. El gate falla cerrado, no
+  reutiliza perfiles stale y T16 permanece abierta.
+
+## 2026-10-23 — Feature 28, undécima remediación entrega condicional
+
+- Estado `ready_for_review_conditional`: implementación y ocho probes TOCTOU en
+  pass; vet, compile-only, focal ×3, global, race global serial y cross-builds
+  Linux/Darwin también pasan.
+- El reintento final de `wsl.exe -l -q` devuelve lista vacía. El gate cerrado
+  vuelve a fallar con `WSL_E_DISTRO_NOT_FOUND` tras generar desde cero su parte
+  Windows y el binary Linux, elimina el temp y no acepta evidencia anterior.
+- Para cerrar T16 después de recuperar WSL: `wsl.exe -l -q` debe listar
+  `docker-desktop` ejecutable y `$env:PYTHONDONTWRITEBYTECODE='1'; python
+  scripts/feature28_coverage.py verify` debe producir >=85 % en esa única
+  operación. No se declara coverage fresca ni PASS del gate hasta entonces.
+
+## 2026-10-23 — Feature 28, undécima remediación completada
+
+- Docker/WSL vuelve a exponer `docker-desktop`. El gate cerrado se ejecutó desde
+  cero sobre el source final y obtuvo `2027/2359 = 85,926240 %`, 21 statements
+  por encima del mínimo entero; ningún profile previo entró en el cálculo.
+- El runner Linux conserva por descriptor la identidad del binary transferido
+  para hash pre, ejecución y hash post, y devuelve el profile desde un descriptor
+  abierto tras retirar su pathname. Los cuatro buffers se cargan una sola vez y
+  parser/merge no reabren filesystem.
+- T16 vuelve a completa. Los ocho probes TOCTOU, vet, compile-only, focal ×3,
+  global, race global serial, runtime Linux, cross-builds Linux/Darwin, formato,
+  diff-check y limpieza pasan; `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 28, duodécima remediación iniciada
+
+- REV-17 reabre T16: el contenido lógico del remote runner era correcto tras la
+  interpretación de WSL, pero sus bytes en Python contenían escapes destinados
+  a una segunda capa `sh -lc`; la evidencia no demostraba sintaxis shell literal.
+- El runner se entregará como bytes exactos por stdin a `sh -s`, con `$(...)`,
+  `/proc/$$/fd/...` y `$before` literales. `bash -n` y una integración WSL con el
+  binario focal ejecutarán exactamente esos mismos bytes antes de repetir el gate.
+
+## 2026-10-23 — Feature 28, duodécima remediación completada
+
+- `linux_runner_script()` produce bytes shell literales y `sh -s` los recibe por
+  stdin. La transferencia previa del binary usa argv directos de WSL y su buffer
+  inmutable; no queda ninguna capa `sh -lc` que reinterprete `$` o backslashes.
+- Diez probes pasan. `bash -n` consume exactamente el mismo buffer del runner y
+  la integración real compila el focal Linux, ejecuta esos bytes, conserva la
+  identidad por descriptores y valida el profile devuelto. El fake contrasta el
+  stdin/output completo y no substrings de una representación escapada.
+- El gate real se regeneró desde cero con WSL y obtuvo `2027/2359 = 85,926240 %`.
+  T16 vuelve a completa; temporales host/WSL se eliminan y `feature_list.json`
+  permanece intacto.
+
+## 2026-10-23 — Feature 28, decimotercera remediación iniciada
+
+- REV-17 reabre T16 para cerrar la identidad remota: el runner literal todavía
+  abría el pathname del binary tres veces antes de unlink.
+- El runner abrirá el pathname exactamente una vez, duplicará ese FD para hash
+  pre, ejecución y hash post, y retirará el nombre. Una barrera determinista de
+  test sustituirá el path después de la apertura para demostrar que solo se usan
+  los bytes originales o se falla cerrado.
+
+## 2026-10-23 — Feature 28, decimotercera remediación completada
+
+- El remote binary se abre una vez con `exec 3<`; los FDs 4 y 5 se duplican desde
+  el 3 y el pathname se retira. Hash pre, focal real y hash post operan por
+  `/proc/$$/fd`, ligados a la identidad abierta.
+- El probe determinista pausa después de las duplicaciones, reemplaza el pathname
+  con otro ejecutable y confirma que el runner usa los bytes originales. El test
+  de sintaxis exige una sola apertura del path y dos duplicaciones de FD.
+- Once probes, `bash -n`, integración focal Linux y gate real pasan. Coverage
+  fresca: `2027/2359 = 85,926240 %`. T16 vuelve a completa; cleanup host/WSL y
+  ausencia de cambios en `feature_list.json` confirmados.
+
+## 2026-10-23 — Feature 28 cerrada
+
+- Review independiente aprobada en la decimotercera revisión; REV-1–REV-17
+  quedan cerrados y R1–R15 trazados.
+- El smoke final de leader para witness, recovery, rollback y CAS multiproceso
+  pasa. El gate fresco reproduce `2027/2359 = 85,926240 %`.
+- T1–T16 completas. El estado de `validated-project-memory` cambia de
+  `in_progress` a `done`; no se incluyó alcance de feature 29.

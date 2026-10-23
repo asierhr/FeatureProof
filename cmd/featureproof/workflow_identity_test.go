@@ -891,6 +891,41 @@ func TestProductIdentityCompositionStopsBeforeInferenceWhenResolverCoverageIsMis
 	}
 }
 
+// TestProductWorkflowCompositionPersistsTrustedMemoryBinding proves the real workflow entrypoint owns query authority and survives restart.
+func TestProductWorkflowCompositionPersistsTrustedMemoryBinding(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	t.Setenv("FEATUREPROOF_MEMORY_ROOT", filepath.Join(root, ".featureproof", "memory"))
+	t.Setenv("FEATUREPROOF_MEMORY_TRUST_ROOT", filepath.Join(root, ".featureproof-trust", "memory"))
+	installProjectMemoryWitness(t)
+	t.Setenv("FEATUREPROOF_MEMORY_INTEGRITY_KEY", "0123456789abcdef0123456789abcdef")
+	t.Setenv("FEATUREPROOF_MEMORY_PRINCIPAL", "memory-principal")
+	t.Setenv("FEATUREPROOF_MEMORY_CREDENTIAL", "memory-credential")
+	t.Setenv("FEATUREPROOF_MEMORY_PROJECT", "project-1")
+	t.Setenv("FEATUREPROOF_MEMORY_REPOSITORY", "7")
+	t.Setenv("FEATUREPROOF_MEMORY_COMMIT", strings.Repeat("a", 40))
+	t.Setenv("FEATUREPROOF_MEMORY_CONFIGURATION_DIGEST", strings.Repeat("b", 64))
+	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) }))
+	defer target.Close()
+	modelTransport := &workflowProductModelTransport{}
+	cli, specPath, contractPath := composeProductIdentityWorkflow(t, root, target.URL, modelTransport)
+	command := productIdentityStartCommand(cli, specPath, contractPath, "memory-product-vertical", validationworkflow.ApprovalDisabled)
+	view, err := cli.Service.Start(context.Background(), command)
+	if err != nil || view.Phase != validationworkflow.PhaseTerminal {
+		t.Fatalf("workflow=%#v err=%v", view, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, ".featureproof", "workflows", "plans", view.Handle+".plan.json"))
+	var artifact validationworkflow.PlanArtifact
+	if err != nil || json.Unmarshal(raw, &artifact) != nil || artifact.MemoryBindingDigest == "" {
+		t.Fatalf("trusted memory binding was not persisted: %#v %v", artifact, err)
+	}
+	restarted := recomposeProductIdentityWorkflow(t, modelTransport)
+	result, err := restarted.Service.Result(context.Background(), view.Handle)
+	if err != nil || result.View.Phase != validationworkflow.PhaseTerminal {
+		t.Fatalf("restart result=%#v err=%v", result, err)
+	}
+}
+
 // TestProductIdentityRedeliveryAndRestartRecoveryResolveFreshMaterial proves terminal redelivery is idempotent and pending approval survives service recreation with a new resolver composition.
 func TestProductIdentityRedeliveryAndRestartRecoveryResolveFreshMaterial(t *testing.T) {
 	t.Run("terminal redelivery", func(t *testing.T) {

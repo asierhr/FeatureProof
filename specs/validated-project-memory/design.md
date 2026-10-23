@@ -129,6 +129,10 @@ aunque la reconciliación todavía no haya persistido el evento.
   proyectos, scopes y sensibilidad permitidos.
 - **Integrity authority port:** autentica/verifica bytes canónicos; la clave
   privada no forma parte de records, eventos, snapshots ni DTOs.
+- **Monotonic witness port:** conserva fuera de todos los ficheros administrados
+  por `LocalStore` el `{project, generation, head, receipts_digest}` vigente.
+  Expone `Read`, bootstrap create-once autorizado y `CompareAndAdvance` atómico;
+  no permite delete, rollback ni recreación desde journal.
 - **Clock/Waiter:** tiempo y backoff deterministas/cancelables.
 
 Toda entidad, constante, variable de paquete, función, método y helper nuevo o
@@ -164,6 +168,25 @@ idempotency receipts, head sequence/digest, schema/index version y authenticator
 El índice exacto contiene únicamente referencias por campos estructurales
 (scope/class/state/authority/sensitivity/logical key); es derivado, no contiene
 contenido nuevo y puede regenerarse del snapshot/journal autenticados.
+
+El adapter local no afirma frescura por sí solo: journal, snapshot, índice y
+registry HMAC son restaurables. Antes de aceptar cualquier lectura exige que el
+witness externo coincida exactamente; missing, unavailable, behind o ahead
+incompatible fallan cerrados. Para escribir, publica y sincroniza primero un
+staging exclusivo autenticado, avanza el witness por CAS con el digest opaco del
+envelope pendiente y solo tras confirmar ese avance materializa journal,
+registry y proyecciones antes de retirar el staging. Un rechazo confirmado
+pre-CAS deja journal/head intactos y permite reintentar. Si el CAS avanzó y el
+proceso cae antes o durante la materialización, restart exige el staging exacto
+ligado al witness y converge sin repetir efectos ni receipts. Nunca se avanza ni
+reconstruye el witness desde historia local.
+
+La composición productiva solo acepta un endpoint HTTPS separado que declare el
+contrato `linearizable-durable-nonreplayable-v1` y una credencial específica. La
+operación bootstrap es explícita, autenticada y create-once. La disponibilidad,
+durabilidad linealizable, retención y prohibición de rollback/delete pertenecen
+al servicio de witness operado fuera de los roots de FeatureProof; si no pueden
+garantizarse, la composición falla en lugar de degradar a almacenamiento local.
 
 ### Integraciones mínimas
 
@@ -287,14 +310,22 @@ Orden mínimo de publicación:
 2. lock cancelable y relectura de head;
 3. validar CAS e idempotency receipt;
 4. construir/autenticar envelope;
-5. append + sync del journal;
-6. construir snapshot/index desde el head confirmado;
-7. escribir temporales exclusivos, sync, rename/replace atómico, sync del padre;
-8. liberar recursos y devolver commit.
+5. publicar mediante temporal exclusivo+fsync un staging local que contiene el
+   envelope ya autenticado;
+6. avanzar el witness por CAS con head, receipts y solo el digest opaco del
+   staging, nunca content ni material sensible;
+7. después de confirmar el CAS, append+sync del journal y publicación atómica de
+   registry/snapshot/index;
+8. retirar staging, liberar recursos y devolver commit.
 
-Si el journal se confirmó pero snapshot no, recovery reproduce el evento. Si no
-se confirmó journal, el temporal nunca cuenta. Un receipt confirmado con el mismo
-digest responde el resultado previo. No se reintentan corrupción, CAS, denial,
+Un rechazo confirmado antes de avanzar elimina el staging y deja journal/head
+anteriores sin cambios. Si el witness avanzó y el proceso cae antes, durante o
+después del append, recovery exige el staging autenticado exacto ligado al
+digest del witness y materializa una sola vez el evento/receipt. Un tail parcial
+solo puede sustituirse por el prefijo totalmente verificado más ese evento. La
+ausencia, alteración, alias o swap del staging falla cerrada; nunca se repiten
+evidence, policy ni otros efectos externos. Un receipt confirmado con el mismo
+digest responde el resultado previo. No se reintentan corrupción, denial,
 secret o input. Fallos locales transitorios pueden reintentarse con máximo,
 deadline y waiter inyectados, reabriendo y verificando todo en cada intento.
 
@@ -318,11 +349,12 @@ deadline y waiter inyectados, reabriendo y verificando todo en cada intento.
 | Último boundary observado | Estado durable | Recovery |
 |---|---|---|
 | antes de lock/CAS | ninguno | reintentar desde cero con misma identidad |
-| temporal previo a journal | head anterior | borrar temporal propio; reintentar |
-| append sin sync confirmado | incierto | verificar cadena/receipt; nunca asumir éxito |
-| journal sincronizado, snapshot viejo | evento confirmado | replay y republicar snapshot/index |
+| staging sincronizado, witness sin avanzar | head anterior | validar y retirar staging; reintentar |
+| witness avanzado, journal anterior | evento confirmado | exigir staging ligado al witness; append exacto |
+| append parcial | evento confirmado | verificar prefijo y reescribir solo tail desde staging |
+| journal sincronizado, snapshot viejo | evento confirmado | validar staging, replay y republicar snapshot/index |
 | snapshot reemplazado, index viejo | record confirmado | reconstruir índice derivado |
-| respuesta perdida tras publish | receipt confirmado | devolver resultado previo |
+| respuesta perdida tras CAS/publish | receipt confirmado | recuperar staging o devolver resultado previo |
 | evento/snapshot corrupto | autoridad desconocida | error integrity; no reparar ni servir |
 | lock de proceso abandonado | head verificable | adquirir lock OS y continuar con CAS |
 
@@ -397,8 +429,18 @@ serializan el mismo DTO cuando exponen la misma operación.
 
 - `gofmt`, `go vet ./...`, compile-only, `go test ./...`, tests focales
   repetidos, `go test -race ./...` y cross-builds aplicables.
-- Script reproducible de coverage del diff que cuenta fuentes Windows/Unix y
-  exige cociente real >=85%.
+- `scripts/feature28_coverage.py verify` ejecuta recetas Windows/Linux cerradas
+  en un temporal privado, abre cada profile una sola vez por handle no-follow y
+  entrega únicamente buffers inmutables y acotados al parser/merge. El binario
+  Linux se transfiere desde su único buffer verificado. El runner son bytes POSIX
+  literales entregados por stdin a `sh -s`, sin interpolación intermedia; abre la
+  identidad transferida antes de retirar su pathname y la conserva para hash
+  pre, ejecución y hash post. El pathname del binary se abre exactamente una vez;
+  los otros handles son duplicados de ese FD y el nombre se retira antes de
+  consumirlos. Source se sella antes de generar, tras cargar todos
+  los buffers y después de medir. Sin runtime Linux el gate falla sin aceptar
+  perfiles, comandos, manifests ni evidencia preexistente. El cociente real del
+  diff debe ser >=85%.
 - Auditoría AST de comentarios sistémicos para todos los símbolos nuevos o
   modificados, incluidos helpers de test.
 - No se requieren red, modelo, cuenta, credencial ni servicio real.
@@ -444,6 +486,10 @@ serializan el mismo DTO cuando exponen la misma operación.
 
 - La seguridad local depende de que composición proteja y ancle las claves de
   integridad fuera del root.
+- La resistencia a rollback depende del witness externo linealizable y durable,
+  incluido su control operativo contra restore/delete. FeatureProof verifica su
+  estado exacto y falla cerrado, pero no puede fabricar esa garantía con otro
+  fichero HMAC local.
 - La resistencia a TOCTOU requiere primitivas distintas en Windows y Unix; los
   tests y coverage deben incluir ambas implementaciones.
 - Los recuerdos `project` pueden seguir siendo conceptualmente incorrectos aun

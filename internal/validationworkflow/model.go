@@ -15,6 +15,7 @@ import (
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/projectmemory"
 	"github.com/asierhr/featureProof/internal/testidentity"
 )
 
@@ -160,6 +161,9 @@ type StartCommand struct {
 	GitHubAuthority                                          *GitHubAuthorityReference
 	ApprovedContract                                         *ApprovedContractReference
 	FunctionalFlow                                           *FunctionalFlowSelection
+	MemoryBinding                                            *projectmemory.MemoryBinding
+	MemoryAuthority                                          *projectmemory.QueryAuthority
+	MemoryDescriptors                                        []projectmemory.AgentMemoryDescriptor
 }
 
 // FunctionalFlowSelection identifies one preauthorized provided flow; nil selects generated normalization.
@@ -197,20 +201,21 @@ func (s AdmissionSnapshot) Clone() AdmissionSnapshot {
 
 // PlanArtifact is the canonical, secret-free generated plan persisted before approval.
 type PlanArtifact struct {
-	Version         string                           `json:"version"`
-	WorkflowID      string                           `json:"workflow_id"`
-	PlanID          string                           `json:"plan_id"`
-	Provider        string                           `json:"provider"`
-	Model           string                           `json:"model"`
-	PromptVersion   string                           `json:"prompt_version"`
-	ProtocolVersion string                           `json:"protocol_version"`
-	Plans           []localvalidation.PlanProjection `json:"plans"`
-	ContextDigest   string                           `json:"context_digest"`
-	RevisionDigest  string                           `json:"revision_digest"`
-	TargetDigest    string                           `json:"target_digest"`
-	RuntimeDigest   string                           `json:"runtime_digest"`
-	ArtifactSHA256  string                           `json:"artifact_sha256"`
-	Usage           ModelUsage                       `json:"usage"`
+	Version             string                           `json:"version"`
+	WorkflowID          string                           `json:"workflow_id"`
+	PlanID              string                           `json:"plan_id"`
+	Provider            string                           `json:"provider"`
+	Model               string                           `json:"model"`
+	PromptVersion       string                           `json:"prompt_version"`
+	ProtocolVersion     string                           `json:"protocol_version"`
+	Plans               []localvalidation.PlanProjection `json:"plans"`
+	ContextDigest       string                           `json:"context_digest"`
+	RevisionDigest      string                           `json:"revision_digest"`
+	TargetDigest        string                           `json:"target_digest"`
+	RuntimeDigest       string                           `json:"runtime_digest"`
+	ArtifactSHA256      string                           `json:"artifact_sha256"`
+	Usage               ModelUsage                       `json:"usage"`
+	MemoryBindingDigest string                           `json:"memory_binding_digest,omitempty"`
 }
 
 // ModelUsage records allowlisted confirmed generation accounting.
