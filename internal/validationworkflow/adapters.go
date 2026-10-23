@@ -11,7 +11,9 @@ import (
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
+	"github.com/asierhr/featureProof/internal/functionalflow"
 	"github.com/asierhr/featureProof/internal/githubpr"
+	"github.com/asierhr/featureProof/internal/planning"
 )
 
 // MCPProtocolVersion identifies the bounded JSON-RPC protocol understood by workflow MCP.
@@ -43,6 +45,102 @@ func (a PreparationAdapter) Restore(ctx context.Context, snapshot AdmissionSnaps
 	return agentplanning.RestorePrepared(ctx, snapshot.Generation, private, a.Assertions, a.Policy)
 }
 
+// PrepareProvided converts a validated flow into a compatibility plan so existing artifact and approval authorities remain shared without model inference.
+func (a PreparationAdapter) PrepareProvided(ctx context.Context, snapshot AdmissionSnapshot, flow functionalflow.Flow) (agentplanning.PreparedPlan, error) {
+	checks := make([]agentplanning.CandidateCheck, len(flow.Steps))
+	for i, step := range flow.Steps {
+		input := map[string]planning.InputValue{}
+		for name, value := range step.Input {
+			input[name] = providedPlanningInput(value)
+		}
+		assertionIDs := []string{}
+		for _, assertion := range step.Assertions {
+			assertionIDs = append(assertionIDs, assertion.ID)
+		}
+		evidenceRequirements := []agentplanning.EvidenceRequirement{}
+		if len(assertionIDs) > 0 {
+			evidenceRequirements = append(evidenceRequirements, agentplanning.EvidenceRequirement{StepID: step.ID, AssertionIDs: assertionIDs})
+		}
+		check := agentplanning.CandidateCheck{ID: "provided-" + step.ID, ConstraintID: step.ConstraintID, Scenario: agentplanning.ScenarioPositive, Capability: step.Operation.Capability, Steps: []planning.PlanStep{{ID: step.ID, Tool: step.Operation.Capability, Input: input, Assertions: append([]planning.AssertionDeclaration(nil), step.Assertions...)}}, Evidence: evidenceRequirements}
+		if step.Operation.Capability == "http.request" {
+			check.Operation = &agentplanning.OperationReference{Method: step.Operation.Method, Path: step.Operation.Path}
+			check.IdentityID = step.IdentityID
+			check.PathParams = providedPathParams(step.Operation.Path, input)
+			delete(check.Steps[0].Input, "method")
+			delete(check.Steps[0].Input, "path")
+		}
+		checks[i] = check
+	}
+	return agentplanning.PrepareAdditional(ctx, snapshot.Generation, checks, a.Assertions, a.Policy)
+}
+
+// providedPlanningInput preserves literals and replaces runtime-only references with type-correct inert compatibility values.
+func providedPlanningInput(value functionalflow.InputValue) planning.InputValue {
+	if value.Literal != nil {
+		return planning.InputValue{Literal: &planning.LiteralValue{Value: value.Literal.Value}}
+	}
+	if value.Object != nil {
+		object := make(map[string]planning.InputValue, len(value.Object))
+		for name, child := range value.Object {
+			object[name] = providedPlanningInput(child)
+		}
+		return planning.InputValue{Object: object}
+	}
+	if value.Array != nil {
+		array := make([]planning.InputValue, len(value.Array))
+		for i, child := range value.Array {
+			array[i] = providedPlanningInput(child)
+		}
+		return planning.InputValue{Array: array}
+	}
+	valueType := planning.ValueString
+	if value.Reference != nil && value.Reference.Step != nil {
+		valueType = value.Reference.Step.ValueType
+	} else if value.Reference != nil && value.Reference.Fixture != nil {
+		valueType = value.Reference.Fixture.ValueType
+	}
+	return planning.InputValue{Literal: &planning.LiteralValue{Value: zeroProvidedValue(valueType)}}
+}
+
+// zeroProvidedValue supplies only a validation placeholder; the functional runtime resolves the sealed private reference later.
+func zeroProvidedValue(valueType planning.ValueType) any {
+	switch valueType {
+	case planning.ValueNumber:
+		return 0
+	case planning.ValueBoolean:
+		return false
+	case planning.ValueObject:
+		return map[string]any{}
+	case planning.ValueArray:
+		return []any{}
+	default:
+		return ""
+	}
+}
+
+// providedPathParams extracts only literal template coordinates for compatibility contract validation.
+func providedPathParams(path string, input map[string]planning.InputValue) map[string]any {
+	out := map[string]any{}
+	for offset := 0; offset < len(path); {
+		start := strings.IndexByte(path[offset:], '{')
+		if start < 0 {
+			break
+		}
+		start += offset
+		end := strings.IndexByte(path[start+1:], '}')
+		if end < 0 {
+			break
+		}
+		end += start + 1
+		name := path[start+1 : end]
+		if value, ok := input[name]; ok && value.Literal != nil {
+			out[name] = value.Literal.Value
+		}
+		offset = end + 1
+	}
+	return out
+}
+
 // CLI translates workflow subcommands into the shared Service without owning orchestration rules.
 type CLI struct {
 	Service        *Service
@@ -50,6 +148,13 @@ type CLI struct {
 	AuthProfiles   map[string]string
 	DirectTargets  map[string]DirectTarget
 	PreviewTargets map[string]PreviewTarget
+	FlowManifests  LocalFlowManifestResolver
+	FlowAliases    map[string]string
+}
+
+// LocalFlowManifestResolver admits one CLI-only local manifest and returns its safe persisted artifact coordinate.
+type LocalFlowManifestResolver interface {
+	Resolve(context.Context, string) (string, error)
 }
 
 // Run parses one exact workflow command and writes a canonical safe JSON projection.
@@ -61,7 +166,20 @@ func (c CLI) Run(ctx context.Context, args []string, output io.Writer) int {
 	var err error
 	switch args[0] {
 	case "start":
-		command, parseErr := parseStartCLI(args[1:], c.AuthProfiles, c.DirectTargets, c.PreviewTargets)
+		startArgs := append([]string(nil), args[1:]...)
+		for index := 0; index+1 < len(startArgs); index += 2 {
+			if startArgs[index] == "--flow-manifest" {
+				if c.FlowManifests == nil {
+					return 2
+				}
+				artifactID, resolveErr := c.FlowManifests.Resolve(ctx, startArgs[index+1])
+				if resolveErr != nil || !safeID.MatchString(artifactID) {
+					return 2
+				}
+				startArgs[index], startArgs[index+1] = "--flow-artifact", artifactID
+			}
+		}
+		command, parseErr := parseStartCLI(startArgs, c.AuthProfiles, c.DirectTargets, c.PreviewTargets)
 		if parseErr != nil {
 			return 2
 		}
@@ -124,7 +242,7 @@ func (c CLI) Run(ctx context.Context, args []string, output io.Writer) int {
 // parseStartCLI requires every explicit workflow selection and resolves target aliases from trusted catalogs.
 func parseStartCLI(args []string, profiles map[string]string, direct map[string]DirectTarget, previews map[string]PreviewTarget) (StartCommand, error) {
 	values := map[string]string{}
-	allowed := map[string]bool{"--spec": true, "--contract": true, "--provider": true, "--model": true, "--profile": true, "--runtime-profile": true, "--repository": true, "--revision": true, "--approval": true, "--idempotency-key": true, "--target": true, "--preview": true, "--review-id": true, "--review-revision": true, "--review-digest": true}
+	allowed := map[string]bool{"--spec": true, "--contract": true, "--provider": true, "--model": true, "--profile": true, "--runtime-profile": true, "--repository": true, "--revision": true, "--approval": true, "--idempotency-key": true, "--target": true, "--preview": true, "--review-id": true, "--review-revision": true, "--review-digest": true, "--flow-alias": true, "--flow-artifact": true}
 	for index := 0; index < len(args); index += 2 {
 		if index+1 >= len(args) || !allowed[args[index]] || args[index+1] == "" || values[args[index]] != "" {
 			return StartCommand{}, &Error{Code: CodeInvalid, Operation: "cli_start"}
@@ -158,6 +276,12 @@ func parseStartCLI(args []string, profiles map[string]string, direct map[string]
 	} else {
 		command.Target.Preview = &previewTarget
 	}
+	if values["--flow-alias"] != "" || values["--flow-artifact"] != "" {
+		if (values["--flow-alias"] == "") == (values["--flow-artifact"] == "") {
+			return StartCommand{}, &Error{Code: CodeInvalid, Operation: "cli_flow"}
+		}
+		command.FunctionalFlow = &FunctionalFlowSelection{Alias: values["--flow-alias"], ArtifactID: values["--flow-artifact"]}
+	}
 	return command, nil
 }
 
@@ -168,6 +292,7 @@ type MCPServer struct {
 	AuthProfiles   map[string]string
 	DirectTargets  map[string]DirectTarget
 	PreviewTargets map[string]PreviewTarget
+	FlowAliases    map[string]string
 }
 
 // MCPRequest is one bounded transport-neutral MCP workflow call.
@@ -343,9 +468,20 @@ func (m MCPServer) Handle(ctx context.Context, request MCPRequest) MCPResponse {
 		} else {
 			compositionRef, profileOK := m.AuthProfiles[input.AuthProfile]
 			command := StartCommand{Principal: m.Principal, IdempotencyKey: input.IdempotencyKey, SpecificationRef: input.SpecificationRef, ContractRef: input.ContractRef, Provider: input.Provider, Model: input.Model, CompositionRef: compositionRef, RuntimeProfile: input.RuntimeProfile, RepositoryID: input.RepositoryID, Revision: input.Revision, Approval: input.Approval, ApprovedContract: input.ApprovedContract}
+			if input.FlowAlias != "" || input.FlowArtifactID != "" {
+				artifactID := input.FlowArtifactID
+				if input.FlowAlias != "" {
+					artifactID = m.FlowAliases[input.FlowAlias]
+				}
+				if artifactID == "" || input.FlowAlias != "" && input.FlowArtifactID != "" {
+					err = &Error{Code: CodeInvalid, Operation: "mcp_flow"}
+				} else {
+					command.FunctionalFlow = &FunctionalFlowSelection{ArtifactID: artifactID}
+				}
+			}
 			direct, directOK := m.DirectTargets[input.TargetAlias]
 			preview, previewOK := m.PreviewTargets[input.PreviewAlias]
-			if !profileOK || len(compositionRef) != 64 || directOK == previewOK {
+			if err != nil || !profileOK || len(compositionRef) != 64 || directOK == previewOK {
 				err = &Error{Code: CodeInvalid, Operation: "mcp_target"}
 			} else {
 				if directOK {
@@ -424,6 +560,8 @@ type mcpStartCommand struct {
 	TargetAlias      string                     `json:"target_alias,omitempty"`
 	PreviewAlias     string                     `json:"preview_alias,omitempty"`
 	ApprovedContract *ApprovedContractReference `json:"approved_contract,omitempty"`
+	FlowAlias        string                     `json:"flow_alias,omitempty"`
+	FlowArtifactID   string                     `json:"flow_artifact_id,omitempty"`
 }
 
 // GitHubGateway maps an already authorized GitHub selection onto a complete configured workflow template.
@@ -479,6 +617,18 @@ func (g GitHubGateway) Status(ctx context.Context, handle string) (githubpr.RunS
 		return githubpr.RunState{}, githubError(err)
 	}
 	return g.githubState(ctx, view)
+}
+
+// Result returns the shared verified terminal package for an authorized GitHub workflow handle.
+func (g GitHubGateway) Result(ctx context.Context, handle string) (WorkflowResult, error) {
+	if g.Service == nil || !safeID.MatchString(g.Principal) {
+		return WorkflowResult{}, &githubpr.Error{Code: githubpr.CodeUnauthorized, Operation: "workflow_result"}
+	}
+	result, err := g.Service.Result(ctx, handle)
+	if err != nil {
+		return WorkflowResult{}, githubError(err)
+	}
+	return result, nil
 }
 
 // Cancel delegates durable cancellation to the shared workflow service.

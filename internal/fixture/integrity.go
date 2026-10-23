@@ -242,7 +242,7 @@ func ValidateSummary(summary FixtureSummary, runID string) error {
 		return &Error{Category: CategoryInvalid, Phase: "summary_binding"}
 	}
 	switch summary.PreparationStatus {
-	case PreparationNotRequired, PreparationPrepared, PreparationFailed, PreparationCancelled:
+	case PreparationNotRequired, PreparationPrepared, PreparationFailed, PreparationCancelled, PreparationRejected:
 	default:
 		return &Error{Category: CategoryInvalid, Phase: "summary_preparation"}
 	}
@@ -280,7 +280,7 @@ func ValidateSummary(summary FixtureSummary, runID string) error {
 		}
 		results[result.FixtureID] = result
 	}
-	if summary.PreparationStatus == PreparationNotRequired && len(results) != 0 || summary.PreparationStatus == PreparationPrepared && len(results) == 0 {
+	if (summary.PreparationStatus == PreparationNotRequired || summary.PreparationStatus == PreparationRejected) && len(results) != 0 || summary.PreparationStatus == PreparationPrepared && len(results) == 0 {
 		return &Error{Category: CategoryInvalid, Phase: "summary_preparation"}
 	}
 	preparedResults := 0

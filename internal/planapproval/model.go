@@ -124,6 +124,19 @@ type GenerationContractSnapshot struct {
 	Model           string `json:"model"`
 }
 
+// FunctionalFlowStepSnapshot is the safe reviewed authority for one exact functional operation.
+type FunctionalFlowStepSnapshot struct {
+	ID, Kind, ConstraintID, IdentityID, Capability, TargetID, Method, Path, BindingDigest, RequirementsDigest string
+	Effectful                                                                                                 bool
+}
+
+// FunctionalFlowSnapshot binds a human decision to one exact immutable FlowArtifact without private inputs.
+type FunctionalFlowSnapshot struct {
+	FlowID, Source, ArtifactDigest, SemanticDigest string
+	Revision                                       uint64
+	Steps                                          []FunctionalFlowStepSnapshot
+}
+
 // ContractSnapshot is the complete serializable context whose semantic changes invalidate approval.
 type ContractSnapshot struct {
 	Target             TargetSnapshot
@@ -133,6 +146,7 @@ type ContractSnapshot struct {
 	Identities         []testidentity.Descriptor
 	Runtime            RuntimeSnapshot
 	GenerationContract GenerationContractSnapshot
+	FunctionalFlow     *FunctionalFlowSnapshot
 }
 
 // Limits bounds canonicalization, projection and journal reconstruction work before any execution can be authorized.
@@ -175,6 +189,7 @@ type ApprovalView struct {
 	Revision                             uint64
 	Constraints                          []ViewConstraint
 	Checks                               []ViewCheck
+	FunctionalFlow                       *FunctionalFlowSnapshot
 }
 
 // ApprovalEvent is one append-only control fact sufficient to reconstruct approval state and audit identity.

@@ -17,6 +17,8 @@ const (
 	MechanismHeader Mechanism = "header"
 	// MechanismCookie injects the lease into one declared dedicated cookie.
 	MechanismCookie Mechanism = "cookie"
+	// MechanismAnonymous declares explicit credential-free authority for an exact operation.
+	MechanismAnonymous Mechanism = "anonymous"
 )
 
 // Operation identifies one exact authorized capability and structural HTTP route.
@@ -32,6 +34,7 @@ type Binding struct {
 	IdentityID string    `json:"identity_id"`
 	Operation  Operation `json:"operation"`
 	Digest     string    `json:"digest"`
+	Anonymous  bool      `json:"anonymous,omitempty"`
 }
 
 // Descriptor is the only identity representation allowed in model context.

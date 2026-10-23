@@ -26,7 +26,7 @@ func CanonicalDescriptors(descriptors []Descriptor) ([]Descriptor, error) {
 	seenIDs := map[string]bool{}
 	for i := range out {
 		descriptor := &out[i]
-		if descriptor.ID == "" || seenIDs[descriptor.ID] || descriptor.Mechanism != MechanismBearer && descriptor.Mechanism != MechanismHeader && descriptor.Mechanism != MechanismCookie || len(descriptor.Operations) == 0 {
+		if descriptor.ID == "" || seenIDs[descriptor.ID] || descriptor.Mechanism != MechanismBearer && descriptor.Mechanism != MechanismHeader && descriptor.Mechanism != MechanismCookie && descriptor.Mechanism != MechanismAnonymous || len(descriptor.Operations) == 0 {
 			return nil, typedError(CategoryInternal, "descriptor", "identity", nil)
 		}
 		seenIDs[descriptor.ID] = true
@@ -195,8 +195,9 @@ func (c *Catalog) Bind(identityID string, operation Operation) (Binding, error) 
 		return Binding{}, typedError(CategoryIdentityNotAllowed, "binding", "operation", nil)
 	}
 	canonical := Operation{Capability: template.Capability, TargetID: template.TargetID, Method: template.Method, Path: template.Path}
-	digest := bindingDigest(identityID, canonical)
-	return Binding{IdentityID: identityID, Operation: canonical, Digest: digest}, nil
+	anonymous := entry.descriptor.Mechanism == MechanismAnonymous
+	digest := bindingDigest(identityID, canonical, anonymous)
+	return Binding{IdentityID: identityID, Operation: canonical, Digest: digest, Anonymous: anonymous}, nil
 }
 
 // BindDescriptor validates an explicit model-visible descriptor selection and creates the same canonical safe binding as Catalog.Bind.
@@ -206,7 +207,20 @@ func BindDescriptor(descriptor Descriptor, operation Operation) (Binding, error)
 		return Binding{}, typedError(CategoryIdentityNotAllowed, "binding", "descriptor", nil)
 	}
 	canonical := Operation{Capability: template.Capability, TargetID: template.TargetID, Method: template.Method, Path: template.Path}
-	return Binding{IdentityID: descriptor.ID, Operation: canonical, Digest: bindingDigest(descriptor.ID, canonical)}, nil
+	anonymous := descriptor.Mechanism == MechanismAnonymous
+	return Binding{IdentityID: descriptor.ID, Operation: canonical, Digest: bindingDigest(descriptor.ID, canonical, anonymous), Anonymous: anonymous}, nil
+}
+
+// RevalidateAnonymous proves an explicit credential-free binding still authorizes the concrete request operation.
+func RevalidateAnonymous(binding Binding, concrete Operation) error {
+	if !binding.Anonymous || binding.IdentityID == "" {
+		return typedError(CategoryIdentityNotAllowed, "revalidate", "anonymous", nil)
+	}
+	template, ok := matchingTemplate([]Operation{binding.Operation}, concrete)
+	if !ok || template != binding.Operation || binding.Digest != bindingDigest(binding.IdentityID, binding.Operation, true) {
+		return typedError(CategoryIdentityNotAllowed, "revalidate", "binding", nil)
+	}
+	return nil
 }
 
 // Revalidate proves an earlier safe binding still belongs to the current immutable catalog and exact operation.
@@ -293,11 +307,12 @@ func sortOperations(operations []Operation) {
 }
 
 // bindingDigest fingerprints only safe selection and permission facts used by approval, execution, and audit.
-func bindingDigest(identityID string, operation Operation) string {
+func bindingDigest(identityID string, operation Operation, anonymous bool) string {
 	raw, _ := json.Marshal(struct {
 		IdentityID string    `json:"identity_id"`
 		Operation  Operation `json:"operation"`
-	}{identityID, operation})
+		Anonymous  bool      `json:"anonymous"`
+	}{identityID, operation, anonymous})
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
 }

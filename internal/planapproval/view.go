@@ -11,7 +11,7 @@ func buildView(ctx context.Context, runID string, revision uint64, plan agentpla
 	if sanitizer == nil {
 		return ApprovalView{}, typedError(CategoryInvalidInput, "build_view", "sanitizer", nil)
 	}
-	view := ApprovalView{RunID: runID, PlanID: plan.ID(), Revision: revision, PlanHash: planHash, ContextHash: contextHash, Constraints: make([]ViewConstraint, len(snapshot.Constraints))}
+	view := ApprovalView{RunID: runID, PlanID: plan.ID(), Revision: revision, PlanHash: planHash, ContextHash: contextHash, Constraints: make([]ViewConstraint, len(snapshot.Constraints)), FunctionalFlow: cloneFunctionalFlowSnapshot(snapshot.FunctionalFlow)}
 	for i, constraint := range snapshot.Constraints {
 		value, err := sanitizer.Sanitize(ctx, constraint.Description)
 		if err != nil {
@@ -61,6 +61,16 @@ func buildView(ctx context.Context, runID string, revision uint64, plan agentpla
 		return ApprovalView{}, err
 	}
 	return view, nil
+}
+
+// cloneFunctionalFlowSnapshot detaches the reviewed safe flow projection from mutable composition slices.
+func cloneFunctionalFlowSnapshot(value *FunctionalFlowSnapshot) *FunctionalFlowSnapshot {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	out.Steps = append([]FunctionalFlowStepSnapshot(nil), value.Steps...)
+	return &out
 }
 
 // sanitizeFailure hides collaborator text while preserving cancellation identity.

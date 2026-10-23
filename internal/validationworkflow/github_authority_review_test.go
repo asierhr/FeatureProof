@@ -10,6 +10,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/githubpr"
+	"github.com/asierhr/featureProof/internal/planapproval"
 )
 
 // mutableGitHubAuthority simulates the authenticated GitHub observation shared by restarted workflow owners.
@@ -75,9 +76,9 @@ type countingApproval struct {
 }
 
 // Decide records entry into the approval boundary and otherwise delegates unchanged.
-func (a *countingApproval) Decide(ctx context.Context, command DecisionCommand, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact) (ApprovalDecision, error) {
+func (a *countingApproval) Decide(ctx context.Context, command DecisionCommand, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact, flow *planapproval.FunctionalFlowSnapshot) (ApprovalDecision, error) {
 	a.decides.Add(1)
-	decision, err := a.ApprovalPort.Decide(ctx, command, prepared, snapshot, artifact)
+	decision, err := a.ApprovalPort.Decide(ctx, command, prepared, snapshot, artifact, flow)
 	if a.afterDecide != nil {
 		a.afterDecide()
 	}
@@ -85,9 +86,9 @@ func (a *countingApproval) Decide(ctx context.Context, command DecisionCommand, 
 }
 
 // Consume records use of an approval grant and otherwise delegates unchanged.
-func (a *countingApproval) Consume(ctx context.Context, grant *ApprovalGrant, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact) (string, error) {
+func (a *countingApproval) Consume(ctx context.Context, grant *ApprovalGrant, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact, flow *planapproval.FunctionalFlowSnapshot) (string, error) {
 	a.consumes.Add(1)
-	return a.ApprovalPort.Consume(ctx, grant, prepared, snapshot, artifact)
+	return a.ApprovalPort.Consume(ctx, grant, prepared, snapshot, artifact, flow)
 }
 
 // TestGitHubAuthorityRefreshFailsClosedAcrossRestart proves durable head and changed-path authority survives ownership changes.

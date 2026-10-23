@@ -325,7 +325,7 @@ func TestWorkflowFixtureRuntimeConfigFailsClosed(t *testing.T) {
 			t.Fatalf("invalid trusted fixture limit %d accepted", index)
 		}
 	}
-	if _, err := composeWorkflowFixtures(context.Background(), t.TempDir(), "owner", specification.Specification{}, planmanifest.Manifest{}, localvalidation.RuntimeDependencies{}, contractcatalog.ReducedContext{}, workflowConfig{}, nil); err == nil {
+	if _, _, err := composeWorkflowFixtures(context.Background(), t.TempDir(), "owner", specification.Specification{}, planmanifest.Manifest{}, localvalidation.RuntimeDependencies{}, contractcatalog.ReducedContext{}, workflowConfig{}, nil); err == nil {
 		t.Fatal("fixture composition accepted missing trusted limits")
 	}
 }
@@ -632,6 +632,25 @@ func TestProductIdentityWorkflowParityReachesTerminalAcrossAllSurfaces(t *testin
 		} else if result.identityID != expected.identityID || result.bindingDigest != expected.bindingDigest || result.outcome != expected.outcome || result.code != expected.code || result.modelCalls != expected.modelCalls || result.resolverCalls != expected.resolverCalls || result.targetCalls != expected.targetCalls {
 			t.Fatalf("surface mismatch %s=%#v expected=%#v", surface, result, expected)
 		}
+	}
+}
+
+// TestProductWorkflowMCPEntrypointComposesFunctionalAliases proves the executable forwards trusted remote flow selections into the shared MCP server.
+func TestProductWorkflowMCPEntrypointComposesFunctionalAliases(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer target.Close()
+	modelTransport := &workflowProductModelTransport{}
+	_, _, _ = composeProductIdentityWorkflowWithOptions(t, root, target.URL, modelTransport, nil, true)
+	configPath := filepath.Join(root, "workflow.json")
+	rewriteWorkflowConfig(t, configPath, func(value map[string]any) {
+		value["functional_flow_aliases"] = map[string]any{"approved": strings.Repeat("a", 64)}
+	})
+	request := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"protocolVersion":"2026-07-28"}}` + "\n"
+	var stdout, stderr bytes.Buffer
+	if code := runWithContext(context.Background(), []string{"workflow", "mcp", "serve"}, strings.NewReader(request), &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "featureproof.workflow.start") {
+		t.Fatalf("code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 }
 

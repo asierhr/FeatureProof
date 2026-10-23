@@ -149,11 +149,14 @@ func (t *Tool) Execute(parent context.Context, call harness.ToolCall) (harness.T
 		targetRedirectPolicy := t.redirectPolicy(addresses)
 		identityRedirectPolicy := func(request *http.Request, via []*http.Request) error {
 			if call.IdentityBinding != nil {
-				if t.authentication == nil {
-					return &testidentity.Error{Category: testidentity.CategoryInternal, Phase: "redirect", Field: "identity"}
-				}
 				redirectOperation := testidentity.Operation{Capability: toolName, TargetID: t.targetID, Method: request.Method, Path: request.URL.Path}
-				if identityErr := t.authentication.Revalidate(*call.IdentityBinding, redirectOperation); identityErr != nil {
+				if call.IdentityBinding.Anonymous {
+					if identityErr := testidentity.RevalidateAnonymous(*call.IdentityBinding, redirectOperation); identityErr != nil {
+						return identityErr
+					}
+				} else if t.authentication == nil {
+					return &testidentity.Error{Category: testidentity.CategoryInternal, Phase: "redirect", Field: "identity"}
+				} else if identityErr := t.authentication.Revalidate(*call.IdentityBinding, redirectOperation); identityErr != nil {
 					return identityErr
 				}
 			}
@@ -164,7 +167,13 @@ func (t *Tool) Execute(parent context.Context, call harness.ToolCall) (harness.T
 	}
 	var response *http.Response
 	var exchangeErr error
-	if call.IdentityBinding != nil {
+	if call.IdentityBinding != nil && call.IdentityBinding.Anonymous {
+		concrete := testidentity.Operation{Capability: toolName, TargetID: t.targetID, Method: input.method, Path: request.URL.Path}
+		if identityErr := testidentity.RevalidateAnonymous(*call.IdentityBinding, concrete); identityErr != nil {
+			return operationFailure("identity_"+string(testidentity.CategoryIdentityNotAllowed), false, identityErr, baseResult)
+		}
+		response, exchangeErr = network(request)
+	} else if call.IdentityBinding != nil {
 		if t.authentication == nil {
 			return operationFailure("identity_unavailable", false, nil, baseResult)
 		}

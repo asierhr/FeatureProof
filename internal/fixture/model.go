@@ -287,6 +287,8 @@ const (
 	PreparationFailed PreparationStatus = "failed"
 	// PreparationCancelled means the primary run context stopped preparation.
 	PreparationCancelled PreparationStatus = "cancelled"
+	// PreparationRejected means workflow authority ended after admission but before fixture preparation began.
+	PreparationRejected PreparationStatus = "rejected"
 )
 
 // CleanupStatus is the safe aggregate outcome of cleanup work.

@@ -112,7 +112,7 @@ func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout,
 			return 3
 		}
 		if len(args) == 3 && args[1] == "mcp" && args[2] == "serve" {
-			server := validationworkflow.MCPServer{Service: cli.Service, Principal: cli.Principal, AuthProfiles: cli.AuthProfiles, DirectTargets: cli.DirectTargets, PreviewTargets: cli.PreviewTargets}
+			server := validationworkflow.MCPServer{Service: cli.Service, Principal: cli.Principal, AuthProfiles: cli.AuthProfiles, DirectTargets: cli.DirectTargets, PreviewTargets: cli.PreviewTargets, FlowAliases: cli.FlowAliases}
 			if server.Serve(ctx, stdin, stdout) != nil {
 				return 3
 			}

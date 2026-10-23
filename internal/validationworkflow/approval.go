@@ -20,14 +20,14 @@ type PlanApprovalBridge struct {
 }
 
 // Stage persists the exact prepared plan and complete contract through planapproval.
-func (b *PlanApprovalBridge) Stage(ctx context.Context, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact) (ApprovalView, error) {
+func (b *PlanApprovalBridge) Stage(ctx context.Context, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact, flow *planapproval.FunctionalFlowSnapshot) (ApprovalView, error) {
 	workflow, err := b.workflow(ctx, prepared.ID(), snapshot, harness.StatusPlanning)
 	if err != nil {
 		return ApprovalView{}, err
 	}
-	view, err := workflow.Stage(ctx, planapproval.StageCommand{Plan: prepared, Context: approvalContext(snapshot, artifact)})
+	view, err := workflow.Stage(ctx, planapproval.StageCommand{Plan: prepared, Context: approvalContext(snapshot, artifact, flow)})
 	if err != nil {
-		view, err = workflow.Restage(ctx, planapproval.StageCommand{Plan: prepared, Context: approvalContext(snapshot, artifact)})
+		view, err = workflow.Restage(ctx, planapproval.StageCommand{Plan: prepared, Context: approvalContext(snapshot, artifact, flow)})
 		if err != nil {
 			return ApprovalView{}, approvalError(err, "approval_stage")
 		}
@@ -45,11 +45,16 @@ func (b *PlanApprovalBridge) View(ctx context.Context, handle string) (ApprovalV
 	if err != nil {
 		return ApprovalView{}, approvalError(err, "approval_view")
 	}
-	return ApprovalView{WorkflowID: view.RunID, PlanID: view.PlanID, Revision: view.Revision, PlanCount: len(view.Checks), ContextDigest: view.ContextHash}, nil
+	flow := cloneApprovalFlow(view.FunctionalFlow)
+	flowDigest := ""
+	if flow != nil {
+		flowDigest = flow.ArtifactDigest
+	}
+	return ApprovalView{WorkflowID: view.RunID, PlanID: view.PlanID, Revision: view.Revision, PlanCount: len(view.Checks), ContextDigest: view.ContextHash, FlowArtifactDigest: flowDigest, FunctionalFlow: flow}, nil
 }
 
 // Decide delegates idempotency, stale detection and grant minting to planapproval.
-func (b *PlanApprovalBridge) Decide(ctx context.Context, command DecisionCommand, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact) (ApprovalDecision, error) {
+func (b *PlanApprovalBridge) Decide(ctx context.Context, command DecisionCommand, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact, flow *planapproval.FunctionalFlowSnapshot) (ApprovalDecision, error) {
 	workflow, err := b.workflow(ctx, prepared.ID(), snapshot, harness.StatusAwaitingApproval)
 	if err != nil {
 		return ApprovalDecision{}, err
@@ -58,7 +63,7 @@ func (b *PlanApprovalBridge) Decide(ctx context.Context, command DecisionCommand
 	if command.Action == DecisionReject {
 		action = planapproval.ActionRejectTerminal
 	}
-	result, err := workflow.Decide(ctx, planapproval.DecisionCommand{PlanID: prepared.ID(), DecisionID: command.DecisionID, ExpectedRevision: command.Revision, Actor: planapproval.Actor{Subject: command.Principal, Source: "validation_workflow"}, Action: action, CurrentPlan: prepared, CurrentContext: approvalContext(snapshot, artifact)})
+	result, err := workflow.Decide(ctx, planapproval.DecisionCommand{PlanID: prepared.ID(), DecisionID: command.DecisionID, ExpectedRevision: command.Revision, Actor: planapproval.Actor{Subject: command.Principal, Source: "validation_workflow"}, Action: action, CurrentPlan: prepared, CurrentContext: approvalContext(snapshot, artifact, flow)})
 	if err != nil {
 		return ApprovalDecision{}, approvalError(err, "approval_decide")
 	}
@@ -68,32 +73,32 @@ func (b *PlanApprovalBridge) Decide(ctx context.Context, command DecisionCommand
 	if result.Authorization == nil {
 		return ApprovalDecision{}, &Error{Code: CodeConflict, Operation: "approval_grant"}
 	}
-	return ApprovalDecision{Grant: &ApprovalGrant{authorization: result.Authorization}}, nil
+	return ApprovalDecision{Grant: &ApprovalGrant{authorization: result.Authorization, flowDigest: approvalFlowDigest(flow)}}, nil
 }
 
 // Recover reconstructs an approved unconsumed grant without replaying a human decision.
-func (b *PlanApprovalBridge) Recover(ctx context.Context, revision uint64, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact) (*ApprovalGrant, error) {
+func (b *PlanApprovalBridge) Recover(ctx context.Context, revision uint64, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact, flow *planapproval.FunctionalFlowSnapshot) (*ApprovalGrant, error) {
 	workflow, err := b.workflow(ctx, prepared.ID(), snapshot, harness.StatusExecuting)
 	if err != nil {
 		return nil, err
 	}
-	authorization, err := workflow.RecoverAuthorization(ctx, snapshot.Generation.RunID, revision, prepared, approvalContext(snapshot, artifact))
+	authorization, err := workflow.RecoverAuthorization(ctx, snapshot.Generation.RunID, revision, prepared, approvalContext(snapshot, artifact, flow))
 	if err != nil {
 		return nil, approvalError(err, "approval_recover")
 	}
-	return &ApprovalGrant{authorization: authorization}, nil
+	return &ApprovalGrant{authorization: authorization, flowDigest: approvalFlowDigest(flow)}, nil
 }
 
 // Consume durably spends the opaque grant once and returns its safe package binding reference.
-func (b *PlanApprovalBridge) Consume(ctx context.Context, grant *ApprovalGrant, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact) (string, error) {
-	if grant == nil || grant.authorization == nil {
+func (b *PlanApprovalBridge) Consume(ctx context.Context, grant *ApprovalGrant, prepared agentplanning.PreparedPlan, snapshot AdmissionSnapshot, artifact PlanArtifact, flow *planapproval.FunctionalFlowSnapshot) (string, error) {
+	if grant == nil || grant.authorization == nil || grant.flowDigest != approvalFlowDigest(flow) {
 		return "", &Error{Code: CodeConflict, Operation: "approval_consume"}
 	}
 	gate, err := planapproval.NewExecutionGate(b.Store, b.Clock, b.Limits)
 	if err != nil {
 		return "", approvalError(err, "approval_gate")
 	}
-	plans, err := gate.Consume(ctx, grant.authorization, snapshot.Generation.RunID, prepared.ID(), approvalContext(snapshot, artifact))
+	plans, err := gate.Consume(ctx, grant.authorization, snapshot.Generation.RunID, prepared.ID(), approvalContext(snapshot, artifact, flow))
 	if err != nil || len(plans) != len(prepared.Checks()) {
 		return "", approvalError(err, "approval_consume")
 	}
@@ -162,17 +167,36 @@ func (b *PlanApprovalBridge) workflow(ctx context.Context, planID string, snapsh
 }
 
 // approvalContext binds every model, target, runtime and generation hash reviewed by a person.
-func approvalContext(snapshot AdmissionSnapshot, artifact PlanArtifact) planapproval.ContractSnapshot {
+func approvalContext(snapshot AdmissionSnapshot, artifact PlanArtifact, flow *planapproval.FunctionalFlowSnapshot) planapproval.ContractSnapshot {
 	capabilities := make([]planapproval.CapabilitySnapshot, len(snapshot.Generation.Capabilities))
 	for i, capability := range snapshot.Generation.Capabilities {
 		capabilities[i] = planapproval.CapabilitySnapshot{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
-	return planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: snapshot.TargetDigest, BaseURL: "https://target.invalid/"}, Constraints: append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...), Contract: snapshot.Generation.Contract, Capabilities: capabilities, Identities: testidentity.CloneDescriptors(snapshot.Generation.Identities), Runtime: planapproval.RuntimeSnapshot{PolicyVersion: snapshot.RuntimeDigest, Limits: map[string]int{"checks": snapshot.Generation.Limits.MaxChecks, "steps": snapshot.Generation.Limits.MaxStepsPerCheck}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: artifact.ProtocolVersion, PromptVersion: artifact.PromptVersion, Provider: artifact.Provider, Model: artifact.Model}}
+	return planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: snapshot.TargetDigest, BaseURL: "https://target.invalid/"}, Constraints: append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...), Contract: snapshot.Generation.Contract, Capabilities: capabilities, Identities: testidentity.CloneDescriptors(snapshot.Generation.Identities), Runtime: planapproval.RuntimeSnapshot{PolicyVersion: snapshot.RuntimeDigest, Limits: map[string]int{"checks": snapshot.Generation.Limits.MaxChecks, "steps": snapshot.Generation.Limits.MaxStepsPerCheck}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: artifact.ProtocolVersion, PromptVersion: artifact.PromptVersion, Provider: artifact.Provider, Model: artifact.Model}, FunctionalFlow: cloneApprovalFlow(flow)}
 }
 
 // projectApprovalView maps the existing sanitized view while retaining workflow artifact bindings.
 func projectApprovalView(view planapproval.ApprovalView, artifact PlanArtifact) ApprovalView {
-	return ApprovalView{WorkflowID: view.RunID, PlanID: view.PlanID, ArtifactSHA256: artifact.ArtifactSHA256, ContextDigest: view.ContextHash, RevisionDigest: artifact.RevisionDigest, TargetDigest: artifact.TargetDigest, Revision: view.Revision, PlanCount: len(view.Checks)}
+	flow := cloneApprovalFlow(view.FunctionalFlow)
+	return ApprovalView{WorkflowID: view.RunID, PlanID: view.PlanID, ArtifactSHA256: artifact.ArtifactSHA256, ContextDigest: view.ContextHash, RevisionDigest: artifact.RevisionDigest, TargetDigest: artifact.TargetDigest, FlowArtifactDigest: approvalFlowDigest(flow), Revision: view.Revision, PlanCount: len(view.Checks), FunctionalFlow: flow}
+}
+
+// cloneApprovalFlow detaches the safe reviewed flow projection before crossing workflow boundaries.
+func cloneApprovalFlow(value *planapproval.FunctionalFlowSnapshot) *planapproval.FunctionalFlowSnapshot {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	out.Steps = append([]planapproval.FunctionalFlowStepSnapshot(nil), value.Steps...)
+	return &out
+}
+
+// approvalFlowDigest returns the exact optional FlowArtifact binding carried by approval context and grants.
+func approvalFlowDigest(value *planapproval.FunctionalFlowSnapshot) string {
+	if value == nil {
+		return ""
+	}
+	return value.ArtifactDigest
 }
 
 // approvalError closes planapproval categories at the workflow boundary.

@@ -2934,3 +2934,145 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - REV-37 cerrado con DACL Windows protegida y allowlist exacta owner/LocalSystem/Administrators en private key y public pin, validada de nuevo en cada reload.
 - La matriz real rechaza Everyone/Users/Authenticated Users con lectura, escritura, delete, FullControl o cambio de owner/DACL; reload válido, links y carrera permanecen verdes.
 - Suite global ×2, vet, compile-only, afectados ×3, race UCRT64, cross-compile Linux/Darwin, coverage 1812/2131 (85,0305 %) y diff-check pasan; T11/T12/T14 vuelven a completas y `feature_list.json` sigue intacto.
+## 2026-10-23 — Feature 27 implementation
+
+- Implementer started T1–T16 from approved commit `b81cee0` on `feature-27-functional-flow-validation`.
+- Scope is limited to `FunctionalFlow/v1`, its deterministic runtime, workflow bridge, safe projections, tests, and delivery evidence.
+- Initial verification confirmed feature 27 is `in_progress` and the worktree was clean.
+- T1–T13 implementation checkpoint: canonical strict model, generated/provided adapters, immutable graph, exact bindings, typed private resolution, sequential executor, action intents, deterministic comparisons/ledger, bounded revisions, authenticated cross-process store, lifecycle bridge, and verified package are implemented.
+- Hermetic focal suites pass; statement coverage for the new `internal/functionalflow` package reached 86.3% before final audit.
+- Remaining delivery work: surface/schema parity audit, systemic-comment audit, all verification gates, traceability report, and task check-off.
+- T14–T16 completed: the shared `validationworkflow.Service` now composes the flow runtime; CLI/API/MCP/GitHub project the same verified package and remote selection rejects inline authority.
+- Final gates pass after the vertical-integration refactor: compile-only and vet global, focal ×3, global suite, focal/global race with UCRT64, Linux/Darwin cross-build, comment/diff audits, and 85.7% statement-weighted coverage across affected packages.
+- The shared service owns `prepare -> functional flow -> package verification -> cleanup`; cleanup recovery is independently retryable and does not replay the functional flow. CLI/API/MCP/GitHub parity uses one verified-package projector.
+- T1–T16 are checked and the delivery evidence is in `progress/functional-flow-validation/implementation.md`; implementation is ready for independent review.
+
+## 2026-10-23 — Feature 27, primera revisión rechazada
+
+- El reviewer registra REV-1..REV-10; la feature permanece `in_progress`.
+- Bloqueantes: comparaciones/fallos funcionales no gobiernan el veredicto, recovery duplica actions inciertas, fixtures se preparan antes del FlowArtifact, no hay composición productiva real, package sin evidence autenticada y publicación anterior al cleanup, y replans pueden reescribir assertions previas.
+- También deben cerrarse el enlace artifact↔flow y la semántica global de required evidence.
+- Se reabren T1–T16 para remediación y nueva revisión independiente; `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 27, segunda revisión rechazada
+
+- REV-1, REV-2, REV-4 y REV-7–REV-10 quedan cerrados; REV-3/5/6 siguen parciales.
+- REV-11..REV-16 exigen ligar aprobación al FlowArtifact exacto, eliminar identidad implícita y drift del request, hashear el selector real, preservar IDs locales históricos, empaquetar el journal durable real y cubrir retries completos con lease.
+- Se reabren T1–T6 y T8–T16; la feature continúa `in_progress` y `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 27, tercera revisión rechazada
+
+- REV-11–REV-15 y la composición vertical quedan cerrados; solo permanecen REV-17 y REV-18.
+- Los terminales reject/cancel/auto-denial anteriores a prepare deben registrar estado causal explícito y producir package verificable.
+- La claim debe cubrir o renovarse durante evidence, journal, action progress, assertions y terminal, con carrera same/different owner después del expiry.
+- Se reabren T11–T13, T15 y T16; la feature continúa `in_progress`.
+
+## 2026-10-23 — Feature 27, cuarta revisión rechazada
+
+- REV-17 queda cerrado y REV-18 funciona dentro del executor, pero REV-19 bloquea recovery productivo.
+- `validationworkflow.Service` interpreta una interrupción post-tool recuperable como primary terminal, inicia cleanup y fabrica un package imposible sin reanudar checkpoints.
+- Se reabren T11–T13, T15 y T16 para introducir flow pending durable y recovery vertical antes de cleanup/package.
+
+## 2026-10-23 — Feature 27, quinta revisión rechazada
+
+- REV-19 queda parcial; REV-20 identifica la ventana después de completar Executor y antes de persistir `FunctionalFlowPrimaryDurable`.
+- Recovery no repite tools, pero reemite `recovery_resumed`/`step_terminal` para pasos terminales y vuelve imposible el package.
+- Se mantienen abiertas T11–T13, T15 y T16 hasta promover el primary desde journal/estado completo sin reemitir terminales.
+
+## 2026-10-23 — Feature 27, sexta revisión rechazada
+
+- REV-20 queda cerrado; REV-21 detecta causalidad más débil en `RecoverCompleted` que en `VerifyPackage`.
+- Una cadena/MAC válidas con `evidence_confirmed` divergente puede promover primary y comenzar cleanup antes de que Finalize rechace el package.
+- T11–T13, T15 y T16 siguen abiertas hasta compartir la misma validación causal estricta antes de `Stage`.
+
+## 2026-10-23 — Feature 27 `functional-flow-validation`, cierre aprobado
+
+- REV-21 queda cerrado al compartir `BuildPackage/VerifyPackage` entre promoción de recovery y publicación final.
+- La séptima revisión independiente aprueba R1–R15, T1–T16 y cierra REV-1..REV-21.
+- Pasan suite global, race global serializada UCRT64, vet, compile-only, focales repetidos y cross-build Linux/Darwin; cobertura del diff: 2674/3137 (85,2407 %).
+- El smoke final del leader pasa en functionalflow, validationworkflow, fixture y cmd/featureproof.
+- El leader cambia feature 27 de `in_progress` a `done`; feature 28 permanece `pending`.
+
+## 2026-10-23 — Feature 27 first review remediation
+
+- T1–T16 reopened after reviewer rejection REV-1..REV-10.
+- Remediation started with canonical required proof, deterministic verdict, uncertain-effect recovery, exact artifact binding, vertical admission, authenticated package and cleanup ownership.
+- feature_list.json remains unchanged.
+
+## 2026-10-23 — Feature 27, remediación REV-1..REV-10 completada
+
+- T1–T16 vuelven a completas tras cerrar comparaciones y fallos funcionales en el veredicto, recovery conservador de effects, admisión anterior a fixtures, artifact↔flow, required evidence global y revisiones inmutables.
+- La vertical productiva compartida ejecuta generated/provided mediante Service y mantiene paridad real CLI/API/MCP/GitHub; alias remoto, restart/redelivery, rotación de identidad y fallos se prueban sin red externa.
+- Evidence manifests y causalidad se verifican dentro del package owned; el primary se conserva y el mismo package se finaliza idempotentemente después de cleanup, incluido recovery.
+- Compile-only, vet, focales ×3, suite global, race focal/global con UCRT64 y cross-build Linux/Darwin pasan. Coverage reproducible del diff desde `b81cee0`: 1795/2111 = 85,0308 %.
+- `feature_list.json` permanece intacto; la evidencia completa queda en `progress/functional-flow-validation/implementation.md` y se solicita nueva revisión independiente.
+
+## 2026-10-23 — Feature 27, segunda remediación en curso
+
+- Segunda revisión rechazada; se reabren T1–T6 y T8–T16 para REV-11..REV-16 y cierres parciales REV-3/REV-5/REV-6.
+- En curso: approval exacta del FlowArtifact, provided independiente, identidad/binding sin fallback, selector privado de recurso, assertion ownership por step, journal causal real y lease total de retries.
+- `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 27, segunda remediación completada
+
+- REV-11 cierra approval exacta: view/context/grant sellan el `FlowArtifact` y Execute consume el mismo digest; provided se prepara sin invocar generación.
+- REV-12..REV-14 cierran identidad explícita anonymous/credentialed, rechazo pre-red de drift, digest privado del recurso resuelto y ownership de declarations por `(stepID, declarationID)`.
+- REV-15 sustituye eventos sintetizados por journal durable append-only de admission, fixtures, claims, intents, attempts, retries, evidence, assertions, comparisons, terminals, recovery, primary y cleanup; el package valida hash-chain, evidence y topología real.
+- REV-16 valida que la lease cubre todos los retries/timeouts/backoff/confirmation y una carrera con reloj+barrier demuestra que el último intento no puede ser reclamado por el mismo ni otro owner.
+- Paridad real incluye GitHub `Result`; package recovery recompone desde el mismo journal sin cambiar primary. Compile-only, vet, focales ×3, suite global, race focal/global, cross-build Linux/Darwin y diff-check pasan.
+- Coverage statement-weighted reproducible de todo el diff desde `b81cee0`: 2256/2653 = 85,0358 %. T1–T16 vuelven a completas; `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 27, tercera remediación en curso
+
+- La tercera review cierra REV-11..REV-16 salvo las fronteras descritas por REV-17/REV-18; se reabren T11–T13, T15 y T16.
+- En curso: terminal explícito `rejected` para runs admitidos que no alcanzan prepare, unión cerrada de estados de fixtures y ownership durable hasta evidence/assertions/terminal con `ConfirmationTimeout` efectivo.
+- Se añadirán verticales reject/cancel/auto-denial con Result en cuatro superficies y carreras deterministas post-tool; `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 27, tercera remediación completada
+
+- REV-17 cerrado: terminales admitidos que no llegan a prepare persisten `fixtures_terminal/rejected`; reject, cancel y auto-denial publican package post-cleanup verificable sin steps, evidence, tools ni fixtures sintéticos, con Result paritario API/CLI/MCP/GitHub y recovery idempotente.
+- REV-18 cerrado: `RenewClaim` conserva owner/token durablemente antes de Evidence.Confirm, journal, progreso del act, assertions y ConfirmTerminal; `ConfirmationTimeout` acota toda la sección post-tool.
+- Barreras con fake clock cruzan expiraciones anteriores durante evidence y assertions, impiden reclaim del mismo y otro owner bajo race, y prueban fallo de renovación cerrado con recovery seguro.
+- Compile-only, vet, focales ×3, suite global, race global y focal UCRT64, cross-build Linux/Darwin y diff-check pasan. Coverage statement-weighted: 2349/2763 = 85,0163 %.
+- T11–T13/T15/T16 vuelven a completas; `feature_list.json` permanece intacto y la entrega solicita cuarta revisión independiente.
+
+## 2026-10-23 — Feature 27, cuarta remediación en curso
+
+- La cuarta review cierra REV-17/REV-18 y abre REV-19; se reabren T11–T13, T15 y T16.
+- En curso: distinguir interrupción recuperable de primary terminal, persistir ejecución funcional pendiente y reanudar el executor desde checkpoints antes de cleanup/package.
+- Se añadirán verticales reales de Service para fallos post-tool, crashes y redelivery multi-owner, preservando cero replay y paridad de Result; `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 27, cuarta remediación completada
+
+- REV-19 cerrado: ejecución funcional pendiente y primary durable son checkpoints distintos; ningún error recuperable inicia cleanup ni package.
+- Recovery recompone el artifact/material aprobado y reanuda claim/intent/evidence/journal/action-progress/assertions/terminal con otro owner; prepare no se repite y el efecto incierto no se duplica.
+- Cancelación durante recovery obtiene primero un primary cancelled; un fallo no recuperable sella un primary error antes del cleanup. Result converge en API/CLI/MCP/GitHub.
+- Compile-only, vet, focales ×3, suite global, race global UCRT64 y cross-build Linux/Darwin pasan. Coverage del diff: 2435/2864 = 85,0209 %.
+- T11–T13/T15/T16 vuelven a completas; `feature_list.json` permanece intacto y se solicita quinta revisión independiente.
+
+## 2026-10-23 — Feature 27, quinta remediación en curso
+
+- La quinta review abre REV-20; se reabren T11–T13, T15 y T16.
+- En curso: cerrar el crash window entre executor completo, primary staged y flag durable mediante reconstrucción autenticada desde state+journal/evidence sin reejecutar tools ni duplicar eventos.
+- Se añadirán verticales con Executor real, restart/otro owner/redelivery concurrente, reconciliación CAS de state y fallo cerrado ante divergencia; `feature_list.json` permanece intacto.
+
+## 2026-10-23 — Feature 27, quinta remediación completada
+
+- REV-20 cerrado: un journal autenticado completo reconstruye/promueve el primary desde state+evidence sin reentrar en Executor.Execute; el state terminal perdido se reconcilia por CAS.
+- Crashes antes y después de Stage, restart con otro owner y redelivery concurrente mantienen una sola llamada de tool y un solo terminal, sin `recovery_resumed` adicional. El package final es verificable y Result coincide en API/CLI/MCP/GitHub.
+- Journal divergente/tampered falla cerrado sin cleanup/replay; un checkpoint parcial reanuda el Executor real y converge sin duplicar I/O.
+- Compile-only, vet, focales ×3, suite global, race global UCRT64 y cross-build Linux/Darwin pasan. Coverage del diff: 2614/3075 = 85,0081 %.
+- T11–T13/T15/T16 vuelven a completas; `feature_list.json` permanece intacto y se solicita sexta revisión independiente.
+
+## 2026-10-23 — Feature 27, sexta remediación en curso
+
+- La sexta review cierra REV-20 y abre únicamente REV-21: la promoción de un primary completo debe aplicar antes de Stage la misma causalidad estricta que el package final.
+- T11–T13, T15 y T16 se reabren hasta probar enlaces exactos journal→evidence→assertions/comparisons→terminal/state, fallo cerrado ante divergencia autenticada y regresión nominal/CAS/concurrent recovery.
+
+## 2026-10-23 — Feature 27, sexta remediación completada
+
+- REV-21 cerrado: `RecoverCompleted` y el package final comparten `BuildPackage`/`VerifyPackage`; una promoción valida toda la máquina causal antes de reconciliar state, Stage o cleanup.
+- `evidence_confirmed` liga ID, bindings de operación/recurso, content digest y digest del manifest. Assertions, comparisons, terminal/state y primary se contrastan con evidence y ledger reales.
+- Mutaciones MAC-válidas y reencadenadas de evidence ID, assertion ref, record digest y terminal, además de stores reales con binding/content/step/revision divergentes, fallan con workflow pending, cero replay, cero Stage durable y cero cleanup. Promoción nominal, CAS y concurrent recovery permanecen verdes.
+- Compile-only, vet, focales ×3, suite global, race global UCRT64 y cross-build Linux/Darwin pasan. Coverage del diff: 2674/3137 = 85,2407 %.
+- T11–T13/T15/T16 vuelven a completas; `feature_list.json` permanece intacto y se solicita séptima revisión independiente.

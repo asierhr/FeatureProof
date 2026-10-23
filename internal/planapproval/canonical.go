@@ -34,13 +34,14 @@ type contextEnvelope struct {
 
 // canonicalContext includes neutral contract bytes and retained authority omitted by its ordinary JSON representation.
 type canonicalContext struct {
-	Target       TargetSnapshot             `json:"target"`
-	Constraints  any                        `json:"constraints"`
-	Contract     any                        `json:"contract"`
-	Capabilities []CapabilitySnapshot       `json:"capabilities"`
-	Identities   []testidentity.Descriptor  `json:"identities,omitempty"`
-	Runtime      RuntimeSnapshot            `json:"runtime"`
-	Generation   GenerationContractSnapshot `json:"generation"`
+	Target         TargetSnapshot             `json:"target"`
+	Constraints    any                        `json:"constraints"`
+	Contract       any                        `json:"contract"`
+	Capabilities   []CapabilitySnapshot       `json:"capabilities"`
+	Identities     []testidentity.Descriptor  `json:"identities,omitempty"`
+	Runtime        RuntimeSnapshot            `json:"runtime"`
+	Generation     GenerationContractSnapshot `json:"generation"`
+	FunctionalFlow *FunctionalFlowSnapshot    `json:"functional_flow,omitempty"`
 }
 
 // canonicalContract captures both the reduced untrusted envelope and its exact retained provenance.
@@ -100,14 +101,17 @@ func fingerprintContext(ctx context.Context, snapshot ContractSnapshot, limits L
 	if identityErr != nil {
 		return contextFingerprints{}, typedError(CategoryInvalidInput, "fingerprint_context", "identities", nil)
 	}
-	all := canonicalContext{Target: snapshot.Target, Constraints: snapshot.Constraints, Contract: contractValue, Capabilities: snapshot.Capabilities, Identities: identities, Runtime: snapshot.Runtime, Generation: snapshot.GenerationContract}
+	all := canonicalContext{Target: snapshot.Target, Constraints: snapshot.Constraints, Contract: contractValue, Capabilities: snapshot.Capabilities, Identities: identities, Runtime: snapshot.Runtime, Generation: snapshot.GenerationContract, FunctionalFlow: snapshot.FunctionalFlow}
 	parts := []struct {
 		value  any
 		target *string
 	}{
 		{contextEnvelope{Version: 1, Context: all}, nil},
 		{snapshot.Target, nil}, {snapshot.Constraints, nil}, {contractValue, nil},
-		{snapshot.Capabilities, nil}, {identities, nil}, {snapshot.Runtime, nil}, {snapshot.GenerationContract, nil},
+		{snapshot.Capabilities, nil}, {identities, nil}, {snapshot.Runtime, nil}, {struct {
+			Generation     GenerationContractSnapshot
+			FunctionalFlow *FunctionalFlowSnapshot
+		}{snapshot.GenerationContract, snapshot.FunctionalFlow}, nil},
 	}
 	values := make([]string, len(parts))
 	for i := range parts {
@@ -127,6 +131,17 @@ func validateContext(snapshot ContractSnapshot, limits Limits) error {
 	}
 	if len(snapshot.Constraints) > limits.MaxConstraints {
 		return typedError(CategoryLimitExceeded, "validate_context", "constraints", nil)
+	}
+	if snapshot.FunctionalFlow != nil {
+		flow := snapshot.FunctionalFlow
+		if flow.FlowID == "" || flow.Source == "" || flow.Revision == 0 || !validSHA256(flow.ArtifactDigest) || !validSHA256(flow.SemanticDigest) || len(flow.Steps) == 0 || len(flow.Steps) > limits.MaxSteps {
+			return typedError(CategoryInvalidInput, "validate_context", "functional_flow", nil)
+		}
+		for _, step := range flow.Steps {
+			if step.ID == "" || step.Kind == "" || step.ConstraintID == "" || step.IdentityID == "" || step.Capability == "" || step.TargetID == "" || step.Method == "" || step.Path == "" || !validSHA256(step.BindingDigest) || !validSHA256(step.RequirementsDigest) {
+				return typedError(CategoryInvalidInput, "validate_context", "functional_flow.steps", nil)
+			}
+		}
 	}
 	return nil
 }

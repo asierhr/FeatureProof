@@ -11,6 +11,7 @@ import (
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/fixture"
+	"github.com/asierhr/featureProof/internal/functionalflow"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planning"
@@ -158,6 +159,13 @@ type StartCommand struct {
 	Target                                                   TargetSelection
 	GitHubAuthority                                          *GitHubAuthorityReference
 	ApprovedContract                                         *ApprovedContractReference
+	FunctionalFlow                                           *FunctionalFlowSelection
+}
+
+// FunctionalFlowSelection identifies one preauthorized provided flow; nil selects generated normalization.
+type FunctionalFlowSelection struct {
+	Alias      string `json:"alias,omitempty"`
+	ArtifactID string `json:"artifact_id,omitempty"`
 }
 
 // ApprovedContractReference binds workflow admission and execution to one current human-approved projection.
@@ -216,13 +224,16 @@ type MissingContext struct {
 // ApprovalView exposes only the exact artifact hashes and bounded plan summaries a human reviews.
 type ApprovalView struct {
 	WorkflowID, PlanID, ArtifactSHA256, ContextDigest, RevisionDigest, TargetDigest string
+	FlowArtifactDigest                                                              string
 	Revision                                                                        uint64
 	PlanCount                                                                       int
+	FunctionalFlow                                                                  *planapproval.FunctionalFlowSnapshot
 }
 
 // ApprovalGrant wraps the unforgeable one-use authorization minted by planapproval.
 type ApprovalGrant struct {
 	authorization *planapproval.ExecutionAuthorization
+	flowDigest    string
 }
 
 // ApprovalDecision contains either a one-use approval grant or a confirmed terminal rejection.
@@ -297,6 +308,12 @@ type Record struct {
 	Package                                          *PackageProjection
 	PackageDir, CleanupIntentID                      string
 	CleanupPending                                   bool
+	FunctionalFlowAdmitted                           bool
+	FunctionalFlowExecutionPending                   bool
+	FunctionalFlowPrimaryDurable                     bool
+	FunctionalFlowApprovalMode                       string
+	FunctionalFlowApprovalReference                  string
+	FunctionalFlowApproval                           *planapproval.FunctionalFlowSnapshot
 	DesiredOutcome                                   *Outcome
 	ApprovalDecisionID                               string
 	ApprovalDecisionAction                           DecisionAction
@@ -337,6 +354,11 @@ type PreparationPort interface {
 	Restore(context.Context, AdmissionSnapshot, agentplanning.PreparedSnapshot) (agentplanning.PreparedPlan, error)
 }
 
+// ProvidedPreparationPort builds a compatibility plan from an already validated provided flow without model inference.
+type ProvidedPreparationPort interface {
+	PrepareProvided(context.Context, AdmissionSnapshot, functionalflow.Flow) (agentplanning.PreparedPlan, error)
+}
+
 // ExecutionPort runs canonical prepared plans through the existing deterministic validation runner.
 type ExecutionPort interface {
 	Execute(context.Context, ExecutionRequest) (string, error)
@@ -354,11 +376,11 @@ type AutoAuthorizationPolicy interface {
 
 // ApprovalPort stages, decides and consumes exact planapproval authorizations.
 type ApprovalPort interface {
-	Stage(context.Context, agentplanning.PreparedPlan, AdmissionSnapshot, PlanArtifact) (ApprovalView, error)
+	Stage(context.Context, agentplanning.PreparedPlan, AdmissionSnapshot, PlanArtifact, *planapproval.FunctionalFlowSnapshot) (ApprovalView, error)
 	View(context.Context, string) (ApprovalView, error)
-	Decide(context.Context, DecisionCommand, agentplanning.PreparedPlan, AdmissionSnapshot, PlanArtifact) (ApprovalDecision, error)
-	Recover(context.Context, uint64, agentplanning.PreparedPlan, AdmissionSnapshot, PlanArtifact) (*ApprovalGrant, error)
-	Consume(context.Context, *ApprovalGrant, agentplanning.PreparedPlan, AdmissionSnapshot, PlanArtifact) (string, error)
+	Decide(context.Context, DecisionCommand, agentplanning.PreparedPlan, AdmissionSnapshot, PlanArtifact, *planapproval.FunctionalFlowSnapshot) (ApprovalDecision, error)
+	Recover(context.Context, uint64, agentplanning.PreparedPlan, AdmissionSnapshot, PlanArtifact, *planapproval.FunctionalFlowSnapshot) (*ApprovalGrant, error)
+	Consume(context.Context, *ApprovalGrant, agentplanning.PreparedPlan, AdmissionSnapshot, PlanArtifact, *planapproval.FunctionalFlowSnapshot) (string, error)
 }
 
 // Finalizer releases preview reservations and other composition-owned resources idempotently.
@@ -424,9 +446,10 @@ type ExecutableMaterial struct {
 
 // ExecutionRequest carries only the canonical artifact and admitted hashes to the shared runner bridge.
 type ExecutionRequest struct {
-	Handle                                          string
-	Plans                                           []planning.ValidationPlan
-	Snapshot                                        AdmissionSnapshot
-	ApprovalMode, ApprovalReference, ArtifactSHA256 string
-	CommitmentKey                                   []byte
+	Handle                                                                string
+	Plans                                                                 []planning.ValidationPlan
+	Snapshot                                                              AdmissionSnapshot
+	ApprovalMode, ApprovalReference, ArtifactSHA256, FunctionalFlowDigest string
+	CommitmentKey                                                         []byte
+	FunctionalFlow                                                        *FunctionalFlowSelection
 }

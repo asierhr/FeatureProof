@@ -26,6 +26,7 @@ import (
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/fixture"
+	"github.com/asierhr/featureProof/internal/functionalflow"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/goinspector"
 	"github.com/asierhr/featureProof/internal/harness"
@@ -36,6 +37,7 @@ import (
 	openapipkg "github.com/asierhr/featureProof/internal/openapi"
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planmanifest"
+	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/previewenv"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 	"github.com/asierhr/featureProof/internal/specification"
@@ -79,6 +81,7 @@ type workflowConfig struct {
 	IdentityCredentialEnvironment map[string]string                       `json:"identity_credential_environment,omitempty"`
 	IdentityObservationTimeoutMS  int                                     `json:"identity_observation_timeout_ms,omitempty"`
 	FixtureRuntime                *workflowFixtureRuntimeConfig           `json:"fixture_runtime,omitempty"`
+	FunctionalFlowAliases         map[string]string                       `json:"functional_flow_aliases,omitempty"`
 }
 
 // workflowFixtureRuntimeConfig is the trusted operator-owned authority for every finite fixture effect and wait.
@@ -567,10 +570,11 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	}
 	wallClock := githubpr.WallClock{}
 	var fixturePort validationworkflow.FixtureLifecyclePort
+	var fixtureState fixture.Store
 	var auditSigner localvalidation.FixtureAuditSigner
 	var auditTrust localvalidation.FixtureAuditTrust
 	if len(spec.Fixtures) > 0 {
-		fixturePort, err = composeWorkflowFixtures(ctx, root, owner, spec, manifest, runtimeDeps, fixtureReduced, config, redaction)
+		fixturePort, fixtureState, err = composeWorkflowFixtures(ctx, root, owner, spec, manifest, runtimeDeps, fixtureReduced, config, redaction)
 		if err != nil {
 			return nil, err
 		}
@@ -579,7 +583,11 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 			return nil, err
 		}
 	}
-	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Preview: previewPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort})
+	functionalPort, flowCatalog, err := composeWorkflowFunctionalFlow(root, storeRoot, owner, spec, manifest, config, runtimeDeps, redaction, targetDigest, runtimeDigest, fixtureState)
+	if err != nil {
+		return nil, err
+	}
+	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Preview: previewPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort})
 	if err != nil {
 		return nil, err
 	}
@@ -588,7 +596,7 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 			return nil, err
 		}
 	}
-	cli := &validationworkflow.CLI{Service: service, Principal: current.Uid, AuthProfiles: map[string]string{config.AuthProfile: compositionRef}, DirectTargets: map[string]validationworkflow.DirectTarget{}, PreviewTargets: map[string]validationworkflow.PreviewTarget{}}
+	cli := &validationworkflow.CLI{Service: service, Principal: current.Uid, AuthProfiles: map[string]string{config.AuthProfile: compositionRef}, DirectTargets: map[string]validationworkflow.DirectTarget{}, PreviewTargets: map[string]validationworkflow.PreviewTarget{}, FlowManifests: flowCatalog, FlowAliases: cloneWorkflowAliases(config.FunctionalFlowAliases)}
 	if config.TargetKind == "direct" {
 		cli.DirectTargets[config.TargetAlias] = validationworkflow.DirectTarget{Alias: config.TargetAlias, Digest: targetDigest}
 	} else {
@@ -597,22 +605,97 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	return cli, nil
 }
 
+// cloneWorkflowAliases detaches trusted remote selections before exposing them to adapter composition.
+func cloneWorkflowAliases(source map[string]string) map[string]string {
+	out := make(map[string]string, len(source))
+	for alias, artifactID := range source {
+		out[alias] = artifactID
+	}
+	return out
+}
+
+// composeWorkflowFunctionalFlow derives exact local runtime authority from the same specification, contract selections, target, policy, and HTTP boundaries as the shared workflow.
+func composeWorkflowFunctionalFlow(root, storeRoot, owner string, spec specification.Specification, manifest planmanifest.Manifest, config workflowConfig, deps localvalidation.RuntimeDependencies, redaction *evidence.Policy, targetDigest, runtimeDigest string, fixtureState fixture.Store) (validationworkflow.FunctionalFlowExecutionPort, *validationworkflow.LocalProvidedFlowCatalog, error) {
+	contractRaw, err := json.Marshal(config.ContractSelections)
+	if err != nil {
+		return nil, nil, err
+	}
+	contractDigest := workflowDigest("functional-contract", string(contractRaw))
+	operationEffects := map[string]bool{}
+	operations := []functionalflow.OperationAuthority{}
+	identityOperations := []testidentity.Operation{}
+	seen := map[functionalflow.OperationReference]bool{}
+	for _, selections := range config.ContractSelections {
+		for _, selection := range selections {
+			method := strings.ToUpper(selection.Method)
+			reference := functionalflow.OperationReference{Capability: "http.request", TargetID: spec.Target.ID, Method: method, Path: selection.Path, ContractDigest: contractDigest}
+			if seen[reference] {
+				continue
+			}
+			seen[reference] = true
+			effectful := method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
+			idempotent := !effectful || method == http.MethodPut || method == http.MethodDelete
+			operations = append(operations, functionalflow.OperationAuthority{Reference: reference, Effectful: effectful, Idempotent: idempotent})
+			operationEffects[method+"\x00"+selection.Path] = effectful
+			identityOperations = append(identityOperations, testidentity.Operation{Capability: reference.Capability, TargetID: reference.TargetID, Method: reference.Method, Path: reference.Path})
+		}
+	}
+	if len(operations) == 0 {
+		return nil, nil, nil
+	}
+	httpTool, identityCatalog, err := localvalidation.BuildFixtureHTTPRuntime(spec, manifest, deps)
+	if err != nil {
+		return nil, nil, err
+	}
+	descriptors := identityCatalog.DescriptorsFor(identityOperations)
+	const publicIdentity = "featureproof-public"
+	descriptors = append(descriptors, testidentity.Descriptor{ID: publicIdentity, Mechanism: testidentity.MechanismAnonymous, Operations: append([]testidentity.Operation(nil), identityOperations...)})
+	identitiesDigest, err := testidentity.DescriptorDigest(descriptors)
+	if err != nil {
+		return nil, nil, err
+	}
+	constraints := map[string]bool{}
+	for _, constraint := range spec.Constraints {
+		constraints[constraint.ID] = true
+	}
+	captures := map[string]planning.ValueType{}
+	for _, declaration := range spec.Fixtures {
+		for _, capture := range declaration.Captures {
+			captures[declaration.ID+"\x00"+capture.Name] = planning.ValueType(capture.ValueType)
+		}
+	}
+	limits := functionalflow.Limits{MaxDocumentBytes: 1 << 20, MaxSteps: max(1, spec.Limits.MaxSteps), MaxAssertions: max(1, spec.Limits.MaxSteps*64), MaxComparisons: max(1, spec.Limits.MaxSteps), MaxReferences: max(1, spec.Limits.MaxSteps*8), MaxDepth: 64, MaxResolvedBytes: 1 << 20, MaxToolCalls: max(1, spec.Limits.MaxToolCalls), MaxRetries: max(0, spec.Limits.MaxRetries), MaxWork: max(100, spec.Limits.MaxSteps*32), MaxRevisions: 3, StepTimeout: manifest.HTTP.Timeout() + time.Second, RunTimeout: time.Duration(max(1, spec.Limits.MaxSteps))*(manifest.HTTP.Timeout()+time.Second) + 30*time.Second}
+	bindings := functionalflow.ArtifactBindings{Specification: workflowDigest("specification", config.SpecificationPath, config.CommitOID), Revision: workflowDigest("revision", config.RepositoryID, config.CommitOID), Target: targetDigest, Contract: contractDigest, Identities: identitiesDigest, Policy: workflowDigest("policy", config.PolicyID), Fixtures: workflowDigest("fixtures", config.RepositoryID, config.EnvironmentID), Capabilities: runtimeDigest, Limits: workflowDigest("functional-limits", strconv.Itoa(limits.MaxSteps), strconv.Itoa(limits.MaxToolCalls), strconv.Itoa(limits.MaxRetries))}
+	fixtureResolver := functionalflow.FixtureCaptureStore(nil)
+	if fixtureState != nil {
+		fixtureResolver = validationworkflow.FunctionalFixtureCaptureAdapter{Store: fixtureState}
+	}
+	confirmation := 10 * time.Second
+	executionConfig := functionalflow.ExecutionConfig{Owner: owner, MaxCalls: limits.MaxToolCalls, MaxRetries: limits.MaxRetries, MaxWork: limits.MaxWork, StepTimeout: limits.StepTimeout, RunTimeout: limits.RunTimeout, ConfirmationTimeout: confirmation, RetryDelay: 100 * time.Millisecond}
+	leaseTTL := time.Duration(executionConfig.MaxRetries+1)*executionConfig.StepTimeout + time.Duration(executionConfig.MaxRetries)*executionConfig.RetryDelay + executionConfig.ConfirmationTimeout + time.Minute
+	runtime, catalog, err := validationworkflow.ComposeLocalFunctionalFlowRuntime(validationworkflow.LocalFunctionalFlowRuntimeConfig{Root: filepath.Join(storeRoot, "functional-flow"), PublicIdentity: publicIdentity, AttemptJournalRoot: filepath.Join(root, ".featureproof", "runs"), AllowedManifestRoots: []string{root}, Aliases: config.FunctionalFlowAliases, Limits: limits, Validation: functionalflow.ValidationAuthority{Constraints: constraints, FixtureCaptures: captures}, Binding: functionalflow.BindingAuthority{Operations: operations, Identities: descriptors, Bindings: bindings}, Generated: functionalflow.GeneratedAuthority{ContextDigest: workflowDigest("functional-context", runtimeDigest, targetDigest), TargetID: spec.Target.ID, ContractDigest: contractDigest, Effects: map[string]bool{"http.request": true}, OperationEffects: operationEffects}, Execution: executionConfig, LeaseTTL: leaseTTL, Tool: httpTool, PolicyFactory: deps.PolicyFactory, Sanitizer: evidence.NewSanitizer(redaction), Evaluator: deps.Evaluator, Identities: identityCatalog, Clock: deps.Clock, IDs: deps.IDs, Waiter: deps.Waiter, Fixtures: fixtureResolver})
+	if err != nil {
+		return nil, nil, err
+	}
+	return runtime, catalog, nil
+}
+
 // composeWorkflowFixtures builds one consumer-owned lifecycle shared by every productive workflow surface.
-func composeWorkflowFixtures(shutdown context.Context, root, owner string, spec specification.Specification, manifest planmanifest.Manifest, deps localvalidation.RuntimeDependencies, reduced contractcatalog.ReducedContext, config workflowConfig, policy *evidence.Policy) (validationworkflow.FixtureLifecyclePort, error) {
+func composeWorkflowFixtures(shutdown context.Context, root, owner string, spec specification.Specification, manifest planmanifest.Manifest, deps localvalidation.RuntimeDependencies, reduced contractcatalog.ReducedContext, config workflowConfig, policy *evidence.Policy) (validationworkflow.FixtureLifecyclePort, fixture.Store, error) {
 	if shutdown == nil {
-		return nil, errors.New("fixture shutdown scope unavailable")
+		return nil, nil, errors.New("fixture shutdown scope unavailable")
 	}
 	if err := config.FixtureRuntime.validate(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	runtimeLimits := *config.FixtureRuntime
 	set, err := fixture.ValidateSet(spec.Fixtures)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	httpTool, identities, err := localvalidation.BuildFixtureHTTPRuntime(spec, manifest, deps)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	redactor := evidence.NewSanitizer(policy)
 	for _, declaration := range spec.Fixtures {
@@ -626,7 +709,7 @@ func composeWorkflowFixtures(shutdown context.Context, root, owner string, spec 
 				}
 			}
 			if policy.OverlapsSensitive(selector) {
-				return nil, errors.New("fixture capture overlaps sensitive evidence")
+				return nil, nil, errors.New("fixture capture overlaps sensitive evidence")
 			}
 		}
 	}
@@ -640,20 +723,20 @@ func composeWorkflowFixtures(shutdown context.Context, root, owner string, spec 
 	fixtureRoot := filepath.Join(root, ".featureproof", "workflows", "fixtures")
 	stateStore, err := fixture.NewFileStore(filepath.Join(fixtureRoot, "state"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	evidenceSink := fixture.FileEvidenceSink{Root: filepath.Join(fixtureRoot, "evidence"), Sanitizer: sanitizer}
 	executor, err := fixture.NewHTTPAdapter(fixture.HTTPAdapterConfig{Tool: httpTool, Evidence: evidenceSink, IdempotencyHeader: workflowFixtureIdempotencyHeader(manifest)})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	guard := &fixture.ProductRevalidator{PolicyFactory: deps.PolicyFactory, Limits: harness.Limits{MaxSteps: 0, MaxToolCalls: runtimeLimits.MaxToolCalls, MaxRetries: runtimeLimits.MaxRetries}}
 	lifecycle, err := fixture.NewLifecycle(stateStore, executor, guard, sanitizer, &fixture.FileObserver{Path: filepath.Join(fixtureRoot, "journal.jsonl")}, fixture.ContextWaiter{}, fixture.DigestKeys{Namespace: config.RepositoryID + ":" + config.EnvironmentID}, fixture.FiniteScopes{Parent: shutdown, Timeout: time.Duration(runtimeLimits.CleanupTimeoutMS) * time.Millisecond, MaxCalls: runtimeLimits.CleanupMaxCalls, MaxRetries: runtimeLimits.CleanupRetries}, fixture.Config{MaxCaptureBytes: runtimeLimits.MaxCaptureBytes, MaxToolCalls: runtimeLimits.MaxToolCalls, MaxRetries: runtimeLimits.MaxRetries, CreateRetries: runtimeLimits.CreateRetries, RetryBackoff: time.Duration(runtimeLimits.RetryBackoffMS) * time.Millisecond, Owner: owner, LeaseTTL: time.Duration(runtimeLimits.LeaseTTLMS) * time.Millisecond, Clock: fixture.WallClock{}})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	authority := fixture.ReducedAuthority{Set: set, TargetID: spec.Target.ID, RepositoryID: config.RepositoryID, Revision: config.CommitOID, Contract: reduced, Identities: identities, Idempotency: fixture.ContractIdempotencyPolicy{}}
-	return fixture.WorkflowAdapter{Lifecycle: lifecycle, Authority: authority}, nil
+	return fixture.WorkflowAdapter{Lifecycle: lifecycle, Authority: authority}, stateStore, nil
 }
 
 // workflowFixtureIdempotencyHeader selects the system-owned key header only when trusted HTTP policy explicitly permits it.

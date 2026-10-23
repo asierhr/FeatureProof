@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/testidentity"
 )
@@ -40,6 +41,7 @@ type Dependencies struct {
 	ContractReview  ApprovedContractAuthority
 	Fixtures        FixtureLifecyclePort
 	FixturePackages FixturePackageWriter
+	FunctionalFlow  FunctionalFlowExecutionPort
 }
 
 // Service is the shared application case use behind API, CLI, MCP and GitHub adapters.
@@ -60,7 +62,7 @@ type workflowWorker struct {
 
 // NewService validates every fail-closed orchestration dependency without starting background work.
 func NewService(config Config, deps Dependencies) (*Service, error) {
-	if config.LeaseTTL <= 0 || config.HeartbeatInterval <= 0 || config.HeartbeatInterval >= config.LeaseTTL || config.FinalizeTimeout <= 0 || config.ApprovalTTL <= 0 || deps.Admission == nil || deps.Generation == nil || deps.Preparation == nil || deps.Approval == nil || deps.Execution == nil || deps.Packages == nil || deps.Authorization == nil || deps.Finalizer == nil || deps.Store == nil || deps.Artifacts == nil || deps.Executables == nil || deps.Clock == nil || deps.Waiter == nil || deps.IDs == nil || !safeID.MatchString(deps.Owner) {
+	if config.LeaseTTL <= 0 || config.HeartbeatInterval <= 0 || config.HeartbeatInterval >= config.LeaseTTL || config.FinalizeTimeout <= 0 || config.ApprovalTTL <= 0 || deps.Admission == nil || deps.Generation == nil || deps.Preparation == nil || deps.Approval == nil || deps.Execution == nil && deps.FunctionalFlow == nil || deps.Packages == nil || deps.Authorization == nil || deps.Finalizer == nil || deps.Store == nil || deps.Artifacts == nil || deps.Executables == nil || deps.Clock == nil || deps.Waiter == nil || deps.IDs == nil || !safeID.MatchString(deps.Owner) {
 		return nil, &Error{Code: CodeInvalid, Operation: "compose"}
 	}
 	return &Service{deps: deps, config: config, snapshots: map[string]AdmissionSnapshot{}, workers: map[string]*workflowWorker{}}, nil
@@ -125,11 +127,36 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	s.snapshots[handle] = snapshot.Clone()
 	s.mu.Unlock()
 	record.Snapshot = snapshot
-	record, err = s.transition(workCtx, record, PhaseGenerating, "generation_started", "")
+	generationEvent := "generation_started"
+	if command.FunctionalFlow != nil {
+		generationEvent = "provided_flow_preparation_started"
+	}
+	record, err = s.transition(workCtx, record, PhaseGenerating, generationEvent, "")
 	if err != nil {
 		return WorkflowView{}, err
 	}
-	result, usage, generationErr := s.deps.Generation.Generate(workCtx, snapshot.Clone())
+	var result agentplanning.Result
+	var usage ModelUsage
+	var generationErr error
+	if command.FunctionalFlow != nil {
+		providedPreparation, ok := s.deps.Preparation.(ProvidedPreparationPort)
+		if !ok || s.deps.FunctionalFlow == nil {
+			generationErr = &Error{Code: CodeInvalid, Operation: "provided_flow_preparation"}
+		} else {
+			flow, inspectErr := s.deps.FunctionalFlow.InspectProvided(workCtx, ExecutionRequest{Handle: handle, FunctionalFlow: cloneFunctionalFlowSelection(command.FunctionalFlow)})
+			if inspectErr != nil {
+				generationErr = inspectErr
+			} else {
+				prepared, prepareErr := providedPreparation.PrepareProvided(workCtx, snapshot.Clone(), flow)
+				generationErr, result.Prepared = prepareErr, &prepared
+				if prepareErr != nil {
+					result.Prepared = nil
+				}
+			}
+		}
+	} else {
+		result, usage, generationErr = s.deps.Generation.Generate(workCtx, snapshot.Clone())
+	}
 	if generationErr != nil {
 		outcome := OutcomeInconclusive
 		if errors.Is(workCtx.Err(), context.Canceled) {
@@ -180,12 +207,33 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		return WorkflowView{}, err
 	}
 	record.Artifact = &artifact
+	if s.deps.FunctionalFlow != nil {
+		plans, mergeErr := mergePrepared(*result.Prepared, snapshot.Generation.Constraints)
+		if mergeErr != nil {
+			record, err = s.terminal(workCtx, record, OutcomeError, "functional_flow_admission_failed")
+			if err != nil {
+				return WorkflowView{}, err
+			}
+			return viewOf(record), nil
+		}
+		executionRequest := ExecutionRequest{Handle: record.Handle, Plans: plans, Snapshot: snapshot.Clone(), ArtifactSHA256: artifact.ArtifactSHA256, CommitmentKey: append([]byte(nil), material.CommitmentKey...), FunctionalFlow: cloneFunctionalFlowSelection(record.Command.FunctionalFlow)}
+		flowApproval, admitErr := s.deps.FunctionalFlow.Admit(workCtx, executionRequest, material.Snapshot)
+		if admitErr != nil {
+			record, err = s.terminal(workCtx, record, OutcomeInconclusive, "functional_flow_admission_failed")
+			if err != nil {
+				return WorkflowView{}, err
+			}
+			return viewOf(record), nil
+		}
+		record.FunctionalFlowAdmitted = true
+		record.FunctionalFlowApproval = cloneApprovalFlow(&flowApproval)
+	}
 	record, err = s.transition(workCtx, record, PhasePlanReady, "plan_artifact_committed", artifact.ArtifactSHA256)
 	if err != nil {
 		return WorkflowView{}, err
 	}
 	if command.Approval == ApprovalRequired {
-		approvalView, approvalErr := s.deps.Approval.Stage(workCtx, *result.Prepared, snapshot, artifact)
+		approvalView, approvalErr := s.deps.Approval.Stage(workCtx, *result.Prepared, snapshot, artifact, record.FunctionalFlowApproval)
 		if approvalErr != nil {
 			return WorkflowView{}, approvalErr
 		}
@@ -268,6 +316,9 @@ func (s *Service) ApprovalView(ctx context.Context, handle string) (ApprovalView
 	if err != nil {
 		return ApprovalView{}, err
 	}
+	if record.FunctionalFlowAdmitted && (record.FunctionalFlowApproval == nil || view.FlowArtifactDigest != record.FunctionalFlowApproval.ArtifactDigest) {
+		return ApprovalView{}, &Error{Code: CodeConflict, Operation: "view_flow"}
+	}
 	view.ArtifactSHA256, view.RevisionDigest, view.TargetDigest = artifactValue.ArtifactSHA256, artifactValue.RevisionDigest, artifactValue.TargetDigest
 	return view, nil
 }
@@ -313,7 +364,7 @@ func (s *Service) Decide(ctx context.Context, command DecisionCommand) (Workflow
 	if err = s.checkpointApprovedContract(ctx, record.Command); err != nil {
 		return WorkflowView{}, err
 	}
-	decision, decisionErr := s.deps.Approval.Decide(ctx, command, prepared, snapshot, artifactValue)
+	decision, decisionErr := s.deps.Approval.Decide(ctx, command, prepared, snapshot, artifactValue, record.FunctionalFlowApproval)
 	if decisionErr != nil {
 		return WorkflowView{}, decisionErr
 	}
@@ -379,6 +430,17 @@ func (s *Service) Cancel(ctx context.Context, principal, handle string) (Workflo
 	if err != nil {
 		return WorkflowView{}, err
 	}
+	if record.FunctionalFlowAdmitted && record.FunctionalFlowExecutionPending && !record.FunctionalFlowPrimaryDurable {
+		snapshot, prepared, restoreErr := s.restorePrepared(ctx, record)
+		if restoreErr != nil {
+			return WorkflowView{}, restoreErr
+		}
+		record, err = s.resumeFunctionalFlow(ctx, record, snapshot, prepared)
+		if err != nil {
+			return WorkflowView{}, err
+		}
+		return viewOf(record), nil
+	}
 	record, err = s.terminal(ctx, record, OutcomeCancelled, "workflow_terminal")
 	if err != nil {
 		return WorkflowView{}, err
@@ -431,7 +493,7 @@ func (s *Service) Recover(ctx context.Context) error {
 		if workErr != nil {
 			return workErr
 		}
-		if record.CleanupPending && record.DesiredOutcome != nil {
+		if record.CleanupPending && record.DesiredOutcome != nil && (!record.FunctionalFlowExecutionPending || record.FunctionalFlowPrimaryDurable) {
 			record, err = s.terminal(workCtx, record, *record.DesiredOutcome, "cleanup_recovered")
 			s.endWork(record.Handle, worker)
 			if err != nil {
@@ -453,7 +515,7 @@ func (s *Service) Recover(ctx context.Context) error {
 				snapshot, prepared, err = s.restorePrepared(workCtx, record)
 				if err == nil && record.Command.Approval == ApprovalRequired {
 					var approvalView ApprovalView
-					approvalView, err = s.deps.Approval.Stage(workCtx, prepared, snapshot, *record.Artifact)
+					approvalView, err = s.deps.Approval.Stage(workCtx, prepared, snapshot, *record.Artifact, record.FunctionalFlowApproval)
 					if err == nil {
 						record.ApprovalRevision = approvalView.Revision
 						record.ApprovalDeadline = s.deps.Clock.Now().UTC().Add(s.config.ApprovalTTL)
@@ -487,7 +549,7 @@ func (s *Service) Recover(ctx context.Context) error {
 			if err == nil {
 				var grant *ApprovalGrant
 				if record.Command.Approval == ApprovalRequired {
-					grant, err = s.deps.Approval.Recover(workCtx, record.ApprovalRevision, prepared, snapshot, *record.Artifact)
+					grant, err = s.deps.Approval.Recover(workCtx, record.ApprovalRevision, prepared, snapshot, *record.Artifact, record.FunctionalFlowApproval)
 				}
 				if err == nil {
 					record, err = s.execute(workCtx, record, snapshot, prepared, grant)
@@ -497,7 +559,16 @@ func (s *Service) Recover(ctx context.Context) error {
 				record, err = s.terminal(workCtx, record, OutcomeInconclusive, "recovery_authorization_unconfirmed")
 			}
 		case PhaseExecuting:
-			record, err = s.terminal(workCtx, record, OutcomeInconclusive, "recovery_uncertain_execution")
+			if record.FunctionalFlowAdmitted && record.FunctionalFlowExecutionPending && !record.FunctionalFlowPrimaryDurable {
+				var snapshot AdmissionSnapshot
+				var prepared agentplanning.PreparedPlan
+				snapshot, prepared, err = s.restorePrepared(workCtx, record)
+				if err == nil {
+					record, err = s.resumeFunctionalFlow(workCtx, record, snapshot, prepared)
+				}
+			} else {
+				record, err = s.terminal(workCtx, record, OutcomeInconclusive, "recovery_uncertain_execution")
+			}
 		case PhaseFinalizing:
 			if record.Package == nil && record.PackageDir != "" && record.Artifact != nil {
 				var projection PackageProjection
@@ -595,35 +666,75 @@ func (s *Service) execute(ctx context.Context, record Record, snapshot Admission
 	approvalMode, approvalReference := "approval_not_required", ""
 	if record.Command.Approval == ApprovalRequired {
 		var consumeErr error
-		approvalReference, consumeErr = s.deps.Approval.Consume(ctx, grant, prepared, snapshot, artifactValue)
+		approvalReference, consumeErr = s.deps.Approval.Consume(ctx, grant, prepared, snapshot, artifactValue, record.FunctionalFlowApproval)
 		if consumeErr != nil {
 			return s.terminal(ctx, record, OutcomeInconclusive, "approval_consume_failed")
 		}
 		approvalMode = "approved"
 	}
+	record.FunctionalFlowApprovalMode, record.FunctionalFlowApprovalReference = approvalMode, approvalReference
 	plans, mergeErr := mergePrepared(prepared, snapshot.Generation.Constraints)
 	if mergeErr != nil {
 		return s.terminal(ctx, record, OutcomeError, "prepared_restore_invalid")
 	}
+	executionRequest := ExecutionRequest{Handle: record.Handle, Plans: plans, Snapshot: snapshot.Clone(), ApprovalMode: approvalMode, ApprovalReference: approvalReference, ArtifactSHA256: artifactValue.ArtifactSHA256, CommitmentKey: append([]byte(nil), material.CommitmentKey...), FunctionalFlow: cloneFunctionalFlowSelection(record.Command.FunctionalFlow)}
+	if record.FunctionalFlowApproval != nil {
+		executionRequest.FunctionalFlowDigest = record.FunctionalFlowApproval.ArtifactDigest
+	}
+	if s.deps.FunctionalFlow != nil && !record.FunctionalFlowAdmitted {
+		return s.terminal(ctx, record, OutcomeError, "functional_flow_artifact_missing")
+	}
 	if s.deps.Fixtures != nil {
 		fixtureSummary, fixtureErr := s.deps.Fixtures.Prepare(ctx, record.Handle)
 		record.FixtureSummary = &fixtureSummary
+		if s.deps.FunctionalFlow != nil {
+			actual, journalErr := s.deps.FunctionalFlow.RecordPreparation(ctx, record.Handle, fixtureSummary.PreparationStatus)
+			if journalErr != nil || actual != fixtureSummary.PreparationStatus {
+				return s.terminal(ctx, record, OutcomeInconclusive, "fixture_preparation_journal_failed")
+			}
+		}
 		if fixtureErr != nil {
 			return s.terminal(ctx, record, OutcomeInconclusive, "fixture_preparation_failed")
 		}
+	} else if s.deps.FunctionalFlow != nil {
+		actual, journalErr := s.deps.FunctionalFlow.RecordPreparation(ctx, record.Handle, fixture.PreparationNotRequired)
+		if journalErr != nil || actual != fixture.PreparationNotRequired {
+			return s.terminal(ctx, record, OutcomeInconclusive, "fixture_preparation_journal_failed")
+		}
+	}
+	if s.deps.FunctionalFlow != nil {
+		record.FunctionalFlowExecutionPending, record.FunctionalFlowPrimaryDurable = true, false
 	}
 	var err error
 	record, err = s.transition(ctx, record, PhaseExecuting, "execution_started", record.Artifact.ArtifactSHA256)
 	if err != nil {
 		return Record{}, err
 	}
-	packageDir, executionErr := s.deps.Execution.Execute(ctx, ExecutionRequest{Handle: record.Handle, Plans: plans, Snapshot: snapshot.Clone(), ApprovalMode: approvalMode, ApprovalReference: approvalReference, ArtifactSHA256: artifactValue.ArtifactSHA256, CommitmentKey: append([]byte(nil), material.CommitmentKey...)})
+	var packageDir string
+	var flowOutcome Outcome
+	var executionErr error
+	if s.deps.FunctionalFlow != nil {
+		flowOutcome, executionErr = s.deps.FunctionalFlow.Execute(ctx, executionRequest, material.Snapshot)
+	} else {
+		packageDir, executionErr = s.deps.Execution.Execute(ctx, executionRequest)
+	}
 	if executionErr != nil {
+		if s.deps.FunctionalFlow != nil && IsRecoverableFunctionalFlowError(executionErr) {
+			return record, executionErr
+		}
 		outcome := OutcomeInconclusive
 		if errors.Is(ctx.Err(), context.Canceled) {
 			outcome = OutcomeCancelled
 		}
 		return s.terminal(ctx, record, outcome, "execution_finished")
+	}
+	if s.deps.FunctionalFlow != nil {
+		record.FunctionalFlowExecutionPending, record.FunctionalFlowPrimaryDurable = false, true
+		record, err = s.transition(ctx, record, PhaseFinalizing, "primary_result_staged", record.Artifact.ArtifactSHA256)
+		if err != nil {
+			return Record{}, err
+		}
+		return s.terminal(ctx, record, flowOutcome, "package_verified")
 	}
 	record.PackageDir = packageDir
 	record, err = s.transition(ctx, record, PhaseFinalizing, "package_intent_committed", record.Artifact.ArtifactSHA256)
@@ -640,6 +751,44 @@ func (s *Service) execute(ctx context.Context, record Record, snapshot Admission
 		return Record{}, err
 	}
 	return s.terminal(ctx, record, projection.Outcome, "package_verified")
+}
+
+// resumeFunctionalFlow reconstructs the exact approved execution request and continues only from durable executor checkpoints.
+func (s *Service) resumeFunctionalFlow(ctx context.Context, record Record, snapshot AdmissionSnapshot, prepared agentplanning.PreparedPlan) (Record, error) {
+	if !record.FunctionalFlowAdmitted || !record.FunctionalFlowExecutionPending || record.FunctionalFlowPrimaryDurable || record.Artifact == nil || record.FunctionalFlowApproval == nil {
+		return Record{}, &Error{Code: CodeConflict, Operation: "functional_flow_recovery"}
+	}
+	if record.FunctionalFlowApprovalMode != "approved" && record.FunctionalFlowApprovalMode != "approval_not_required" || record.FunctionalFlowApprovalMode == "approved" && record.FunctionalFlowApprovalReference == "" {
+		return Record{}, &Error{Code: CodeConflict, Operation: "functional_flow_recovery"}
+	}
+	material, err := s.deps.Executables.Load(ctx, record.Handle)
+	if err != nil || verifyExecutableMaterial(record, snapshot, prepared, material) != nil {
+		return Record{}, &Error{Code: CodeConflict, Operation: "functional_flow_recovery"}
+	}
+	plans, err := mergePrepared(prepared, snapshot.Generation.Constraints)
+	if err != nil {
+		return Record{}, &Error{Code: CodeConflict, Operation: "functional_flow_recovery"}
+	}
+	request := ExecutionRequest{Handle: record.Handle, Plans: plans, Snapshot: snapshot.Clone(), ApprovalMode: record.FunctionalFlowApprovalMode, ApprovalReference: record.FunctionalFlowApprovalReference, ArtifactSHA256: record.Artifact.ArtifactSHA256, CommitmentKey: append([]byte(nil), material.CommitmentKey...), FunctionalFlow: cloneFunctionalFlowSelection(record.Command.FunctionalFlow), FunctionalFlowDigest: record.FunctionalFlowApproval.ArtifactDigest}
+	executionCtx := ctx
+	if record.CancelRequested {
+		var cancel context.CancelFunc
+		executionCtx, cancel = context.WithCancel(ctx)
+		cancel()
+	}
+	outcome, executionErr := s.deps.FunctionalFlow.Execute(executionCtx, request, material.Snapshot)
+	if executionErr != nil {
+		if IsRecoverableFunctionalFlowError(executionErr) {
+			return record, executionErr
+		}
+		return s.terminal(ctx, record, OutcomeError, "functional_flow_unrecoverable")
+	}
+	record.FunctionalFlowExecutionPending, record.FunctionalFlowPrimaryDurable = false, true
+	record, err = s.transition(ctx, record, PhaseFinalizing, "primary_result_staged", record.Artifact.ArtifactSHA256)
+	if err != nil {
+		return Record{}, err
+	}
+	return s.terminal(ctx, record, outcome, "package_verified")
 }
 
 // checkpointApprovedContract resolves exact review authority and validates repository, commit and digest before approval or tools.
@@ -748,6 +897,9 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 	if record.Phase == PhaseTerminal {
 		return record, nil
 	}
+	if record.FunctionalFlowAdmitted && record.FunctionalFlowExecutionPending && !record.FunctionalFlowPrimaryDurable {
+		return record, &Error{Code: CodeUnavailable, Operation: "functional_flow_execution_pending"}
+	}
 	if !record.CleanupPending {
 		record.CleanupPending, record.CleanupIntentID, record.DesiredOutcome = true, record.Handle+":release", &outcome
 		var err error
@@ -760,7 +912,14 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.config.FinalizeTimeout)
 	defer cancel()
-	if s.deps.Fixtures != nil && record.FixtureSummary != nil {
+	if record.FunctionalFlowAdmitted && record.FixtureSummary == nil {
+		status, preparationErr := s.deps.FunctionalFlow.RecordPreparation(cleanupCtx, record.Handle, fixture.PreparationRejected)
+		if preparationErr != nil {
+			return Record{}, &Error{Code: CodeUnavailable, Operation: "functional_flow_preparation_pending"}
+		}
+		record.FixtureSummary = &fixture.FixtureSummary{PreparationStatus: status, Cleanup: fixture.CleanupReport{Status: fixture.CleanupNotRequired}}
+	}
+	if s.deps.Fixtures != nil && record.FixtureSummary != nil && record.FixtureSummary.PreparationStatus != fixture.PreparationRejected {
 		report, fixtureErr := s.deps.Fixtures.Cleanup(cleanupCtx, record.Handle)
 		record.FixtureSummary.Cleanup = report
 		if record.Package != nil {
@@ -773,7 +932,7 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 			}
 			return updated, &Error{Code: CodeUnavailable, Operation: "fixture_cleanup_pending"}
 		}
-		if record.Package != nil {
+		if record.Package != nil && !record.FunctionalFlowAdmitted {
 			writer := s.deps.FixturePackages
 			if writer == nil || writer.AttachFixtures(cleanupCtx, record.Package.PackageDir, *record.FixtureSummary) != nil {
 				updated, saveErr := s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: "fixture_package_pending", Category: "unavailable"})
@@ -782,6 +941,22 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 				}
 				return updated, &Error{Code: CodeUnavailable, Operation: "fixture_package_pending"}
 			}
+		}
+	}
+	if record.FunctionalFlowAdmitted && record.Package == nil {
+		summary := fixture.FixtureSummary{PreparationStatus: fixture.PreparationNotRequired, Cleanup: fixture.CleanupReport{Status: fixture.CleanupNotRequired}}
+		if record.FixtureSummary != nil {
+			summary = *record.FixtureSummary
+		}
+		projection, finalizeErr := s.deps.FunctionalFlow.Finalize(cleanupCtx, record.Handle, outcome, summary)
+		if finalizeErr != nil {
+			return Record{}, &Error{Code: CodeUnavailable, Operation: "functional_flow_package_pending"}
+		}
+		record.Package, record.PackageDir = &projection, projection.PackageDir
+		var saveErr error
+		record, saveErr = s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: "functional_flow_package_finalized", ArtifactSHA256: record.Artifact.ArtifactSHA256})
+		if saveErr != nil {
+			return Record{}, saveErr
 		}
 	}
 	if record.Command.Target.Preview != nil && s.deps.Preview != nil {
@@ -826,7 +1001,19 @@ func validateStart(command StartCommand) error {
 	if command.GitHubAuthority != nil && (!validGitHubAuthorityReference(command.GitHubAuthority) || command.RepositoryID != itoaSigned(command.GitHubAuthority.RepositoryID) || command.Revision != command.GitHubAuthority.HeadOID) {
 		return &Error{Code: CodeInvalid, Operation: "github_authority"}
 	}
+	if command.FunctionalFlow != nil && (command.FunctionalFlow.Alias == "") == (command.FunctionalFlow.ArtifactID == "") || command.FunctionalFlow != nil && (command.FunctionalFlow.Alias != "" && !safeID.MatchString(command.FunctionalFlow.Alias) || command.FunctionalFlow.ArtifactID != "" && !safeID.MatchString(command.FunctionalFlow.ArtifactID)) {
+		return &Error{Code: CodeInvalid, Operation: "functional_flow_selection"}
+	}
 	return nil
+}
+
+// cloneFunctionalFlowSelection detaches one safe provided-flow coordinate before crossing composition boundaries.
+func cloneFunctionalFlowSelection(selection *FunctionalFlowSelection) *FunctionalFlowSelection {
+	if selection == nil {
+		return nil
+	}
+	copy := *selection
+	return &copy
 }
 
 // validateSnapshot ensures trusted preflight produced every bound digest and exact selected model metadata.

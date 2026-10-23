@@ -607,3 +607,31 @@ Bitácora append-only de features completadas.
 - Cobertura statement-weighted multiplataforma del diff productivo:
   1812/2131 statements (85,0305 %), reproducible con
   `python scripts/feature26_coverage.py`.
+
+## 2026-10-23 — functional-flow-validation
+
+- Estado final: `done`.
+- Resultado: contrato estricto e inmutable `FunctionalFlow/v1` para flujos
+  provided/generated, con grafo estable, bindings exactos, referencias tipadas,
+  observations pre/post y assertions deterministas.
+- Ejecución: el `validationworkflow.Service` admite y persiste el FlowArtifact
+  aprobado antes de fixtures, ejecuta steps secuenciales con policy, budget,
+  identidad e intents durables, y preserva branches bloqueadas/independientes.
+- Recovery: journal HMAC append-only, leases/CAS, checkpoints de effect/evidence
+  y promoción causal del primary evitan replay y convergen entre owners,
+  restart y redelivery antes de cleanup.
+- Resultado: ledger y verdict no dependen del agente; el package post-cleanup
+  autentica artifact, evidence, journal, primary y causalidad completa. Cleanup
+  permanece separado e inmutable respecto al resultado funcional.
+- Integración: CLI, API, MCP y GitHub comparten Start/Status/Cancel/Result y
+  soportan generated, provided local y alias/artifact remoto sin autoridad
+  inline ni exposición de captures, credenciales o idempotency keys.
+- Spec aprobada por el usuario el `2026-10-23T09:21:17+02:00`.
+- Tasks T1–T16 completas; R1–R15 y REV-1–REV-21 trazados en
+  `progress/functional-flow-validation/{implementation,review}.md`.
+- Review independiente aprobada en la séptima revisión. Pasan suite global,
+  race global UCRT64 serializada, vet, compile-only, focales repetidos y
+  cross-build Linux/Darwin.
+- Cobertura statement-weighted multiplataforma del diff productivo:
+  2674/3137 statements (85,2407 %), reproducible con
+  `python scripts/feature27_coverage.py`.
