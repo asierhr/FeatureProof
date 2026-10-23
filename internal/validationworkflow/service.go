@@ -21,23 +21,25 @@ type Config struct{ LeaseTTL, HeartbeatInterval, FinalizeTimeout, ApprovalTTL ti
 
 // Dependencies supplies the existing planning, execution, package and lifecycle boundaries.
 type Dependencies struct {
-	Admission      AdmissionBuilder
-	Generation     GenerationPort
-	Preparation    PreparationPort
-	Approval       ApprovalPort
-	Execution      ExecutionPort
-	Packages       PackageReader
-	Authorization  AutoAuthorizationPolicy
-	Finalizer      Finalizer
-	Preview        PreviewPort
-	Store          WorkflowStore
-	Artifacts      PlanArtifactStore
-	Executables    ExecutablePlanStore
-	Clock          Clock
-	Waiter         Waiter
-	IDs            IDSource
-	Owner          string
-	ContractReview ApprovedContractAuthority
+	Admission       AdmissionBuilder
+	Generation      GenerationPort
+	Preparation     PreparationPort
+	Approval        ApprovalPort
+	Execution       ExecutionPort
+	Packages        PackageReader
+	Authorization   AutoAuthorizationPolicy
+	Finalizer       Finalizer
+	Preview         PreviewPort
+	Store           WorkflowStore
+	Artifacts       PlanArtifactStore
+	Executables     ExecutablePlanStore
+	Clock           Clock
+	Waiter          Waiter
+	IDs             IDSource
+	Owner           string
+	ContractReview  ApprovedContractAuthority
+	Fixtures        FixtureLifecyclePort
+	FixturePackages FixturePackageWriter
 }
 
 // Service is the shared application case use behind API, CLI, MCP and GitHub adapters.
@@ -603,6 +605,13 @@ func (s *Service) execute(ctx context.Context, record Record, snapshot Admission
 	if mergeErr != nil {
 		return s.terminal(ctx, record, OutcomeError, "prepared_restore_invalid")
 	}
+	if s.deps.Fixtures != nil {
+		fixtureSummary, fixtureErr := s.deps.Fixtures.Prepare(ctx, record.Handle)
+		record.FixtureSummary = &fixtureSummary
+		if fixtureErr != nil {
+			return s.terminal(ctx, record, OutcomeInconclusive, "fixture_preparation_failed")
+		}
+	}
 	var err error
 	record, err = s.transition(ctx, record, PhaseExecuting, "execution_started", record.Artifact.ArtifactSHA256)
 	if err != nil {
@@ -751,6 +760,30 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.config.FinalizeTimeout)
 	defer cancel()
+	if s.deps.Fixtures != nil && record.FixtureSummary != nil {
+		report, fixtureErr := s.deps.Fixtures.Cleanup(cleanupCtx, record.Handle)
+		record.FixtureSummary.Cleanup = report
+		if record.Package != nil {
+			record.Package.Fixtures = record.FixtureSummary
+		}
+		if fixtureErr != nil {
+			updated, saveErr := s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: "fixture_cleanup_pending", Category: "unavailable"})
+			if saveErr != nil {
+				return Record{}, saveErr
+			}
+			return updated, &Error{Code: CodeUnavailable, Operation: "fixture_cleanup_pending"}
+		}
+		if record.Package != nil {
+			writer := s.deps.FixturePackages
+			if writer == nil || writer.AttachFixtures(cleanupCtx, record.Package.PackageDir, *record.FixtureSummary) != nil {
+				updated, saveErr := s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: "fixture_package_pending", Category: "unavailable"})
+				if saveErr != nil {
+					return Record{}, saveErr
+				}
+				return updated, &Error{Code: CodeUnavailable, Operation: "fixture_package_pending"}
+			}
+		}
+	}
 	if record.Command.Target.Preview != nil && s.deps.Preview != nil {
 		if err := s.deps.Preview.Release(cleanupCtx, record.Handle); err != nil {
 			return Record{}, &Error{Code: CodeUnavailable, Operation: "preview_cleanup_pending"}
@@ -839,7 +872,7 @@ func allowedTransition(from, to Phase) bool {
 
 // viewOf builds the common safe adapter projection from durable state.
 func viewOf(record Record) WorkflowView {
-	return WorkflowView{ContractVersion: ContractVersion, Handle: record.Handle, RepositoryID: record.RepositoryID, Revision: record.Revision, Phase: record.Phase, Outcome: record.Outcome, UpdatedAt: record.UpdatedAt, ApprovalRevision: record.ApprovalRevision}
+	return WorkflowView{ContractVersion: ContractVersion, Handle: record.Handle, RepositoryID: record.RepositoryID, Revision: record.Revision, Phase: record.Phase, Outcome: record.Outcome, UpdatedAt: record.UpdatedAt, ApprovalRevision: record.ApprovalRevision, Fixtures: record.FixtureSummary}
 }
 
 // mapBoundaryError prevents raw dependency text from crossing the public API.

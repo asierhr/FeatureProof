@@ -580,3 +580,30 @@ Bitácora append-only de features completadas.
   `validationworkflow` 85,6 %; conjunto medido 88,3 %.
 - Limitación del host: la suite global conserva únicamente el subtest histórico
   de symlink de `localvalidation`, que Windows no puede crear sin privilegio.
+
+## 2026-10-23 — fixture-api
+
+- Estado final: `done`.
+- Resultado: specification v3 con fixtures HTTP declarativos, grafo y orden
+  deterministas, inputs referenciados y captures tipadas, acotadas y privadas;
+  v1/v2 conservan su interpretación estricta.
+- Ejecución: create y cleanup se ligan a contrato, target, identidad, policy,
+  budget e idempotencia exactos. Los intents, reservations, claims, outbox y
+  terminales son durables; recovery evita replay y cleanup usa scope propio,
+  orden inverso, límites confiables y ownership multiproceso.
+- Auditoría: primary outcome permanece inmutable y separado de summary/report
+  de fixtures. El package incluye audit firmado y verificable offline con
+  signer privado y trust público separados, pin persistente y protección ACL
+  estricta en Windows y permisos/owner estrictos en Unix.
+- Integración: CLI, API, MCP y GitHub comparten el lifecycle productivo; la
+  composición rechaza configuración incompleta y mantiene secretos, captures
+  e idempotency keys fuera del modelo y de las superficies públicas.
+- Spec aprobada por el usuario el `2026-10-22T18:29:01+02:00`.
+- Tasks T1–T14 completas; R1–R13 y REV-1–REV-37 trazados en
+  `progress/fixture-api/{implementation,review}.md`.
+- Review independiente aprobada en la décima revisión. Pasan suite global ×2,
+  race global UCRT64, vet, compile-only, focales repetidos y cross-build
+  Linux/Darwin.
+- Cobertura statement-weighted multiplataforma del diff productivo:
+  1812/2131 statements (85,0305 %), reproducible con
+  `python scripts/feature26_coverage.py`.

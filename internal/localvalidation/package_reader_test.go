@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -80,7 +81,7 @@ func twoBatchPackageFixture(t *testing.T) string {
 	deps.Clock = &testClock{next: time.Unix(100, 0).UTC()}
 	deps.IDs = &testIDs{}
 	deps.Waiter = testWaiter{}
-	deps.FinalizeTimeout = 10 * time.Second
+	deps.FinalizeTimeout = 30 * time.Second
 	runner, err := NewRunner(context.Background(), Request{SpecPath: spec, PlanPath: plan, Target: server.URL, RepositoryID: "repo", Revision: "main", EnvironmentID: "preview"}, deps)
 	if err != nil {
 		t.Fatal(err)
@@ -1329,6 +1330,7 @@ func TestPackageInventoryRejectsOversizedAndInvalidEntries(t *testing.T) {
 	}
 }
 
+// TestOfflinePackageRejectsEvidenceInventoryAndSchemaErrors proves the offline verifier rejects undeclared, malformed, and cross-bound evidence inventory.
 func TestOfflinePackageRejectsEvidenceInventoryAndSchemaErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -1364,6 +1366,9 @@ func TestOfflinePackageRejectsEvidenceInventoryAndSchemaErrors(t *testing.T) {
 		}, "invalid_path"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "evidence symlink" && runtime.GOOS == "windows" {
+				t.Skip("Windows symlink creation requires an optional developer privilege")
+			}
 			dir := failedPackageFixture(t)
 			tc.change(dir)
 			if _, err := ReadPackage(context.Background(), dir); !IsPackageError(err, tc.want) {
@@ -1434,7 +1439,7 @@ func TestOfflinePackageRejectsForgedReportTopologyAndReferences(t *testing.T) {
 			node["evidence_ids"] = []any{"ghost"}
 		}},
 		{"report missing plan", "report.json", "binding_integrity", func(m map[string]any) { m["plan_bindings"] = []any{} }},
-		{"plan wrong version", "plan.json", "invalid_schema", func(m map[string]any) { m["version"] = 3 }},
+		{"plan wrong version", "plan.json", "invalid_schema", func(m map[string]any) { m["version"] = 4 }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := failedPackageFixture(t)

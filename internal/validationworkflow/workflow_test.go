@@ -27,6 +27,7 @@ import (
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/evidence"
+	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/localvalidation"
@@ -359,6 +360,11 @@ type fakePackages struct {
 // Read proves functional outcome crosses only the package reader boundary.
 func (f fakePackages) Read(context.Context, string, string, string) (PackageProjection, error) {
 	return f.projection, f.err
+}
+
+// AttachFixtures simulates atomic package resealing for workflow lifecycle tests.
+func (f fakePackages) AttachFixtures(context.Context, string, fixture.FixtureSummary) error {
+	return f.err
 }
 
 // fakeAuto explicitly controls disabled-approval authorization.
@@ -803,7 +809,7 @@ func TestAdmissionFailsClosedAtEveryBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	builder, specs, _, _, _ = makeBuilder()
-	specs.spec.Version = 3
+	specs.spec.Version = 4
 	if _, err := builder.Build(context.Background(), command); !IsCode(err, CodeInvalid) {
 		t.Fatal(err)
 	}

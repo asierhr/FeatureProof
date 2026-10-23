@@ -17,9 +17,12 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/assertion"
+	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/evidence"
+	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/harness"
+	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/specification"
@@ -278,6 +281,16 @@ type workflowProductSurfaceResult struct {
 	modelCalls, resolverCalls, targetCalls int32
 }
 
+// workflowFixtureContractFixture extends the productive OpenAPI authority with exact create and cleanup operations.
+func workflowFixtureContractFixture() map[string]any {
+	document := workflowContractFixture()
+	paths := document["paths"].(map[string]any)
+	security := []any{map[string]any{"oauth": []any{"read"}}}
+	paths["/fixtures"] = map[string]any{"post": map[string]any{"operationId": "createFixture", "parameters": []any{map[string]any{"name": "Idempotency-Key", "in": "header", "required": true, "schema": map[string]any{"type": "string"}}}, "requestBody": map[string]any{"required": true, "content": map[string]any{"application/json": map[string]any{"schema": map[string]any{"type": "object"}}}}, "security": security, "responses": map[string]any{"201": map[string]any{"description": "created", "headers": map[string]any{}, "content": map[string]any{"application/json": map[string]any{"schema": map[string]any{"type": "object"}}}}}}}
+	paths["/fixtures/{id}"] = map[string]any{"delete": map[string]any{"operationId": "deleteFixture", "parameters": []any{map[string]any{"name": "id", "in": "path", "required": true, "schema": map[string]any{"type": "string"}}}, "security": security, "responses": map[string]any{"204": map[string]any{"description": "deleted", "headers": map[string]any{}}, "404": map[string]any{"description": "absent", "headers": map[string]any{}}}}}
+	return document
+}
+
 // composeProductIdentityWorkflow writes trusted v2 inputs and creates the real workflow composition around controlled model and target servers.
 func composeProductIdentityWorkflow(t *testing.T, root string, targetURL string, modelTransport *workflowProductModelTransport) (*validationworkflow.CLI, string, string) {
 	return composeProductIdentityWorkflowWithOptions(t, root, targetURL, modelTransport, nil, true)
@@ -285,10 +298,87 @@ func composeProductIdentityWorkflow(t *testing.T, root string, targetURL string,
 
 // composeProductIdentityWorkflowWithOptions creates the fixture and injects a trusted resolver port plus explicit startup recovery behavior.
 func composeProductIdentityWorkflowWithOptions(t *testing.T, root string, targetURL string, modelTransport *workflowProductModelTransport, spy *workflowProductResolverSpy, recoverPending bool) (*validationworkflow.CLI, string, string) {
+	return composeProductWorkflowWithOptions(t, root, targetURL, modelTransport, spy, recoverPending, false)
+}
+
+// TestWorkflowFixtureRuntimeConfigFailsClosed proves every effect, retry, timeout, backoff, and lease limit comes from coherent trusted configuration.
+func TestWorkflowFixtureRuntimeConfigFailsClosed(t *testing.T) {
+	valid := workflowFixtureRuntimeConfig{MaxCaptureBytes: 1024, MaxToolCalls: 8, MaxRetries: 2, CreateRetries: 1, CleanupTimeoutMS: 2000, CleanupMaxCalls: 2, CleanupRetries: 1, RetryBackoffMS: 10, LeaseTTLMS: 3000}
+	if err := valid.validate(); err != nil {
+		t.Fatal(err)
+	}
+	invalid := []workflowFixtureRuntimeConfig{valid, valid, valid, valid, valid, valid, valid, valid, valid, valid, valid, valid}
+	invalid[0].MaxCaptureBytes = 0
+	invalid[1].MaxToolCalls = 0
+	invalid[2].MaxRetries = 0
+	invalid[3].CreateRetries = 0
+	invalid[4].CleanupTimeoutMS = 0
+	invalid[5].CleanupMaxCalls = 0
+	invalid[6].CleanupRetries = 0
+	invalid[7].RetryBackoffMS = 0
+	invalid[8].LeaseTTLMS = 0
+	invalid[9].CreateRetries = valid.MaxRetries + 1
+	invalid[10].CleanupMaxCalls = valid.MaxToolCalls + 1
+	invalid[11].LeaseTTLMS = valid.CleanupTimeoutMS
+	for index := range invalid {
+		if err := invalid[index].validate(); err == nil {
+			t.Fatalf("invalid trusted fixture limit %d accepted", index)
+		}
+	}
+	if _, err := composeWorkflowFixtures(context.Background(), t.TempDir(), "owner", specification.Specification{}, planmanifest.Manifest{}, localvalidation.RuntimeDependencies{}, contractcatalog.ReducedContext{}, workflowConfig{}, nil); err == nil {
+		t.Fatal("fixture composition accepted missing trusted limits")
+	}
+}
+
+// composeProductFixtureWorkflowWithOptions enables v3 fixtures in the same productive service graph.
+func composeProductFixtureWorkflowWithOptions(t *testing.T, root string, targetURL string, modelTransport *workflowProductModelTransport, spy *workflowProductResolverSpy, recoverPending bool) (*validationworkflow.CLI, string, string) {
+	return composeProductWorkflowWithOptions(t, root, targetURL, modelTransport, spy, recoverPending, true)
+}
+
+// composeProductWorkflowWithOptions creates controlled real composition with optional fixture lifecycle declarations.
+func composeProductWorkflowWithOptions(t *testing.T, root string, targetURL string, modelTransport *workflowProductModelTransport, spy *workflowProductResolverSpy, recoverPending, withFixtures bool) (*validationworkflow.CLI, string, string) {
 	t.Helper()
-	configPath, specPath, contractPath := writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
+	document := workflowContractFixture()
+	if withFixtures {
+		document = workflowFixtureContractFixture()
+	}
+	configPath, specPath, contractPath := writeWorkflowCompositionFixture(t, root, document, "/pets", workflowProjectionFixture())
 	spec := "version: 2\nfeature:\n  id: identity-product\n  description: product identity\ntarget:\n  id: deployed\n  base_url: " + targetURL + "\nconstraints:\n  - id: c1\n    description: selected contract\n    target_id: deployed\nlimits:\n  max_steps: 6\n  max_tool_calls: 3\n  max_retries: 0\nidentities:\n  - id: customer\n    target_id: deployed\n    credential_ref: cred_customer\n    mechanism:\n      type: bearer\n    operations:\n      - capability: http.request\n        method: GET\n        path: /pets\n"
 	manifest := `{"version":2,"runtime":{"http":{"allowed_methods":["GET"],"allowed_request_headers":[],"allowed_response_headers":["Content-Type"],"follow_redirects_for_methods":[],"max_redirects":0,"timeout_ms":1000,"max_url_bytes":2048,"max_request_header_bytes":8192,"max_request_body_bytes":1024,"max_response_header_bytes":8192,"max_response_body_bytes":1024},"redaction":{"max_body_bytes":1024,"additional_sensitive_headers":[],"sensitive_json_paths":[],"model_sensitive_json_paths":[]},"policy":{"allowed_tools":["http.request"]}},"plans":[{"id":"p1","constraint_id":"c1","steps":[{"id":"request","tool":"http.request","identity_id":"customer","input":{"method":{"literal":"GET"},"path":{"literal":"/pets"}},"assertions":[{"id":"status","definition":{"operator":"eq","path":"/status","expected":200}}],"depends_on":[]}]}]}`
+	if withFixtures {
+		manifest = strings.Replace(manifest, `"version":2`, `"version":3`, 1)
+		spec = strings.Replace(spec, "version: 2", "version: 3", 1)
+		spec += "      - capability: http.request\n        method: POST\n        path: /fixtures\n      - capability: http.request\n        method: DELETE\n        path: /fixtures/{id}\n"
+		spec += `fixtures:
+  - id: account
+    depends_on: []
+    create:
+      operation: {method: POST, path: /fixtures}
+      identity_id: customer
+      input:
+        body:
+          object:
+            name: {literal: product-fixture}
+      accepted_statuses: [201]
+      idempotency: contract
+    capture:
+      - name: id
+        path: [id]
+        value_type: string
+        max_bytes: 64
+    cleanup:
+      operation: {method: DELETE, path: "/fixtures/{id}"}
+      identity_id: customer
+      input:
+        path_parameters:
+          id:
+            reference: {fixture_id: account, output: id, value_type: string}
+      accepted_statuses: [204, 404]
+      idempotency: contract
+`
+		manifest = strings.Replace(manifest, `"allowed_methods":["GET"]`, `"allowed_methods":["GET","POST","DELETE"]`, 1)
+		manifest = strings.Replace(manifest, `"allowed_request_headers":[]`, `"allowed_request_headers":["Idempotency-Key"]`, 1)
+	}
 	if err := os.WriteFile(specPath, []byte(spec), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -308,6 +398,10 @@ func composeProductIdentityWorkflowWithOptions(t *testing.T, root string, target
 		value["allow_disabled_approval"] = true
 		value["identity_credential_environment"] = map[string]any{"cred_customer": "FEATUREPROOF_PRODUCT_IDENTITY"}
 		value["identity_observation_timeout_ms"] = 1000
+		if withFixtures {
+			value["contract_selections"] = map[string]any{"c1": []any{map[string]any{"method": "GET", "path": "/pets"}, map[string]any{"method": "POST", "path": "/fixtures"}, map[string]any{"method": "DELETE", "path": "/fixtures/{id}"}}}
+			value["fixture_runtime"] = map[string]any{"max_capture_bytes": 1024, "max_tool_calls": 8, "max_retries": 2, "create_retries": 1, "cleanup_timeout_ms": 10000, "cleanup_max_calls": 2, "cleanup_retries": 1, "retry_backoff_ms": 10, "lease_ttl_ms": 11000}
+		}
 	})
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)
 	t.Setenv("FEATUREPROOF_PRODUCT_IDENTITY", "PRODUCT-IDENTITY-CANARY")
@@ -538,6 +632,133 @@ func TestProductIdentityWorkflowParityReachesTerminalAcrossAllSurfaces(t *testin
 		} else if result.identityID != expected.identityID || result.bindingDigest != expected.bindingDigest || result.outcome != expected.outcome || result.code != expected.code || result.modelCalls != expected.modelCalls || result.resolverCalls != expected.resolverCalls || result.targetCalls != expected.targetCalls {
 			t.Fatalf("surface mismatch %s=%#v expected=%#v", surface, result, expected)
 		}
+	}
+}
+
+// TestProductFixtureLifecycleParityAcrossAllSurfaces exercises real v3 create, primary validation, cleanup, and safe projection through every adapter.
+func TestProductFixtureLifecycleParityAcrossAllSurfaces(t *testing.T) {
+	for _, surface := range []string{"api", "cli", "mcp", "github"} {
+		t.Run(surface, func(t *testing.T) {
+			root := t.TempDir()
+			t.Chdir(root)
+			var targetCalls atomic.Int32
+			target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				targetCalls.Add(1)
+				if request.Header.Get("Authorization") != "Bearer PRODUCT-IDENTITY-CANARY" {
+					t.Fatalf("missing rotated identity at %s", request.URL.Path)
+				}
+				switch {
+				case request.Method == http.MethodPost && request.URL.Path == "/fixtures":
+					if request.Header.Get("Idempotency-Key") == "" {
+						t.Fatal("create omitted contract-declared idempotency key")
+					}
+					writer.Header().Set("Content-Type", "application/json")
+					writer.WriteHeader(http.StatusCreated)
+					_, _ = writer.Write([]byte(`{"id":"fixture-private-canary"}`))
+				case request.Method == http.MethodGet && request.URL.Path == "/pets":
+					writer.Header().Set("Content-Type", "application/json")
+					_, _ = writer.Write([]byte(`{"ok":true}`))
+				case request.Method == http.MethodDelete && request.URL.Path == "/fixtures/fixture-private-canary":
+					if request.Header.Get("Idempotency-Key") != "" {
+						t.Fatal("cleanup received header absent from its operation contract")
+					}
+					writer.WriteHeader(http.StatusNoContent)
+				default:
+					t.Fatalf("unexpected fixture request %s %s", request.Method, request.URL.Path)
+				}
+			}))
+			defer target.Close()
+			modelTransport := &workflowProductModelTransport{}
+			resolverSpy := &workflowProductResolverSpy{}
+			cli, specPath, contractPath := composeProductFixtureWorkflowWithOptions(t, root, target.URL, modelTransport, resolverSpy, true)
+			command := productIdentityStartCommand(cli, specPath, contractPath, "fixture-"+surface, validationworkflow.ApprovalDisabled)
+			handle := ""
+			switch surface {
+			case "api":
+				view, err := cli.Service.Start(context.Background(), command)
+				if err != nil {
+					t.Fatal(err)
+				}
+				handle = view.Handle
+			case "cli":
+				var output bytes.Buffer
+				args := []string{"start", "--spec", specPath, "--contract", contractPath, "--provider", "openai", "--model", "selected-model", "--profile", "profile", "--runtime-profile", "runtime", "--repository", "7", "--revision", strings.Repeat("a", 40), "--approval", "disabled", "--idempotency-key", command.IdempotencyKey, "--target", "target"}
+				if code := cli.Run(context.Background(), args, &output); code != 0 {
+					t.Fatalf("CLI code=%d output=%s", code, output.String())
+				}
+				var view validationworkflow.WorkflowView
+				if json.Unmarshal(output.Bytes(), &view) != nil {
+					t.Fatal("invalid CLI projection")
+				}
+				handle = view.Handle
+			case "mcp":
+				arguments, _ := json.Marshal(map[string]any{"idempotency_key": command.IdempotencyKey, "specification_ref": specPath, "contract_ref": contractPath, "provider": "openai", "model": "selected-model", "auth_profile": "profile", "runtime_profile": "runtime", "repository_id": "7", "revision": strings.Repeat("a", 40), "approval": "disabled", "target_alias": "target"})
+				response := (validationworkflow.MCPServer{Service: cli.Service, Principal: cli.Principal, AuthProfiles: cli.AuthProfiles, DirectTargets: cli.DirectTargets}).Handle(context.Background(), validationworkflow.MCPRequest{Version: validationworkflow.ContractVersion, Operation: "workflow.start", Arguments: arguments})
+				view, ok := response.Value.(validationworkflow.WorkflowView)
+				if response.Error != "" || !ok {
+					t.Fatalf("MCP=%#v", response)
+				}
+				handle = view.Handle
+			case "github":
+				command.Approval = validationworkflow.ApprovalRequired
+				snapshot, _ := githubpr.SealSnapshot(githubpr.PullRequestSnapshot{Version: 1, InstallationID: 1, RepositoryID: 7, Number: 2, AuthorID: 9, State: "open", HeadOID: strings.Repeat("a", 40), HeadRepositoryID: 7})
+				state, err := (validationworkflow.GitHubGateway{Service: cli.Service, Principal: cli.Principal, Commands: map[string]validationworkflow.StartCommand{"default": command}}).Submit(context.Background(), githubpr.Selection{Alias: "default"}, snapshot, command.IdempotencyKey)
+				if err != nil {
+					t.Fatal(err)
+				}
+				handle = state.RunHandle
+				approval, _ := cli.Service.ApprovalView(context.Background(), handle)
+				if _, err = cli.Service.Decide(context.Background(), validationworkflow.DecisionCommand{Principal: cli.Principal, Handle: handle, DecisionID: "fixture-approve", Revision: approval.Revision, Action: validationworkflow.DecisionApprove}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			result, err := cli.Service.Result(context.Background(), handle)
+			if err != nil || result.View.Fixtures == nil || result.View.Fixtures.PreparationStatus != fixture.PreparationPrepared || result.View.Fixtures.Cleanup.Status != fixture.CleanupSucceeded || len(result.View.Fixtures.Fixtures) != 1 || len(result.View.Fixtures.Fixtures[0].ConfirmedCaptureNames) != 1 || targetCalls.Load() != 3 || resolverSpy.calls.Load() != 3 {
+				t.Fatalf("result=%#v calls=%d resolver=%d err=%v", result, targetCalls.Load(), resolverSpy.calls.Load(), err)
+			}
+			assertProductDurableFilesExclude(t, root, "PRODUCT-IDENTITY-CANARY")
+		})
+	}
+}
+
+// TestProductFixtureRetryAndCleanupResolveRotatedCredentials proves credentials are reacquired at each fixture and primary attempt.
+func TestProductFixtureRetryAndCleanupResolveRotatedCredentials(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	var calls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		attempt := calls.Add(1)
+		wanted := "Bearer PRODUCT-IDENTITY-CANARY"
+		if attempt > 1 {
+			wanted = "Bearer ROTATED-PRODUCT-IDENTITY"
+		}
+		if request.Header.Get("Authorization") != wanted {
+			t.Fatalf("attempt %d credential=%q wanted=%q", attempt, request.Header.Get("Authorization"), wanted)
+		}
+		switch request.Method {
+		case http.MethodPost:
+			_ = os.Setenv("FEATUREPROOF_PRODUCT_IDENTITY", "ROTATED-PRODUCT-IDENTITY")
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusCreated)
+			_, _ = writer.Write([]byte(`{"id":"rotated-id"}`))
+		case http.MethodGet:
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = writer.Write([]byte(`{"ok":true}`))
+		case http.MethodDelete:
+			writer.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer target.Close()
+	modelTransport := &workflowProductModelTransport{}
+	spy := &workflowProductResolverSpy{}
+	cli, specPath, contractPath := composeProductFixtureWorkflowWithOptions(t, root, target.URL, modelTransport, spy, true)
+	view, err := cli.Service.Start(context.Background(), productIdentityStartCommand(cli, specPath, contractPath, "fixture-rotation", validationworkflow.ApprovalDisabled))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := cli.Service.Result(context.Background(), view.Handle)
+	if err != nil || result.View.Fixtures == nil || result.View.Fixtures.Cleanup.Status != fixture.CleanupSucceeded || calls.Load() != 3 || spy.calls.Load() != 3 {
+		t.Fatalf("result=%#v calls=%d resolver=%d err=%v", result, calls.Load(), spy.calls.Load(), err)
 	}
 }
 

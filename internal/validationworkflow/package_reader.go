@@ -7,18 +7,32 @@ import (
 	"path/filepath"
 	"reflect"
 
+	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 )
 
 // LocalPackageReader verifies the existing evidence package and its exact generated plan artifact.
-type LocalPackageReader struct{ Artifacts PlanArtifactStore }
+type LocalPackageReader struct {
+	Artifacts  PlanArtifactStore
+	AuditTrust localvalidation.FixtureAuditTrust
+}
+
+// LocalFixturePackageWriter owns only the private signing capability used during package finalization.
+type LocalFixturePackageWriter struct {
+	AuditSigner localvalidation.FixtureAuditSigner
+}
+
+// AttachFixtures seals the final allowlisted lifecycle audit without exposing signing authority to the reader.
+func (w LocalFixturePackageWriter) AttachFixtures(ctx context.Context, dir string, summary fixture.FixtureSummary) error {
+	return localvalidation.AttachFixtureAudit(ctx, dir, summary, w.AuditSigner)
+}
 
 // Read accepts functional status only after package lineage, artifact digest and plan bytes all match.
 func (r LocalPackageReader) Read(ctx context.Context, dir, handle, artifactDigest string) (PackageProjection, error) {
 	if r.Artifacts == nil {
 		return PackageProjection{}, &Error{Code: CodeInternal, Operation: "package_reader"}
 	}
-	index, err := localvalidation.ReadPackage(ctx, dir)
+	index, err := localvalidation.ReadPackageWithFixtureTrust(ctx, dir, r.AuditTrust)
 	if err != nil {
 		return PackageProjection{}, &Error{Code: CodeUnavailable, Operation: "package_verify"}
 	}

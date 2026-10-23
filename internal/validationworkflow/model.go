@@ -10,6 +10,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
+	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planning"
@@ -241,22 +242,24 @@ type DecisionCommand struct {
 
 // PackageProjection is the only source allowed to claim a functional passed or failed result.
 type PackageProjection struct {
-	RunID         string  `json:"run_id"`
-	BindingSHA256 string  `json:"binding_sha256"`
-	PackageDir    string  `json:"package_dir"`
-	Outcome       Outcome `json:"outcome"`
+	RunID         string                  `json:"run_id"`
+	BindingSHA256 string                  `json:"binding_sha256"`
+	PackageDir    string                  `json:"package_dir"`
+	Outcome       Outcome                 `json:"outcome"`
+	Fixtures      *fixture.FixtureSummary `json:"fixtures,omitempty"`
 }
 
 // WorkflowView is the safe lifecycle projection shared by every adapter.
 type WorkflowView struct {
-	ContractVersion  string    `json:"contract_version"`
-	Handle           string    `json:"handle"`
-	RepositoryID     string    `json:"repository_id"`
-	Revision         string    `json:"revision"`
-	Phase            Phase     `json:"phase"`
-	Outcome          *Outcome  `json:"outcome,omitempty"`
-	UpdatedAt        time.Time `json:"updated_at"`
-	ApprovalRevision uint64    `json:"approval_revision,omitempty"`
+	ContractVersion  string                  `json:"contract_version"`
+	Handle           string                  `json:"handle"`
+	RepositoryID     string                  `json:"repository_id"`
+	Revision         string                  `json:"revision"`
+	Phase            Phase                   `json:"phase"`
+	Outcome          *Outcome                `json:"outcome,omitempty"`
+	UpdatedAt        time.Time               `json:"updated_at"`
+	ApprovalRevision uint64                  `json:"approval_revision,omitempty"`
+	Fixtures         *fixture.FixtureSummary `json:"fixtures,omitempty"`
 }
 
 // WorkflowResult is a closed terminal union containing either safe missing context or verified package data.
@@ -300,6 +303,18 @@ type Record struct {
 	ApprovalDecisionRevision                         uint64
 	PreviewDigest                                    string
 	ApprovalDeadline                                 time.Time
+	FixtureSummary                                   *fixture.FixtureSummary
+}
+
+// FixtureLifecyclePort prepares bound fixtures before functional execution and converges cleanup from durable state.
+type FixtureLifecyclePort interface {
+	Prepare(context.Context, string) (fixture.FixtureSummary, error)
+	Cleanup(context.Context, string) (fixture.CleanupReport, error)
+}
+
+// FixturePackageWriter seals a completed allowlisted fixture audit into the offline-verifiable result package.
+type FixturePackageWriter interface {
+	AttachFixtures(context.Context, string, fixture.FixtureSummary) error
 }
 
 // AdmissionBuilder performs all validation and external observation before a durable handle exists.

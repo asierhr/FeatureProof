@@ -3,15 +3,18 @@ package localvalidation
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 
 	"github.com/asierhr/featureProof/internal/evidence"
+	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
@@ -41,10 +44,22 @@ type packagePlanDocument struct {
 // reference validation of the entire local directory; it has no tool or network
 // dependency and never interprets model text as a result.
 func ReadPackage(ctx context.Context, dir string) (PackageIndex, error) {
-	return readPackageWithInventory(ctx, dir, inventoryPackage)
+	return readPackageWithInventory(ctx, dir, inventoryPackage, FixtureAuditTrust{})
 }
 
-func readPackageWithInventory(ctx context.Context, dir string, scan func(context.Context, string) ([]PackageArtifact, error)) (PackageIndex, error) {
+// ReadPackageWithFixtureTrust verifies fixture audit authority with an external public trust anchor.
+func ReadPackageWithFixtureTrust(ctx context.Context, dir string, trust FixtureAuditTrust) (PackageIndex, error) {
+	return readPackageWithInventory(ctx, dir, inventoryPackage, trust)
+}
+
+// readPackageWithInventory verifies one stable inventory and optionally one external fixture trust anchor.
+func readPackageWithInventory(ctx context.Context, dir string, scan func(context.Context, string) ([]PackageArtifact, error), trusts ...FixtureAuditTrust) (PackageIndex, error) {
+	trust := FixtureAuditTrust{}
+	if len(trusts) == 1 {
+		trust = trusts[0]
+	} else if len(trusts) > 1 {
+		return PackageIndex{}, &PackageError{Category: "binding_integrity", Path: "fixture-authority.json"}
+	}
 	if err := ctx.Err(); err != nil {
 		return PackageIndex{}, err
 	}
@@ -128,6 +143,21 @@ func readPackageWithInventory(ctx context.Context, dir string, scan func(context
 	if err != nil {
 		return PackageIndex{}, err
 	}
+	if fixtureArtifact, ok := verified["fixtures.json"]; ok {
+		fixtureRaw, readErr := read("fixtures.json")
+		if readErr != nil {
+			return PackageIndex{}, readErr
+		}
+		var summary fixture.FixtureSummary
+		if decodePackageJSON(fixtureRaw, fixtureArtifact.Path, &summary) != nil || index.Fixtures == nil || !reflect.DeepEqual(*index.Fixtures, summary) || fixture.ValidateSummary(summary, index.RunID) != nil {
+			return PackageIndex{}, &PackageError{Category: "binding_integrity", Path: "fixtures.json"}
+		}
+		if err := verifyFixtureAuditAuthority(index, read, summary, trust); err != nil {
+			return PackageIndex{}, err
+		}
+	} else if index.Fixtures != nil {
+		return PackageIndex{}, &PackageError{Category: "missing_artifact", Path: "fixtures.json"}
+	}
 	if index.RunID != manifest.RunID || index.Binding.BindingSHA256 != manifest.BindingSHA256 {
 		return PackageIndex{}, &PackageError{Category: "binding_integrity", Path: "package.json"}
 	}
@@ -164,6 +194,26 @@ func readPackageWithInventory(ctx context.Context, dir string, scan func(context
 		return PackageIndex{}, &PackageError{Category: "digest_mismatch", Path: "manifest.json"}
 	}
 	return index, nil
+}
+
+// verifyFixtureAuditAuthority verifies the full audit against consumer-owned authority outside the re-sealable package.
+func verifyFixtureAuditAuthority(index PackageIndex, read func(string) ([]byte, error), summary fixture.FixtureSummary, trust FixtureAuditTrust) error {
+	sealRaw, err := read("fixture-authority.json")
+	if err != nil {
+		return err
+	}
+	var seal fixtureAuditSeal
+	if decodePackageJSON(sealRaw, "fixture-authority.json", &seal) != nil {
+		return &PackageError{Category: "binding_integrity", Path: "fixture-authority.json"}
+	}
+	signature, signatureErr := hex.DecodeString(seal.Signature)
+	raw, marshalErr := json.Marshal(summary)
+	digest := sha256.Sum256(raw)
+	publicDigest := sha256.Sum256(trust.PublicKey)
+	if len(trust.PublicKey) != ed25519.PublicKeySize || !validFixtureAuthorityID(trust.KeyID) || trust.KeyID != hex.EncodeToString(publicDigest[:]) || seal.KeyID != trust.KeyID || signatureErr != nil || marshalErr != nil || seal.Digest != hex.EncodeToString(digest[:]) || !ed25519.Verify(trust.PublicKey, fixtureAuditMessage(index, seal.KeyID, digest), signature) {
+		return &PackageError{Category: "binding_integrity", Path: "fixture-authority.json"}
+	}
+	return nil
 }
 
 func readPackageFile(ctx context.Context, root *os.Root, rel string, limit int64) ([]byte, error) {
@@ -227,6 +277,16 @@ func validatePackageDocuments(ctx context.Context, read func(string) ([]byte, er
 	}
 	if run.Binding == nil || report.Binding == nil || *run.Binding != index.Binding || *report.Binding != index.Binding || run.ID != index.RunID || report.RunID != index.RunID || run.Status != index.Status || report.Status != index.Status || !equalPlanBindings(run.PlanBindings, index.PlanBindings) || !equalPlanBindings(report.PlanBindings, index.PlanBindings) {
 		return &PackageError{Category: "binding_integrity", Path: "run.json"}
+	}
+	if !reflect.DeepEqual(report.Fixtures, index.Fixtures) {
+		return &PackageError{Category: "binding_integrity", Path: "report.json"}
+	}
+	if index.Fixtures != nil {
+		markdown, markdownErr := read("report.md")
+		expected := fixtureMarkdownSection(*index.Fixtures)
+		if markdownErr != nil || bytes.Count(markdown, []byte("\n## Fixture lifecycle\n")) != 1 || !bytes.HasSuffix(markdown, expected) {
+			return &PackageError{Category: "binding_integrity", Path: "report.md"}
+		}
 	}
 	if len(index.Constraints) != len(run.Constraints) || len(index.Constraints) != len(report.Constraints) {
 		return &PackageError{Category: "broken_reference", Path: "package.json"}
@@ -392,7 +452,7 @@ type packagePlanTopology struct {
 
 // validatePlanTopology validates the public plan/report graph and preserves each step identity binding for journal verification.
 func validatePlanTopology(plan packagePlanDocument, report reportArtifact) (packagePlanTopology, error) {
-	if plan.Version != 0 && plan.Version != 1 && plan.Version != 2 {
+	if plan.Version != 0 && plan.Version != 1 && plan.Version != 2 && plan.Version != 3 {
 		return packagePlanTopology{}, &PackageError{Category: "invalid_schema", Path: "plan.json"}
 	}
 	known := map[string]map[string]bool{}

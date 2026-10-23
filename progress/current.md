@@ -2730,3 +2730,186 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
   `fixture-api` de `spec_ready` a `in_progress`.
 - Se autoriza al implementer a ejecutar T1–T14; el cierre seguirá condicionado
   a trazabilidad completa, gates y review independiente.
+
+## 2026-10-22 — Feature 26 fixture-api (implementación)
+
+- Specification v3 implementada manteniendo dispatch estricto de v1/v2.
+- Nuevo paquete `internal/fixture`: grafo inmutable, binding de contrato/identidad/idempotencia, resolución y extracción tipadas, intent durable, lifecycle secuencial y cleanup inverso finito.
+- Persistencia CAS atómica y adapter compartido conectado a `validationworkflow`; la proyección externa contiene solo `FixtureSummary`/`CleanupReport` allowlisted.
+- En curso: endurecimiento de recovery/ownership, matriz adversaria, cobertura y gates finales.
+
+- T1–T14 completadas con trazabilidad R1–R13 en `progress/fixture-api/implementation.md`.
+- Gates: vet/compile/focales repetidas/race/cross-build/diff-check correctos; coverage fixture 86,2 % y validationworkflow 85,6 %.
+- Suite global verde salvo la limitación histórica de symlink en Windows sin privilegio; la regresión de diagnóstico de versión futura fue corregida y verificada focalmente.
+- Entrega solicitada para review independiente; feature permanece `in_progress` y `feature_list.json` no fue modificado.
+
+## 2026-10-22 — Feature 26, primera revisión rechazada
+
+- El reviewer independiente detectó REV-1..REV-9; la feature permanece `in_progress`.
+- Bloqueantes: falta composición productiva del lifecycle, recovery inseguro después de I/O, terminalización del workflow pese a cleanup no confirmado, sello/estado/capturas manipulables y ausencia de claim durable entre owners.
+- También deben cerrarse terminales durables de cleanup, proyección de dependientes bloqueados, restricciones estrictas del contrato v3 y las matrices reales de crash, concurrencia y paridad de superficies.
+- Se reabren T1, T4, T8–T14 para remediación y nueva revisión independiente; `feature_list.json` permanece intacto.
+
+## 2026-10-22 — Feature 26 fixture-api (primera revisión rechazada)
+
+- Reabiertas T1, T4 y T8–T14 por REV-1..REV-9.
+- La revisión detectó ausencia de composición productiva, ventanas post-I/O no conservadoras, cleanup terminalizado prematuramente, sellos incompletos, ausencia de ownership por efecto, estados de bloqueo incompletos y validación v3 insuficiente.
+- En curso: rediseño del estado durable/claims/recovery y cierre de matrices adversarias antes de volver a marcar tareas.
+
+## 2026-10-22 — Feature 26, segunda revisión rechazada
+
+- La segunda revisión confirma cerrados REV-1, REV-2, REV-3 y REV-7; REV-4, REV-6 y REV-8 quedan parciales, y REV-5/REV-9 siguen abiertos.
+- Se registran REV-10..REV-17: intercalaciones que duplican cleanup, idempotencia no acreditada por contrato, ausencia productiva de policy/budget, cleanup desligado de shutdown, estado durable forjable, captures sensibles aceptadas como `[REDACTED]`, audit de fixtures fuera del package verificable y `json.Number` no finito.
+- Se reabren T1, T4–T14 para corregir garantías productivas y ampliar las matrices adversarias; la feature permanece `in_progress` y `feature_list.json` no cambia.
+
+## 2026-10-22 — Feature 26, tercera revisión rechazada
+
+- La tercera revisión cierra REV-8, REV-13, REV-15 y REV-17, pero mantiene parciales REV-4/5/6/10/16 y abiertos REV-9/11/12/14.
+- REV-18..REV-24 exigen key por operación exacta, policy sobre request resuelto, budget durable por run/retry, lease válido durante I/O, historia durable no resellable, verificación semántica offline, audit recuperable de captures/eventos y limpieza de temporales/comentarios.
+- Se reabren T4–T14; la feature continúa `in_progress` hasta cerrar las intercalaciones y pruebas omitidas.
+
+## 2026-10-22 — Feature 26, cuarta revisión rechazada
+
+- La cuarta revisión valida headers por operación, claims/leases, autenticación del state, outbox/captures, paridad y alcance, pero detecta REV-25..REV-27.
+- Debe hacerse exacto y durable el budget por intento/retry y restart, cerrar todas las invariantes semánticas del package re-sellado y recibir cada límite desde configuración confiable obligatoria.
+- Se reabren T9–T14; la feature permanece `in_progress` hasta nueva revisión independiente.
+
+## 2026-10-22 — Feature 26, quinta revisión rechazada
+
+- REV-25 y REV-27 quedan cerrados; REV-26 continúa abierto y se concreta en REV-29.
+- REV-28 exige cerrar durablemente el intent ante denial de budget anterior a I/O; REV-29 exige validar toda la máquina de create y una única sección Markdown exacta; REV-30 exige coverage reproducible >=85 % sobre todo el código productivo añadido/modificado.
+- Se reabren T8 y T10–T14; la feature continúa `in_progress`.
+
+## 2026-10-22 — Feature 26, sexta revisión rechazada
+
+- REV-28 queda cerrado y no se reproducen los timeouts bajo carga.
+- REV-31 exige autenticar offline el audit completo con una autoridad no regenerable por quien re-sella el package; forma y hashes internos no bastan.
+- REV-32 detecta 16 statements Unix omitidos por el gate: el coverage conservador real es 84,9792 %, por debajo del 85 %.
+- Se reabren T11, T12 y T14; la feature continúa `in_progress`.
+
+## 2026-10-22 — Feature 26, séptima revisión rechazada
+
+- REV-33 demuestra que el reader posee la clave privada y permite sustituir el trust anchor completo; writer y verifier deben recibir capacidades separadas desde configuración confiable.
+- REV-34 corrige el coverage conservador a 1666/1959 (85,0434 %), pero exige conteo simétrico y reproducible entre Windows y Unix.
+- Se mantienen reabiertas T11, T12 y T14; la feature continúa `in_progress`.
+
+## 2026-10-22 — Feature 26, octava revisión rechazada
+
+- REV-34 queda cerrado con coverage multiplataforma reproducible 1695/1993 (85,0477 %).
+- REV-35 exige pin público independiente, rotación autenticada, coherencia seed/private/public/key ID, carga endurecida y separación del reader respecto al signer.
+- REV-36 exige retirar `scripts/__pycache__/` y evitar su regeneración; T11, T12 y T14 siguen abiertas.
+
+## 2026-10-23 — Feature 26, novena revisión rechazada
+
+- REV-35 y REV-36 quedan cerrados; cobertura, race global, suite global y cross-build pasan.
+- REV-37 detecta que Windows valida el owner SID pero no rechaza DACL hostiles: la private key puede ser legible y el pin modificable por `Everyone`.
+- T11, T12 y T14 permanecen abiertas hasta endurecer y validar ACL de key/pin en create y reload.
+
+## 2026-10-23 — Feature 26 `fixture-api`, cierre aprobado
+
+- REV-37 queda cerrado con DACL Windows protegida y exacta para private key y pin; la matriz hostil real, reload, links y race pasan.
+- La décima revisión independiente aprueba R1–R13 y cierra REV-1..REV-37.
+- T1–T14 están completas; cobertura statement-weighted multiplataforma 1812/2131 (85,0305 %), suite global ×2, race global, vet, compile-only y cross-build pasan.
+- El smoke final del leader pasa en fixture, localvalidation, validationworkflow, specification/YAML y cmd/featureproof.
+- El leader cambia feature 26 de `in_progress` a `done`; feature 27 permanece `pending`.
+
+## 2026-10-22 — fixture-api remediation checkpoint 2
+
+- REV-1: el composition root productivo crea `fixture.WorkflowAdapter` con lifecycle/store/HTTP/identidad/evidence/journal/scopes reales y lo inyecta en el mismo `validationworkflow.Service`; prueba vertical v3 completa API/CLI/MCP/GitHub verde.
+- REV-2..REV-8: máquina conservadora, cleanup pending recuperable, sello/state/capture autenticados, claim/lease CAS, terminales durables, bloqueos cerrados y JSON v3 estricto implementados con pruebas focales.
+- REV-9: añadidas carreras de dos owners sin sleeps, lease handoff, crash post-I/O, fallo de persistencia del report, redelivery y rotación de credenciales en composición real. Pendientes auditoría de canarios/gates/coverage y actualizar informe final.
+- Verificación estable: compile-only global; suites focales `internal/fixture`, `internal/specification/...`, `internal/validationworkflow`; vertical productiva `TestProductFixtureLifecycleParityAcrossAllSurfaces` y rotación productiva.
+
+## 2026-10-22 — fixture-api remediación completada
+
+- REV-1..REV-9 cerradas con composición productiva, máquina durable conservadora, recovery/ownership y matrices T14 verificadas.
+- `go test ./...`, vet, compile-only, focales repetidas, race, coverage >=85 %, cross-build y diff-check pasan; symlink se omite únicamente en Windows sin privilegio del SO.
+- T1–T14 marcadas completas con trazabilidad reproducible en `progress/fixture-api/implementation.md`.
+- Se solicita nueva revisión independiente; no se modificó `feature_list.json` ni se implementó feature 27.
+
+## 2026-10-22 — fixture-api segunda remediación en curso
+
+- Reabiertas T1 y T4–T14 por REV-10..REV-17 y cierres parciales REV-4/5/6/8/9.
+- En curso: token único/lease de cleanup, authority contractual de idempotencia, policy+budget productivos, scope de shutdown, snapshot durable autenticado, captures sensibles, package auditado y json.Number finito.
+- Las tareas permanecerán abiertas hasta que sus pruebas adversarias y gates correspondientes pasen; feature_list.json no se modifica.
+
+## 2026-10-22 — fixture-api segunda remediación completada
+
+- Cerradas REV-10..REV-17 y los cierres parciales REV-4/5/6/8/9: claim por invocación, idempotencia contractual, policy/budget productivos, shutdown scope, snapshot sellado, captures sensibles y audit de fixtures offline-verificable.
+- Matrices focales, suite global, vet, compile-only, race con UCRT64, coverage fixture 85,0 %, validationworkflow 85,4 %, cross-build Linux/Darwin y diff-check correctos.
+- T1 y T4–T14 vuelven a completas con evidencia actualizada; no se modificó feature_list.json.
+
+## 2026-10-22 — fixture-api tercera remediación en curso
+
+- Reabiertas T4–T14 por REV-18..REV-24.
+- En curso: idempotency por operación, request completo antes de policy, budget durable ordinal, lease vigente durante I/O, cadena de estado estricta, package/report auditado y captures enlazadas con journal.
+- Las tareas permanecerán abiertas hasta completar matrices adversarias y gates; feature_list.json no se modifica.
+
+## 2026-10-22 — fixture-api tercera remediación completada
+
+- Cerradas REV-18..REV-24: header ligado a operación exacta, policy sobre request resuelto, budget aislado/durable por run y ordinal, exclusión durante I/O, MAC consumer-owned, máquina/audit cerrados, reports resealados y outbox recuperable de captures/eventos.
+- Matrices nuevas cubren POST con key/DELETE sin key, tres runs, request final, retry budget, same/different owner con expiry activo, snapshot resellado falso, package doblemente resellado, metadata de capture y recovery del journal.
+- Suite global, vet, compile-only, race UCRT64, coverage fixture 85,1 % / validationworkflow 85,4 %, cross-build Linux/Darwin y diff-check pasan; temporales retirados y feature_list.json intacto.
+- T4–T14 vuelven a completas y se solicita nueva revisión independiente.
+
+## 2026-10-22 — fixture-api cuarta remediación en curso
+
+- Reabiertas T9–T14 por REV-25..REV-27.
+- En curso: presupuesto durable exacto por ordinal/restart, invariantes bidireccionales summary/audit/package y límites trusted explícitos fail-closed.
+- feature_list.json permanece intacto.
+
+## 2026-10-22 — fixture-api cuarta remediación completada
+
+- Cerradas REV-25..REV-27: reserva durable exacta dentro de cada intento/retry, reconstrucción de budget tras restart, summary/package bidireccional y límites trusted explícitos fail-closed.
+- Las matrices cubren `MaxCalls=1` con transitorio, restart entre ordinals, ownership concurrente, cinco dimensiones rehasheadas en todas las copias y cada dimensión de configuración productiva.
+- Suite global, vet, compile-only, focales repetidas, race UCRT64, coverage fixture 85,3 % / validationworkflow 85,4 %, cross-build Linux/Darwin y diff-check pasan; no hay temporales y feature_list.json sigue intacto.
+- T9–T14 vuelven a completas y se solicita revisión independiente.
+
+## 2026-10-22 — fixture-api quinta remediación en curso
+
+- Reabiertas T8 y T10–T14 por REV-28..REV-30.
+- En curso: cierre durable de budget pre-I/O, máquina pública completa de create/report Markdown exacto y cobertura statement-weighted reproducible de todo el diff productivo desde `1daa391`.
+- `feature_list.json` permanece intacto.
+
+## 2026-10-22 — fixture-api quinta remediación completada
+
+- Cerradas REV-28..REV-30: cierre durable pre-I/O ante budget, conservación conservadora tras I/O, máquina create/report estricta y cobertura ponderada reproducible del diff.
+- Las matrices adversarias cubren denegación inicial/retry/save, ordinal 99, categoría/evidence canario, re-sell concordante y Markdown duplicado.
+- Vet, compile-only, focales y coverage 1635/1908 (85,7 %) pasan; no hay temporales y `feature_list.json` sigue intacto.
+- T8 y T10–T14 vuelven a completas y se solicita revisión independiente.
+
+## 2026-10-22 — fixture-api sexta remediación completada
+
+- T11/T12/T14 se reabrieron para REV-31/REV-32 y vuelven a completas tras añadir autoridad Ed25519 consumer-owned offline y cobertura multiplataforma fail-closed.
+- Probes SHA-256 válidas de fixture set/evidence/capture/cleanup fallan tras re-sellado; cobertura total del diff 1666/1958 = 85,0868 %.
+- `feature_list.json` permanece intacto.
+
+## 2026-10-22 — fixture-api séptima remediación completada
+
+- T11/T12/T14 se reabrieron para REV-33/34 y vuelven a completas.
+- Writer privado y reader público están separados; firma domain-separated ligada a package/run/binding/audit y matriz de ausencia/sustitución/rotación/sidecar falla cerrado.
+- Coverage simétrica Windows/Unix pasa con 1695/1993 = 85,0477 %; vet, compile-only, race focal y cross-build pasan; feature_list intacto.
+
+## 2026-10-23 — fixture-api octava remediación en curso
+
+- Reabiertas T11, T12 y T14 por REV-35/REV-36.
+- En curso: pin público independiente de la private key, coherencia Ed25519 completa, key ID criptográficamente ligado, persistencia endurecida y separación estricta de capacidades writer/reader.
+- Retirado `scripts/__pycache__/`; los gates Python se ejecutan con `PYTHONDONTWRITEBYTECODE=1`. `feature_list.json` permanece intacto.
+
+## 2026-10-23 — fixture-api octava remediación completada
+
+- REV-35 cerrado con pin público independiente, keypair/key ID coherentes, persistencia endurecida, mensaje firmado ligado al key ID y capacidades writer/reader separadas.
+- REV-36 cerrado: `__pycache__` retirado y gates Python sin bytecode dentro del repositorio.
+- Suite global, vet, compile-only, afectados repetidos, race UCRT64, cross-compile Linux/Darwin, coverage 1769/2080 (85,0481 %) y diff-check pasan; T11/T12/T14 vuelven a completas y `feature_list.json` sigue intacto.
+
+## 2026-10-23 — fixture-api novena remediación en curso
+
+- Reabiertas T11, T12 y T14 por REV-37.
+- En curso: DACL Windows explícita, protegida y validada en cada reload para private key y public pin, con owner/SYSTEM/Administrators como únicos principals autorizados.
+- Se añadirán ataques reales de ACL contra lectura de la key y escritura/control del pin; `feature_list.json` permanece intacto.
+
+## 2026-10-23 — fixture-api novena remediación completada
+
+- REV-37 cerrado con DACL Windows protegida y allowlist exacta owner/LocalSystem/Administrators en private key y public pin, validada de nuevo en cada reload.
+- La matriz real rechaza Everyone/Users/Authenticated Users con lectura, escritura, delete, FullControl o cambio de owner/DACL; reload válido, links y carrera permanecen verdes.
+- Suite global ×2, vet, compile-only, afectados ×3, race UCRT64, cross-compile Linux/Darwin, coverage 1812/2131 (85,0305 %) y diff-check pasan; T11/T12/T14 vuelven a completas y `feature_list.json` sigue intacto.

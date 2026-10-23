@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 )
@@ -140,6 +141,7 @@ type PackageIndex struct {
 	Facts        []PackageFact                 `json:"facts"`
 	Evidence     []PackageEvidence             `json:"evidence"`
 	Reproduction []PackageReproduction         `json:"reproduction"`
+	Fixtures     *fixture.FixtureSummary       `json:"fixtures,omitempty"`
 }
 
 type PackageConstraint struct {

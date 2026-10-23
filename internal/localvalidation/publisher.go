@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/evidence"
+	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
@@ -317,6 +318,7 @@ type reportArtifact struct {
 	PlanBindings []revisionbinding.PlanBinding `json:"plan_bindings,omitempty"`
 	Status       ResultStatus                  `json:"status"`
 	Constraints  []reportConstraint            `json:"constraints"`
+	Fixtures     *fixture.FixtureSummary       `json:"fixtures,omitempty"`
 }
 
 // reportConstraint records one ordered constraint with its complete safe step outcomes.

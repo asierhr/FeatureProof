@@ -1,8 +1,10 @@
 package specification
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"regexp"
 	"strings"
@@ -140,7 +142,7 @@ func Validate(spec Specification) error {
 	if spec.Version == 0 {
 		return validationError(CategoryRequired, "version", nil)
 	}
-	if spec.Version != 1 && spec.Version != 2 {
+	if spec.Version != 1 && spec.Version != 2 && spec.Version != 3 {
 		return validationError(CategoryInvalidValue, "version", nil)
 	}
 	if err := validID(spec.Feature.ID, "feature.id"); err != nil {
@@ -195,12 +197,211 @@ func Validate(spec Specification) error {
 		if len(spec.Identities) != 0 {
 			return validationError(CategoryUnknownField, "identities", nil)
 		}
+		if len(spec.Fixtures) != 0 {
+			return validationError(CategoryUnknownField, "fixtures", nil)
+		}
 		return nil
 	}
 	if err := validateIdentities(spec); err != nil {
 		return err
 	}
+	if spec.Version == 2 && len(spec.Fixtures) != 0 {
+		return validationError(CategoryUnknownField, "fixtures", nil)
+	}
+	if spec.Version == 3 {
+		return validateFixtures(spec)
+	}
 	return nil
+}
+
+// validateFixtures checks v3 local shape while leaving graph closure and contract authority to the fixture package.
+func validateFixtures(spec Specification) error {
+	seen := map[string]bool{}
+	for i, fixture := range spec.Fixtures {
+		prefix := fmt.Sprintf("fixtures[%d]", i)
+		if err := validID(fixture.ID, prefix+".id"); err != nil {
+			return err
+		}
+		if seen[fixture.ID] {
+			return validationError(CategoryDuplicateID, prefix+".id", nil)
+		}
+		seen[fixture.ID] = true
+		deps := map[string]bool{}
+		for j, dependency := range fixture.DependsOn {
+			if !identifierPattern.MatchString(dependency) || dependency == fixture.ID {
+				return validationError(CategoryInvalidValue, fmt.Sprintf("%s.depends_on[%d]", prefix, j), nil)
+			}
+			if deps[dependency] {
+				return validationError(CategoryDuplicateID, fmt.Sprintf("%s.depends_on[%d]", prefix, j), nil)
+			}
+			deps[dependency] = true
+		}
+		if err := validateFixtureOperation(fixture.Create, prefix+".create"); err != nil {
+			return err
+		}
+		if len(fixture.Captures) == 0 {
+			return validationError(CategoryRequired, prefix+".capture", nil)
+		}
+		captureNames := map[string]bool{}
+		for j, capture := range fixture.Captures {
+			field := fmt.Sprintf("%s.capture[%d]", prefix, j)
+			if err := validID(capture.Name, field+".name"); err != nil {
+				return err
+			}
+			if captureNames[capture.Name] {
+				return validationError(CategoryDuplicateID, field+".name", nil)
+			}
+			captureNames[capture.Name] = true
+			if len(capture.Path) == 0 || !validFixtureType(capture.ValueType) || capture.MaxBytes <= 0 {
+				return validationError(CategoryInvalidValue, field, nil)
+			}
+			for k, segment := range capture.Path {
+				if (segment.Field == nil) == (segment.Index == nil) || segment.Field != nil && *segment.Field == "" || segment.Index != nil && *segment.Index < 0 {
+					return validationError(CategoryInvalidValue, fmt.Sprintf("%s.path[%d]", field, k), nil)
+				}
+			}
+		}
+		if err := validateFixtureOperation(fixture.Cleanup, prefix+".cleanup"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateFixtureOperation rejects incomplete, unsafe, or caller-keyed operation declarations before composition.
+func validateFixtureOperation(operation FixtureOperation, field string) error {
+	if !validHTTPMethod(operation.Method) || !validOperationTemplate(operation.Path) {
+		return validationError(CategoryInvalidValue, field+".operation", nil)
+	}
+	if !identifierPattern.MatchString(operation.IdentityID) {
+		return validationError(CategoryRequired, field+".identity_id", nil)
+	}
+	if operation.Idempotency != "contract" {
+		return validationError(CategoryInvalidValue, field+".idempotency", nil)
+	}
+	if len(operation.AcceptedStatuses) == 0 {
+		return validationError(CategoryRequired, field+".accepted_statuses", nil)
+	}
+	seen := map[int]bool{}
+	for i, status := range operation.AcceptedStatuses {
+		if status < 100 || status > 599 || seen[status] {
+			return validationError(CategoryInvalidValue, fmt.Sprintf("%s.accepted_statuses[%d]", field, i), nil)
+		}
+		seen[status] = true
+	}
+	return validateFixtureInput(operation.Input, field+".input")
+}
+
+// validateFixtureInput bounds recursive structured input and proves each node uses exactly one union alternative.
+func validateFixtureInput(input FixtureInput, field string) error {
+	for name, value := range input.PathParameters {
+		if !identifierPattern.MatchString(name) {
+			return validationError(CategoryInvalidValue, field+".path_parameters", nil)
+		}
+		if err := validateFixtureValue(value, field+".path_parameters."+name, 0); err != nil {
+			return err
+		}
+	}
+	for name, value := range input.Query {
+		if !identifierPattern.MatchString(name) {
+			return validationError(CategoryInvalidValue, field+".query", nil)
+		}
+		if err := validateFixtureValue(value, field+".query."+name, 0); err != nil {
+			return err
+		}
+	}
+	if input.Body != nil {
+		return validateFixtureValue(*input.Body, field+".body", 0)
+	}
+	return nil
+}
+
+// validateFixtureValue validates the explicit union discriminator and recursive finite JSON shape.
+func validateFixtureValue(value FixtureValue, field string, depth int) error {
+	if depth > 32 {
+		return validationError(CategoryInvalidValue, field, nil)
+	}
+	switch value.Kind {
+	case "literal":
+		if value.Reference != nil || value.Object != nil || value.Array != nil || !validFixtureJSON(value.Literal, depth) {
+			return validationError(CategoryInvalidValue, field, nil)
+		}
+		return nil
+	case "reference":
+		if value.Reference == nil || value.Literal != nil || value.Object != nil || value.Array != nil || !identifierPattern.MatchString(value.Reference.FixtureID) || !identifierPattern.MatchString(value.Reference.Output) || !validFixtureType(value.Reference.ValueType) {
+			return validationError(CategoryInvalidValue, field+".reference", nil)
+		}
+	case "object":
+		if value.Reference != nil || value.Literal != nil || value.Object == nil || value.Array != nil {
+			return validationError(CategoryInvalidValue, field, nil)
+		}
+		for key, child := range value.Object {
+			if key == "" {
+				return validationError(CategoryInvalidValue, field, nil)
+			}
+			if err := validateFixtureValue(child, field+"."+key, depth+1); err != nil {
+				return err
+			}
+		}
+	case "array":
+		if value.Reference != nil || value.Literal != nil || value.Object != nil || value.Array == nil {
+			return validationError(CategoryInvalidValue, field, nil)
+		}
+		for i, child := range value.Array {
+			if err := validateFixtureValue(child, fmt.Sprintf("%s[%d]", field, i), depth+1); err != nil {
+				return err
+			}
+		}
+	default:
+		return validationError(CategoryInvalidValue, field, nil)
+	}
+	return nil
+}
+
+// validFixtureType limits captures and references to closed JSON-compatible scalar/container types.
+func validFixtureType(value string) bool {
+	switch value {
+	case "string", "number", "boolean", "object", "array":
+		return true
+	}
+	return false
+}
+
+// validFixtureJSON recursively accepts only finite JSON-compatible literal values within the fixture depth bound.
+func validFixtureJSON(value any, depth int) bool {
+	if depth > 32 {
+		return false
+	}
+	switch typed := value.(type) {
+	case nil, string, bool, json.Number:
+		if number, ok := typed.(json.Number); ok {
+			parsed, err := number.Float64()
+			return err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0)
+		}
+		return true
+	case float32:
+		return !math.IsNaN(float64(typed)) && !math.IsInf(float64(typed), 0)
+	case float64:
+		return !math.IsNaN(typed) && !math.IsInf(typed, 0)
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+		return true
+	case map[string]any:
+		for key, child := range typed {
+			if key == "" || !validFixtureJSON(child, depth+1) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		for _, child := range typed {
+			if !validFixtureJSON(child, depth+1) {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 // validateIdentities proves every v2 identity is unique, target-bound, non-secret, and limited to complete operations.

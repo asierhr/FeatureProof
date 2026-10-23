@@ -217,7 +217,7 @@ func Load(ctx context.Context, path string, spec specification.Specification) (M
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return Manifest{}, &Error{Category: "trailing_data", Field: "$", Cause: err}
 	}
-	if doc.Version != 1 && doc.Version != 2 {
+	if doc.Version != 1 && doc.Version != 2 && doc.Version != 3 {
 		return Manifest{}, &Error{Category: "unsupported_version", Field: "version"}
 	}
 	if spec.Version != 0 && doc.Version != spec.Version {
@@ -231,7 +231,7 @@ func Load(ctx context.Context, path string, spec specification.Specification) (M
 	}
 	plans := make([]planning.ValidationPlan, len(doc.Plans))
 	var identities *testidentity.Catalog
-	if doc.Version == 2 {
+	if doc.Version == 2 || doc.Version == 3 {
 		identities, err = testidentity.NewCatalog(spec.Identities)
 		if err != nil {
 			return Manifest{}, &Error{Category: "invalid_relation", Field: "identities", Cause: err}
