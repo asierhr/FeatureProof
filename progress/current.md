@@ -2993,6 +2993,27 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - El smoke final del leader pasa en functionalflow, validationworkflow, fixture y cmd/featureproof.
 - El leader cambia feature 27 de `in_progress` a `done`; feature 28 permanece `pending`.
 
+## 2026-10-23 — Feature 28 `validated-project-memory`, especificación iniciada
+
+- Rama creada: `feature-28-validated-project-memory`, basada en feature 27 completada.
+- Preflight correcto: feature 28 está `pending`, usa SDD, tiene criterios suficientes y no existe otra feature `in_progress` o `spec_ready`.
+- La feature depende de artifacts, evidence, revisions, ownership y packages verificados disponibles hasta feature 27.
+- Se inicia `spec_author`; no se modificará código productivo ni tests antes de aprobación humana explícita.
+
+## 2026-10-23 — Feature 28, spec preparada
+
+- Creados `specs/validated-project-memory/{requirements,design,tasks}.md` sin modificar código productivo ni tests.
+- La spec define R1–R15 y T1–T16: contrato `ProjectMemory/v1`, scopes y estados cerrados, autoridad/provenance/evidence, staleness, secret gate, journal/snapshots/índice verificables, CAS/recovery y confinamiento multiplataforma.
+- No quedan decisiones abiertas; el ensamblado de contexto y ranking semántico de feature 29 quedan explícitamente fuera de alcance.
+- El leader cambia feature 28 de `pending` a `spec_ready`; el workflow queda detenido hasta aprobación humana explícita.
+
+## 2026-10-23 — Feature 28, spec aprobada
+
+- El usuario aprueba explícitamente la spec al solicitar continuar con la implementación.
+- Se registra `approved_by: user` y `approved_at: 2026-10-23T13:23:48+02:00` en requirements.
+- El leader cambia feature 28 de `spec_ready` a `in_progress` y autoriza T1–T16.
+- El cierre seguirá condicionado a trazabilidad R1–R15, gates completos y review independiente.
+
 ## 2026-10-23 — Feature 27 first review remediation
 
 - T1–T16 reopened after reviewer rejection REV-1..REV-10.

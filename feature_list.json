@@ -507,7 +507,7 @@
           "Escrituras concurrentes, retries, cancelación y reinicio preservan idempotencia, CAS, orden de eventos e integridad sin aceptar archivos manipulados, symlinks ni paths fuera del root autorizado",
           "Los tests cubren propuesta, aprobación, invalidación, sustitución, scope, memoria obsoleta, concurrencia, recovery, corrupción, memory poisoning y secretos canario"
         ],
-        "status": "pending"
+        "status": "in_progress"
     },
     {
         "id": 29,
