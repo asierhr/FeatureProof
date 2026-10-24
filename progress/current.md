@@ -3453,6 +3453,25 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
   fresca: `2027/2359 = 85,926240 %`. T16 vuelve a completa; cleanup host/WSL y
   ausencia de cambios en `feature_list.json` confirmados.
 
+## 2026-10-24 — Feature 29, especificación iniciada
+
+- Seleccionada `context-assembly`, primera feature `pending` con SDD y sin otra
+  feature `in_progress`.
+- Rama `feature-29-context-assembly` creada desde la feature 28 completada,
+  porque el ensamblado consume su memoria validada y sus bindings.
+- El spec author redactará requirements, design y tasks. No se tocará código
+  productivo antes de la aprobación humana explícita.
+
+## 2026-10-24 — Feature 29, especificación preparada
+
+- Creados `requirements.md`, `design.md` y `tasks.md` para
+  `context-assembly`; la feature pasa de `pending` a `spec_ready`.
+- La spec define R1–R15 y T1–T16: perfiles por rol, filtros estructurales antes
+  de ranking, secciones de confianza, budgets exactos, snapshots/bindings,
+  revalidación, store, integración vertical y verificación multiplataforma.
+- GitHub PR context, environment providers y configuración de proyecto futura
+  permanecen fuera de alcance. Se espera aprobación humana antes de implementar.
+
 ## 2026-10-23 — Feature 28 cerrada
 
 - Review independiente aprobada en la decimotercera revisión; REV-1–REV-17
