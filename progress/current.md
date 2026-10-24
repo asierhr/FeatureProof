@@ -3472,6 +3472,14 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - GitHub PR context, environment providers y configuración de proyecto futura
   permanecen fuera de alcance. Se espera aprobación humana antes de implementar.
 
+## 2026-10-24 — Feature 29 aprobada e implementación iniciada
+
+- El usuario aprueba explícitamente la spec; `requirements.md` registra
+  `approved_by: user` y `approved_at: 2026-10-24T15:52:24+02:00`.
+- `context-assembly` cambia de `spec_ready` a `in_progress`.
+- El implementer ejecutará T1–T16 en orden, con comentarios de responsabilidad
+  sistémica, trazabilidad R→test y gates multiplataforma antes de review.
+
 ## 2026-10-23 — Feature 28 cerrada
 
 - Review independiente aprobada en la decimotercera revisión; REV-1–REV-17

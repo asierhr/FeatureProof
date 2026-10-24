@@ -526,7 +526,7 @@
           "El journal registra IDs y motivos seguros de inclusión u omisión sin guardar el prompt completo, secretos, chain of thought ni contenido externo innecesario",
           "Los tests cubren selección por rol, presupuesto, orden estable, memoria obsoleta, scopes incompatibles, contradicción, prompt injection, ranking opcional, invalidación y ausencia de secretos"
         ],
-        "status": "spec_ready"
+        "status": "in_progress"
     },
     {
         "id": 30,

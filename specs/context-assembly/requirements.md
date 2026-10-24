@@ -406,9 +406,9 @@ fakes, no cambian elegibilidad y mantienen todos los contratos anteriores.
 ## Aprobación humana
 
 ```yaml
-status: pending
-approved_by:
-approved_at:
+status: approved
+approved_by: user
+approved_at: 2026-10-24T15:52:24+02:00
 ```
 
 La implementación no puede comenzar hasta que una persona apruebe explícitamente
