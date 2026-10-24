@@ -641,6 +641,7 @@ type rejectedFlowHarness struct {
 func newRejectedFlowHarness(t *testing.T) rejectedFlowHarness {
 	t.Helper()
 	service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+	service.config.FinalizeTimeout = 5 * time.Second
 	validated, artifact := workflowFlowFixture(t)
 	artifacts, err := OpenLocalFunctionalFlowArtifactStore(filepath.Join(t.TempDir(), "artifacts"))
 	if err != nil {
@@ -738,7 +739,7 @@ func newCheckpointFlowHarness(t *testing.T, stageCrash, journalCrash string, dro
 		reconciler = &droppingTerminalState{inner: state, drop: true}
 		statePort = reconciler
 	}
-	realExecutor := &functionalflow.Executor{Authority: authority, Clock: clock, Policy: checkpointFlowPolicy{}, Revalidator: checkpointFlowRevalidator{}, Tool: tool, Evidence: evidenceStore, Assertions: checkpointAssertionEvaluator{}, State: statePort, Journal: journal, Keys: functionalFlowKeyFactory{}, Waiter: clock, Config: functionalflow.ExecutionConfig{Owner: "functional-owner", MaxCalls: 2, MaxRetries: 0, MaxWork: 10, StepTimeout: time.Second, RunTimeout: 5 * time.Second, ConfirmationTimeout: time.Second}}
+	realExecutor := &functionalflow.Executor{Authority: authority, Clock: clock, Policy: checkpointFlowPolicy{}, Revalidator: checkpointFlowRevalidator{}, Tool: tool, Evidence: evidenceStore, Assertions: checkpointAssertionEvaluator{}, State: statePort, Journal: journal, Keys: functionalFlowKeyFactory{}, Waiter: clock, Config: functionalflow.ExecutionConfig{Owner: "functional-owner", MaxCalls: 2, MaxRetries: 0, MaxWork: 10, StepTimeout: 5 * time.Second, RunTimeout: 30 * time.Second, ConfirmationTimeout: 5 * time.Second}}
 	executor := &checkpointExecutorProbe{inner: realExecutor}
 	realPublisher, err := OpenLocalFunctionalFlowPublisher(filepath.Join(t.TempDir(), "packages"), artifacts, evidenceStore, journalStore)
 	if err != nil {

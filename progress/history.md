@@ -662,3 +662,14 @@ Bitácora append-only de features completadas.
 - Cobertura statement-weighted multiplataforma del diff productivo:
   2027/2359 statements (85,926240 %), reproducible con
   `python scripts/feature28_coverage.py verify`.
+
+## 2026-10-24 — context-assembly
+
+- Estado final: `done`.
+- Resultado: `ContextAssembler` construye snapshots mínimos y tipados por rol a partir de fuentes autorizadas, con filtros estructurales previos al ranking, separación de instrucciones y datos no confiables, presupuestos exactos y detección de contexto insuficiente.
+- Integridad: snapshots y bindings canónicos quedan ligados a run, revisión, configuración, plan y producers actuales; se revalidan antes de aprobación, ejecución y recovery.
+- Persistencia: staging no direccionable, witness monotónico, journal y receipts autenticados, recuperación ante CAS ambiguo y retención segura de objetos content-addressed bajo concurrencia. CLI, API, MCP y GitHub atraviesan el mismo servicio compartido.
+- Spec aprobada por el usuario el `2026-10-24T15:52:24+02:00`.
+- Tasks T1–T16 completas; R1–R15 y REV-1–REV-29 trazados en `progress/context-assembly/{implementation,review}.md`.
+- Review independiente aprobada en la octava revisión. Pasan smoke del leader, vet, compile-only, suites focal/global normal y race, cinco runtimes Linux y cross-builds Windows/Linux/Darwin 15/15.
+- Cobertura statement-weighted multiplataforma del diff productivo: `1881/2187 = 86,008230 %`, incluyendo `publish_unix_other.go` conservadoramente como 0/1.

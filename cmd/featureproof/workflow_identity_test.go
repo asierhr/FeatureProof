@@ -276,9 +276,9 @@ func (t *workflowProductModelTransport) RoundTrip(request *http.Request) (*http.
 
 // workflowProductSurfaceResult captures the public values and effect counters compared across workflow adapters.
 type workflowProductSurfaceResult struct {
-	identityID, bindingDigest, outcome     string
-	code                                   int
-	modelCalls, resolverCalls, targetCalls int32
+	identityID, bindingDigest, outcome, contextDigest, contextBinding string
+	code                                                              int
+	modelCalls, resolverCalls, targetCalls                            int32
 }
 
 // workflowFixtureContractFixture extends the productive OpenAPI authority with exact create and cleanup operations.
@@ -337,6 +337,9 @@ func composeProductFixtureWorkflowWithOptions(t *testing.T, root string, targetU
 
 // composeProductWorkflowWithOptions creates controlled real composition with optional fixture lifecycle declarations.
 func composeProductWorkflowWithOptions(t *testing.T, root string, targetURL string, modelTransport *workflowProductModelTransport, spy *workflowProductResolverSpy, recoverPending, withFixtures bool) (*validationworkflow.CLI, string, string) {
+	if os.Getenv("FEATUREPROOF_MEMORY_WITNESS_URL") == "" {
+		installProjectMemoryWitness(t)
+	}
 	t.Helper()
 	document := workflowContractFixture()
 	if withFixtures {
@@ -547,25 +550,26 @@ func assertProductDurableFilesExclude(t *testing.T, root string, forbidden ...st
 // TestProductIdentityWorkflowParityReachesTerminalAcrossAllSurfaces executes one authenticated semantic snapshot through real composition for every adapter.
 func TestProductIdentityWorkflowParityReachesTerminalAcrossAllSurfaces(t *testing.T) {
 	results := map[string]workflowProductSurfaceResult{}
+	root := t.TempDir()
+	t.Chdir(root)
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		targetCalls.Add(1)
+		if request.URL.Path != "/pets" || request.Header.Get("Authorization") != "Bearer PRODUCT-IDENTITY-CANARY" {
+			t.Fatalf("authenticated target request path=%q auth=%q", request.URL.Path, request.Header.Get("Authorization"))
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`{"ok":true}`))
+	}))
+	defer target.Close()
+	modelTransport := &workflowProductModelTransport{}
+	resolverSpy := &workflowProductResolverSpy{}
+	cli, specPath, contractPath := composeProductIdentityWorkflowWithOptions(t, root, target.URL, modelTransport, resolverSpy, true)
+	command := productIdentityStartCommand(cli, specPath, contractPath, "product-parity", validationworkflow.ApprovalRequired)
+	canonicalHandle := ""
 	for _, surface := range []string{"api", "cli", "mcp", "github"} {
 		t.Run(surface, func(t *testing.T) {
-			root := t.TempDir()
-			t.Chdir(root)
-			var targetCalls atomic.Int32
-			target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				targetCalls.Add(1)
-				if request.URL.Path != "/pets" || request.Header.Get("Authorization") != "Bearer PRODUCT-IDENTITY-CANARY" {
-					t.Fatalf("authenticated target request path=%q auth=%q", request.URL.Path, request.Header.Get("Authorization"))
-				}
-				writer.Header().Set("Content-Type", "application/json")
-				writer.WriteHeader(http.StatusOK)
-				_, _ = writer.Write([]byte(`{"ok":true}`))
-			}))
-			defer target.Close()
-			modelTransport := &workflowProductModelTransport{}
-			resolverSpy := &workflowProductResolverSpy{}
-			cli, specPath, contractPath := composeProductIdentityWorkflowWithOptions(t, root, target.URL, modelTransport, resolverSpy, true)
-			command := productIdentityStartCommand(cli, specPath, contractPath, "product-"+surface, validationworkflow.ApprovalDisabled)
 			handle, code := "", 0
 			switch surface {
 			case "api":
@@ -576,7 +580,7 @@ func TestProductIdentityWorkflowParityReachesTerminalAcrossAllSurfaces(t *testin
 				handle = view.Handle
 			case "cli":
 				var output bytes.Buffer
-				args := []string{"start", "--spec", specPath, "--contract", contractPath, "--provider", "openai", "--model", "selected-model", "--profile", "profile", "--runtime-profile", "runtime", "--repository", "7", "--revision", strings.Repeat("a", 40), "--approval", "disabled", "--idempotency-key", command.IdempotencyKey, "--target", "target"}
+				args := []string{"start", "--spec", specPath, "--contract", contractPath, "--provider", "openai", "--model", "selected-model", "--profile", "profile", "--runtime-profile", "runtime", "--repository", "7", "--revision", strings.Repeat("a", 40), "--approval", "required", "--idempotency-key", command.IdempotencyKey, "--target", "target"}
 				code = cli.Run(context.Background(), args, &output)
 				var view validationworkflow.WorkflowView
 				if code != 0 || json.Unmarshal(output.Bytes(), &view) != nil {
@@ -585,7 +589,7 @@ func TestProductIdentityWorkflowParityReachesTerminalAcrossAllSurfaces(t *testin
 				handle = view.Handle
 			case "mcp":
 				server := validationworkflow.MCPServer{Service: cli.Service, Principal: cli.Principal, AuthProfiles: cli.AuthProfiles, DirectTargets: cli.DirectTargets}
-				arguments, _ := json.Marshal(map[string]any{"idempotency_key": command.IdempotencyKey, "specification_ref": specPath, "contract_ref": contractPath, "provider": "openai", "model": "selected-model", "auth_profile": "profile", "runtime_profile": "runtime", "repository_id": "7", "revision": strings.Repeat("a", 40), "approval": "disabled", "target_alias": "target"})
+				arguments, _ := json.Marshal(map[string]any{"idempotency_key": command.IdempotencyKey, "specification_ref": specPath, "contract_ref": contractPath, "provider": "openai", "model": "selected-model", "auth_profile": "profile", "runtime_profile": "runtime", "repository_id": "7", "revision": strings.Repeat("a", 40), "approval": "required", "target_alias": "target"})
 				response := server.Handle(context.Background(), validationworkflow.MCPRequest{Version: validationworkflow.ContractVersion, Operation: "workflow.start", Arguments: arguments})
 				view, ok := response.Value.(validationworkflow.WorkflowView)
 				if response.Error != "" || !ok {
@@ -593,21 +597,24 @@ func TestProductIdentityWorkflowParityReachesTerminalAcrossAllSurfaces(t *testin
 				}
 				handle = view.Handle
 			case "github":
-				command.Approval = validationworkflow.ApprovalRequired
-				snapshot, err := githubpr.SealSnapshot(githubpr.PullRequestSnapshot{Version: 1, InstallationID: 1, RepositoryID: 7, Number: 2, AuthorID: 9, State: "open", HeadOID: strings.Repeat("a", 40), HeadRepositoryID: 7})
-				if err != nil {
-					t.Fatal(err)
-				}
 				gateway := validationworkflow.GitHubGateway{Service: cli.Service, Principal: cli.Principal, Commands: map[string]validationworkflow.StartCommand{"default": command}}
-				state, err := gateway.Submit(context.Background(), githubpr.Selection{Alias: "default"}, snapshot, command.IdempotencyKey)
+				state, err := gateway.ResolveExisting(context.Background(), githubpr.ExistingRunLookup{RunHandle: canonicalHandle, RepositoryID: 7, HeadOID: strings.Repeat("a", 40)})
 				if err != nil {
 					t.Fatal(err)
 				}
 				handle = state.RunHandle
-				approval, _ := cli.Service.ApprovalView(context.Background(), handle)
-				if _, err = cli.Service.Decide(context.Background(), validationworkflow.DecisionCommand{Principal: cli.Principal, Handle: handle, DecisionID: "approve-github", Revision: approval.Revision, Action: validationworkflow.DecisionApprove}); err != nil {
-					t.Fatal(err)
+			}
+			if canonicalHandle == "" {
+				canonicalHandle = handle
+				approval, approvalErr := cli.Service.ApprovalView(context.Background(), handle)
+				if approvalErr != nil {
+					t.Fatal(approvalErr)
 				}
+				if _, decisionErr := cli.Service.Decide(context.Background(), validationworkflow.DecisionCommand{Principal: cli.Principal, Handle: handle, DecisionID: "approve-parity", Revision: approval.Revision, Action: validationworkflow.DecisionApprove}); decisionErr != nil {
+					t.Fatal(decisionErr)
+				}
+			} else if handle != canonicalHandle {
+				t.Fatalf("surface created divergent run: %s != %s", handle, canonicalHandle)
 			}
 			result, err := cli.Service.Result(context.Background(), handle)
 			if err != nil || result.View.Outcome == nil || result.Package == nil {
@@ -618,18 +625,23 @@ func TestProductIdentityWorkflowParityReachesTerminalAcrossAllSurfaces(t *testin
 				t.Fatalf("terminal outcome=%s result=%#v err=%v model=%d target=%d plan=%s fault=%s", outcome, result, err, modelTransport.calls.Load(), targetCalls.Load(), modelTransport.plan, modelTransport.fault)
 			}
 			identityID, bindingDigest := readProductIdentityBinding(t, root, handle)
-			results[surface] = workflowProductSurfaceResult{identityID: identityID, bindingDigest: bindingDigest, outcome: string(*result.View.Outcome), code: code, modelCalls: modelTransport.calls.Load(), resolverCalls: resolverSpy.calls.Load(), targetCalls: targetCalls.Load()}
+			artifactRaw, artifactErr := os.ReadFile(filepath.Join(root, ".featureproof", "workflows", "plans", handle+".plan.json"))
+			var artifact validationworkflow.PlanArtifact
+			if artifactErr != nil || json.Unmarshal(artifactRaw, &artifact) != nil {
+				t.Fatalf("context artifact unavailable: %v", artifactErr)
+			}
+			results[surface] = workflowProductSurfaceResult{identityID: identityID, bindingDigest: bindingDigest, outcome: string(*result.View.Outcome), contextDigest: artifact.ContextSnapshotDigest, contextBinding: artifact.ContextBindingDigest, code: code, modelCalls: modelTransport.calls.Load(), resolverCalls: resolverSpy.calls.Load(), targetCalls: targetCalls.Load()}
 		})
 	}
 	var expected workflowProductSurfaceResult
 	for _, surface := range []string{"api", "cli", "mcp", "github"} {
 		result := results[surface]
-		if result.identityID != "customer" || len(result.bindingDigest) != 64 || result.outcome != string(validationworkflow.OutcomePassed) || result.code != 0 || result.modelCalls != 1 || result.resolverCalls != 1 || result.targetCalls != 1 {
+		if result.identityID != "customer" || len(result.bindingDigest) != 64 || result.outcome != string(validationworkflow.OutcomePassed) || len(result.contextDigest) != 64 || len(result.contextBinding) != 64 || result.code != 0 || result.modelCalls != 1 || result.resolverCalls != 1 || result.targetCalls != 1 {
 			t.Fatalf("%s parity result=%#v", surface, result)
 		}
 		if expected.identityID == "" {
 			expected = result
-		} else if result.identityID != expected.identityID || result.bindingDigest != expected.bindingDigest || result.outcome != expected.outcome || result.code != expected.code || result.modelCalls != expected.modelCalls || result.resolverCalls != expected.resolverCalls || result.targetCalls != expected.targetCalls {
+		} else if result.identityID != expected.identityID || result.bindingDigest != expected.bindingDigest || result.outcome != expected.outcome || result.contextDigest != expected.contextDigest || result.contextBinding != expected.contextBinding || result.code != expected.code || result.modelCalls != expected.modelCalls || result.resolverCalls != expected.resolverCalls || result.targetCalls != expected.targetCalls {
 			t.Fatalf("surface mismatch %s=%#v expected=%#v", surface, result, expected)
 		}
 	}

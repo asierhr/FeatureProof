@@ -2,6 +2,8 @@ package agentplanning
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -65,7 +67,11 @@ func (g *Generator) Generate(ctx context.Context, request GenerationRequest) (re
 		record.Category = categoryOf(marshalErr)
 		return Result{}, marshalErr
 	}
-	modelResponse, modelErr := g.model.Generate(ctx, StructuredRequest{RunID: snapshot.RunID, Instructions: planningInstructions, Untrusted: payload, MaxOutputBytes: snapshot.Limits.MaxOutputBytes})
+	instructions := planningInstructions
+	if len(snapshot.ContextEnvelope) > 0 {
+		instructions = snapshot.ContextInstructions
+	}
+	modelResponse, modelErr := g.model.Generate(ctx, StructuredRequest{RunID: snapshot.RunID, Instructions: instructions, Untrusted: payload, MaxOutputBytes: snapshot.Limits.MaxOutputBytes})
 	if modelErr != nil {
 		mapped := mapModelError(ctx, modelErr)
 		record.Category = categoryOf(mapped)
@@ -168,12 +174,14 @@ func (g *Generator) Generate(ctx context.Context, request GenerationRequest) (re
 		record.Category = CategoryPolicyDenial
 		return Result{}, typedError(CategoryPolicyDenial, "policy", field("checks", denied), nil)
 	}
-	provenance, provenanceErr := generationProvenance(snapshot.Constraints, snapshot.Contract, snapshot.Capabilities, snapshot.Identities)
+	provenance, provenanceErr := generationProvenance(snapshot.Constraints, snapshot.Contract, snapshot.Capabilities, snapshot.Identities, snapshot.ContextDigest, snapshot.ContextEnvelope, snapshot.ContextInstructions, snapshot.ContextSeal)
 	if provenanceErr != nil {
 		record.Category = CategoryInternal
 		return Result{}, typedError(CategoryInternal, "provenance", "generation_context", nil)
 	}
-	value := PreparedPlan{id: snapshot.PlanID, checks: prepared, provenance: provenance}
+	contextSum := sha256.Sum256(snapshot.ContextEnvelope)
+	instructionsSum := sha256.Sum256([]byte(snapshot.ContextInstructions))
+	value := PreparedPlan{id: snapshot.PlanID, checks: prepared, provenance: provenance, contextDigest: snapshot.ContextDigest, contextEnvelopeHash: hex.EncodeToString(contextSum[:]), contextInstructionsHash: hex.EncodeToString(instructionsSum[:]), contextSeal: snapshot.ContextSeal}
 	record.Outcome, record.Category = OutcomePrepared, ""
 	return Result{Prepared: &value}, nil
 }
@@ -226,7 +234,15 @@ func snapshotRequest(ctx context.Context, request GenerationRequest) (requestSna
 		return requestSnapshot{}, nil, err
 	}
 	identities := cloneIdentityDescriptors(request.Identities)
-	return requestSnapshot{GenerationRequest: GenerationRequest{RunID: request.RunID, PlanID: request.PlanID, Constraints: constraints, Contract: request.Contract, Capabilities: append([]CapabilityDescriptor(nil), request.Capabilities...), Identities: identities, Limits: limits}}, catalog, nil
+	contextEnvelope := append(json.RawMessage(nil), request.ContextEnvelope...)
+	if len(contextEnvelope) > 0 {
+		envelope, decodeErr := decodeAssembledContext(contextEnvelope)
+		seal, sealErr := assembledContextSeal(envelope, request.ContextInstructions)
+		if decodeErr != nil || sealErr != nil || request.ContextDigest == "" || request.ContextInstructions == "" || request.ContextSeal == "" || envelope.ContextDigest != request.ContextDigest || envelope.ContextSeal != request.ContextSeal || seal != request.ContextSeal || envelope.PlanID != request.PlanID || envelope.Version != assembledContextVersion || envelope.Role != "planner" || len(envelope.Configuration) == 0 || len(envelope.Untrusted) == 0 {
+			return requestSnapshot{}, nil, typedError(CategoryInvalidInput, "preflight", "context_envelope", nil)
+		}
+	}
+	return requestSnapshot{GenerationRequest: GenerationRequest{RunID: request.RunID, PlanID: request.PlanID, Constraints: constraints, Contract: request.Contract, Capabilities: append([]CapabilityDescriptor(nil), request.Capabilities...), Identities: identities, Limits: limits, ContextEnvelope: contextEnvelope, ContextInstructions: request.ContextInstructions, ContextDigest: request.ContextDigest, ContextSeal: request.ContextSeal}}, catalog, nil
 }
 
 // modelInput is the only untrusted data envelope sent to the planning model.
@@ -241,6 +257,12 @@ type modelInput struct {
 
 // marshalModelInput serializes bounded untrusted data without privileged instructions or handles.
 func marshalModelInput(request requestSnapshot, catalog *CapabilityCatalog) ([]byte, error) {
+	if len(request.ContextEnvelope) > 0 {
+		if int64(len(request.ContextEnvelope)) > request.Limits.MaxInputBytes {
+			return nil, typedError(CategoryLimitExceeded, "preflight", "input_bytes", nil)
+		}
+		return append([]byte(nil), request.ContextEnvelope...), nil
+	}
 	payload, err := json.Marshal(modelInput{Label: "untrusted_data", PlanID: request.PlanID, Constraints: request.Constraints, Contract: json.RawMessage(request.Contract.Bytes()), Capabilities: catalog.projections(), Identities: cloneIdentityDescriptors(request.Identities)})
 	if err != nil || int64(len(payload)) > request.Limits.MaxInputBytes {
 		return nil, typedError(CategoryLimitExceeded, "preflight", "input_bytes", nil)

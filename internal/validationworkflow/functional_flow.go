@@ -231,6 +231,17 @@ func (a FunctionalFlowExecutionAdapter) Execute(ctx context.Context, request Exe
 			return "", &RecoverableFunctionalFlowError{cause: err}
 		}
 	}
+	if !complete && a.Journal != nil {
+		events, journalErr := a.Journal.Events(durableCtx, request.Handle)
+		if journalErr != nil {
+			return "", &RecoverableFunctionalFlowError{cause: journalErr}
+		}
+		for _, event := range events {
+			if event.Type == "primary_terminal" {
+				return "", &RecoverableFunctionalFlowError{cause: functionalflowIntegrityError("completed_primary")}
+			}
+		}
+	}
 	if !complete {
 		primary, err = a.Executor.Execute(ctx, request.Handle, validated, artifact)
 	}
@@ -250,6 +261,11 @@ func (a FunctionalFlowExecutionAdapter) Execute(ctx context.Context, request Exe
 		return "", &Error{Code: CodeUnavailable, Operation: "functional_flow_publish"}
 	}
 	return workflowOutcome(primary.Outcome), nil
+}
+
+// functionalflowIntegrityError creates a payload-free integrity category for an inconsistent recovery checkpoint.
+func functionalflowIntegrityError(path string) error {
+	return &functionalflow.Error{Category: functionalflow.CategoryIntegrity, Path: path}
 }
 
 // recoverableFunctionalRuntimeError keeps durable post-tool checkpoints resumable while rejecting contract corruption.

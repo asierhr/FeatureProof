@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/functionalflow"
@@ -194,6 +195,9 @@ func (s AdmissionSnapshot) Clone() AdmissionSnapshot {
 	out.Generation.Constraints = append([]agentplanning.Constraint(nil), s.Generation.Constraints...)
 	out.Generation.Capabilities = append([]agentplanning.CapabilityDescriptor(nil), s.Generation.Capabilities...)
 	out.Generation.Identities = testidentity.CloneDescriptors(s.Generation.Identities)
+	out.Generation.ContextEnvelope = append([]byte(nil), s.Generation.ContextEnvelope...)
+	out.Generation.ContextInstructions = s.Generation.ContextInstructions
+	out.Generation.ContextSeal = s.Generation.ContextSeal
 	out.Binding = canonicalBindingContext(s.Binding)
 	out.Runtime = canonicalRuntimeContext(s.Runtime)
 	return out
@@ -201,21 +205,25 @@ func (s AdmissionSnapshot) Clone() AdmissionSnapshot {
 
 // PlanArtifact is the canonical, secret-free generated plan persisted before approval.
 type PlanArtifact struct {
-	Version             string                           `json:"version"`
-	WorkflowID          string                           `json:"workflow_id"`
-	PlanID              string                           `json:"plan_id"`
-	Provider            string                           `json:"provider"`
-	Model               string                           `json:"model"`
-	PromptVersion       string                           `json:"prompt_version"`
-	ProtocolVersion     string                           `json:"protocol_version"`
-	Plans               []localvalidation.PlanProjection `json:"plans"`
-	ContextDigest       string                           `json:"context_digest"`
-	RevisionDigest      string                           `json:"revision_digest"`
-	TargetDigest        string                           `json:"target_digest"`
-	RuntimeDigest       string                           `json:"runtime_digest"`
-	ArtifactSHA256      string                           `json:"artifact_sha256"`
-	Usage               ModelUsage                       `json:"usage"`
-	MemoryBindingDigest string                           `json:"memory_binding_digest,omitempty"`
+	Version                 string                           `json:"version"`
+	WorkflowID              string                           `json:"workflow_id"`
+	PlanID                  string                           `json:"plan_id"`
+	Provider                string                           `json:"provider"`
+	Model                   string                           `json:"model"`
+	PromptVersion           string                           `json:"prompt_version"`
+	ProtocolVersion         string                           `json:"protocol_version"`
+	Plans                   []localvalidation.PlanProjection `json:"plans"`
+	ContextDigest           string                           `json:"context_digest"`
+	RevisionDigest          string                           `json:"revision_digest"`
+	TargetDigest            string                           `json:"target_digest"`
+	RuntimeDigest           string                           `json:"runtime_digest"`
+	ArtifactSHA256          string                           `json:"artifact_sha256"`
+	Usage                   ModelUsage                       `json:"usage"`
+	MemoryBindingDigest     string                           `json:"memory_binding_digest,omitempty"`
+	ContextSnapshotDigest   string                           `json:"context_snapshot_digest,omitempty"`
+	ContextBindingDigest    string                           `json:"context_binding_digest,omitempty"`
+	ContextSeal             string                           `json:"context_seal,omitempty"`
+	ContextInstructionsHash string                           `json:"context_instructions_hash,omitempty"`
 }
 
 // ModelUsage records allowlisted confirmed generation accounting.
@@ -326,6 +334,22 @@ type Record struct {
 	PreviewDigest                                    string
 	ApprovalDeadline                                 time.Time
 	FixtureSummary                                   *fixture.FixtureSummary
+	ContextBindingDigest                             string
+}
+
+// ContextAssemblySelection is the detached planner envelope and immutable snapshot identity owned by composition.
+type ContextAssemblySelection struct {
+	Instructions string
+	Envelope     []byte
+	Digest       string
+	Seal         string
+}
+
+// ContextAssemblyPort assembles, binds and revalidates context without exposing its store or producers to workflow callers.
+type ContextAssemblyPort interface {
+	Prepare(context.Context, string, AdmissionSnapshot, StartCommand) (ContextAssemblySelection, error)
+	Bind(context.Context, string, string, agentplanning.PreparedSnapshot, string) (string, error)
+	Revalidate(context.Context, string) (contextassembly.RevalidationResult, error)
 }
 
 // FixtureLifecyclePort prepares bound fixtures before functional execution and converges cleanup from durable state.

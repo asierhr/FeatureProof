@@ -9,7 +9,7 @@ No se obtiene contexto desde GitHub, no se adquieren entornos y no se añade
 ninguna capability ejecutable. Las features 30 y 31 conectarán esas fronteras
 mediante los contratos neutrales definidos aquí.
 
-- [ ] T1. Definir el modelo canónico `ContextSnapshot/v1`. [R1, R4, R5, R9, R15]
+- [x] T1. Definir el modelo canónico `ContextSnapshot/v1`. [R1, R4, R5, R9, R15]
   - Crear enums cerrados para role, source kind, trust class, authority,
     completeness, omission/conflict reason y outcome.
   - Modelar request, authority, source/item projection, secciones, manifests,
@@ -18,7 +18,7 @@ mediante los contratos neutrales definidos aquí.
   - Probar unknown/null/duplicate fields, uniones ambiguas, límites, mutación
     posterior, orden de maps y equivalencia canónica.
 
-- [ ] T2. Implementar catálogos sellados de perfiles e instrucciones. [R2, R4, R6, R12]
+- [x] T2. Implementar catálogos sellados de perfiles e instrucciones. [R2, R4, R6, R12]
   - Definir perfiles versionados para planner, analyzer y diagnostic con fuentes,
     campos, sensibilidad, completitud, budgets e instruction/protocol versions.
   - Permitir que request limits estrechen autoridad y rechazar role/source/field/
@@ -26,7 +26,7 @@ mediante los contratos neutrales definidos aquí.
   - Probar matriz completa de diferencias entre roles e instrucciones imposibles
     de aportar o reemplazar desde una fuente/caller.
 
-- [ ] T3. Implementar registry y contrato de producers. [R1, R3, R5, R13]
+- [x] T3. Implementar registry y contrato de producers. [R1, R3, R5, R13]
   - Definir puertos mínimos en `contextassembly` para source projection y
     revalidación de bindings; registrar producers exclusivamente en composición.
   - Validar project/repository/revision, producer/version, source digest,
@@ -34,7 +34,7 @@ mediante los contratos neutrales definidos aquí.
   - Probar producer missing/duplicado, binding inválido, cross-project/cross-repo,
     corrupción, mutación posterior, cancelación y orden estable de lectura.
 
-- [ ] T4. Añadir secret gate y fronteras de trust class. [R4, R5, R14]
+- [x] T4. Añadir secret gate y fronteras de trust class. [R4, R5, R14]
   - Escanear metadata y payload canónico antes de ranking, tokenización, store o
     model; aceptar únicamente proyecciones redactadas con estado conocido.
   - Construir secciones tipadas sin interpolar contenido y forzar que memoria,
@@ -42,7 +42,7 @@ mediante los contratos neutrales definidos aquí.
   - Probar canarios anidados, credentials/bodies/prompt/chain-of-thought, detector
     cancelado/fallido e intentos de reclasificación mediante prompt injection.
 
-- [ ] T5. Implementar elegibilidad estructural y deduplicación. [R2, R3, R5]
+- [x] T5. Implementar elegibilidad estructural y deduplicación. [R2, R3, R5]
   - Cruzar request, role profile, source authority y item metadata en el orden
     project/repository/scope/revision/state/authority/validity/sensitivity/kind.
   - Generar omissions cerradas y deduplicar por identidad/digest sin usar texto,
@@ -50,7 +50,7 @@ mediante los contratos neutrales definidos aquí.
   - Usar spies que prueben que memoria/source inelegible nunca llega al ranker,
     tokenizer ni snapshot; cubrir todos los scopes y bordes temporales.
 
-- [ ] T6. Implementar conflictos, parcialidad e insufficient context. [R5, R8]
+- [x] T6. Implementar conflictos, parcialidad e insufficient context. [R5, R8]
   - Fusionar conflictos declarados por producers con contradicciones por
     logical key, manteniendo todos los IDs y orden canónico.
   - Aplicar política sellada para fuentes/items obligatorios y opcionales sin
@@ -58,7 +58,7 @@ mediante los contratos neutrales definidos aquí.
   - Probar conflict requerido/opcional, fuente missing/stale/partial/truncated,
     manifests capados y resultado insufficient sin model call.
 
-- [ ] T7. Implementar ranking opcional y derivado. [R3, R7, R13]
+- [x] T7. Implementar ranking opcional y derivado. [R3, R7, R13]
   - Definir `SemanticRanker` sobre IDs/metadatos elegibles y work budget;
     validar cardinalidad, IDs, duplicados y scores finitos.
   - Añadir orden estructural estable, desempate normativo y fallback solo cuando
@@ -66,7 +66,7 @@ mediante los contratos neutrales definidos aquí.
   - Probar ranker ausente, ties, índice missing/stale/corrupt, output adversario,
     budget/cancelación y contenido filtrado nunca observado por el fake.
 
-- [ ] T8. Implementar packing exacto de items, bytes y tokens. [R5, R6, R8]
+- [x] T8. Implementar packing exacto de items, bytes y tokens. [R5, R6, R8]
   - Definir `TokenCounter` resuelto para provider/model y contar el envelope
     canónico final, incluida metadata obligatoria.
   - Reservar guardias/configuración primero y añadir items completos siguiendo
@@ -75,7 +75,7 @@ mediante los contratos neutrales definidos aquí.
     instrucciones obligatorias que no caben, counter incompatible/fallido/
     cancelado y determinismo repetido.
 
-- [ ] T9. Implementar snapshot binding y revalidación de drift. [R9, R10]
+- [x] T9. Implementar snapshot binding y revalidación de drift. [R9, R10]
   - Sellar snapshot con run/role/project/repository/revision/config/profile/
     instructions/provider/model/source bindings y `plan_id`.
   - Añadir `ContextBinding/v1` content-free con prepared plan digest y adapter de
@@ -84,7 +84,7 @@ mediante los contratos neutrales definidos aquí.
     configuración, perfil, instrucciones, memoria, evidencia y otras fuentes;
     confirmar que cambios del índice derivado no invalidan autoridad.
 
-- [ ] T10. Implementar `ContextStore` local y journal seguro. [R9, R11, R13, R14]
+- [x] T10. Implementar `ContextStore` local y journal seguro. [R9, R11, R13, R14]
   - Persistir snapshot/binding direccionados por digest y receipts de
     idempotencia; journal solo con IDs, digests, counts, reasons y outcome.
   - Publicar con temporales exclusivos, sync, atomic replace y parent sync;
@@ -94,7 +94,7 @@ mediante los contratos neutrales definidos aquí.
   - Cubrir traversal, absolute/device names, permissions, symlink/junction/
     reparse/hardlink, root swap y no-follow en Windows/Unix.
 
-- [ ] T11. Adaptar las fuentes de dominio existentes. [R1, R2, R3, R5, R8, R14]
+- [x] T11. Adaptar las fuentes de dominio existentes. [R1, R2, R3, R5, R8, R14]
   - Implementar producers para restricciones, contrato reducido, configuración
     aprobada, memoria validada, historial, plan, diagnostic y evidencia/package
     verificado mediante puertos estrechos.
@@ -105,7 +105,7 @@ mediante los contratos neutrales definidos aquí.
   - Probar adapters con snapshots reales/fakes, conflicts de memoria, fuentes
     parciales, cross-scope y ausencia de secrets/capability handles.
 
-- [ ] T12. Integrar el snapshot planner con `agentplanning`. [R4, R6, R9, R12, R14]
+- [x] T12. Integrar el snapshot planner con `agentplanning`. [R4, R6, R9, R12, R14]
   - Incorporar el snapshot inmutable a generation sin exponer store/producers y
     mantener catálogos privados solo para validación determinista.
   - Cambiar la serialización model-facing para usar exclusivamente instrucciones
@@ -115,7 +115,7 @@ mediante los contratos neutrales definidos aquí.
   - Probar separación `Instructions`/`Untrusted`, equivalencia canónica,
     descriptors declarativos sin closures y rechazo de plan/context cruzados.
 
-- [ ] T13. Integrar ensamblado y revalidación en `validationworkflow`. [R9, R10, R11, R12, R13]
+- [x] T13. Integrar ensamblado y revalidación en `validationworkflow`. [R9, R10, R11, R12, R13]
   - Componer un único assembler/store/authority con admission y memoria; rechazar
     claims de snapshot/binding procedentes de CLI/API/MCP/GitHub.
   - Persistir context digest/binding en artifact/checkpoint y revalidar antes de
@@ -125,7 +125,7 @@ mediante los contratos neutrales definidos aquí.
   - Probar vertical completa, restart y cada clase de drift con cero model/tool
     calls después de detectar staleness.
 
-- [ ] T14. Integrar proyecciones por rol y superficies reales. [R2, R4, R11, R12]
+- [x] T14. Integrar proyecciones por rol y superficies reales. [R2, R4, R11, R12]
   - Añadir consumers controlados de analyzer/diagnostic sobre el mismo assembler
     sin introducir nuevos verdicts, remediation loops o capacidades.
   - Verificar que las cuatro superficies reales atraviesan el service compartido
@@ -133,7 +133,7 @@ mediante los contratos neutrales definidos aquí.
   - Probar que planner/analyzer/diagnostic no reciben la proyección de otro rol,
     toda la memoria, evidence bodies, credentials, stores o tool handles.
 
-- [ ] T15. Cerrar observabilidad, cancelación, concurrencia e idempotencia. [R11, R13, R14]
+- [x] T15. Cerrar observabilidad, cancelación, concurrencia e idempotencia. [R11, R13, R14]
   - Emitir un terminal record exactamente una vez por assembly/binding/
     revalidation con metadata allowlisted y observer timeout acotado.
   - Propagar cancelación por producers, filters, ranker, tokenizer, store y
@@ -142,7 +142,7 @@ mediante los contratos neutrales definidos aquí.
     `-race`, zero goroutine/temp leaks y escaneo byte-for-byte de canarios en
     errors/events/metrics/journal/model request.
 
-- [ ] T16. Ejecutar verificación y completar trazabilidad. [R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15]
+- [x] T16. Ejecutar verificación y completar trazabilidad. [R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15]
   - Registrar en `progress/context-assembly/implementation.md` el mapa exacto
     R1–R15 → tests y resultados, incluidas matrices adversarias y de superficies.
   - Ejecutar `gofmt`, `go vet ./...`, compile global, suite focal repetida,

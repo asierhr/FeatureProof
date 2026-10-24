@@ -3480,6 +3480,53 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - El implementer ejecutará T1–T16 en orden, con comentarios de responsabilidad
   sistémica, trazabilidad R→test y gates multiplataforma antes de review.
 
+## 2026-10-24 — Feature 29, núcleo e integración implementados
+
+- Añadido `internal/contextassembly` con contratos `ContextSnapshot/v1` y
+  `ContextBinding/v1`, perfiles sellados por rol, producers neutrales, secret
+  gate, filtros estructurales, ranking derivado, packing exacto, bindings,
+  revalidación y stores inmutable en memoria y filesystem.
+- Integrado el envelope estructurado como único input de `agentplanning` y el
+  lifecycle prepare/bind/revalidate en `validationworkflow`, incluida la
+  composición compartida por CLI, API, MCP y GitHub sin obtener contexto de
+  GitHub ni implementar environments.
+- Añadidas matrices adversarias para schemas, secretos, autoridad, conflicts,
+  budgets, drift, tampering, root replacement, concurrencia, observabilidad y
+  consumidores planner/analyzer/diagnostic.
+
+## 2026-10-24 — Feature 29, verificación en curso
+
+- Coverage fresco combinado en Windows y runtime Linux, calculado contra
+  `45d325a` e incluyendo archivos con build tags: `966/1122 = 86,096257 %`.
+- `go vet ./...`, compile-only global, runtime Linux focal, suite global y la
+  flake histórica de `validationworkflow` aislada tres veces pasan; una primera
+  repetición focal concurrente reprodujo flakes preexistentes de feature 28 y
+  se repite de forma aislada/serial antes del cierre.
+- La auditoría AST confirma comentarios de responsabilidad en todas las
+  declaraciones nuevas de producción y helpers de test de feature 29.
+
+## 2026-10-24 — Feature 29, implementación preparada para review
+
+- El store local instala y revalida permisos owner-only en Unix y una DACL
+  protegida allowlisted en Windows; también rechaza mutación de permisos,
+  symlink/reparse, hardlink y reemplazo coordinado de root/directorios.
+- Pasan vet, compile-only, focales ×3, global, global serial ×3, race focal ×3,
+  race global serial UCRT64, runtime Linux y cross-builds
+  Linux/Darwin/Windows para los cuatro paquetes afectados.
+- T1–T16 quedan completas y la trazabilidad R1–R15, comandos, coverage exacta y
+  limitaciones se registran en `progress/context-assembly/implementation.md`.
+
+## 2026-10-24 — Feature 29, primera remediación iniciada
+
+- Review 1 rechaza la entrega con REV-1–REV-11: trust classes aportadas por
+  sources, boundary de modelo incorrecto, packing sobre bytes distintos,
+  suficiencia/policies incompletas, budgets/allowlists ausentes, secret gate y
+  redaction insuficientes, journal/store incompletos, provenance sin contexto,
+  consumers productivos ausentes y una flake de lifecycle bajo race.
+- Se reabren T1–T16 por afectación transversal. La remediación conservará el
+  spec aprobado, añadirá matrices adversarias y regenerará toda la evidencia
+  Windows/Linux desde `45d325a` antes de solicitar una segunda review.
+
 ## 2026-10-23 — Feature 28 cerrada
 
 - Review independiente aprobada en la decimotercera revisión; REV-1–REV-17
@@ -3488,3 +3535,144 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
   pasa. El gate fresco reproduce `2027/2359 = 85,926240 %`.
 - T1–T16 completas. El estado de `validated-project-memory` cambia de
   `in_progress` a `done`; no se incluyó alcance de feature 29.
+
+## 2026-10-24 — Feature 29, primera remediación completada
+
+- Cerrados REV-1–REV-11 sin rebajar el spec: composición posee trust classes,
+  instrucciones/model envelope quedan separados, el packing cuenta el envelope
+  final, perfiles y budgets fallan cerrado, redaction/journal/store se autentican
+  y provenance/workflow/superficies ligan el context digest completo.
+- Analyzer y diagnostic consumen proyecciones productivas de mínimo privilegio;
+  CLI, API, MCP y GitHub comparten el mismo run, digest, binding y service sin
+  aceptar claims de autoridad del caller.
+- Pasan focal ×3, global serial, vet, compile-only, race focal/global,
+  compilación cruzada Linux/Darwin/Windows y auditoría de comentarios/cleanup.
+  Coverage reproducible contra `45d325a`: `1273/1479 = 86,071670 %`.
+- El runtime Linux ya pasó sobre el árbol productivo final. El reintento de
+  cierre no pudo iniciar `docker-desktop` por `ERROR_NO_SYSTEM_RESOURCES`; queda
+  documentado como limitación del host y no como fallo del código.
+
+## 2026-10-24 — Feature 29, segunda remediación iniciada
+
+- Review 2 rechaza la entrega con REV-12–REV-19: duration budget sin deadline
+  efectivo, commit point ambiguo, journal sin witness monotónico externo, sello
+  incompleto del contexto privilegiado, registry de roles controlable por el
+  caller, taxonomía de secretos incompleta, operaciones pathname vulnerables y
+  auditoría de comentarios no portable a Linux.
+- Se reabren T3, T5, T9, T10, T12, T14, T15 y T16. La remediación mantendrá
+  REV-1–REV-11 cerrados y repetirá coverage, race, runtimes Linux y gates
+  multiplataforma antes de una nueva review.
+
+## 2026-10-24 — Feature 29, segunda remediación completada
+
+- Cerrados REV-12–REV-19: deadline efectivo y propagado; commit point en CAS;
+  witness monotónico externo de feature 28; sello canónico end-to-end; registries
+  privados de composición; taxonomía R14 recursiva; filesystem descriptor-relative
+  no-follow en Windows/Unix; auditoría portable y cinco runtimes Linux reales.
+- Pasan focal ×3, global, vet, compile-only, race focal/global serial, los cinco
+  cross-builds Linux/Darwin y compilación Windows nativa. La auditoría de
+  comentarios y los swaps reales de root/subdir/temp/object también pasan.
+- Coverage fresca contra `45d325a`, incluidos build tags: `1655/1919 =
+  86,242835 %`, umbral 1632 y margen 23 statements. T3, T5, T9, T10, T12,
+  T14, T15 y T16 vuelven a completas con evidencia.
+
+## 2026-10-24 — Feature 29, tercera remediación iniciada
+
+- Review 3 reabre únicamente T10, T13, T14, T15 y T16 por REV-20–REV-22:
+  terminal observer bajo deadline agotado, reconciliación de CAS ambiguo y
+  revalidación durable reconstruible tras restart.
+- La remediación mantendrá REV-1–REV-19 cerrados, exigirá store/witness durable
+  en producción y repetirá coverage, race, Linux, cross-builds y cleanup antes
+  de solicitar nueva review.
+
+## 2026-10-24 — Feature 29, tercera remediación completada
+
+- Cerrados REV-20–REV-22: el observer terminal usa finalización detached y
+  acotada; todo error CAS se reconcilia contra el witness con estados confirmed,
+  rollback o uncertain recuperable; el registry durable se reconstruye tras
+  restart sin maps activos del proceso.
+- La composición productiva exige store local y witness monotónico durable. Un
+  adapter nuevo revalida snapshots, bindings y profiles persistidos antes de
+  approval, execution y recovery; redelivery converge sin duplicar receipts.
+- Pasan vet, compile-only, focales ×3, suite global, race focal/global, cinco
+  runtimes Linux y diez cross-builds Linux/Darwin. Coverage fresca contra
+  `45d325a`: `1713/1987 = 86,210367 %`, umbral 1689 y margen 24 statements.
+- T10, T13, T14, T15 y T16 vuelven a completas; no se modificó
+  `feature_list.json` ni se añadió alcance de feature 30/31.
+
+## 2026-10-24 — Feature 29, cuarta remediación iniciada
+
+- Review 4 reabre T3, T10, T13, T15 y T16 por REV-23–REV-25: el registry
+  durable debe resolver producers productivos actuales; `LocalStore` no puede
+  mantener locks Go durante filesystem o witness; la composición debe propagar
+  cancelación del caller a Bootstrap/Read/HTTP del witness.
+- La remediación mantiene REV-1–REV-22 cerrados y añadirá probes de restart con
+  drift real, witness bloqueado, writers concurrentes y servidor HTTP cancelado
+  antes de regenerar coverage y gates multiplataforma.
+
+## 2026-10-24 — Feature 29, cuarta remediación completada
+
+- Cerrados REV-23–REV-25: restart resuelve producers desde workflow/admission
+  actuales; `LocalStore` no mantiene locks Go durante disco o witness; el caller
+  context alcanza Read, Bootstrap y HTTP de la composición productiva.
+- Probes nuevos demuestran drift seq1→seq2 antes de approval/execution/recovery,
+  rechazo de registry missing/version/authority mismatch, reads confirmados con
+  CAS bloqueado, writers concurrentes y cancelación HTTP sin goroutines.
+- Pasan gofmt, auditoría comments, vet, compile-only, focales ×3, suite global,
+  race focal/global, cinco runtimes Linux y diez cross-builds Linux/Darwin.
+  Coverage fresca contra `45d325a`: `1777/2069 = 85,886902 %`, umbral 1759 y
+  margen 18 statements.
+- T3, T10, T13, T15 y T16 vuelven a completas. `feature_list.json` permanece
+  sin cambios y no se implementa alcance de feature 30/31.
+## Feature 29 — quinta remediación iniciada (2026-10-24)
+
+- Reabiertas T10, T13, T15 y T16 por REV-24, REV-26 y REV-27 de la quinta revisión.
+- REV-24: reducir la coordinación a reservas/transiciones breves sin mantener locks durante disco, witness, timers o callbacks, conservando convergencia por identidad.
+- REV-26: impedir que snapshots o bindings precommit sean direccionables hasta que exista confirmación autoritativa ligada a receipt/journal.
+- REV-27: conservar `context.Canceled`/`context.DeadlineExceeded` y su categoría tipada en Read, Bootstrap y construcción inicial del store.
+- Alcance congelado a estos findings; feature 30/31 y `feature_list.json` permanecen fuera del cambio.
+## Feature 29 — quinta remediación completada (2026-10-24)
+
+- Cerrados REV-24, REV-26 y REV-27 sin ampliar alcance: commits optimistas sin locks durante I/O externo, objetos invisibles hasta receipt confirmado y cancelación preservada en composición/store.
+- Los candidatos precommit viven en `staging`; writers independientes progresan con otro CAS bloqueado, la misma identidad converge y restart distingue rollback, confirmado y estado incierto.
+- Probes cubren snapshot/binding antes y durante CAS, rollback/reopen, payload confirmado ausente, Read/Bootstrap HTTP cancelados y contexto cancelado antes de validar `NewLocalStore`.
+- Pasan gofmt, auditoría de comentarios, vet, compile-only, focales ×3, focal race ×3, suite global serial normal/race, cinco runtimes Linux y cross-builds 15/15.
+- Coverage fresca contra `45d325a`, incluyendo build tags: `1853/2169 = 85,431074 %`; umbral 1844 y margen 9 statements.
+- T10, T13, T15 y T16 vuelven a completas; `feature_list.json` permanece sin cambios y feature 30/31 siguen fuera de alcance.
+## Feature 29 — sexta remediación iniciada (2026-10-24)
+
+- Reabiertas T1, T10, T13, T15 y T16 por REV-28 y la parte restante de REV-27.
+- REV-28: eliminar el cleanup basado en `objectCreated`/ausencia transitoria de receipt y probar la intercalación exacta de dos keys con digest compartido para snapshot y binding.
+- REV-27: conservar `context.Cause`, añadir `CategoryTimeout` y distinguir deadline de cancelación en store y composición productiva.
+- REV-1–REV-26 permanecen cerrados salvo la concurrencia de REV-24 continuada como REV-28; `feature_list.json` y feature 30/31 quedan fuera de alcance.
+
+## Feature 29 — sexta remediación completada (2026-10-24)
+
+- REV-28 queda cerrado: objetos content-addressed compartidos sobreviven al interleaving perdedor-ganador entre CAS y receipt para snapshot y binding; cleanup autentica staging, journal y receipts y falla cerrado ante metadata/transitorios.
+- REV-27 queda cerrado: `context.Cause` conserva sentinels sin filtrar texto, `CategoryTimeout` distingue deadlines y composición/store mantienen `errors.Is` en Read, Bootstrap y construcción pre-cancelada.
+- Los interleavings snapshot/binding y witness bloqueado pasan ×50; focal race pasa ×20. Focales, compile-only, vet, global serial, race global serial y cinco binarios Linux permanecen verdes sin cambios productivos posteriores.
+- Coverage fresca combinada contra `45d325a`: `1909/2234 = 85,452104 %`, umbral 1899 y margen 10 statements; cross-builds 15/15.
+- T1, T10, T13, T15 y T16 vuelven a completas. `feature_list.json` no fue modificado en esta remediación y feature 30/31 siguen fuera de alcance.
+
+## Feature 29 — séptima remediación iniciada (2026-10-24)
+
+- Reabiertas T10, T15 y T16 por REV-29; REV-1–REV-28 permanecen cerrados.
+- Se elimina el borrado transaccional de objetos content-addressed: rollback y contención solo retiran candidatos no direccionables; una GC futura deberá partir de un snapshot autoritativo estable.
+- Se añade una intercalación coordinada de tres writers para snapshot y binding, colocando el tercer staging después de que el primer perdedor alcance cleanup y antes de liberar al ganador.
+- `feature_list.json`, feature 30 y feature 31 permanecen fuera de alcance.
+
+## Feature 29 — séptima remediación completada (2026-10-24)
+
+- REV-29 cerrado mediante retención: ningún camino transaccional o de recovery borra objetos content-addressed; rollback y contención solo retiran candidatos no direccionables.
+- El probe de tres writers pasa para snapshot y binding: matriz combinada con witness bloqueado ×50 normal y ×20 race, sin ampliar timeouts.
+- Pasan focales ×3 normal/race, vet, compile-only, suite global serial normal/race, cinco binarios Linux reales en Alpine y cross-builds 15/15.
+- Coverage fresca contra `45d325a`, con cinco profiles Windows y cinco Linux: `1874/2179 = 86,002754 %`; umbral 1853 y margen 21 statements.
+- T10, T15 y T16 vuelven a completas; `feature_list.json` permanece sin cambios de worktree y feature 30/31 siguen fuera de alcance.
+
+## Feature 29 — cierre aprobado (2026-10-24)
+
+- La revisión independiente 8 aprobó el diff completo: R1–R15 y REV-1–REV-29 quedan cerrados sin regresiones.
+- El smoke final del leader pasó en `contextassembly`, `agentplanning`, `planapproval`, `validationworkflow` y `cmd/featureproof`; `git diff --check` también pasó.
+- Gates verificados por reviewer: suite global normal/race, cinco runtimes Linux y cross-builds 15/15.
+- Cobertura fresca multiplataforma del diff productivo: `1881/2187 = 86,008230 %`, incluyendo conservadoramente el fallback Unix no ejecutado.
+- Feature 29 marcada `done`; queda pendiente únicamente commit y push de la rama `feature-29-context-assembly`.

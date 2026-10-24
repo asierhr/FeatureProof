@@ -23,6 +23,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/agenteval"
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
@@ -172,6 +173,7 @@ func TestComposedWorkflowRejectsConfiguredSensitiveContractSurfacesBeforeEffects
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			installProjectMemoryWitness(t)
 			root := t.TempDir()
 			t.Chdir(root)
 			secret := "opaque-" + strings.ReplaceAll(test.name, "_", "-") + "-918273"
@@ -271,6 +273,7 @@ func TestComposeWorkflowCLIFailsClosedAtInputAndStorageBoundaries(t *testing.T) 
 
 // TestComposeWorkflowCLISealsGoInspectorAuthority verifies productive composition carries configured roots into the shared binding port.
 func TestComposeWorkflowCLISealsGoInspectorAuthority(t *testing.T) {
+	installProjectMemoryWitness(t)
 	root := t.TempDir()
 	t.Chdir(root)
 	configPath, _, _ := writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
@@ -294,6 +297,7 @@ func TestComposeWorkflowCLISealsGoInspectorAuthority(t *testing.T) {
 
 // TestComposeWorkflowCLIUsesMatchingPreviewConfiguration covers the productive preview branch without acquiring an environment.
 func TestComposeWorkflowCLIUsesMatchingPreviewConfiguration(t *testing.T) {
+	installProjectMemoryWitness(t)
 	root := t.TempDir()
 	t.Chdir(root)
 	previewPath := writeConfiguredPreviewFixture(t, root, "https://target.example/")
@@ -324,6 +328,181 @@ func TestComposeWorkflowCLIUsesMatchingPreviewConfiguration(t *testing.T) {
 	if _, err = composeWorkflowCLI(context.Background(), io.Discard, io.Discard); err == nil {
 		t.Fatal("preview identity drift accepted")
 	}
+}
+
+// TestComposeWorkflowCLIRequiresDurableContextWitness proves production cannot silently replace restart authority with process memory.
+func TestComposeWorkflowCLIRequiresDurableContextWitness(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	configPath, _, _ := writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
+	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)
+	t.Run("missing", func(t *testing.T) {
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_URL", "")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_CREDENTIAL", "")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_GUARANTEE", "")
+		t.Setenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM", "")
+		if _, err := composeWorkflowCLI(context.Background(), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "durable context witness required") {
+			t.Fatalf("production accepted volatile context persistence: %v", err)
+		}
+	})
+	t.Run("weak-guarantee", func(t *testing.T) {
+		t.Setenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM", "context-required")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_GUARANTEE", "filesystem-only")
+		if _, err := composeWorkflowCLI(context.Background(), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "context witness guarantee unavailable") {
+			t.Fatalf("production accepted replayable witness: %v", err)
+		}
+	})
+	t.Run("unavailable", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusServiceUnavailable) }))
+		defer server.Close()
+		t.Setenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM", "context-required")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_GUARANTEE", "linearizable-durable-nonreplayable-v1")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_URL", server.URL)
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_CREDENTIAL", "credential")
+		if _, err := composeWorkflowCLI(context.Background(), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "context witness unavailable") {
+			t.Fatalf("production accepted unavailable witness: %v", err)
+		}
+	})
+	t.Run("bootstrap-failure", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodGet {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			writer.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+		t.Setenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM", "context-required")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_GUARANTEE", "linearizable-durable-nonreplayable-v1")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_URL", server.URL)
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_CREDENTIAL", "credential")
+		if _, err := composeWorkflowCLI(context.Background(), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "context witness bootstrap unavailable") {
+			t.Fatalf("production accepted uninitialized witness: %v", err)
+		}
+	})
+	t.Run("caller-cancellation", func(t *testing.T) {
+		entered, stopped := make(chan struct{}), make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+			close(entered)
+			<-request.Context().Done()
+			close(stopped)
+		}))
+		defer server.Close()
+		t.Setenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM", "context-required")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_GUARANTEE", "linearizable-durable-nonreplayable-v1")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_URL", server.URL)
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_CREDENTIAL", "credential")
+		cause := errors.New("read cancellation sentinel")
+		ctx, cancel := context.WithCancelCause(context.Background())
+		result := make(chan error, 1)
+		go func() {
+			_, composeErr := composeWorkflowCLI(ctx, io.Discard, io.Discard)
+			result <- composeErr
+		}()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			cancel(cause)
+			t.Fatal("composition did not reach witness HTTP")
+		}
+		cancel(cause)
+		select {
+		case composeErr := <-result:
+			if !contextassembly.IsCategory(composeErr, contextassembly.CategoryCancelled) || !errors.Is(composeErr, cause) || strings.Contains(composeErr.Error(), cause.Error()) {
+				t.Fatalf("cancelled witness composition=%v", composeErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cancelled composition did not return")
+		}
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Fatal("cancelled witness request leaked")
+		}
+	})
+	t.Run("bootstrap-cancellation", func(t *testing.T) {
+		entered, stopped := make(chan struct{}), make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodGet {
+				writer.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = io.Copy(io.Discard, request.Body)
+			close(entered)
+			<-request.Context().Done()
+			close(stopped)
+		}))
+		defer server.Close()
+		t.Setenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM", "context-required")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_GUARANTEE", "linearizable-durable-nonreplayable-v1")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_URL", server.URL)
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_CREDENTIAL", "credential")
+		cause := errors.New("bootstrap cancellation sentinel")
+		ctx, cancel := context.WithCancelCause(context.Background())
+		result := make(chan error, 1)
+		go func() {
+			_, composeErr := composeWorkflowCLI(ctx, io.Discard, io.Discard)
+			result <- composeErr
+		}()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			cancel(cause)
+			t.Fatal("composition did not reach witness bootstrap HTTP")
+		}
+		cancel(cause)
+		select {
+		case composeErr := <-result:
+			if !contextassembly.IsCategory(composeErr, contextassembly.CategoryCancelled) || !errors.Is(composeErr, cause) || strings.Contains(composeErr.Error(), cause.Error()) {
+				t.Fatalf("cancelled witness bootstrap=%v", composeErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("cancelled bootstrap did not return")
+		}
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Fatal("cancelled bootstrap request leaked")
+		}
+	})
+	t.Run("read-deadline", func(t *testing.T) {
+		entered, stopped := make(chan struct{}), make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+			close(entered)
+			<-request.Context().Done()
+			close(stopped)
+		}))
+		defer server.Close()
+		t.Setenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM", "context-required")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_GUARANTEE", "linearizable-durable-nonreplayable-v1")
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_URL", server.URL)
+		t.Setenv("FEATUREPROOF_MEMORY_WITNESS_CREDENTIAL", "credential")
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		result := make(chan error, 1)
+		go func() {
+			_, composeErr := composeWorkflowCLI(ctx, io.Discard, io.Discard)
+			result <- composeErr
+		}()
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("composition did not reach deadline witness HTTP")
+		}
+		select {
+		case composeErr := <-result:
+			if !contextassembly.IsCategory(composeErr, contextassembly.CategoryTimeout) || !errors.Is(composeErr, context.DeadlineExceeded) {
+				t.Fatalf("deadline witness composition=%v", composeErr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("deadline composition did not return")
+		}
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Fatal("deadline witness request leaked")
+		}
+	})
 }
 
 // blockWorkflowStoreDirectory places a regular file where one composition-owned store directory must be created.

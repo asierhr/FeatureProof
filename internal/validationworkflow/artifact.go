@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sort"
+	"strings"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
@@ -39,6 +40,10 @@ type artifactContext struct {
 	Capabilities                                                                                                          []contextCapability
 	Identities                                                                                                            []testidentity.Descriptor `json:"identities,omitempty"`
 	Limits                                                                                                                agentplanning.Limits
+	ContextDigest                                                                                                         string
+	ContextEnvelopeSHA256                                                                                                 string
+	ContextInstructionsSHA256                                                                                             string
+	ContextSeal                                                                                                           string
 }
 
 // buildArtifact converts only validated PreparedPlan snapshots into a deterministic auditable artifact.
@@ -54,7 +59,8 @@ func buildArtifact(ctx context.Context, handle string, snapshot AdmissionSnapsho
 	if err != nil {
 		return PlanArtifact{}, err
 	}
-	artifact := PlanArtifact{Version: ArtifactVersion, WorkflowID: handle, PlanID: prepared.ID(), Provider: snapshot.Provider, Model: snapshot.Model, PromptVersion: "agentplanning/v1", ProtocolVersion: "planning/v1", ContextDigest: contextSHA, RevisionDigest: snapshot.RevisionDigest, TargetDigest: snapshot.TargetDigest, RuntimeDigest: snapshot.RuntimeDigest, Usage: usage}
+	instructionsSum := sha256.Sum256([]byte(snapshot.Generation.ContextInstructions))
+	artifact := PlanArtifact{Version: ArtifactVersion, WorkflowID: handle, PlanID: prepared.ID(), Provider: snapshot.Provider, Model: snapshot.Model, PromptVersion: "agentplanning/v1", ProtocolVersion: "planning/v1", ContextDigest: contextSHA, RevisionDigest: snapshot.RevisionDigest, TargetDigest: snapshot.TargetDigest, RuntimeDigest: snapshot.RuntimeDigest, Usage: usage, ContextSeal: snapshot.Generation.ContextSeal, ContextInstructionsHash: hex.EncodeToString(instructionsSum[:])}
 	artifact.Plans = localvalidation.ProjectPlans(plans, commitmentKey)
 	digest, err := artifactDigest(artifact)
 	if err != nil {
@@ -71,27 +77,33 @@ func canonicalContextDigest(snapshot AdmissionSnapshot) (string, error) {
 		capabilities[index] = contextCapability{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
 	openAPISum := sha256.Sum256(snapshot.Generation.Contract.Bytes())
+	contextEnvelopeSum := sha256.Sum256(snapshot.Generation.ContextEnvelope)
+	contextInstructionsSum := sha256.Sum256([]byte(snapshot.Generation.ContextInstructions))
 	identities, identityErr := testidentity.CanonicalDescriptors(snapshot.Generation.Identities)
 	if identityErr != nil {
 		return "", &Error{Code: CodeInvalid, Operation: "identity_context"}
 	}
 	return safeDigest(artifactContext{
-		SpecificationDigest:  snapshot.SpecificationDigest,
-		ContractDigest:       snapshot.ContractDigest,
-		CatalogDigest:        snapshot.CatalogDigest,
-		ContractPolicyDigest: snapshot.ContractPolicyDigest,
-		RevisionDigest:       snapshot.RevisionDigest,
-		TargetDigest:         snapshot.TargetDigest,
-		RuntimeDigest:        snapshot.RuntimeDigest,
-		Provider:             snapshot.Provider,
-		Model:                snapshot.Model,
-		Binding:              canonicalBindingContext(snapshot.Binding),
-		Runtime:              canonicalRuntimeContext(snapshot.Runtime),
-		Constraints:          append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...),
-		Contract:             contextContract{MediaType: snapshot.Generation.Contract.MediaType(), Untrusted: snapshot.Generation.Contract.Untrusted(), BytesSHA256: hex.EncodeToString(openAPISum[:]), Omissions: snapshot.Generation.Contract.Omissions()},
-		Capabilities:         capabilities,
-		Identities:           identities,
-		Limits:               snapshot.Generation.Limits,
+		SpecificationDigest:       snapshot.SpecificationDigest,
+		ContractDigest:            snapshot.ContractDigest,
+		CatalogDigest:             snapshot.CatalogDigest,
+		ContractPolicyDigest:      snapshot.ContractPolicyDigest,
+		RevisionDigest:            snapshot.RevisionDigest,
+		TargetDigest:              snapshot.TargetDigest,
+		RuntimeDigest:             snapshot.RuntimeDigest,
+		Provider:                  snapshot.Provider,
+		Model:                     snapshot.Model,
+		Binding:                   canonicalBindingContext(snapshot.Binding),
+		Runtime:                   canonicalRuntimeContext(snapshot.Runtime),
+		Constraints:               append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...),
+		Contract:                  contextContract{MediaType: snapshot.Generation.Contract.MediaType(), Untrusted: snapshot.Generation.Contract.Untrusted(), BytesSHA256: hex.EncodeToString(openAPISum[:]), Omissions: snapshot.Generation.Contract.Omissions()},
+		Capabilities:              capabilities,
+		Identities:                identities,
+		Limits:                    snapshot.Generation.Limits,
+		ContextDigest:             snapshot.Generation.ContextDigest,
+		ContextEnvelopeSHA256:     hex.EncodeToString(contextEnvelopeSum[:]),
+		ContextInstructionsSHA256: hex.EncodeToString(contextInstructionsSum[:]),
+		ContextSeal:               snapshot.Generation.ContextSeal,
 	})
 }
 
@@ -174,12 +186,21 @@ func artifactDigest(artifact PlanArtifact) (string, error) {
 
 // verifyArtifact detects tampering and identity drift before approval or execution.
 func verifyArtifact(artifact PlanArtifact, handle string) error {
-	if artifact.Version != ArtifactVersion || artifact.WorkflowID != handle || len(artifact.Plans) == 0 {
+	if artifact.Version != ArtifactVersion || artifact.WorkflowID != handle || len(artifact.Plans) == 0 || !validSHA256(artifact.ContextInstructionsHash) {
 		return &Error{Code: CodeConflict, Operation: "artifact_identity"}
+	}
+	if artifact.ContextSnapshotDigest != "" && (!validSHA256(artifact.ContextSnapshotDigest) || !validSHA256(artifact.ContextBindingDigest) || !validSHA256(artifact.ContextSeal)) {
+		return &Error{Code: CodeConflict, Operation: "artifact_context_seal"}
 	}
 	want, err := artifactDigest(artifact)
 	if err != nil || want != artifact.ArtifactSHA256 {
 		return &Error{Code: CodeConflict, Operation: "artifact_integrity"}
 	}
 	return nil
+}
+
+// validSHA256 accepts only one lowercase canonical SHA-256 representation.
+func validSHA256(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
 }

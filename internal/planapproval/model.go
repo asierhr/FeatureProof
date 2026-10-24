@@ -3,6 +3,7 @@ package planapproval
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -139,14 +140,18 @@ type FunctionalFlowSnapshot struct {
 
 // ContractSnapshot is the complete serializable context whose semantic changes invalidate approval.
 type ContractSnapshot struct {
-	Target             TargetSnapshot
-	Constraints        []agentplanning.Constraint
-	Contract           contractcatalog.ReducedContext
-	Capabilities       []CapabilitySnapshot
-	Identities         []testidentity.Descriptor
-	Runtime            RuntimeSnapshot
-	GenerationContract GenerationContractSnapshot
-	FunctionalFlow     *FunctionalFlowSnapshot
+	Target              TargetSnapshot
+	Constraints         []agentplanning.Constraint
+	Contract            contractcatalog.ReducedContext
+	Capabilities        []CapabilitySnapshot
+	Identities          []testidentity.Descriptor
+	Runtime             RuntimeSnapshot
+	GenerationContract  GenerationContractSnapshot
+	ContextDigest       string
+	ContextEnvelope     json.RawMessage
+	ContextInstructions string
+	ContextSeal         string
+	FunctionalFlow      *FunctionalFlowSnapshot
 }
 
 // Limits bounds canonicalization, projection and journal reconstruction work before any execution can be authorized.

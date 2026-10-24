@@ -2,6 +2,7 @@ package planapproval
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -542,7 +543,7 @@ func provenanceInput(snapshot ContractSnapshot) agentplanning.ProvenanceInput {
 	for i, capability := range snapshot.Capabilities {
 		capabilities[i] = agentplanning.CapabilityDescriptor{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
-	return agentplanning.ProvenanceInput{Constraints: append([]agentplanning.Constraint(nil), snapshot.Constraints...), Contract: snapshot.Contract, Capabilities: capabilities, Identities: testidentity.CloneDescriptors(snapshot.Identities)}
+	return agentplanning.ProvenanceInput{Constraints: append([]agentplanning.Constraint(nil), snapshot.Constraints...), Contract: snapshot.Contract, Capabilities: capabilities, Identities: testidentity.CloneDescriptors(snapshot.Identities), ContextDigest: snapshot.ContextDigest, ContextEnvelope: append(json.RawMessage(nil), snapshot.ContextEnvelope...), ContextInstructions: snapshot.ContextInstructions, ContextSeal: snapshot.ContextSeal}
 }
 
 // transitionRun keeps the mutable harness aggregate aligned with the event-derived approval projection.

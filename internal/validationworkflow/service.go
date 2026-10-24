@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/projectmemory"
@@ -45,6 +46,7 @@ type Dependencies struct {
 	FunctionalFlow  FunctionalFlowExecutionPort
 	Memory          ProjectMemoryPort
 	MemoryObserver  ProjectMemoryObservationPort
+	Context         ContextAssemblyPort
 }
 
 // ProjectMemorySelection is the trusted planning projection and its exact historical seal.
@@ -158,6 +160,23 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		record.PreviewDigest = previewDigest
 	}
 	snapshot.Generation.RunID, snapshot.Generation.PlanID = handle, handle+"-plan"
+	if s.deps.Context != nil && command.FunctionalFlow == nil {
+		selection, contextErr := s.deps.Context.Prepare(workCtx, handle, snapshot.Clone(), command)
+		if contextErr != nil || len(selection.Envelope) == 0 || len(selection.Digest) != 64 || len(selection.Seal) != 64 {
+			if IsCode(contextErr, CodeInsufficientContext) {
+				record, err = s.terminal(workCtx, record, OutcomeInsufficientContext, "context_insufficient")
+				if err != nil {
+					return WorkflowView{}, err
+				}
+				return viewOf(record), nil
+			}
+			return WorkflowView{}, mapBoundaryError(workCtx, "context_assembly", contextErr)
+		}
+		snapshot.Generation.ContextEnvelope = append([]byte(nil), selection.Envelope...)
+		snapshot.Generation.ContextInstructions = selection.Instructions
+		snapshot.Generation.ContextDigest = selection.Digest
+		snapshot.Generation.ContextSeal = selection.Seal
+	}
 	s.mu.Lock()
 	s.snapshots[handle] = snapshot.Clone()
 	s.mu.Unlock()
@@ -226,6 +245,14 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		}
 		return viewOf(record), nil
 	}
+	contextBindingDigest := ""
+	if s.deps.Context != nil && command.FunctionalFlow == nil {
+		contextBindingDigest, err = s.deps.Context.Bind(workCtx, handle+":context-binding", result.Prepared.ID(), result.Prepared.Snapshot(), snapshot.Generation.ContextDigest)
+		if err != nil {
+			return WorkflowView{}, mapBoundaryError(workCtx, "context_bind", err)
+		}
+		record.ContextBindingDigest = contextBindingDigest
+	}
 	commitmentKey := make([]byte, 32)
 	if _, err = rand.Read(commitmentKey); err != nil {
 		return WorkflowView{}, &Error{Code: CodeInternal, Operation: "commitment_key"}
@@ -236,6 +263,13 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	}
 	if command.MemoryBinding != nil {
 		artifact.MemoryBindingDigest = command.MemoryBinding.Digest
+		artifact.ArtifactSHA256, err = artifactDigest(artifact)
+		if err != nil {
+			return WorkflowView{}, err
+		}
+	}
+	if snapshot.Generation.ContextDigest != "" {
+		artifact.ContextSnapshotDigest, artifact.ContextBindingDigest = snapshot.Generation.ContextDigest, contextBindingDigest
 		artifact.ArtifactSHA256, err = artifactDigest(artifact)
 		if err != nil {
 			return WorkflowView{}, err
@@ -325,6 +359,12 @@ func (s *Service) revalidateGeneratedPlan(ctx context.Context, command StartComm
 		return &Error{Code: CodeConflict, Operation: "admission_drift"}
 	}
 	current.Generation.RunID, current.Generation.PlanID = expected.Generation.RunID, expected.Generation.PlanID
+	// The assembly binding is created immediately before inference and remains the
+	// authoritative model-facing context for this post-inference admission check.
+	current.Generation.ContextInstructions = expected.Generation.ContextInstructions
+	current.Generation.ContextDigest = expected.Generation.ContextDigest
+	current.Generation.ContextSeal = expected.Generation.ContextSeal
+	current.Generation.ContextEnvelope = append(json.RawMessage(nil), expected.Generation.ContextEnvelope...)
 	if command.Target.Preview != nil {
 		current.Binding.Target = expected.Binding.Target
 		current.TargetDigest = expected.TargetDigest
@@ -335,7 +375,7 @@ func (s *Service) revalidateGeneratedPlan(ctx context.Context, command StartComm
 	if command.Target.Direct != nil {
 		unchanged = unchanged && current.TargetDigest == expected.TargetDigest
 	}
-	if !unchanged || !prepared.MatchesProvenance(agentplanning.ProvenanceInput{Constraints: current.Generation.Constraints, Contract: current.Generation.Contract, Capabilities: current.Generation.Capabilities, Identities: current.Generation.Identities}) {
+	if !unchanged || !prepared.MatchesProvenance(agentplanning.ProvenanceInput{Constraints: current.Generation.Constraints, Contract: current.Generation.Contract, Capabilities: current.Generation.Capabilities, Identities: current.Generation.Identities, ContextDigest: current.Generation.ContextDigest, ContextEnvelope: current.Generation.ContextEnvelope, ContextInstructions: current.Generation.ContextInstructions, ContextSeal: current.Generation.ContextSeal}) {
 		return &Error{Code: CodeConflict, Operation: "admission_drift"}
 	}
 	return nil
@@ -413,6 +453,9 @@ func (s *Service) Decide(ctx context.Context, command DecisionCommand) (Workflow
 		return WorkflowView{}, err
 	}
 	if err = s.checkpointMemory(ctx, record.Command); err != nil {
+		return WorkflowView{}, err
+	}
+	if err = s.checkpointContext(ctx, record.ContextBindingDigest); err != nil {
 		return WorkflowView{}, err
 	}
 	decision, decisionErr := s.deps.Approval.Decide(ctx, command, prepared, snapshot, artifactValue, record.FunctionalFlowApproval)
@@ -713,6 +756,9 @@ func (s *Service) execute(ctx context.Context, record Record, snapshot Admission
 	if checkpointErr := s.checkpointMemory(ctx, record.Command); checkpointErr != nil {
 		return s.terminal(ctx, record, OutcomeInconclusive, "memory_binding_drift")
 	}
+	if checkpointErr := s.checkpointContext(ctx, record.ContextBindingDigest); checkpointErr != nil {
+		return s.terminal(ctx, record, OutcomeInconclusive, "stale_context")
+	}
 	material, materialErr := s.deps.Executables.Load(ctx, record.Handle)
 	if materialErr != nil || verifyExecutableMaterial(record, snapshot, prepared, material) != nil {
 		return s.terminal(ctx, record, OutcomeError, "executable_integrity")
@@ -882,6 +928,21 @@ func (s *Service) checkpointMemory(ctx context.Context, command StartCommand) er
 	return nil
 }
 
+// checkpointContext blocks approval, recovery and execution when an authoritative source binding drifted.
+func (s *Service) checkpointContext(ctx context.Context, bindingDigest string) error {
+	if bindingDigest == "" {
+		return nil
+	}
+	if s.deps.Context == nil {
+		return &Error{Code: CodeInvalid, Operation: "context_composition"}
+	}
+	status, err := s.deps.Context.Revalidate(ctx, bindingDigest)
+	if err != nil || status.Outcome != contextassembly.OutcomeValid {
+		return &Error{Code: CodeConflict, Operation: "stale_context"}
+	}
+	return nil
+}
+
 // restorePrepared rebuilds current admission and revalidates private executable values after restart.
 func (s *Service) restorePrepared(ctx context.Context, record Record) (AdmissionSnapshot, agentplanning.PreparedPlan, error) {
 	snapshot, err := s.deps.Admission.Build(ctx, record.Command)
@@ -904,6 +965,19 @@ func (s *Service) restorePrepared(ctx context.Context, record Record) (Admission
 		snapshot.TargetDigest = digest
 	}
 	snapshot.Generation.RunID, snapshot.Generation.PlanID = record.Handle, record.Handle+"-plan"
+	if s.deps.Context != nil && record.Command.FunctionalFlow == nil {
+		selection, contextErr := s.deps.Context.Prepare(ctx, record.Handle, snapshot.Clone(), record.Command)
+		if contextErr != nil || record.Artifact == nil || selection.Digest != record.Artifact.ContextSnapshotDigest {
+			return AdmissionSnapshot{}, agentplanning.PreparedPlan{}, &Error{Code: CodeConflict, Operation: "stale_context"}
+		}
+		snapshot.Generation.ContextEnvelope = append([]byte(nil), selection.Envelope...)
+		snapshot.Generation.ContextInstructions = selection.Instructions
+		snapshot.Generation.ContextDigest = selection.Digest
+		snapshot.Generation.ContextSeal = selection.Seal
+	}
+	if err := s.checkpointContext(ctx, record.ContextBindingDigest); err != nil {
+		return AdmissionSnapshot{}, agentplanning.PreparedPlan{}, err
+	}
 	private, err := s.deps.Executables.Load(ctx, record.Handle)
 	if err != nil {
 		return AdmissionSnapshot{}, agentplanning.PreparedPlan{}, err
@@ -940,7 +1014,7 @@ func verifyExecutableMaterial(record Record, snapshot AdmissionSnapshot, prepare
 
 // verifyExecutableContext recomputes the complete current admission binding before policy, approval or execution work.
 func verifyExecutableContext(record Record, snapshot AdmissionSnapshot, private ExecutableMaterial) error {
-	if record.Artifact == nil || private.Version != ArtifactVersion || private.WorkflowID != record.Handle || private.ArtifactSHA256 != record.Artifact.ArtifactSHA256 || private.ContextDigest != record.Artifact.ContextDigest || private.RevisionDigest != record.Artifact.RevisionDigest || private.TargetDigest != record.Artifact.TargetDigest {
+	if record.Artifact == nil || private.Version != ArtifactVersion || private.WorkflowID != record.Handle || private.ArtifactSHA256 != record.Artifact.ArtifactSHA256 || private.ContextDigest != record.Artifact.ContextDigest || private.RevisionDigest != record.Artifact.RevisionDigest || private.TargetDigest != record.Artifact.TargetDigest || private.Snapshot.ContextDigest != record.Artifact.ContextSnapshotDigest || private.Snapshot.ContextInstructionsHash != record.Artifact.ContextInstructionsHash || private.Snapshot.ContextSeal != record.Artifact.ContextSeal {
 		return &Error{Code: CodeConflict, Operation: "executable_binding"}
 	}
 	revisionDigest, targetDigest, bindingErr := bindingDigests(snapshot.Binding)

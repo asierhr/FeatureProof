@@ -21,6 +21,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/assertion"
+	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/contractreview"
 	"github.com/asierhr/featureProof/internal/evidence"
@@ -590,6 +591,8 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	}
 	var memoryPort validationworkflow.ProjectMemoryPort
 	var memoryObserver validationworkflow.ProjectMemoryObservationPort
+	var contextWitness projectmemory.MonotonicWitness
+	var contextWitnessStream string
 	if projectMemoryConfigured() {
 		memoryComposition, memoryErr := composeProjectMemory()
 		if memoryErr != nil {
@@ -599,8 +602,45 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 		memoryComposition.Service.Evidence = workflowMemoryEvidence{project: os.Getenv("FEATUREPROOF_MEMORY_PROJECT"), repository: config.RepositoryID, packageRoot: memoryPackages}
 		integration := workflowProjectMemory{service: memoryComposition.Service, authority: memoryComposition.HumanAuthority, observerPrincipal: memoryComposition.ObserverPrincipal, packages: memoryPackages}
 		memoryPort, memoryObserver = integration, integration
+		contextWitness, contextWitnessStream = memoryComposition.Witness, memoryComposition.ProjectID+"-context"
 	}
-	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Preview: previewPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, Memory: memoryPort, MemoryObserver: memoryObserver})
+	contextProfiles, err := contextassembly.DefaultProfiles()
+	if err != nil {
+		return nil, err
+	}
+	var contextStore contextassembly.Store
+	if contextWitness == nil && os.Getenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM") != "" {
+		if os.Getenv("FEATUREPROOF_MEMORY_WITNESS_GUARANTEE") != "linearizable-durable-nonreplayable-v1" {
+			return nil, errors.New("context witness guarantee unavailable")
+		}
+		contextWitness, err = projectmemory.NewHTTPMonotonicWitness(os.Getenv("FEATUREPROOF_MEMORY_WITNESS_URL"), os.Getenv("FEATUREPROOF_MEMORY_WITNESS_CREDENTIAL"), projectMemoryWitnessClient)
+		if err != nil {
+			return nil, err
+		}
+		contextWitnessStream = os.Getenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM")
+	}
+	if contextWitness == nil {
+		return nil, errors.New("durable context witness required")
+	}
+	if _, witnessErr := contextWitness.Read(ctx, contextWitnessStream); errors.Is(witnessErr, projectmemory.ErrWitnessMissing) {
+		if _, witnessErr = contextWitness.Bootstrap(ctx, contextWitnessStream); witnessErr != nil {
+			if ctx.Err() != nil {
+				return nil, workflowContextFailure(ctx)
+			}
+			return nil, errors.New("context witness bootstrap unavailable")
+		}
+	} else if witnessErr != nil {
+		if ctx.Err() != nil {
+			return nil, workflowContextFailure(ctx)
+		}
+		return nil, errors.New("context witness unavailable")
+	}
+	contextStore, err = contextassembly.NewLocalStore(ctx, filepath.Join(storeRoot, "context"), contextWitnessStream, contextWitness)
+	if err != nil {
+		return nil, err
+	}
+	contextPort := &validationworkflow.ContextAssemblyAdapter{Profiles: contextProfiles, Registry: validationworkflow.CurrentContextProducerRegistry{Workflows: store, Admission: admission}, Secrets: contextassembly.NewCanaryGate(nil), Tokens: contextassembly.ByteTokenCounter{Selections: map[string]bool{config.Provider + "/" + config.Model: true}}, Store: contextStore, Observer: validationworkflow.ContextObserver{}, Clock: wallClock}
+	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Preview: previewPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, Memory: memoryPort, MemoryObserver: memoryObserver, Context: contextPort})
 	if err != nil {
 		return nil, err
 	}
@@ -616,6 +656,19 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 		cli.PreviewTargets[config.TargetAlias] = validationworkflow.PreviewTarget{Alias: config.TargetAlias, Digest: targetDigest}
 	}
 	return cli, nil
+}
+
+// workflowContextFailure preserves an owner context's sentinel cause while exposing a stable cancellation category.
+func workflowContextFailure(ctx context.Context) error {
+	category := contextassembly.CategoryCancelled
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		category = contextassembly.CategoryTimeout
+	}
+	cause := context.Cause(ctx)
+	if cause == nil {
+		cause = ctx.Err()
+	}
+	return &contextassembly.Error{Category: category, Stage: "composition", Path: "context", Cause: cause}
 }
 
 // projectMemoryConfigured enables workflow memory only when composition configuration is intentionally present.

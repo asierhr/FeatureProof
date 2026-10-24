@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1876,8 +1875,17 @@ func TestCanonicalPlanProjectionRedactsNestedLiterals(t *testing.T) {
 
 // TestValidationWorkflowSystemicCommentsCoverAllChangedSymbols enforces systemic comments for package and test symbols.
 func TestValidationWorkflowSystemicCommentsCoverAllChangedSymbols(t *testing.T) {
-	_, file, _, _ := runtime.Caller(0)
-	root := filepath.Dir(file)
+	root := os.Getenv("FEATUREPROOF_SOURCE_ROOT")
+	if root == "" {
+		workingDirectory, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		root = workingDirectory
+		if filepath.Base(root) != "validationworkflow" {
+			root = filepath.Join(root, "internal", "validationworkflow")
+		}
+	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		t.Fatal(err)
@@ -2220,7 +2228,7 @@ func TestArtifactStoreIsImmutableAndPackageTopologyRejectsDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	artifact := PlanArtifact{Version: ArtifactVersion, WorkflowID: "workflow-artifact", PlanID: "plan", Plans: localvalidation.ProjectPlans([]planning.ValidationPlan{{ID: "plan", ConstraintID: "c", Steps: []planning.PlanStep{{ID: "s", Tool: "probe", Assertions: []planning.AssertionDeclaration{{ID: "a"}}}}}}), ContextDigest: strings.Repeat("1", 64), RevisionDigest: strings.Repeat("2", 64), TargetDigest: strings.Repeat("3", 64), RuntimeDigest: strings.Repeat("4", 64)}
+	artifact := PlanArtifact{Version: ArtifactVersion, WorkflowID: "workflow-artifact", PlanID: "plan", Plans: localvalidation.ProjectPlans([]planning.ValidationPlan{{ID: "plan", ConstraintID: "c", Steps: []planning.PlanStep{{ID: "s", Tool: "probe", Assertions: []planning.AssertionDeclaration{{ID: "a"}}}}}}), ContextDigest: strings.Repeat("1", 64), RevisionDigest: strings.Repeat("2", 64), TargetDigest: strings.Repeat("3", 64), RuntimeDigest: strings.Repeat("4", 64), ContextInstructionsHash: strings.Repeat("5", 64)}
 	artifact.ArtifactSHA256, _ = artifactDigest(artifact)
 	if err = store.Commit(context.Background(), artifact); err != nil {
 		t.Fatal(err)
@@ -2493,7 +2501,7 @@ func TestAuthorizedGeneratedPlanUsesExistingRunnerAndPackage(t *testing.T) {
 	runtimeDigest := strings.Repeat("5", 64)
 	commitmentKey := []byte(strings.Repeat("k", 32))
 	port := LocalExecutionPort{Configurations: map[string]LocalRunnerConfiguration{runtimeDigest: {Digest: runtimeDigest, Request: localvalidation.PreparedRequest{Specification: spec, Runtime: manifest, Target: server.URL, RepositoryID: "repo", Revision: "main", EnvironmentID: "preview"}, Dependencies: deps}}}
-	artifact := PlanArtifact{Version: ArtifactVersion, WorkflowID: "workflow-vertical", PlanID: "generated", Provider: "fake", Model: "selected", PromptVersion: "v1", ProtocolVersion: "v1", Plans: localvalidation.ProjectPlans([]planning.ValidationPlan{plan}, commitmentKey), ContextDigest: strings.Repeat("1", 64), RevisionDigest: strings.Repeat("2", 64), TargetDigest: strings.Repeat("3", 64), RuntimeDigest: runtimeDigest}
+	artifact := PlanArtifact{Version: ArtifactVersion, WorkflowID: "workflow-vertical", PlanID: "generated", Provider: "fake", Model: "selected", PromptVersion: "v1", ProtocolVersion: "v1", Plans: localvalidation.ProjectPlans([]planning.ValidationPlan{plan}, commitmentKey), ContextDigest: strings.Repeat("1", 64), RevisionDigest: strings.Repeat("2", 64), TargetDigest: strings.Repeat("3", 64), RuntimeDigest: runtimeDigest, ContextInstructionsHash: strings.Repeat("5", 64)}
 	artifact.ArtifactSHA256, _ = artifactDigest(artifact)
 	packageDir, err := port.Execute(context.Background(), ExecutionRequest{Handle: "workflow-vertical", Plans: []planning.ValidationPlan{plan}, Snapshot: AdmissionSnapshot{RuntimeDigest: runtimeDigest}, ArtifactSHA256: artifact.ArtifactSHA256, CommitmentKey: commitmentKey})
 	if err != nil {
@@ -2513,5 +2521,41 @@ func TestAuthorizedGeneratedPlanUsesExistingRunnerAndPackage(t *testing.T) {
 	planDocument, err := os.ReadFile(filepath.Join(packageDir, "plan.json"))
 	if err != nil || bytes.Contains(planDocument, commitmentKey) || bytes.Contains(planDocument, []byte(base64.StdEncoding.EncodeToString(commitmentKey))) {
 		t.Fatalf("private commitment key reached package: %v %s", err, planDocument)
+	}
+}
+
+// TestExecutableBindingRejectsCoordinatedPublicContextSubstitution proves recovery trusts the private prepared seal over a rehashed artifact.
+func TestExecutableBindingRejectsCoordinatedPublicContextSubstitution(t *testing.T) {
+	artifact := PlanArtifact{Version: ArtifactVersion, WorkflowID: "sealed-run", Plans: []localvalidation.PlanProjection{{ID: "plan"}}, ContextDigest: strings.Repeat("1", 64), RevisionDigest: strings.Repeat("2", 64), TargetDigest: strings.Repeat("3", 64), ContextSnapshotDigest: strings.Repeat("4", 64), ContextBindingDigest: strings.Repeat("5", 64), ContextInstructionsHash: strings.Repeat("6", 64), ContextSeal: strings.Repeat("7", 64)}
+	artifact.ArtifactSHA256, _ = artifactDigest(artifact)
+	private := ExecutableMaterial{Version: ArtifactVersion, WorkflowID: artifact.WorkflowID, ArtifactSHA256: artifact.ArtifactSHA256, ContextDigest: artifact.ContextDigest, RevisionDigest: artifact.RevisionDigest, TargetDigest: artifact.TargetDigest, Snapshot: agentplanning.PreparedSnapshot{ContextDigest: artifact.ContextSnapshotDigest, ContextInstructionsHash: artifact.ContextInstructionsHash, ContextSeal: artifact.ContextSeal}}
+	artifact.ContextInstructionsHash = strings.Repeat("8", 64)
+	artifact.ContextSeal = strings.Repeat("9", 64)
+	artifact.ArtifactSHA256, _ = artifactDigest(artifact)
+	private.ArtifactSHA256 = artifact.ArtifactSHA256
+	record := Record{Handle: artifact.WorkflowID, Artifact: &artifact}
+	if err := verifyExecutableContext(record, AdmissionSnapshot{}, private); !IsCode(err, CodeConflict) {
+		t.Fatalf("coordinated public context substitution accepted: %v", err)
+	}
+}
+
+// TestArtifactVerificationRequiresCanonicalContextSealFields proves public recovery metadata cannot omit or widen assembled-context hashes.
+func TestArtifactVerificationRequiresCanonicalContextSealFields(t *testing.T) {
+	artifact := PlanArtifact{Version: ArtifactVersion, WorkflowID: "sealed-artifact", Plans: []localvalidation.PlanProjection{{ID: "plan"}}, ContextInstructionsHash: strings.Repeat("a", 64), ContextSnapshotDigest: strings.Repeat("b", 64), ContextBindingDigest: strings.Repeat("c", 64), ContextSeal: strings.Repeat("d", 64)}
+	artifact.ArtifactSHA256, _ = artifactDigest(artifact)
+	if err := verifyArtifact(artifact, artifact.WorkflowID); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*PlanArtifact){
+		func(value *PlanArtifact) { value.ContextSeal = "" },
+		func(value *PlanArtifact) { value.ContextInstructionsHash = strings.Repeat("G", 64) },
+		func(value *PlanArtifact) { value.ContextBindingDigest = strings.Repeat("c", 63) },
+	} {
+		changed := artifact
+		mutate(&changed)
+		changed.ArtifactSHA256, _ = artifactDigest(changed)
+		if err := verifyArtifact(changed, changed.WorkflowID); !IsCode(err, CodeConflict) {
+			t.Fatalf("invalid context seal metadata accepted: %#v err=%v", changed, err)
+		}
 	}
 }

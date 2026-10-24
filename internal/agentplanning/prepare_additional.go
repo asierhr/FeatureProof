@@ -2,6 +2,8 @@ package agentplanning
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 
 	"github.com/asierhr/featureProof/internal/planning"
 )
@@ -79,16 +81,20 @@ func PrepareAdditional(ctx context.Context, request GenerationRequest, checks []
 			return PreparedPlan{}, typedError(CategoryPolicyDenial, "prepare_additional", field("checks", i), nil)
 		}
 	}
-	provenance, err := generationProvenance(snapshot.Constraints, snapshot.Contract, snapshot.Capabilities, snapshot.Identities)
+	provenance, err := generationProvenance(snapshot.Constraints, snapshot.Contract, snapshot.Capabilities, snapshot.Identities, snapshot.ContextDigest, snapshot.ContextEnvelope, snapshot.ContextInstructions, snapshot.ContextSeal)
 	if err != nil {
 		return PreparedPlan{}, typedError(CategoryInternal, "prepare_additional", "provenance", nil)
 	}
-	return PreparedPlan{id: snapshot.PlanID, checks: prepared, provenance: provenance}, nil
+	contextSum := sha256.Sum256(snapshot.ContextEnvelope)
+	instructionsSum := sha256.Sum256([]byte(snapshot.ContextInstructions))
+	return PreparedPlan{id: snapshot.PlanID, checks: prepared, provenance: provenance, contextDigest: snapshot.ContextDigest, contextEnvelopeHash: hex.EncodeToString(contextSum[:]), contextInstructionsHash: hex.EncodeToString(instructionsSum[:]), contextSeal: snapshot.ContextSeal}, nil
 }
 
 // RestorePrepared revalidates a private snapshot through every registry, assertion, policy and provenance gate.
 func RestorePrepared(ctx context.Context, request GenerationRequest, snapshot PreparedSnapshot, assertions AssertionValidator, policy GenerationPolicy) (PreparedPlan, error) {
-	if snapshot.ID == "" || snapshot.ID != request.PlanID {
+	contextSum := sha256.Sum256(request.ContextEnvelope)
+	instructionsSum := sha256.Sum256([]byte(request.ContextInstructions))
+	if snapshot.ID == "" || snapshot.ID != request.PlanID || snapshot.ContextDigest != request.ContextDigest || snapshot.ContextEnvelopeHash != hex.EncodeToString(contextSum[:]) || snapshot.ContextInstructionsHash != hex.EncodeToString(instructionsSum[:]) || snapshot.ContextSeal != request.ContextSeal {
 		return PreparedPlan{}, typedError(CategoryInvalidInput, "restore_prepared", "plan_id", nil)
 	}
 	return PrepareAdditional(ctx, request, snapshot.Checks, assertions, policy)

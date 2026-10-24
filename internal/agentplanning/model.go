@@ -3,6 +3,7 @@ package agentplanning
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -69,6 +70,14 @@ type GenerationRequest struct {
 	Capabilities  []CapabilityDescriptor
 	Identities    []testidentity.Descriptor
 	Limits        Limits
+	// ContextEnvelope is the sole assembled model-facing payload when context assembly is configured.
+	ContextEnvelope json.RawMessage
+	// ContextInstructions carries only composition-sealed instructions into the privileged model channel.
+	ContextInstructions string
+	// ContextDigest binds the assembled payload to workflow provenance without granting execution authority.
+	ContextDigest string
+	// ContextSeal authenticates both privileged instructions and untrusted envelope bytes as one composition value.
+	ContextSeal string
 }
 
 // ScenarioEntry is one constraint/scenario declaration in the candidate matrix.
@@ -268,15 +277,23 @@ func (p PreparedCheck) Evidence() []EvidenceRequirement { return cloneEvidence(p
 
 // PreparedPlan is the all-or-nothing result that passed every generation validation stage.
 type PreparedPlan struct {
-	id         string
-	checks     []PreparedCheck
-	provenance string
+	id                      string
+	checks                  []PreparedCheck
+	provenance              string
+	contextDigest           string
+	contextEnvelopeHash     string
+	contextInstructionsHash string
+	contextSeal             string
 }
 
 // PreparedSnapshot is the private serializable proposal required to revalidate a prepared plan after restart.
 type PreparedSnapshot struct {
-	ID     string           `json:"id"`
-	Checks []CandidateCheck `json:"checks"`
+	ID                      string           `json:"id"`
+	Checks                  []CandidateCheck `json:"checks"`
+	ContextDigest           string           `json:"context_digest,omitempty"`
+	ContextEnvelopeHash     string           `json:"context_envelope_hash,omitempty"`
+	ContextInstructionsHash string           `json:"context_instructions_hash,omitempty"`
+	ContextSeal             string           `json:"context_seal,omitempty"`
 }
 
 // ID returns the caller-selected plan identifier.
@@ -291,20 +308,24 @@ func (p PreparedPlan) Snapshot() PreparedSnapshot {
 	for i := range p.checks {
 		checks[i] = cloneCheck(p.checks[i].check)
 	}
-	return PreparedSnapshot{ID: p.id, Checks: checks}
+	return PreparedSnapshot{ID: p.id, Checks: checks, ContextDigest: p.contextDigest, ContextEnvelopeHash: p.contextEnvelopeHash, ContextInstructionsHash: p.contextInstructionsHash, ContextSeal: p.contextSeal}
 }
 
 // ProvenanceInput is the non-executable generation context that an approval boundary may verify against a prepared plan.
 type ProvenanceInput struct {
-	Constraints  []Constraint
-	Contract     contractcatalog.ReducedContext
-	Capabilities []CapabilityDescriptor
-	Identities   []testidentity.Descriptor
+	Constraints         []Constraint
+	Contract            contractcatalog.ReducedContext
+	Capabilities        []CapabilityDescriptor
+	Identities          []testidentity.Descriptor
+	ContextDigest       string
+	ContextEnvelope     json.RawMessage
+	ContextInstructions string
+	ContextSeal         string
 }
 
 // MatchesProvenance proves that this plan was minted from the supplied generation inputs without exposing a forgeable token.
 func (p PreparedPlan) MatchesProvenance(input ProvenanceInput) bool {
-	want, err := generationProvenance(input.Constraints, input.Contract, input.Capabilities, input.Identities)
+	want, err := generationProvenance(input.Constraints, input.Contract, input.Capabilities, input.Identities, input.ContextDigest, input.ContextEnvelope, input.ContextInstructions, input.ContextSeal)
 	return err == nil && p.provenance != "" && p.provenance == want
 }
 

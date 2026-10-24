@@ -2,6 +2,7 @@ package validationworkflow
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
@@ -172,7 +173,7 @@ func approvalContext(snapshot AdmissionSnapshot, artifact PlanArtifact, flow *pl
 	for i, capability := range snapshot.Generation.Capabilities {
 		capabilities[i] = planapproval.CapabilitySnapshot{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
-	return planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: snapshot.TargetDigest, BaseURL: "https://target.invalid/"}, Constraints: append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...), Contract: snapshot.Generation.Contract, Capabilities: capabilities, Identities: testidentity.CloneDescriptors(snapshot.Generation.Identities), Runtime: planapproval.RuntimeSnapshot{PolicyVersion: snapshot.RuntimeDigest, Limits: map[string]int{"checks": snapshot.Generation.Limits.MaxChecks, "steps": snapshot.Generation.Limits.MaxStepsPerCheck}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: artifact.ProtocolVersion, PromptVersion: artifact.PromptVersion, Provider: artifact.Provider, Model: artifact.Model}, FunctionalFlow: cloneApprovalFlow(flow)}
+	return planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: snapshot.TargetDigest, BaseURL: "https://target.invalid/"}, Constraints: append([]agentplanning.Constraint(nil), snapshot.Generation.Constraints...), Contract: snapshot.Generation.Contract, Capabilities: capabilities, Identities: testidentity.CloneDescriptors(snapshot.Generation.Identities), Runtime: planapproval.RuntimeSnapshot{PolicyVersion: snapshot.RuntimeDigest, Limits: map[string]int{"checks": snapshot.Generation.Limits.MaxChecks, "steps": snapshot.Generation.Limits.MaxStepsPerCheck}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: artifact.ProtocolVersion, PromptVersion: artifact.PromptVersion, Provider: artifact.Provider, Model: artifact.Model}, ContextDigest: snapshot.Generation.ContextDigest, ContextEnvelope: append(json.RawMessage(nil), snapshot.Generation.ContextEnvelope...), ContextInstructions: snapshot.Generation.ContextInstructions, ContextSeal: snapshot.Generation.ContextSeal, FunctionalFlow: cloneApprovalFlow(flow)}
 }
 
 // projectApprovalView maps the existing sanitized view while retaining workflow artifact bindings.

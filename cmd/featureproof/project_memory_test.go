@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/projectmemory"
 )
@@ -64,7 +65,7 @@ type compositionWitness struct {
 func installProjectMemoryWitness(t *testing.T) {
 	t.Helper()
 	emptyReceipts := sha256.Sum256([]byte("{}"))
-	authority := &compositionWitness{states: map[string]projectmemory.WitnessState{"project-1": {ProjectID: "project-1", ReceiptsDigest: fmt.Sprintf("%x", emptyReceipts)}}}
+	authority := &compositionWitness{states: map[string]projectmemory.WitnessState{"project-1": {ProjectID: "project-1", ReceiptsDigest: fmt.Sprintf("%x", emptyReceipts)}, "project-1-context": contextassembly.InitialWitnessState("project-1-context")}}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer witness-credential" {
 			writer.WriteHeader(http.StatusUnauthorized)
@@ -106,6 +107,7 @@ func installProjectMemoryWitness(t *testing.T) {
 	t.Setenv("FEATUREPROOF_MEMORY_WITNESS_URL", server.URL)
 	t.Setenv("FEATUREPROOF_MEMORY_WITNESS_CREDENTIAL", "witness-credential")
 	t.Setenv("FEATUREPROOF_MEMORY_WITNESS_GUARANTEE", "linearizable-durable-nonreplayable-v1")
+	t.Setenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM", "project-1-context")
 }
 
 // setProjectMemoryEnvironment installs one complete isolated production composition for entrypoint tests.

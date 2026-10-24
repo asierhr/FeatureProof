@@ -340,6 +340,8 @@ type projectMemoryComposition struct {
 	API               projectmemory.APIHandler
 	MCP               projectmemory.MCPAdapter
 	GitHub            projectmemory.GitHubAdapter
+	Witness           projectmemory.MonotonicWitness
+	ProjectID         string
 }
 
 // composeProjectMemory builds the local authenticated store and all memory transport adapters from process configuration.
@@ -392,5 +394,5 @@ func composeProjectMemory() (projectMemoryComposition, error) {
 	reconciler := projectMemoryAuthority{principal: reconcilerPrincipal, project: project, repository: repository, commit: commit, configuration: configuration, role: "reconciler", actorKind: "reconciler", actions: map[string]bool{"expire": true}}
 	service := &projectmemory.Service{Store: store, Evidence: projectMemoryEvidence{}, HumanPrincipals: human, ObserverPrincipals: observer, ReconcilerPrincipals: reconciler, Clock: projectMemoryClock{}, Gate: projectmemory.SecretGate{Rules: projectmemory.SecretRules{Names: []string{"password", "token", "secret"}, MaxWork: 10000}}, Limits: projectmemory.DefaultLimits()}
 	surface := projectmemory.Surface{Service: service, Authority: human}
-	return projectMemoryComposition{Service: service, HumanAuthority: human, ObserverPrincipal: observerPrincipal, CLI: projectmemory.CLIAdapter{Surface: surface, Principal: principal}, API: projectmemory.APIHandler{Surface: surface, Auth: human}, MCP: projectmemory.MCPAdapter{Surface: surface, Auth: human}, GitHub: projectmemory.GitHubAdapter{Surface: surface, Auth: human}}, nil
+	return projectMemoryComposition{Service: service, HumanAuthority: human, ObserverPrincipal: observerPrincipal, CLI: projectmemory.CLIAdapter{Surface: surface, Principal: principal}, API: projectmemory.APIHandler{Surface: surface, Auth: human}, MCP: projectmemory.MCPAdapter{Surface: surface, Auth: human}, GitHub: projectmemory.GitHubAdapter{Surface: surface, Auth: human}, Witness: witness, ProjectID: project}, nil
 }

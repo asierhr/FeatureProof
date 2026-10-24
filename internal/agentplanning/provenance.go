@@ -26,12 +26,16 @@ type provenanceEnvelope struct {
 		Omissions                              contractcatalog.OmissionCounts
 		Retained                               []contractcatalog.RetainedOperation
 	}
-	Capabilities []provenanceCapability
-	Identities   []testidentity.Descriptor
+	Capabilities            []provenanceCapability
+	Identities              []testidentity.Descriptor
+	ContextDigest           string
+	ContextEnvelopeHash     string
+	ContextInstructionsHash string
+	ContextSeal             string
 }
 
 // generationProvenance hashes the exact immutable generation inputs without retaining callbacks or credentials.
-func generationProvenance(constraints []Constraint, reduced contractcatalog.ReducedContext, capabilities []CapabilityDescriptor, identities []testidentity.Descriptor) (string, error) {
+func generationProvenance(constraints []Constraint, reduced contractcatalog.ReducedContext, capabilities []CapabilityDescriptor, identities []testidentity.Descriptor, contextDigest string, contextEnvelope json.RawMessage, contextInstructions, contextSeal string) (string, error) {
 	envelope := provenanceEnvelope{Version: 1, Constraints: append([]Constraint(nil), constraints...)}
 	envelope.Contract.MediaType, envelope.Contract.Untrusted = reduced.MediaType(), reduced.Untrusted()
 	envelope.Contract.CatalogDigest, envelope.Contract.PolicyDigest = reduced.CatalogDigest(), reduced.PolicyDigest()
@@ -43,6 +47,12 @@ func generationProvenance(constraints []Constraint, reduced contractcatalog.Redu
 		envelope.Capabilities[i] = provenanceCapability{Name: capability.Name, Class: capability.Class, Description: capability.Description, Effects: capability.Effects, Idempotent: capability.Idempotent}
 	}
 	envelope.Identities = cloneIdentityDescriptors(identities)
+	envelope.ContextDigest = contextDigest
+	contextSum := sha256.Sum256(contextEnvelope)
+	envelope.ContextEnvelopeHash = hex.EncodeToString(contextSum[:])
+	instructionsSum := sha256.Sum256([]byte(contextInstructions))
+	envelope.ContextInstructionsHash = hex.EncodeToString(instructionsSum[:])
+	envelope.ContextSeal = contextSeal
 	raw, err := json.Marshal(envelope)
 	if err != nil {
 		return "", err
