@@ -390,9 +390,9 @@ no afecte autoridad, addressability, secretos ni comportamiento observable.
 ## Aprobación humana
 
 ```yaml
-status: pending
-approved_by:
-approved_at:
+status: approved
+approved_by: user
+approved_at: 2026-10-25T11:52:20+01:00
 ```
 
 La implementación no puede comenzar hasta que una persona apruebe explícitamente

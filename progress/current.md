@@ -3689,3 +3689,9 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - La spec define R1–R15 y T1–T16, separa autoridad de composición y contenido GitHub no confiable, y delimita la feature frente a webhooks/publicación y entornos.
 - Todos los requirements tienen criterios verificables y referencias de tasks; no quedan decisiones de producto abiertas ni excepciones arquitectónicas.
 - Estado cambiado de `pending` a `spec_ready`. La implementación queda detenida hasta aprobación humana explícita.
+
+## Feature 30 — especificación aprobada (2026-10-25)
+
+- El usuario aprobó explícitamente la especificación de `github-pull-request-context`.
+- Aprobación registrada a las `2026-10-25T11:52:20+01:00`; estado cambiado de `spec_ready` a `in_progress`.
+- Comienza la implementación ordenada de T1–T16; el estado `done` queda reservado a una review independiente aprobada y gates completos.
