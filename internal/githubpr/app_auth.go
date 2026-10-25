@@ -60,7 +60,7 @@ func NewGitHubAppTokenSource(config GitHubAppTokenConfig) (*GitHubAppTokenSource
 
 // Token requests a new token restricted to one repository and the exact minimum permission set.
 func (s *GitHubAppTokenSource) Token(ctx context.Context, installationID, repositoryID int64, permissions PermissionSet) (InstallationToken, error) {
-	if installationID <= 0 || repositoryID <= 0 || ValidatePermissions(permissions) != nil {
+	if installationID <= 0 || repositoryID <= 0 || !equalPermissions(permissions, RequiredPermissions()) && !equalPermissions(permissions, ContextPermissions()) {
 		return InstallationToken{}, &Error{Code: CodeUnauthorized, Operation: "token_scope"}
 	}
 	jwt, err := s.signJWT()
@@ -98,11 +98,11 @@ func (s *GitHubAppTokenSource) Token(ctx context.Context, installationID, reposi
 			ID int64 `json:"id"`
 		} `json:"repositories"`
 	}
-	if json.Unmarshal(responseRaw, &dto) != nil || len(dto.Repositories) != 1 || dto.Repositories[0].ID != repositoryID || ValidatePermissions(dto.Permissions) != nil {
+	if json.Unmarshal(responseRaw, &dto) != nil || len(dto.Repositories) != 1 || dto.Repositories[0].ID != repositoryID || !equalPermissions(dto.Permissions, permissions) {
 		return InstallationToken{}, &Error{Code: CodeIntegrity, Operation: "token_response"}
 	}
 	token := InstallationToken{Value: dto.Token, RepositoryID: repositoryID, Permissions: dto.Permissions, ExpiresAt: dto.ExpiresAt}
-	if ValidateToken(token, repositoryID, s.config.Clock.Now()) != nil {
+	if ValidateTokenFor(token, repositoryID, permissions, s.config.Clock.Now()) != nil {
 		return InstallationToken{}, &Error{Code: CodeUnauthorized, Operation: "token_response"}
 	}
 	return token, nil

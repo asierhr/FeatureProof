@@ -673,3 +673,15 @@ Bitácora append-only de features completadas.
 - Tasks T1–T16 completas; R1–R15 y REV-1–REV-29 trazados en `progress/context-assembly/{implementation,review}.md`.
 - Review independiente aprobada en la octava revisión. Pasan smoke del leader, vet, compile-only, suites focal/global normal y race, cinco runtimes Linux y cross-builds Windows/Linux/Darwin 15/15.
 - Cobertura statement-weighted multiplataforma del diff productivo: `1881/2187 = 86,008230 %`, incluyendo `publish_unix_other.go` conservadoramente como 0/1.
+
+## 2026-10-25 — github-pull-request-context
+
+- Estado final: `done`.
+- Resultado: adquisición read-only y coherente `metadata → files → metadata` para una pull request autorizada, con identidad ligada a repository/PR/head/base/policy y detección de drift antes de planificación, aprobación, ejecución y recovery.
+- Seguridad: contenido GitHub permanece `untrusted_data`; paths y unified diff usan gramáticas estrictas, constraints solo proceden de extractores versionados, contratos OpenAPI se seleccionan por rutas confiables y secrets/credenciales no cruzan transporte.
+- Operación: límites y omisiones explícitos, paginación ligada al endpoint, retries/rate limits/cancelación acotados, Context/Binding canónicos y persistencia/records content-free con CAS e idempotencia exactly-once.
+- Integración: `githubcontext` proyecta `SourceDiff` mínimo hacia `ContextAssembler`; se reutilizan autoridad y transporte de `github-pr-integration` sin añadir webhooks, checks, checkout ni entornos.
+- Spec aprobada por el usuario el `2026-10-25T11:52:20+01:00`.
+- Tasks T1–T16 completas; R1–R15 y REV-1–REV-12 trazados en `progress/github-pull-request-context/{implementation,review}.md`.
+- Review independiente aprobada en la cuarta revisión. Pasan smoke del leader, vet, compile-only, suites focal/global normal y race, cuatro runtimes Linux y cross-builds Windows/Linux/Darwin 12/12.
+- Cobertura statement-weighted multiplataforma del diff productivo: `1012/1186 = 85,328836 %`.

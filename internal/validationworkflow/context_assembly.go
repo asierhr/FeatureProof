@@ -25,12 +25,14 @@ type ContextAssemblyAdapter struct {
 	Store    contextassembly.Store
 	Observer contextassembly.Observer
 	Clock    contextassembly.Clock
+	GitHub   GitHubContextSource
 }
 
 // CurrentContextProducerRegistry resolves sealed producer IDs from the workflow's current durable command and admission authorities.
 type CurrentContextProducerRegistry struct {
 	Workflows WorkflowStore
 	Admission AdmissionBuilder
+	GitHub    GitHubContextSource
 }
 
 // Resolve rebuilds current source projections from product authorities and never from historical snapshot bindings.
@@ -50,11 +52,16 @@ func (r CurrentContextProducerRegistry) Resolve(ctx context.Context, runID strin
 	if historical.ProjectID != authority.ProjectID || historical.RepositoryID != authority.RepositoryID {
 		return nil, &Error{Code: CodeConflict, Operation: "context_registry_authority"}
 	}
-	return buildContextProducers(authority, current, record.Command)
+	return buildContextProducersWithGitHub(ctx, record.Handle, authority, current, record.Command, r.GitHub, true)
 }
 
 // buildContextProducers constructs the complete product registry from current admitted values under one authority binding.
-func buildContextProducers(authority contextassembly.AuthorityBinding, snapshot AdmissionSnapshot, command StartCommand) ([]contextassembly.Producer, error) {
+func buildContextProducers(ctx context.Context, authority contextassembly.AuthorityBinding, snapshot AdmissionSnapshot, command StartCommand) ([]contextassembly.Producer, error) {
+	return buildContextProducersWithGitHub(ctx, command.IdempotencyKey, authority, snapshot, command, nil, false)
+}
+
+// buildContextProducersWithGitHub appends a neutral PR projection only when durable GitHub authority and composition source both exist.
+func buildContextProducersWithGitHub(ctx context.Context, runID string, authority contextassembly.AuthorityBinding, snapshot AdmissionSnapshot, command StartCommand, github GitHubContextSource, current bool) ([]contextassembly.Producer, error) {
 	constraints, err := contextassembly.ConstraintProducer(authority, snapshot.Generation.Constraints)
 	if err != nil {
 		return nil, &Error{Code: CodeInvalid, Operation: "context_constraints"}
@@ -80,6 +87,21 @@ func buildContextProducers(authority contextassembly.AuthorityBinding, snapshot 
 			return nil, &Error{Code: CodeInvalid, Operation: "context_memory"}
 		}
 		producers = append(producers, memory)
+	}
+	if command.GitHubAuthority != nil {
+		if github == nil {
+			return producers, nil
+		}
+		var producer contextassembly.Producer
+		if current {
+			producer, err = github.Current(ctx, runID, command.GitHubAuthority, authority)
+		} else {
+			producer, err = github.Initial(ctx, runID, command.GitHubAuthority, authority)
+		}
+		if err != nil {
+			return nil, err
+		}
+		producers = append(producers, producer)
 	}
 	return producers, nil
 }
@@ -160,7 +182,7 @@ func (a *ContextAssemblyAdapter) Prepare(ctx context.Context, handle string, sna
 		return ContextAssemblySelection{}, &Error{Code: CodeInvalid, Operation: "context_profile"}
 	}
 	authority := contextassembly.AuthorityBinding{ProjectID: command.RepositoryID, RepositoryID: command.RepositoryID, Revision: command.Revision, ConfigurationDigest: snapshot.RuntimeDigest, ProfileVersion: profile.Version, InstructionVersion: profile.InstructionVersion, Provider: snapshot.Provider, Model: snapshot.Model}
-	producers, err := buildContextProducers(authority, snapshot, command)
+	producers, err := buildContextProducersWithGitHub(ctx, handle, authority, snapshot, command, a.GitHub, false)
 	if err != nil {
 		return ContextAssemblySelection{}, err
 	}

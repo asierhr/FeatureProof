@@ -3695,3 +3695,90 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - El usuario aprobó explícitamente la especificación de `github-pull-request-context`.
 - Aprobación registrada a las `2026-10-25T11:52:20+01:00`; estado cambiado de `spec_ready` a `in_progress`.
 - Comienza la implementación ordenada de T1–T16; el estado `done` queda reservado a una review independiente aprobada y gates completos.
+
+## Feature 30 — implementación en curso (2026-10-25)
+
+- Añadido `internal/githubcontext`: policy y modelos canónicos, adquisición coherente metadata/files/metadata, límites y omisiones, parser de hunks, extractores versionados, selección OpenAPI, secret gate, binding, refresh y stores idempotentes memory/local.
+- `internal/githubpr.RESTAdapter` expone un puerto de contexto read-only con permisos exactos `metadata:read` + `pull_requests:read`; no sigue URLs remotas ni devuelve DTOs/credenciales.
+- `validationworkflow` compone producers SourceDiff iniciales y actuales desde autoridad GitHub sellada; restart/revalidation usa observación fresca. `cmd/featureproof` acepta una policy sellada opcional y persiste context receipts bajo el workflow store.
+- Los constraints extraídos viajan como datos no confiables dentro de SourceDiff para no competir con el producer autoritativo `SourceConstraints` existente.
+- Focales actuales de `githubcontext`, `githubpr`, `validationworkflow` y `cmd/featureproof` pasan; cobertura focal de `githubcontext`: 85,2 %.
+
+## Feature 30 — endurecimiento de límites (2026-10-25)
+
+- La policy de contexto limita ahora los bytes de cada respuesta REST antes de decodificar; el adapter conserva el reloj inyectado al traducir `Retry-After`.
+- Los límites globales de archivos, páginas e items producen omisiones content-free, marcan completitud parcial y evitan iniciar páginas adicionales una vez agotado el presupuesto.
+- La selección de contratos parte de paths observados y allowlisted aunque el patch esté ausente, por lo que rename/delete siguen siendo representables sin inventar bodies.
+- La proyección empaqueta metadata, constraints, contratos y omisiones en un único item neutral y mantiene `1 + files <= MaxItems`; todo contenido GitHub conserva `untrusted_data`.
+- `Refresh` aplica los mismos intentos, espera y deadline que la adquisición inicial. Los focales de los cuatro paquetes afectados vuelven a pasar tras el endurecimiento.
+
+## Feature 30 — verificación detenida por runtime Linux (2026-10-25)
+
+- T1–T15 quedan implementadas, probadas y marcadas; T16 conserva pendiente únicamente la ejecución real de los cuatro binarios Linux.
+- Pasan formato, auditoría de comentarios, vet, compile-only, focales ×3, suite global normal, focal race y race global serial con UCRT64.
+- Cross-builds Windows/Linux/Darwin pasan 12/12. Coverage exacta conservadora del diff desde `4d0a0da`: `654/766 = 85,378590 %`, contando `sync_unix.go` como 0/1.
+- El runtime Linux no está disponible en este host: Docker Desktop/WSL devolvió `ERROR_NO_SYSTEM_RESOURCES`; tras apagar WSL no queda ninguna distro registrada y el servicio Docker requiere privilegios ausentes.
+- Informe y trazabilidad completa: `progress/github-pull-request-context/implementation.md`. `feature_list.json` permanece intacto y no hay temporales.
+
+## Feature 30 — verificación Linux completada (2026-10-25)
+
+- Recuperado un runtime hermético Alpine 3.22.2 en WSL2 `FeatureProof-Test` y compilados de cero cuatro test binaries Linux `CGO_ENABLED=0` fuera del repositorio.
+- `githubcontext`, `githubpr`, `validationworkflow` y `cmd/featureproof` pasan en Linux desde cwd compatibles; el profile Linux ejecuta también `sync_unix.go`.
+- Coverage exacta multiplataforma fresca del diff desde `4d0a0da`: `656/770 = 85,194805 %`; `sync_unix.go` 4/5 y `sync_windows.go` 1/1.
+- T16 queda completada y todas las tasks T1–T16 están `[x]`; no hubo cambios productivos al reanudar este gate.
+
+## Feature 30 — remediación de review 1 iniciada (2026-10-25)
+
+- Reabiertas T1, T2, T3, T4, T6, T7, T10, T11, T13, T14, T15 y T16 por REV-1–REV-6.
+- Alcance cerrado a los seis blockers: record durable exactly-once, Link ligado al endpoint, constraints sin truncado semántico, policy estricta, verificación semántica de Context/Binding y cancel/timeout preservados en fronteras.
+- `feature_list.json`, webhooks/publicación y features 31/36 permanecen fuera de alcance.
+
+## Feature 30 — remediación de review 1 completada (2026-10-25)
+
+- REV-1: la composición productiva usa `LocalRecordObserver`, que publica records terminales content-free por hard-link inmutable; reopen, redelivery, respuesta perdida, outcomes y corrupción están probados.
+- REV-2: cada `Link` se valida contra scheme/host, endpoint exacto, repo, PR, `page` y `per_page`; origen externo, cross-repo, página repetida y query adicional fallan cerrado.
+- REV-3/REV-4: constraints se extraen del body completo antes de proyectarlo y nunca de un prefijo truncado; policy, extensiones, catálogo, aliases/versiones, constraints y safe refs quedan canónicos y no ambiguos.
+- REV-5: `Context`, `Binding`, store y decode verifican semántica completa además del digest, incluidas relaciones entre objetos y miembros JSON duplicados.
+- REV-6: token, HTTP, body, paginación, Load/Commit y publicación consultan `context.Cause`/`Err`; timeout y cancelación conservan categoría y sentinel distintos.
+- Gates finales verdes: formato/comments/diff, vet, compile-only, focal ×3, global normal, focal/global race UCRT64, cross-builds 12/12 y runtime Alpine WSL2 4/4.
+- Coverage exacta fresca contra `4d0a0da`, uniendo cuatro profiles Windows y uno Linux por statement: `909/1069 = 85,032741 %`; incluye `sync_unix.go` 4/5 y `sync_windows.go` 1/1.
+- T1–T16 vuelven a `[x]`; no se modificó `feature_list.json` ni se amplió el alcance.
+
+## Feature 30 — remediación de review 2 iniciada (2026-10-25)
+
+- Reabiertas T5, T6, T15 y T16 por REV-1, REV-7 y REV-8; REV-2–REV-6 permanecen cerrados.
+- Alcance limitado a identidad terminal válida/exactly-once y propagación de fallo del observer, validación completa de rangos unified diff y una gramática canónica de paths compartida por dominio/adapter.
+- `feature_list.json`, webhooks/publicación y features 31/36 permanecen fuera de alcance.
+
+## Feature 30 — remediación de review 2 completada (2026-10-25)
+
+- REV-1: el record incorpora `acquisition_digest`; su ID terminal se recalcula desde dimensiones content-free estables, sanea inputs inválidos, diferencia stale/success y converge redeliveries aunque cambien attempts/duration. Un fallo de confirmación del observer ya no se ignora.
+- REV-7: cada header unified diff valida gramática/rangos canónicos sin overflow y cada hunk consume exactamente sus líneas old/new; el verificador de Context repite la comprobación ante objetos self-signed.
+- REV-8: `CanonicalRepositoryPath` es la única gramática usada por dominio y adapter; rechaza controles Unicode, NUL, segmentos vacíos/trailing, traversal, separadores/colon y devices DOS reservados con/sin extensión.
+- Gates completos verdes: formato/comments/diff, vet, compile-only, focal ×3, global normal, focal/global race UCRT64, cross-builds 12/12 y runtime Alpine WSL2 4/4.
+- Coverage exacta fresca contra `4d0a0da`, con cuatro profiles Windows y uno Linux unidos por coordenada: `989/1162 = 85,111876 %`; incluye ambos build tags.
+- T5/T6/T15/T16 vuelven a `[x]`; `feature_list.json` permanece intacto y no se amplió alcance.
+
+## Feature 30 — remediación de review 3 iniciada (2026-10-25)
+
+- Reabiertas T5, T6, T15 y T16 por REV-9–REV-12; REV-2–REV-8 y recorridos nominales anteriores permanecen cerrados.
+- Alcance limitado a preservar Context/Binding ante fallo del observer, separar key estable/digest integral del record, validar orden/overlap de hunks y rechazar UTF-8 inválido antes de canonicalizar/decodificar.
+- `feature_list.json`, webhooks/publicación y features 31/36 permanecen fuera de alcance.
+
+## Feature 30 — remediación de review 3 completada (2026-10-25)
+
+- REV-9: error/cancel/timeout del observer conserva Context y Binding ya confirmados junto al error tipado/cause; una redelivery posterior publica el terminal record desde store sin repetir gateway.
+- REV-10: `Record.ID` es la key exactly-once estable y `Record.Digest` sella canónicamente todos los campos, incluidos attempts/duration; publish, read y redelivery verifican ambos y el tamper falla cerrado.
+- REV-11: cada hunk conserva coordenadas old/new half-open y la secuencia exige avance monotónico sin overlap, duplicado ni retroceso, también para rangos zero-count y Context self-signed.
+- REV-12: paths rechazan bytes UTF-8 inválidos antes de canonicalización y el adapter rechaza toda respuesta no UTF-8 antes del decoder JSON, cubriendo title/body/filename/patch raw.
+- Gates completos verdes: formato/comments/diff, vet, compile-only, focal ×3, global normal, focal/global race UCRT64, cross-builds 12/12 y runtime Alpine WSL2 4/4.
+- Coverage exacta fresca contra `4d0a0da`, uniendo cuatro profiles Windows y uno Linux: `1009/1183 = 85,291631 %`, incluidos ambos build tags.
+- T5/T6/T15/T16 vuelven a `[x]`; `feature_list.json` permanece intacto y no se amplió alcance.
+
+## Feature 30 — cierre aprobado (2026-10-25)
+
+- La revisión independiente 4 aprobó el diff completo: R1–R15, T1–T16 y REV-1–REV-12 quedan cerrados.
+- El smoke final del leader pasó en `githubcontext`, `githubpr`, `validationworkflow` y `cmd/featureproof`; `git diff --check` también pasó.
+- Gates independientes: suite global normal/race, cuatro runtimes Linux y cross-builds Windows/Linux/Darwin 12/12.
+- Cobertura fresca multiplataforma del diff productivo: `1012/1186 = 85,328836 %`, incluyendo `sync_unix.go` y `sync_windows.go`.
+- Feature 30 marcada `done`; queda commit, push y retirada del runner WSL temporal.

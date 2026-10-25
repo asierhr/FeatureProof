@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/asierhr/featureProof/internal/githubcontext"
 )
 
 // HTTPDoer is the only transport capability required by the REST adapter.
@@ -40,6 +43,8 @@ var repositorySlug = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,99})$`)
 type pullRequestDTO struct {
 	Number int64  `json:"number"`
 	State  string `json:"state"`
+	Title  string `json:"title"`
+	Body   string `json:"body"`
 	User   struct {
 		ID int64 `json:"id"`
 	} `json:"user"`
@@ -50,11 +55,114 @@ type pullRequestDTO struct {
 		} `json:"repo"`
 	} `json:"head"`
 	Base struct {
+		SHA  string `json:"sha"`
 		Repo struct {
 			ID       int64  `json:"id"`
 			FullName string `json:"full_name"`
 		} `json:"repo"`
 	} `json:"base"`
+}
+
+// ContextPermissions returns the read-only installation scope used by PR context acquisition.
+func ContextPermissions() PermissionSet {
+	return PermissionSet{"metadata": "read", "pull_requests": "read"}
+}
+
+// Metadata reads the exact neutral PR fields required by githubcontext without exposing DTO URLs.
+func (a *RESTAdapter) Metadata(ctx context.Context, installationID, repositoryID, number int64, maxResponseBytes int) (githubcontext.RemoteMetadata, error) {
+	var dto pullRequestDTO
+	resource := fmt.Sprintf("/repositories/%d/pulls/%d", repositoryID, number)
+	if _, err := a.requestHeadersWithPermissionsLimit(ctx, installationID, repositoryID, ContextPermissions(), maxResponseBytes, http.MethodGet, resource, nil, &dto); err != nil {
+		return githubcontext.RemoteMetadata{}, mapContextError(ctx, err, a.config.Clock.Now())
+	}
+	if ctx.Err() != nil {
+		return githubcontext.RemoteMetadata{}, mapContextError(ctx, ctx.Err(), a.config.Clock.Now())
+	}
+	if dto.Number != number || dto.Base.Repo.ID != repositoryID {
+		return githubcontext.RemoteMetadata{}, &githubcontext.Error{Category: githubcontext.CategoryIntegrity, Stage: "metadata"}
+	}
+	return githubcontext.RemoteMetadata{InstallationID: installationID, RepositoryID: repositoryID, Number: dto.Number, State: dto.State, HeadOID: dto.Head.SHA, BaseOID: dto.Base.SHA, Title: dto.Title, Body: dto.Body}, nil
+}
+
+// Files reads one locally addressed bounded page and never follows provider URLs.
+func (a *RESTAdapter) Files(ctx context.Context, installationID, repositoryID, number int64, pageNumber, perPage, maxResponseBytes int) (githubcontext.FilePage, error) {
+	if pageNumber <= 0 || perPage <= 0 || perPage > 100 || maxResponseBytes <= 0 {
+		return githubcontext.FilePage{}, &githubcontext.Error{Category: githubcontext.CategoryInvalid, Stage: "files_page"}
+	}
+	var values []struct {
+		Filename         string  `json:"filename"`
+		PreviousFilename string  `json:"previous_filename"`
+		Status           string  `json:"status"`
+		Additions        int     `json:"additions"`
+		Deletions        int     `json:"deletions"`
+		Changes          int     `json:"changes"`
+		Patch            *string `json:"patch"`
+	}
+	resource := fmt.Sprintf("/repositories/%d/pulls/%d/files?per_page=%d&page=%d", repositoryID, number, perPage, pageNumber)
+	header, err := a.requestHeadersWithPermissionsLimit(ctx, installationID, repositoryID, ContextPermissions(), maxResponseBytes, http.MethodGet, resource, nil, &values)
+	if err != nil {
+		return githubcontext.FilePage{}, mapContextError(ctx, err, a.config.Clock.Now())
+	}
+	if ctx.Err() != nil {
+		return githubcontext.FilePage{}, mapContextError(ctx, ctx.Err(), a.config.Clock.Now())
+	}
+	if len(values) > perPage {
+		return githubcontext.FilePage{}, &githubcontext.Error{Category: githubcontext.CategoryIntegrity, Stage: "files_page"}
+	}
+	page := githubcontext.FilePage{Files: make([]githubcontext.RemoteFile, len(values))}
+	for index, value := range values {
+		page.Files[index] = githubcontext.RemoteFile{Path: value.Filename, PreviousPath: value.PreviousFilename, Status: githubcontext.FileStatus(value.Status), Additions: value.Additions, Deletions: value.Deletions, Changes: value.Changes, Patch: value.Patch}
+	}
+	expectedPath := strings.TrimSuffix(a.base.Path, "/") + fmt.Sprintf("/repositories/%d/pulls/%d/files", repositoryID, number)
+	page.Next, err = strictNextLink(header.Get("Link"), a.base, expectedPath, pageNumber, perPage)
+	if ctx.Err() != nil {
+		return githubcontext.FilePage{}, mapContextError(ctx, ctx.Err(), a.config.Clock.Now())
+	}
+	if err != nil || page.Next && len(page.Files) == 0 {
+		return githubcontext.FilePage{}, &githubcontext.Error{Category: githubcontext.CategoryIntegrity, Stage: "files_pagination"}
+	}
+	return page, nil
+}
+
+// mapContextError translates the existing adapter taxonomy without leaking provider responses.
+func mapContextError(ctx context.Context, err error, now time.Time) error {
+	if ctx.Err() != nil {
+		cause := context.Cause(ctx)
+		if cause == nil {
+			cause = ctx.Err()
+		}
+		category := githubcontext.CategoryCancelled
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(cause, context.DeadlineExceeded) {
+			category = githubcontext.CategoryTimeout
+		}
+		return &githubcontext.Error{Category: category, Stage: "github", Cause: cause}
+	}
+	var typed *Error
+	if !errors.As(err, &typed) {
+		return &githubcontext.Error{Category: githubcontext.CategoryInternal, Stage: "github", Cause: err}
+	}
+	category := githubcontext.CategoryUnauthorized
+	switch typed.Code {
+	case CodeInvalid:
+		category = githubcontext.CategoryInvalid
+	case CodeConflict:
+		category = githubcontext.CategoryConflict
+	case CodeIntegrity:
+		category = githubcontext.CategoryIntegrity
+	case CodeTransient:
+		category = githubcontext.CategoryTransient
+	case CodeRateLimited:
+		category = githubcontext.CategoryRateLimited
+	case CodeCancelled:
+		category = githubcontext.CategoryCancelled
+	case CodeInternal:
+		category = githubcontext.CategoryInternal
+	}
+	retryAt := typed.ResetAt
+	if retryAt.IsZero() && typed.RetryAfter > 0 {
+		retryAt = now.Add(typed.RetryAfter)
+	}
+	return &githubcontext.Error{Category: category, Stage: "github", Cause: err, RetryAt: retryAt}
 }
 
 // RESTAdapter translates GitHub REST DTOs into the package-owned gateway contract.
@@ -143,7 +251,8 @@ func (a *RESTAdapter) readChangedPaths(ctx context.Context, installationID, repo
 			seen[canonical] = true
 			values = append(values, canonical)
 		}
-		next, linkErr := strictNextLink(header.Get("Link"))
+		expectedPath := strings.TrimSuffix(a.base.Path, "/") + fmt.Sprintf("/repos/%s/%s/pulls/%d/files", url.PathEscape(owner), url.PathEscape(repository), number)
+		next, linkErr := strictNextLink(header.Get("Link"), a.base, expectedPath, pageNumber, 100)
 		if linkErr != nil || next && len(pageValues) == 0 {
 			return nil, &Error{Code: CodeIntegrity, Operation: "pull_request_files_pagination"}
 		}
@@ -157,14 +266,16 @@ func (a *RESTAdapter) readChangedPaths(ctx context.Context, installationID, repo
 
 // canonicalGitHubChangedPath accepts only already-canonical repository-relative slash paths.
 func canonicalGitHubChangedPath(value string) (string, bool) {
-	clean := path.Clean(value)
-	return clean, value != "" && value == clean && clean != "." && clean != ".." && !strings.HasPrefix(clean, "../") && !strings.HasPrefix(clean, "/") && !strings.Contains(clean, "\\") && !strings.Contains(clean, ":")
+	return githubcontext.CanonicalRepositoryPath(value)
 }
 
 // strictNextLink validates the bounded pagination signal while never following a remote URL from the response.
-func strictNextLink(value string) (bool, error) {
+func strictNextLink(value string, base *url.URL, expectedPath string, currentPage, perPage int) (bool, error) {
 	if value == "" {
 		return false, nil
+	}
+	if base == nil || currentPage <= 0 || perPage <= 0 || expectedPath == "" {
+		return false, &Error{Code: CodeIntegrity, Operation: "pull_request_files_link"}
 	}
 	found := false
 	relations := make(map[string]bool)
@@ -180,11 +291,19 @@ func strictNextLink(value string) (bool, error) {
 			return false, &Error{Code: CodeIntegrity, Operation: "pull_request_files_link"}
 		}
 		parsed, err := url.Parse(target[1 : len(target)-1])
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		if err != nil || parsed.Scheme != base.Scheme || !strings.EqualFold(parsed.Host, base.Host) || parsed.User != nil || parsed.Fragment != "" || parsed.Path != expectedPath {
 			return false, &Error{Code: CodeIntegrity, Operation: "pull_request_files_link"}
 		}
 		name := strings.TrimSuffix(strings.TrimPrefix(relation, `rel="`), `"`)
 		if relations[name] || name != "next" && name != "prev" && name != "first" && name != "last" {
+			return false, &Error{Code: CodeIntegrity, Operation: "pull_request_files_link"}
+		}
+		query := parsed.Query()
+		if len(query) != 2 || len(query["page"]) != 1 || len(query["per_page"]) != 1 || query.Get("per_page") != strconv.Itoa(perPage) {
+			return false, &Error{Code: CodeIntegrity, Operation: "pull_request_files_link"}
+		}
+		pageNumber, pageErr := strconv.Atoi(query.Get("page"))
+		if pageErr != nil || pageNumber <= 0 || name == "next" && pageNumber != currentPage+1 || name == "prev" && (currentPage <= 1 || pageNumber != currentPage-1) || name == "first" && pageNumber != 1 || name == "last" && pageNumber < currentPage {
 			return false, &Error{Code: CodeIntegrity, Operation: "pull_request_files_link"}
 		}
 		relations[name] = true
@@ -362,7 +481,23 @@ func (a *RESTAdapter) request(ctx context.Context, installationID, repositoryID 
 
 // requestHeaders performs one bounded authenticated REST exchange and returns safe response metadata for pagination.
 func (a *RESTAdapter) requestHeaders(ctx context.Context, installationID, repositoryID int64, method, resource string, input, output any) (http.Header, error) {
-	token, err := a.config.Tokens.Token(ctx, installationID, repositoryID, RequiredPermissions())
+	return a.requestHeadersWithPermissions(ctx, installationID, repositoryID, RequiredPermissions(), method, resource, input, output)
+}
+
+// requestHeadersWithPermissions confines context acquisition to its smaller read-only token scope.
+func (a *RESTAdapter) requestHeadersWithPermissions(ctx context.Context, installationID, repositoryID int64, permissions PermissionSet, method, resource string, input, output any) (http.Header, error) {
+	return a.requestHeadersWithPermissionsLimit(ctx, installationID, repositoryID, permissions, int(a.config.MaxResponse), method, resource, input, output)
+}
+
+// requestHeadersWithPermissionsLimit applies the narrower policy response budget before decoding a context DTO.
+func (a *RESTAdapter) requestHeadersWithPermissionsLimit(ctx context.Context, installationID, repositoryID int64, permissions PermissionSet, maxResponseBytes int, method, resource string, input, output any) (http.Header, error) {
+	if maxResponseBytes <= 0 || int64(maxResponseBytes) > a.config.MaxResponse {
+		return nil, &Error{Code: CodeInvalid, Operation: "response_limit"}
+	}
+	token, err := a.config.Tokens.Token(ctx, installationID, repositoryID, permissions)
+	if ctx.Err() != nil {
+		return nil, &Error{Code: CodeCancelled, Operation: "token"}
+	}
 	if err != nil {
 		var typed *Error
 		if asGitHubError(err, &typed) && (typed.Code == CodeTransient || typed.Code == CodeRateLimited || typed.Code == CodeCancelled) {
@@ -370,7 +505,7 @@ func (a *RESTAdapter) requestHeaders(ctx context.Context, installationID, reposi
 		}
 		return nil, &Error{Code: CodeUnauthorized, Operation: "token"}
 	}
-	if err = ValidateToken(token, repositoryID, a.config.Clock.Now()); err != nil {
+	if err = ValidateTokenFor(token, repositoryID, permissions, a.config.Clock.Now()); err != nil {
 		return nil, err
 	}
 	raw, err := json.Marshal(input)
@@ -400,14 +535,21 @@ func (a *RESTAdapter) requestHeaders(ctx context.Context, installationID, reposi
 		return nil, &Error{Code: CodeTransient, Operation: "http"}
 	}
 	defer response.Body.Close()
+	if ctx.Err() != nil {
+		return nil, &Error{Code: CodeCancelled, Operation: "http"}
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, classifyHTTP(response, a.config.Clock.Now())
 	}
 	if output == nil {
 		return response.Header, nil
 	}
-	responseRaw, err := io.ReadAll(io.LimitReader(response.Body, a.config.MaxResponse+1))
-	if err != nil || int64(len(responseRaw)) > a.config.MaxResponse {
+	responseLimit := int64(maxResponseBytes)
+	responseRaw, err := io.ReadAll(io.LimitReader(response.Body, responseLimit+1))
+	if ctx.Err() != nil {
+		return nil, &Error{Code: CodeCancelled, Operation: "response"}
+	}
+	if err != nil || int64(len(responseRaw)) > responseLimit || !utf8.Valid(responseRaw) {
 		return nil, &Error{Code: CodeIntegrity, Operation: "response"}
 	}
 	decoder := json.NewDecoder(bytes.NewReader(responseRaw))
@@ -444,3 +586,6 @@ func classifyHTTP(response *http.Response, now time.Time) error {
 
 // Compile-time checks ensure the REST adapter exposes only the package-owned contract.
 var _ PullRequestGateway = (*RESTAdapter)(nil)
+
+// Compile-time context check keeps read-only acquisition behind the consumer-owned neutral port.
+var _ githubcontext.Gateway = (*RESTAdapter)(nil)

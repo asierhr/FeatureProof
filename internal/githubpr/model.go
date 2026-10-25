@@ -443,6 +443,27 @@ func ValidateToken(token InstallationToken, repositoryID int64, now time.Time) e
 	return nil
 }
 
+// ValidateTokenFor checks a token against the exact operation-specific permission set requested by composition.
+func ValidateTokenFor(token InstallationToken, repositoryID int64, permissions PermissionSet, now time.Time) error {
+	if token.Value == "" || token.RepositoryID != repositoryID || !token.ExpiresAt.After(now) || !equalPermissions(token.Permissions, permissions) {
+		return &Error{Code: CodeUnauthorized, Operation: "token"}
+	}
+	return nil
+}
+
+// equalPermissions requires exact permission identity and rejects silent privilege widening.
+func equalPermissions(actual, expected PermissionSet) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for name, access := range expected {
+		if actual[name] != access {
+			return false
+		}
+	}
+	return true
+}
+
 // CanonicalDigest returns a stable hash for durable idempotency identities.
 func CanonicalDigest(value any) (string, error) {
 	raw, err := json.Marshal(value)

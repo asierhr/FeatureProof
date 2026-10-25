@@ -27,6 +27,8 @@ import (
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
+	"github.com/asierhr/featureProof/internal/githubcontext"
+	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/goinspector"
 	"github.com/asierhr/featureProof/internal/model"
 	"github.com/asierhr/featureProof/internal/planmanifest"
@@ -44,6 +46,24 @@ func (s staticWorkflowSpecification) Load(context.Context, string) (specificatio
 
 // rejectingWorkflowTransport records any unexpected productive network attempt and always fails it.
 type rejectingWorkflowTransport struct{ calls atomic.Int32 }
+
+// workflowGitHubContextAuthority implements both admitted identity refresh and bounded context reads for composition tests.
+type workflowGitHubContextAuthority struct{}
+
+// PullRequest returns the structural authority used by the existing GitHub admission path.
+func (workflowGitHubContextAuthority) PullRequest(context.Context, int64, int64, int64) (githubpr.PullRequestSnapshot, error) {
+	return githubpr.PullRequestSnapshot{}, nil
+}
+
+// Metadata returns one neutral current context observation.
+func (workflowGitHubContextAuthority) Metadata(context.Context, int64, int64, int64, int) (githubcontext.RemoteMetadata, error) {
+	return githubcontext.RemoteMetadata{}, nil
+}
+
+// Files returns an empty bounded page.
+func (workflowGitHubContextAuthority) Files(context.Context, int64, int64, int64, int, int, int) (githubcontext.FilePage, error) {
+	return githubcontext.FilePage{}, nil
+}
 
 // RoundTrip makes a model, OAuth or tool network attempt observable without reaching an external system.
 func (t *rejectingWorkflowTransport) RoundTrip(*http.Request) (*http.Response, error) {
@@ -74,6 +94,24 @@ func TestWorkflowConfigurationRequiresExplicitSnakeCaseSelections(t *testing.T) 
 	if err != nil || loaded.Model != "selected-model" || loaded.TargetAlias != "target" {
 		t.Fatalf("valid config rejected: %#v %v", loaded, err)
 	}
+	githubPolicy, policyErr := githubcontext.SealPolicy(githubcontext.Policy{Version: githubcontext.PolicyVersion, ID: "github-policy", Revision: "v1", Extractor: githubcontext.ExtractorPolicy{Kind: "markdown_section", Version: "v1", Marker: "## Constraints"}, PathPrefixes: []string{"src/"}, TextExtensions: []string{".go"}, AllowedStatuses: []githubcontext.FileStatus{githubcontext.StatusModified}, Limits: githubcontext.Limits{MaxAttempts: 1, MaxPages: 1, MaxFiles: 10, MaxTitleBytes: 100, MaxBodyBytes: 100, MaxPatchBytesPerFile: 100, MaxPatchBytesTotal: 100, MaxHunks: 10, MaxLines: 10, MaxConstraints: 10, MaxItems: 20, MaxResponseBytes: 1024, MaxDuration: time.Minute, MaxRetryWait: time.Second}})
+	if policyErr != nil {
+		t.Fatal(policyErr)
+	}
+	config["github_context"] = githubPolicy
+	write(config)
+	loaded, err = loadWorkflowConfig()
+	if err != nil || loaded.GitHubContext == nil || loaded.GitHubContext.Digest != githubPolicy.Digest {
+		t.Fatalf("GitHub context policy rejected: %#v %v", loaded.GitHubContext, err)
+	}
+	invalidGitHubPolicy := githubPolicy
+	invalidGitHubPolicy.Limits.MaxPages = 0
+	config["github_context"] = invalidGitHubPolicy
+	write(config)
+	if _, err = loadWorkflowConfig(); err == nil {
+		t.Fatal("invalid GitHub context policy accepted")
+	}
+	delete(config, "github_context")
 	delete(config, "model")
 	write(config)
 	if _, err = loadWorkflowConfig(); err == nil {
@@ -130,6 +168,24 @@ func TestWorkflowConfigurationRequiresExplicitSnakeCaseSelections(t *testing.T) 
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", filepath.Join(root, "missing.json"))
 	if _, err = loadWorkflowConfig(); err == nil {
 		t.Fatal("missing configuration file accepted")
+	}
+}
+
+// TestWorkflowGitHubContextCompositionRequiresSealedReadOnlyAuthority verifies optional product wiring remains composition-owned.
+func TestWorkflowGitHubContextCompositionRequiresSealedReadOnlyAuthority(t *testing.T) {
+	if source, err := composeWorkflowGitHubContext(t.TempDir(), "2", nil, nil, githubpr.WallClock{}); err != nil || source != nil {
+		t.Fatalf("absent policy changed composition: %v", err)
+	}
+	policy, err := githubcontext.SealPolicy(githubcontext.Policy{Version: githubcontext.PolicyVersion, ID: "policy", Revision: "v1", Extractor: githubcontext.ExtractorPolicy{Kind: "markdown_section", Version: "v1", Marker: "## Constraints"}, PathPrefixes: []string{"src/"}, TextExtensions: []string{".go"}, AllowedStatuses: []githubcontext.FileStatus{githubcontext.StatusModified}, Limits: githubcontext.Limits{MaxAttempts: 1, MaxPages: 1, MaxFiles: 10, MaxTitleBytes: 100, MaxBodyBytes: 100, MaxPatchBytesPerFile: 100, MaxPatchBytesTotal: 100, MaxHunks: 10, MaxLines: 10, MaxConstraints: 10, MaxItems: 10, MaxResponseBytes: 1024, MaxDuration: time.Minute, MaxRetryWait: time.Second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = composeWorkflowGitHubContext(t.TempDir(), "repo", &policy, workflowGitHubContextAuthority{}, githubpr.WallClock{}); err == nil {
+		t.Fatal("nonnumeric repository accepted")
+	}
+	source, err := composeWorkflowGitHubContext(t.TempDir(), "2", &policy, workflowGitHubContextAuthority{}, githubpr.WallClock{})
+	if err != nil || source == nil {
+		t.Fatalf("valid composition rejected: %v", err)
 	}
 }
 

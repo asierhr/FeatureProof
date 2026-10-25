@@ -28,6 +28,7 @@ import (
 	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/functionalflow"
+	"github.com/asierhr/featureProof/internal/githubcontext"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/goinspector"
 	"github.com/asierhr/featureProof/internal/harness"
@@ -84,6 +85,7 @@ type workflowConfig struct {
 	IdentityObservationTimeoutMS  int                                     `json:"identity_observation_timeout_ms,omitempty"`
 	FixtureRuntime                *workflowFixtureRuntimeConfig           `json:"fixture_runtime,omitempty"`
 	FunctionalFlowAliases         map[string]string                       `json:"functional_flow_aliases,omitempty"`
+	GitHubContext                 *githubcontext.Policy                   `json:"github_context,omitempty"`
 }
 
 // workflowFixtureRuntimeConfig is the trusted operator-owned authority for every finite fixture effect and wait.
@@ -315,6 +317,13 @@ func loadWorkflowConfig() (workflowConfig, error) {
 	}
 	if _, err := config.approvedContractReference(); err != nil {
 		return workflowConfig{}, errors.New("invalid workflow configuration")
+	}
+	if config.GitHubContext != nil {
+		sealed, policyErr := githubcontext.SealPolicy(*config.GitHubContext)
+		if policyErr != nil || config.GitHubContext.Digest != "" && config.GitHubContext.Digest != sealed.Digest {
+			return workflowConfig{}, errors.New("invalid github context configuration")
+		}
+		config.GitHubContext = &sealed
 	}
 	return config, nil
 }
@@ -639,7 +648,12 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if err != nil {
 		return nil, err
 	}
-	contextPort := &validationworkflow.ContextAssemblyAdapter{Profiles: contextProfiles, Registry: validationworkflow.CurrentContextProducerRegistry{Workflows: store, Admission: admission}, Secrets: contextassembly.NewCanaryGate(nil), Tokens: contextassembly.ByteTokenCounter{Selections: map[string]bool{config.Provider + "/" + config.Model: true}}, Store: contextStore, Observer: validationworkflow.ContextObserver{}, Clock: wallClock}
+	githubContextSource, err := composeWorkflowGitHubContext(storeRoot, config.RepositoryID, config.GitHubContext, options.githubAuthority, wallClock)
+	if err != nil {
+		return nil, err
+	}
+	contextRegistry := validationworkflow.CurrentContextProducerRegistry{Workflows: store, Admission: admission, GitHub: githubContextSource}
+	contextPort := &validationworkflow.ContextAssemblyAdapter{Profiles: contextProfiles, Registry: contextRegistry, Secrets: contextassembly.NewCanaryGate(nil), Tokens: contextassembly.ByteTokenCounter{Selections: map[string]bool{config.Provider + "/" + config.Model: true}}, Store: contextStore, Observer: validationworkflow.ContextObserver{}, Clock: wallClock, GitHub: githubContextSource}
 	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Preview: previewPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, Memory: memoryPort, MemoryObserver: memoryObserver, Context: contextPort})
 	if err != nil {
 		return nil, err
@@ -656,6 +670,35 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 		cli.PreviewTargets[config.TargetAlias] = validationworkflow.PreviewTarget{Alias: config.TargetAlias, Digest: targetDigest}
 	}
 	return cli, nil
+}
+
+// composeWorkflowGitHubContext confines trusted policy, read-only gateway and durable store to product composition.
+func composeWorkflowGitHubContext(storeRoot, repository string, policy *githubcontext.Policy, authority validationworkflow.GitHubPullRequestAuthority, clock githubcontext.Clock) (validationworkflow.GitHubContextSource, error) {
+	if policy == nil {
+		return nil, nil
+	}
+	githubGateway, ok := authority.(githubcontext.Gateway)
+	repositoryID, err := strconv.ParseInt(repository, 10, 64)
+	if !ok || err != nil || repositoryID <= 0 || clock == nil {
+		return nil, errors.New("github context composition unavailable")
+	}
+	sealed, err := githubcontext.SealPolicy(*policy)
+	if err != nil || policy.Digest != sealed.Digest {
+		return nil, errors.New("github context policy unavailable")
+	}
+	store, err := githubcontext.OpenLocalStore(filepath.Join(storeRoot, "github-context"))
+	if err != nil {
+		return nil, err
+	}
+	observer, err := githubcontext.OpenLocalRecordObserver(filepath.Join(storeRoot, "github-context-records"))
+	if err != nil {
+		return nil, err
+	}
+	acquirer, err := githubcontext.NewAcquirer(githubcontext.Dependencies{Gateway: githubGateway, Secrets: githubcontext.NewCanaryGate(nil), Clock: clock, Store: store, Observer: observer})
+	if err != nil {
+		return nil, err
+	}
+	return validationworkflow.GitHubContextAdapter{Acquirer: acquirer, Policies: validationworkflow.StaticGitHubContextPolicies{repositoryID: sealed}}, nil
 }
 
 // workflowContextFailure preserves an owner context's sentinel cause while exposing a stable cancellation category.

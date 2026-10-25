@@ -23,6 +23,7 @@ type changedPathHTTPFixture struct {
 	status        int
 	linkOverride  string
 	metadataBody  string
+	baseURL       string
 }
 
 // handler serves only the exact metadata and changed-file routes used by RESTAdapter.PullRequest.
@@ -59,7 +60,7 @@ func (f *changedPathHTTPFixture) handler(w http.ResponseWriter, request *http.Re
 	if f.linkOverride != "" {
 		w.Header().Set("Link", f.linkOverride)
 	} else if pageNumber < len(f.pages) {
-		w.Header().Set("Link", `<https://api.github.test/repos/owner/repository/pulls/3/files?page=`+strconv.Itoa(pageNumber+1)+`>; rel="next"`)
+		w.Header().Set("Link", `<`+f.baseURL+`/repos/owner/repository/pulls/3/files?per_page=100&page=`+strconv.Itoa(pageNumber+1)+`>; rel="next"`)
 	}
 	if len(values) == 0 {
 		_, _ = w.Write([]byte(`[]`))
@@ -72,6 +73,7 @@ func (f *changedPathHTTPFixture) handler(w http.ResponseWriter, request *http.Re
 func changedPathAdapter(t *testing.T, fixture *changedPathHTTPFixture, maxPages, maxPaths int) (*RESTAdapter, *httptest.Server) {
 	t.Helper()
 	server := httptest.NewTLSServer(http.HandlerFunc(fixture.handler))
+	fixture.baseURL = server.URL
 	clock := &fakeClock{now: time.Unix(100, 0)}
 	adapter, err := NewRESTAdapter(RESTConfig{BaseURL: server.URL, APIVersion: "2022-11-28", AppID: 10, Tokens: &fakeTokenSource{clock: clock}, HTTP: server.Client(), Clock: clock, MaxResponse: 1 << 20, MaxPages: maxPages, MaxChangedPaths: maxPaths})
 	if err != nil {

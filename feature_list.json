@@ -543,7 +543,7 @@
           "Retries, rate limits, paginación, cancelación y respuestas inciertas se resuelven de forma acotada e idempotente",
           "Los tests usan un GitHub falso y cubren contexto válido, truncado, cambio de head, diff malicioso, contrato afectado, paginación, rate limit y ausencia de secretos"
         ],
-        "status": "in_progress"
+        "status": "done"
     },
     {
         "id": 31,

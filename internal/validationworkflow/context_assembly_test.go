@@ -37,7 +37,7 @@ func (r currentWorkflowProducerRegistry) Resolve(ctx context.Context, _ string, 
 	if authority.ProjectID != historical.ProjectID || authority.RepositoryID != historical.RepositoryID {
 		return nil, &Error{Code: CodeConflict, Operation: "test_registry_authority"}
 	}
-	return buildContextProducers(authority, current, r.command)
+	return buildContextProducers(ctx, authority, current, r.command)
 }
 
 // Read returns the current durable context generation.

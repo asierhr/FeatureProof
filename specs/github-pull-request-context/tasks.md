@@ -11,7 +11,7 @@ La feature reutiliza la autoridad de `github-pr-integration`, entrega una
 proyección neutral a `context-assembly` y mantiene todo acceso real a GitHub
 fuera de `go test`.
 
-- [ ] T1. Definir el modelo canónico `PullRequestContext/v1`. [R1, R2, R3, R14]
+- [x] T1. Definir el modelo canónico `PullRequestContext/v1`. [R1, R2, R3, R14]
   - Crear enums cerrados y tipos para request, authority, policy reference,
     metadata, file/hunk, omission, constraint, contract ref, completeness,
     context, binding, counts, record y errores.
@@ -19,14 +19,14 @@ fuera de `go test`.
   - Probar unknown/null/duplicate fields, OIDs/IDs/paths/enums inválidos,
     tampering, mutación posterior y equivalencia canónica.
 
-- [ ] T2. Modelar y validar la policy de composición. [R1, R4, R6, R7, R8]
+- [x] T2. Modelar y validar la policy de composición. [R1, R4, R6, R7, R8]
   - Sellar kind/version de extractor, catálogo, routes OpenAPI, path/status/type
     allowlists y todos los budgets positivos/finitos.
   - Permitir solo narrowing explícito de límites; rechazar policy/authority
     aportada por contenido o callers no GitHub.
   - Probar overlap/duplicados/ambigüedad de rutas, widening y límites exactos.
 
-- [ ] T3. Añadir el puerto mínimo de lectura GitHub y DTOs privados. [R1, R2, R3, R11]
+- [x] T3. Añadir el puerto mínimo de lectura GitHub y DTOs privados. [R1, R2, R3, R11]
   - Extender el adapter existente con metadata title/body/base/head y archivos
     con current/previous path, status, counts y patch opcional.
   - Reutilizar token scope, API version, HTTPS y clasificación segura sin
@@ -34,7 +34,7 @@ fuera de `go test`.
   - Probar endpoints/métodos/headers exactos con servidor local y confirmar que
     solo se requieren lecturas autorizadas de pull requests.
 
-- [ ] T4. Implementar la lectura coherente metadata/files/metadata. [R2, R10, R12]
+- [x] T4. Implementar la lectura coherente metadata/files/metadata. [R2, R10, R12]
   - Comparar fingerprints completos y descartar el intento entero ante drift de
     repository, PR, state, head, base, title o body.
   - Leer páginas en serie construyendo localmente cada ruta y no seguir URLs de
@@ -42,7 +42,7 @@ fuera de `go test`.
   - Probar drift de cada campo, cambios entre páginas, PR cerrada, identidad
     cruzada y ausencia de output parcial.
 
-- [ ] T5. Implementar canonicalización y filtering de archivos. [R3, R6, R7]
+- [x] T5. Implementar canonicalización y filtering de archivos. [R3, R6, R7]
   - Validar paths current/previous, status, counts, duplicados, rename/delete,
     tipo textual y allowlists antes de materializar payload.
   - Clasificar binary/submodule/LFS, patch ausente y paths fuera de scope como
@@ -50,14 +50,14 @@ fuera de `go test`.
   - Probar traversal/absolute/device/backslash/colon, conteos inconsistentes,
     statuses desconocidos y links maliciosos en DTO/patch.
 
-- [ ] T6. Implementar el parser y packer bounded de unified diff. [R4, R6, R7]
+- [x] T6. Implementar el parser y packer bounded de unified diff. [R4, R6, R7]
   - Dividir patches autorizados en hunks/líneas completas y aplicar límites por
     file y globales sin cortar UTF-8, JSON o unidades semánticas.
   - Producir IDs/digests/referencias seguras y omission counts en orden estable.
   - Probar bordes exactos, oversized, diff malicioso, prompt injection, CRLF,
     UTF-8 inválido, patch ausente y determinismo repetido.
 
-- [ ] T7. Implementar extractores versionados de restricciones. [R4, R5, R6]
+- [x] T7. Implementar extractores versionados de restricciones. [R4, R5, R6]
   - Añadir registry cerrado con `markdown_section/v1` y
     `catalog_reference/v1`, sin fallback ni parser/modelo libre.
   - Ligar referencia a catálogo/digest composition-owned y mantener constraints
@@ -65,7 +65,7 @@ fuera de `go test`.
   - Probar sección/referencia válida, duplicada, anidada, desconocida,
     oversized, alias/version drift y texto imperativo fuera de la sección.
 
-- [ ] T8. Implementar selección de contratos OpenAPI afectados. [R6, R7, R8]
+- [x] T8. Implementar selección de contratos OpenAPI afectados. [R6, R7, R8]
   - Comparar solo current/previous paths con routes confiables y emitir safe refs
     deduplicadas ligadas a contract ID/version/head/status.
   - Propagar partial/insufficient ante colección incompleta y representar
@@ -73,7 +73,7 @@ fuera de `go test`.
   - Probar match exacto/patrón aprobado, no-match, mención textual adversaria,
     varios paths por contrato, delete, rename y file/page limit.
 
-- [ ] T9. Añadir secret gate antes de toda frontera durable o model-facing. [R4, R9, R11]
+- [x] T9. Añadir secret gate antes de toda frontera durable o model-facing. [R4, R9, R11]
   - Escanear metadata, constraints, paths y hunks bounded antes de store, ranking,
     observer o model; aplicar únicamente la policy explícita de redact/fail.
   - Mantener tokens/headers/capabilities dentro del adapter y excluir remote
@@ -81,7 +81,7 @@ fuera de `go test`.
   - Probar canarios anidados en cada campo, detector cancelado/fallido y escaneo
     byte-for-byte de errors/events/journal/model request.
 
-- [ ] T10. Construir `Acquirer` con attempts y outcomes acotados. [R2, R6, R12, R13, R14]
+- [x] T10. Construir `Acquirer` con attempts y outcomes acotados. [R2, R6, R12, R13, R14]
   - Coordinar validación, intento coherente, normalization, extractors, selector,
     secret gate y seal bajo un único context/deadline.
   - Reintentar solo fallos read-only transitorios/rate-limited reiniciando la
@@ -89,7 +89,7 @@ fuera de `go test`.
   - Probar 408/403/429/5xx/transport, Retry-After/reset, budget exhaustion,
     cancel cause/timeout en cada fase y cero trabajo propio vivo al retornar.
 
-- [ ] T11. Implementar idempotencia y persistencia content-free. [R3, R10, R13, R14]
+- [x] T11. Implementar idempotencia y persistencia content-free. [R3, R10, R13, R14]
   - Ligar key a run/PR/expected head/policy, confirmar context/binding por digest
     y rechazar redelivery conflictiva.
   - Mantener journal/receipts/records solo con IDs, digests, counts/reasons y
@@ -97,7 +97,7 @@ fuera de `go test`.
   - Probar reopen, same/different key, lost response, corrupción, CAS,
     adquisiciones concurrentes y ausencia de locks durante red/disco/timers.
 
-- [ ] T12. Adaptar el contexto GitHub a producers neutrales. [R3, R4, R6, R9, R11]
+- [x] T12. Adaptar el contexto GitHub a producers neutrales. [R3, R4, R6, R9, R11]
   - Convertir context validado en `SourceDiff` y constraints autorizadas con
     provenance, authority, completeness, safe refs y bindings verificables.
   - Actualizar field/profile policies mínimamente para metadata, hunks,
@@ -105,7 +105,7 @@ fuera de `go test`.
   - Probar proyección mínima por planner/analyzer/diagnostic, orden/digest,
     partial/insufficient y ausencia de payload GitHub legacy.
 
-- [ ] T13. Integrar adquisición en admission y composición productiva. [R1, R9, R11, R13]
+- [x] T13. Integrar adquisición en admission y composición productiva. [R1, R9, R11, R13]
   - Resolver gateway, policy, extractor registry, catálogo, clock, store y
     observer exclusivamente en composición después de autoridad GitHub.
   - Mantener CLI/API/MCP sin capacidad de inventar PR identity y hacer que el
@@ -113,7 +113,7 @@ fuera de `go test`.
   - Probar vertical GitHub→acquire→assemble→plan y paridad interna de superficies
     con fakes, sin webhooks/publicaciones nuevas ni red real.
 
-- [ ] T14. Implementar binding y revalidación en todos los checkpoints. [R2, R8, R10]
+- [x] T14. Implementar binding y revalidación en todos los checkpoints. [R2, R8, R10]
   - Sellar repository/PR/head/base/observation/policy/catalog/extractor/producer
     y reconstruir authorities/producers actuales tras restart.
   - Revalidar antes de generate/regenerate, approval, execution y recovery;
@@ -121,7 +121,7 @@ fuera de `go test`.
   - Probar drift independiente de head, base, title, body, files, policy,
     catálogo, extractor y contract routes, además de no-drift derivado.
 
-- [ ] T15. Cerrar observabilidad, concurrencia y resistencia adversaria. [R4, R11, R12, R13, R14]
+- [x] T15. Cerrar observabilidad, concurrencia y resistencia adversaria. [R4, R11, R12, R13, R14]
   - Emitir un terminal record exactamente una vez con allowlist content-free y
     observer timeout acotado.
   - Ejecutar matrices concurrentes/repeated/race para misma PR, PRs distintas,
@@ -129,7 +129,7 @@ fuera de `go test`.
   - Probar que failures GitHub son operativos/insufficient, nunca verdict
     funcional, y que no quedan goroutines, timers, temporales o secretos.
 
-- [ ] T16. Completar trazabilidad y verificación multiplataforma. [R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15]
+- [x] T16. Completar trazabilidad y verificación multiplataforma. [R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15]
   - Registrar en `progress/github-pull-request-context/implementation.md` el mapa
     exacto R1–R15→tests y resultados, tasks, comandos, coverage y riesgos.
   - Ejecutar gofmt, comments audit, vet, compile-only, focales repetidos, suite
