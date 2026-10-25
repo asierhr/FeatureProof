@@ -3676,3 +3676,16 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Gates verificados por reviewer: suite global normal/race, cinco runtimes Linux y cross-builds 15/15.
 - Cobertura fresca multiplataforma del diff productivo: `1881/2187 = 86,008230 %`, incluyendo conservadoramente el fallback Unix no ejecutado.
 - Feature 29 marcada `done`; queda pendiente únicamente commit y push de la rama `feature-29-context-assembly`.
+
+## Feature 30 — especificación iniciada (2026-10-25)
+
+- Seleccionada `github-pull-request-context`, primera feature `pending` con SDD y sin otra feature `in_progress`.
+- Rama `feature-30-github-pull-request-context` creada desde la feature 29, porque el contexto de pull request se integrará con `ContextAssembler` y sus contratos de diff autorizados.
+- Alcance de esta fase: redactar `requirements.md`, `design.md` y `tasks.md`; no se modifica código productivo ni tests antes de aprobación humana.
+
+## Feature 30 — especificación lista (2026-10-25)
+
+- El spec author completó `requirements.md`, `design.md` y `tasks.md` para `github-pull-request-context`.
+- La spec define R1–R15 y T1–T16, separa autoridad de composición y contenido GitHub no confiable, y delimita la feature frente a webhooks/publicación y entornos.
+- Todos los requirements tienen criterios verificables y referencias de tasks; no quedan decisiones de producto abiertas ni excepciones arquitectónicas.
+- Estado cambiado de `pending` a `spec_ready`. La implementación queda detenida hasta aprobación humana explícita.
