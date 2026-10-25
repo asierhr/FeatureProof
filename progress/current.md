@@ -3796,3 +3796,9 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - La spec define R1–R15 y T1–T16, unifica adquisición/revalidación/release mediante `EnvironmentPort` y adapta feature 19 sin duplicar su lifecycle.
 - El provider gestionado queda limitado a un fake contractual; Kubernetes e infraestructura real permanecen fuera de alcance.
 - No quedan decisiones de producto abiertas ni excepciones arquitectónicas. Estado cambiado de `pending` a `spec_ready`; la implementación espera aprobación humana explícita.
+
+## Feature 31 — especificación aprobada (2026-10-25)
+
+- El usuario aprobó explícitamente la especificación de `environment-provider`.
+- Aprobación registrada a las `2026-10-25T15:47:03+01:00`; estado cambiado de `spec_ready` a `in_progress`.
+- Comienza la implementación ordenada de T1–T16; el cierre requiere gates completos y review independiente aprobada.

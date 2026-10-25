@@ -372,9 +372,9 @@ demuestra con un fake gestionado.
 ## Aprobación humana
 
 ```yaml
-status: pending
-approved_by:
-approved_at:
+status: approved
+approved_by: user
+approved_at: 2026-10-25T15:47:03+01:00
 ```
 
 La implementación no puede comenzar hasta aprobación humana explícita y cambio

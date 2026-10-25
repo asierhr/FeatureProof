@@ -560,7 +560,7 @@
           "Fallo, cancelación o timeout durante adquisición o liberación producen estados operativos tipados y nunca un fallo funcional de la aplicación",
           "Los tests contractuales ejecutan los mismos casos de selección, adquisición, readiness, binding, cancelación y liberación contra providers falsos existentes y gestionados"
         ],
-        "status": "spec_ready"
+        "status": "in_progress"
     },
     {
         "id": 32,
