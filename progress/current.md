@@ -3782,3 +3782,17 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Gates independientes: suite global normal/race, cuatro runtimes Linux y cross-builds Windows/Linux/Darwin 12/12.
 - Cobertura fresca multiplataforma del diff productivo: `1012/1186 = 85,328836 %`, incluyendo `sync_unix.go` y `sync_windows.go`.
 - Feature 30 marcada `done`; queda commit, push y retirada del runner WSL temporal.
+
+## Feature 31 — especificación iniciada (2026-10-25)
+
+- Seleccionada `environment-provider`, primera feature `pending` con SDD y sin otra feature `in_progress`.
+- Rama `feature-31-environment-provider` creada desde la feature 30 para conservar el workflow, la atestación y las fronteras de contexto ya integradas.
+- La spec deberá abstraer adquisición/liberación de targets y adaptar el preview existente sin implementar todavía Kubernetes ni otro provider gestionado real.
+- No se modifica código productivo ni tests antes de aprobación humana.
+
+## Feature 31 — especificación lista (2026-10-25)
+
+- El spec author completó `requirements.md`, `design.md` y `tasks.md` para `environment-provider`.
+- La spec define R1–R15 y T1–T16, unifica adquisición/revalidación/release mediante `EnvironmentPort` y adapta feature 19 sin duplicar su lifecycle.
+- El provider gestionado queda limitado a un fake contractual; Kubernetes e infraestructura real permanecen fuera de alcance.
+- No quedan decisiones de producto abiertas ni excepciones arquitectónicas. Estado cambiado de `pending` a `spec_ready`; la implementación espera aprobación humana explícita.
