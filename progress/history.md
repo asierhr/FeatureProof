@@ -685,3 +685,16 @@ Bitácora append-only de features completadas.
 - Tasks T1–T16 completas; R1–R15 y REV-1–REV-12 trazados en `progress/github-pull-request-context/{implementation,review}.md`.
 - Review independiente aprobada en la cuarta revisión. Pasan smoke del leader, vet, compile-only, suites focal/global normal y race, cuatro runtimes Linux y cross-builds Windows/Linux/Darwin 12/12.
 - Cobertura statement-weighted multiplataforma del diff productivo: `1012/1186 = 85,328836 %`.
+
+## 2026-10-25 — environment-provider
+
+- Estado final: `done`.
+- Resultado: abstracción provider-neutral `EnvironmentProvider` y `ValidationTarget/v1`, catálogo explícito composition-owned y un único `EnvironmentPort` para direct, preview y futuros providers gestionados.
+- Lifecycle: adquisición, reconcile, readiness, binding, revalidación, promoción y release durable con owner/lease, CAS, recovery ante respuestas inciertas y cleanup intent previo a I/O.
+- Integración: `ExistingURLProvider` adapta feature 19 sin provisionar ni duplicar reservas/releases; el managed provider existe solo como fake contractual hermético. CLI, API, MCP y GitHub comparten digest y transiciones.
+- Seguridad: template, perfil, capabilities y policy de red quedan ligados a la selección sellada; credentials/handles/payloads permanecen en el adapter y fallos operativos no sustituyen el veredicto funcional.
+- Portabilidad: fallback Linux `ENOSYS` conserva no-clobber mediante claims descriptor-relative/hard links, con pruebas concurrentes, crash y redelivery.
+- Spec aprobada por el usuario el `2026-10-25T15:47:03+01:00`.
+- Tasks T1–T16 completas; R1–R15 y hallazgos de seis revisiones trazados en `progress/environment-provider/{implementation,review}.md`.
+- Review independiente aprobada en la sexta revisión. Pasan global normal repetido/serial, global race, matriz contractual ×30/race ×20, Linux 5/5 repetido y cross-builds 9/9.
+- Cobertura statement-weighted multiplataforma con Go 1.25.1 y manifests autenticados: `1182/1384 = 85,404624 %`.

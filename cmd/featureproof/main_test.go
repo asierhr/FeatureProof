@@ -25,6 +25,7 @@ import (
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
+	"github.com/asierhr/featureProof/internal/environment"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/githubcontext"
@@ -80,6 +81,7 @@ func TestWorkflowConfigurationRequiresExplicitSnakeCaseSelections(t *testing.T) 
 		"specification_path": "spec.yaml", "contract_path": "openapi.yaml", "runtime_manifest_path": "runtime.json", "repository_id": "repo", "commit_oid": strings.Repeat("a", 40),
 		"environment_id": "environment", "attestation_ref": "attestation", "target_alias": "target", "target_url": "https://example.test", "target_kind": "direct", "policy_id": "network",
 		"attestation_valid_until": time.Now().Add(time.Hour).UTC(), "allow_disabled_approval": false,
+		"environment_catalog": workflowEnvironmentCatalogFixture("existing-url", "v1", "target", "target-ref", "runtime", "network", "repo"),
 		"contract_projection": map[string]any{"max_string_bytes": 4096, "allowed_url_schemes": []string{"https"}, "sensitive_names": []string{}, "sensitive_paths": []string{}, "sensitive_header_names": []string{"authorization"}, "forbidden_values": []string{}},
 	}
 	write := func(value map[string]any) {
@@ -165,9 +167,77 @@ func TestWorkflowConfigurationRequiresExplicitSnakeCaseSelections(t *testing.T) 
 	if _, err = loadWorkflowConfig(); err == nil {
 		t.Fatal("incomplete combined source accepted")
 	}
+	config["contract_source"] = "openapi"
+	delete(config, "environment_catalog")
+	write(config)
+	if _, err = loadWorkflowConfig(); err == nil {
+		t.Fatal("missing environment catalog received defaults")
+	}
+	config["environment_catalog"] = workflowEnvironmentCatalogFixture("existing-url", "v1", "target", "target-ref", "runtime", "network", "repo")
+	for name, mutateCatalog := range map[string]func(map[string]any){
+		"provider_kind": func(item map[string]any) { item["kind"] = "managed" },
+		"project":       func(item map[string]any) { item["project_id"] = "other" },
+		"repository":    func(item map[string]any) { item["repository_id"] = "other" },
+		"network_policy": func(item map[string]any) {
+			item["network_policy_id"] = "other"
+		},
+	} {
+		t.Run("environment_catalog_"+name, func(t *testing.T) {
+			catalog := workflowEnvironmentCatalogFixture("existing-url", "v1", "target", "target-ref", "runtime", "network", "repo")
+			item := catalog["items"].([]any)[0].(map[string]any)
+			mutateCatalog(item)
+			config["environment_catalog"] = catalog
+			write(config)
+			if _, catalogErr := loadWorkflowConfig(); catalogErr == nil {
+				t.Fatal("catalog authority mismatch accepted")
+			}
+		})
+	}
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", filepath.Join(root, "missing.json"))
 	if _, err = loadWorkflowConfig(); err == nil {
 		t.Fatal("missing configuration file accepted")
+	}
+}
+
+// TestWorkflowEnvironmentCompositionFailsClosedAtAuthorityBoundaries covers catalog, target, store and preview adapter failures.
+func TestWorkflowEnvironmentCompositionFailsClosedAtAuthorityBoundaries(t *testing.T) {
+	selection, err := environment.SealSelection(environment.Selection{Version: 1, Alias: "target", ProviderID: "existing-url", ProviderVersion: "v1", Kind: environment.KindExistingURL, TemplateReference: "template", ProfileID: "profile", NetworkPolicyID: "network", Secretless: true, ProjectID: "repo", RepositoryID: "repo", Capabilities: []string{"http"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := environment.SealCatalog(environment.Catalog{Version: 1, Items: []environment.Selection{selection}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := validationworkflow.TargetContext{ProviderID: selection.ProviderID, EnvironmentRef: selection.TemplateReference, ProfileID: selection.ProfileID, Network: validationworkflow.NetworkContext{PolicyID: selection.NetworkPolicyID}}
+	config := workflowConfig{TargetAlias: selection.Alias, RepositoryID: selection.RepositoryID, EnvironmentCatalog: catalog}
+	missing := config
+	missing.EnvironmentCatalog = environment.Catalog{}
+	if _, err = composeWorkflowEnvironment(t.TempDir(), missing, target, nil); err == nil {
+		t.Fatal("missing catalog authority accepted")
+	}
+	mismatched := target
+	mismatched.EnvironmentRef = "other-template"
+	if _, err = composeWorkflowEnvironment(t.TempDir(), config, mismatched, nil); err == nil {
+		t.Fatal("target authority mismatch accepted")
+	}
+	fileRoot := filepath.Join(t.TempDir(), "not-a-directory")
+	if err = os.WriteFile(fileRoot, []byte("occupied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = composeWorkflowEnvironment(fileRoot, config, target, nil); err == nil {
+		t.Fatal("unwritable lifecycle store accepted")
+	}
+	lifecycle := &workflowExistingLifecycle{target: validationworkflow.TargetContext{Attestation: validationworkflow.AttestationContext{RepositoryID: "repo", CommitOID: strings.Repeat("a", 40)}}}
+	if _, err = lifecycle.directBinding(selection, "other", strings.Repeat("a", 40)); err == nil {
+		t.Fatal("cross-revision direct binding accepted")
+	}
+	previewLifecycle := &workflowExistingLifecycle{preview: &workflowPreviewPort{}}
+	if _, err = previewLifecycle.AcquireExisting(context.Background(), "run", selection, "repo", strings.Repeat("a", 40)); err == nil {
+		t.Fatal("unconfigured preview acquisition accepted")
+	}
+	if _, err = previewLifecycle.RestoreExisting(context.Background(), "run", selection, "repo", strings.Repeat("a", 40)); err == nil {
+		t.Fatal("unconfigured preview restore accepted")
 	}
 }
 
@@ -369,7 +439,7 @@ func TestComposeWorkflowCLIUsesMatchingPreviewConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	configPath := filepath.Join(root, "workflow.json")
-	config := map[string]any{"provider": "openai", "model": "selected-model", "auth_profile": "profile", "profile_store": filepath.Join(root, "profiles.json"), "runtime_profile": "runtime", "specification_path": preview.SpecPath, "contract_path": contractPath, "runtime_manifest_path": preview.PlanPath, "repository_id": preview.RepositoryID, "commit_oid": preview.CommitOID, "environment_id": preview.EnvironmentID, "attestation_ref": preview.AttestationRef, "target_alias": preview.Alias, "target_url": preview.Target, "target_kind": "preview", "policy_id": preview.NetworkPolicyID, "attestation_valid_until": preview.AttestationValidUntil, "allow_disabled_approval": false, "contract_selections": map[string]any{"health": []any{map[string]any{"method": "GET", "path": "/pets"}}}, "contract_projection": workflowProjectionFixture()}
+	config := map[string]any{"provider": "openai", "model": "selected-model", "auth_profile": "profile", "profile_store": filepath.Join(root, "profiles.json"), "runtime_profile": "runtime", "specification_path": preview.SpecPath, "contract_path": contractPath, "runtime_manifest_path": preview.PlanPath, "repository_id": preview.RepositoryID, "commit_oid": preview.CommitOID, "environment_id": preview.EnvironmentID, "attestation_ref": preview.AttestationRef, "target_alias": preview.Alias, "target_url": preview.Target, "target_kind": "preview", "policy_id": preview.NetworkPolicyID, "attestation_valid_until": preview.AttestationValidUntil, "allow_disabled_approval": false, "environment_catalog": workflowEnvironmentCatalogFixture(preview.ProviderID, "v1", preview.Alias, preview.EnvironmentRef, preview.ProfileID, preview.NetworkPolicyID, preview.RepositoryID), "contract_selections": map[string]any{"health": []any{map[string]any{"method": "GET", "path": "/pets"}}}, "contract_projection": workflowProjectionFixture()}
 	rawConfig, _ := json.Marshal(config)
 	if err = os.WriteFile(configPath, rawConfig, 0o600); err != nil {
 		t.Fatal(err)
@@ -642,6 +712,16 @@ func workflowProjectionFixture() map[string]any {
 	return map[string]any{"max_string_bytes": 4096, "allowed_url_schemes": []string{"https"}, "sensitive_names": []string{}, "sensitive_paths": []string{}, "sensitive_header_names": []string{"authorization"}, "forbidden_values": []string{}}
 }
 
+// workflowEnvironmentCatalogFixture builds one fully explicit trusted selection without product defaults.
+func workflowEnvironmentCatalogFixture(providerID, providerVersion, alias, template, profile, policy, repository string) map[string]any {
+	return map[string]any{
+		"version": 1,
+		"items": []any{
+			map[string]any{"version": 1, "alias": alias, "provider_id": providerID, "provider_version": providerVersion, "kind": "existing_url", "template_reference": template, "profile_id": profile, "network_policy_id": policy, "secretless": true, "project_id": repository, "repository_id": repository, "capabilities": []string{"http"}},
+		},
+	}
+}
+
 // writeWorkflowCompositionFixture writes complete trusted composition inputs and returns their exact references.
 func writeWorkflowCompositionFixture(t *testing.T, root string, document map[string]any, selectedPath string, projection map[string]any) (string, string, string) {
 	t.Helper()
@@ -656,7 +736,7 @@ func writeWorkflowCompositionFixture(t *testing.T, root string, document map[str
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := map[string]any{"provider": "openai", "model": "selected-model", "auth_profile": "profile", "profile_store": profilePath, "runtime_profile": "runtime", "specification_path": specPath, "contract_path": contractPath, "runtime_manifest_path": manifestPath, "repository_id": "repo", "commit_oid": strings.Repeat("a", 40), "environment_id": "environment", "attestation_ref": "attestation", "target_alias": "target", "target_url": "https://target.example", "target_kind": "direct", "policy_id": "network", "attestation_valid_until": time.Now().Add(time.Hour).UTC(), "allow_disabled_approval": false, "contract_selections": map[string]any{"c1": []any{map[string]any{"method": "GET", "path": selectedPath}}}, "contract_projection": projection}
+	config := map[string]any{"provider": "openai", "model": "selected-model", "auth_profile": "profile", "profile_store": profilePath, "runtime_profile": "runtime", "specification_path": specPath, "contract_path": contractPath, "runtime_manifest_path": manifestPath, "repository_id": "repo", "commit_oid": strings.Repeat("a", 40), "environment_id": "environment", "attestation_ref": "attestation", "target_alias": "target", "target_url": "https://target.example", "target_kind": "direct", "policy_id": "network", "attestation_valid_until": time.Now().Add(time.Hour).UTC(), "allow_disabled_approval": false, "environment_catalog": workflowEnvironmentCatalogFixture("existing-url", "v1", "target", "target-ref", "runtime", "network", "repo"), "contract_selections": map[string]any{"c1": []any{map[string]any{"method": "GET", "path": selectedPath}}}, "contract_projection": projection}
 	rawConfig, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)

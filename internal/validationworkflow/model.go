@@ -32,6 +32,7 @@ var safeID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 // Phase identifies one durable orchestration checkpoint.
 type Phase string
 
+// Phases form the closed durable orchestration state machine.
 const (
 	// PhaseAdmitted means preflight succeeded and the workflow owns a durable handle.
 	PhaseAdmitted Phase = "admitted"
@@ -54,6 +55,7 @@ const (
 // Outcome identifies the closed terminal result vocabulary.
 type Outcome string
 
+// Outcomes separate verified functional results from operational termination.
 const (
 	// OutcomePassed is derived only from a verified package whose assertions passed.
 	OutcomePassed Outcome = "passed"
@@ -72,6 +74,7 @@ const (
 // ApprovalMode controls whether an exact generated artifact requires human authorization.
 type ApprovalMode string
 
+// Approval modes encode composition-owned authorization policy.
 const (
 	// ApprovalRequired stages a safe view and waits for an authenticated decision.
 	ApprovalRequired ApprovalMode = "required"
@@ -82,6 +85,7 @@ const (
 // DecisionAction is the closed human decision vocabulary.
 type DecisionAction string
 
+// Decision actions encode the closed human authorization vocabulary.
 const (
 	// DecisionApprove grants one exact artifact revision.
 	DecisionApprove DecisionAction = "approve"
@@ -92,6 +96,7 @@ const (
 // ErrorCode is the safe pre-admission and operation failure vocabulary.
 type ErrorCode string
 
+// Error codes project safe workflow failures without collaborator payloads.
 const (
 	// CodeInvalid rejects malformed or incomplete selections.
 	CodeInvalid ErrorCode = "invalid_request"
@@ -281,6 +286,8 @@ type WorkflowView struct {
 	Revision         string                  `json:"revision"`
 	Phase            Phase                   `json:"phase"`
 	Outcome          *Outcome                `json:"outcome,omitempty"`
+	CleanupPending   bool                    `json:"cleanup_pending,omitempty"`
+	OperationalState string                  `json:"operational_state,omitempty"`
 	UpdatedAt        time.Time               `json:"updated_at"`
 	ApprovalRevision uint64                  `json:"approval_revision,omitempty"`
 	Fixtures         *fixture.FixtureSummary `json:"fixtures,omitempty"`
@@ -331,7 +338,8 @@ type Record struct {
 	ApprovalDecisionID                               string
 	ApprovalDecisionAction                           DecisionAction
 	ApprovalDecisionRevision                         uint64
-	PreviewDigest                                    string
+	EnvironmentDigest                                string
+	OperationalCategory                              string
 	ApprovalDeadline                                 time.Time
 	FixtureSummary                                   *fixture.FixtureSummary
 	ContextBindingDigest                             string
@@ -388,9 +396,16 @@ type ProvidedPreparationPort interface {
 	PrepareProvided(context.Context, AdmissionSnapshot, functionalflow.Flow) (agentplanning.PreparedPlan, error)
 }
 
-// ExecutionPort runs canonical prepared plans through the existing deterministic validation runner.
+// ExecutionPort stages canonical runner output privately and promotes it only after environment revalidation.
 type ExecutionPort interface {
-	Execute(context.Context, ExecutionRequest) (string, error)
+	Execute(context.Context, ExecutionRequest) (ExecutionPreparation, error)
+	Promote(context.Context, ExecutionPreparation) (string, error)
+}
+
+// ExecutionPreparation identifies one complete private runner bundle awaiting composition-owned promotion.
+type ExecutionPreparation struct {
+	StagedDir string
+	FinalDir  string
 }
 
 // PackageReader verifies and projects a terminal package instead of trusting control-flow events.
@@ -417,15 +432,16 @@ type Finalizer interface {
 	Release(context.Context, string) error
 }
 
-// PreviewBinding carries the complete safe acquired target object rather than a caller-supplied digest.
-type PreviewBinding struct {
+// EnvironmentBinding carries the complete safe acquired target object rather than a caller-supplied digest.
+type EnvironmentBinding struct {
 	Target TargetContext
 }
 
-// PreviewPort acquires and releases a sealed preview reservation around planning and deterministic execution.
-type PreviewPort interface {
-	Acquire(context.Context, string, StartCommand) (PreviewBinding, error)
-	Restore(context.Context, string, StartCommand) (PreviewBinding, error)
+// EnvironmentPort acquires and releases every target through one provider-neutral lifecycle.
+type EnvironmentPort interface {
+	Acquire(context.Context, string, StartCommand) (EnvironmentBinding, error)
+	Restore(context.Context, string, StartCommand) (EnvironmentBinding, error)
+	Revalidate(context.Context, string, StartCommand, EnvironmentBinding) (EnvironmentBinding, error)
 	Release(context.Context, string) error
 }
 

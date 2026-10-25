@@ -35,8 +35,18 @@ type FunctionalFlowExecutionPort interface {
 	InspectProvided(context.Context, ExecutionRequest) (functionalflow.Flow, error)
 	Admit(context.Context, ExecutionRequest, agentplanning.PreparedSnapshot) (planapproval.FunctionalFlowSnapshot, error)
 	RecordPreparation(context.Context, string, fixture.PreparationStatus) (fixture.PreparationStatus, error)
-	Execute(context.Context, ExecutionRequest, agentplanning.PreparedSnapshot) (Outcome, error)
+	Execute(context.Context, ExecutionRequest, agentplanning.PreparedSnapshot) (FunctionalFlowPrimary, error)
+	Promote(context.Context, FunctionalFlowPrimary) error
 	Finalize(context.Context, string, Outcome, fixture.FixtureSummary) (PackageProjection, error)
+}
+
+// FunctionalFlowPrimary keeps a verified primary private until the environment publication checkpoint succeeds.
+type FunctionalFlowPrimary struct {
+	Outcome  Outcome
+	runID    string
+	artifact functionalflow.Artifact
+	result   functionalflow.Result
+	publish  FunctionalFlowPublisher
 }
 
 // FunctionalFlowComposer rebuilds and seals one canonical flow from already approved workflow material.
@@ -206,9 +216,9 @@ func projectFlowApproval(artifact functionalflow.Artifact) planapproval.Function
 }
 
 // Execute reloads the admitted artifact, recomposes its private canonical snapshot, and stages immutable primary proof.
-func (a FunctionalFlowExecutionAdapter) Execute(ctx context.Context, request ExecutionRequest, snapshot agentplanning.PreparedSnapshot) (Outcome, error) {
+func (a FunctionalFlowExecutionAdapter) Execute(ctx context.Context, request ExecutionRequest, snapshot agentplanning.PreparedSnapshot) (FunctionalFlowPrimary, error) {
 	if a.Composer == nil || a.Executor == nil || a.Artifacts == nil || a.Publisher == nil || request.Handle == "" {
-		return "", &Error{Code: CodeInvalid, Operation: "functional_flow_composition"}
+		return FunctionalFlowPrimary{}, &Error{Code: CodeInvalid, Operation: "functional_flow_composition"}
 	}
 	durableCtx := ctx
 	if ctx.Err() != nil {
@@ -217,28 +227,28 @@ func (a FunctionalFlowExecutionAdapter) Execute(ctx context.Context, request Exe
 	validated, artifact, err := a.Composer.Compose(durableCtx, request, snapshot)
 	committed, loadErr := a.Artifacts.Load(durableCtx, request.Handle)
 	if err != nil || loadErr != nil || functionalflow.ValidateArtifactAgainst(validated, artifact) != nil || committed.ArtifactDigest != artifact.ArtifactDigest || request.FunctionalFlowDigest == "" || request.FunctionalFlowDigest != committed.ArtifactDigest {
-		return "", &Error{Code: CodeConflict, Operation: "functional_flow_artifact"}
+		return FunctionalFlowPrimary{}, &Error{Code: CodeConflict, Operation: "functional_flow_artifact"}
 	}
 	lineage, err := functionalflow.NewRevisionSet(artifact, 1)
 	if err != nil {
-		return "", &Error{Code: CodeConflict, Operation: "functional_flow_revision"}
+		return FunctionalFlowPrimary{}, &Error{Code: CodeConflict, Operation: "functional_flow_revision"}
 	}
 	var primary functionalflow.Result
 	complete := false
 	if recoverer, ok := a.Executor.(FunctionalFlowCompletedRecoverer); ok {
 		primary, complete, err = recoverer.RecoverCompleted(durableCtx, request.Handle, validated, artifact)
 		if err != nil {
-			return "", &RecoverableFunctionalFlowError{cause: err}
+			return FunctionalFlowPrimary{}, &RecoverableFunctionalFlowError{cause: err}
 		}
 	}
 	if !complete && a.Journal != nil {
 		events, journalErr := a.Journal.Events(durableCtx, request.Handle)
 		if journalErr != nil {
-			return "", &RecoverableFunctionalFlowError{cause: journalErr}
+			return FunctionalFlowPrimary{}, &RecoverableFunctionalFlowError{cause: journalErr}
 		}
 		for _, event := range events {
 			if event.Type == "primary_terminal" {
-				return "", &RecoverableFunctionalFlowError{cause: functionalflowIntegrityError("completed_primary")}
+				return FunctionalFlowPrimary{}, &RecoverableFunctionalFlowError{cause: functionalflowIntegrityError("completed_primary")}
 			}
 		}
 	}
@@ -247,20 +257,28 @@ func (a FunctionalFlowExecutionAdapter) Execute(ctx context.Context, request Exe
 	}
 	if err != nil {
 		if recoverableFunctionalRuntimeError(err) {
-			return "", &RecoverableFunctionalFlowError{cause: err}
+			return FunctionalFlowPrimary{}, &RecoverableFunctionalFlowError{cause: err}
 		}
 		primary = terminalFunctionalFlowFailure(request.Handle, artifact)
 		if journalErr := appendTerminalFailureEvents(durableCtx, a.Journal, artifact, primary); journalErr != nil {
-			return "", &RecoverableFunctionalFlowError{cause: journalErr}
+			return FunctionalFlowPrimary{}, &RecoverableFunctionalFlowError{cause: journalErr}
 		}
 	}
 	if _, err = lineage.Confirm(primary); err != nil {
-		return "", &Error{Code: CodeConflict, Operation: "functional_flow_revision"}
+		return FunctionalFlowPrimary{}, &Error{Code: CodeConflict, Operation: "functional_flow_revision"}
 	}
-	if err = a.Publisher.Stage(durableCtx, request.Handle, artifact, primary); err != nil {
-		return "", &Error{Code: CodeUnavailable, Operation: "functional_flow_publish"}
+	return FunctionalFlowPrimary{Outcome: workflowOutcome(primary.Outcome), runID: request.Handle, artifact: artifact, result: primary, publish: a.Publisher}, nil
+}
+
+// Promote makes one already verified functional primary visible after composition-owned revalidation.
+func (a FunctionalFlowExecutionAdapter) Promote(ctx context.Context, primary FunctionalFlowPrimary) error {
+	if primary.publish == nil || primary.runID == "" || primary.artifact.ArtifactDigest == "" || primary.result.ArtifactDigest != primary.artifact.ArtifactDigest {
+		return &Error{Code: CodeConflict, Operation: "functional_flow_promote"}
 	}
-	return workflowOutcome(primary.Outcome), nil
+	if err := primary.publish.Stage(ctx, primary.runID, primary.artifact, primary.result); err != nil {
+		return &Error{Code: CodeUnavailable, Operation: "functional_flow_publish"}
+	}
+	return nil
 }
 
 // functionalflowIntegrityError creates a payload-free integrity category for an inconsistent recovery checkpoint.

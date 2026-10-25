@@ -2,6 +2,8 @@ package validationworkflow
 
 import (
 	"context"
+	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -22,11 +24,11 @@ type LocalExecutionPort struct {
 	Configurations map[string]LocalRunnerConfiguration
 }
 
-// Execute invokes localvalidation.NewPreparedRunner and returns its canonical package directory.
-func (p LocalExecutionPort) Execute(ctx context.Context, request ExecutionRequest) (string, error) {
+// Execute invokes localvalidation.NewPreparedRunner with a hidden final name and returns a private complete bundle.
+func (p LocalExecutionPort) Execute(ctx context.Context, request ExecutionRequest) (ExecutionPreparation, error) {
 	configuration, ok := p.Configurations[request.Snapshot.RuntimeDigest]
 	if !ok || configuration.Digest != request.Snapshot.RuntimeDigest {
-		return "", &Error{Code: CodeUnauthorized, Operation: "runtime_profile"}
+		return ExecutionPreparation{}, &Error{Code: CodeUnauthorized, Operation: "runtime_profile"}
 	}
 	prepared := configuration.Request
 	prepared.Plans = append([]planning.ValidationPlan(nil), request.Plans...)
@@ -35,15 +37,41 @@ func (p LocalExecutionPort) Execute(ctx context.Context, request ExecutionReques
 	prepared.PlanCommitmentKey = append([]byte(nil), request.CommitmentKey...)
 	deps := configuration.Dependencies
 	deps.IDs = &workflowRunIDs{first: request.Handle, next: deps.IDs}
+	hiddenName := "." + request.Handle + ".workflow-primary"
+	preparation := ExecutionPreparation{StagedDir: filepath.Join(deps.Root, ".featureproof", "runs", hiddenName), FinalDir: filepath.Join(deps.Root, ".featureproof", "runs", request.Handle)}
+	if _, stagedErr := os.Stat(preparation.StagedDir); stagedErr == nil {
+		return preparation, nil
+	} else if !errors.Is(stagedErr, os.ErrNotExist) {
+		return ExecutionPreparation{}, &Error{Code: CodeUnavailable, Operation: "runner_stage"}
+	}
+	if _, finalErr := os.Stat(preparation.FinalDir); finalErr == nil {
+		return preparation, nil
+	} else if !errors.Is(finalErr, os.ErrNotExist) {
+		return ExecutionPreparation{}, &Error{Code: CodeUnavailable, Operation: "runner_stage"}
+	}
+	deps.PublisherFactory = func(root, runID string) (*localvalidation.Publisher, error) {
+		return localvalidation.NewPublisherWithFinalName(root, runID, hiddenName)
+	}
 	runner, err := localvalidation.NewPreparedRunner(ctx, prepared, deps)
 	if err != nil {
-		return "", &Error{Code: CodeInvalid, Operation: "runner_composition"}
+		return ExecutionPreparation{}, &Error{Code: CodeInvalid, Operation: "runner_composition"}
 	}
 	code := runner.Run(ctx)
 	if code != 0 && code != 1 && code != 2 && code != 130 {
-		return "", &Error{Code: CodeUnavailable, Operation: "runner"}
+		return ExecutionPreparation{}, &Error{Code: CodeUnavailable, Operation: "runner"}
 	}
-	return filepath.Join(deps.Root, ".featureproof", "runs", request.Handle), nil
+	return preparation, nil
+}
+
+// Promote atomically exposes a complete hidden runner bundle under its canonical run identity.
+func (p LocalExecutionPort) Promote(ctx context.Context, preparation ExecutionPreparation) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := localvalidation.PromoteBundleNoReplace(preparation.StagedDir, preparation.FinalDir); err != nil {
+		return "", &Error{Code: CodeUnavailable, Operation: "runner_promote"}
+	}
+	return preparation.FinalDir, nil
 }
 
 // workflowRunIDs fixes the package run ID to the workflow handle and delegates subsequent evidence IDs.

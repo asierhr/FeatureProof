@@ -397,6 +397,11 @@ func composeProductWorkflowWithOptions(t *testing.T, root string, targetURL stri
 	}
 	rewriteWorkflowConfig(t, configPath, func(value map[string]any) {
 		value["repository_id"] = "7"
+		catalog := value["environment_catalog"].(map[string]any)
+		items := catalog["items"].([]any)
+		selection := items[0].(map[string]any)
+		selection["project_id"] = "7"
+		selection["repository_id"] = "7"
 		value["target_url"] = targetURL
 		value["allow_disabled_approval"] = true
 		value["identity_credential_environment"] = map[string]any{"cred_customer": "FEATUREPROOF_PRODUCT_IDENTITY"}

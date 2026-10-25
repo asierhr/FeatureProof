@@ -24,6 +24,7 @@ import (
 	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/contractreview"
+	"github.com/asierhr/featureProof/internal/environment"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/fixture"
@@ -86,6 +87,7 @@ type workflowConfig struct {
 	FixtureRuntime                *workflowFixtureRuntimeConfig           `json:"fixture_runtime,omitempty"`
 	FunctionalFlowAliases         map[string]string                       `json:"functional_flow_aliases,omitempty"`
 	GitHubContext                 *githubcontext.Policy                   `json:"github_context,omitempty"`
+	EnvironmentCatalog            environment.Catalog                     `json:"environment_catalog"`
 }
 
 // workflowFixtureRuntimeConfig is the trusted operator-owned authority for every finite fixture effect and wait.
@@ -281,6 +283,12 @@ func loadWorkflowConfig() (workflowConfig, error) {
 	if config.Provider != "openai" || config.Model == "" || config.AuthProfile == "" || config.ProfileStore == "" || config.RuntimeProfile == "" || config.SpecificationPath == "" || config.ContractPath == "" || config.RuntimeManifestPath == "" || !revisionbinding.ValidID(config.RepositoryID) || !revisionbinding.ValidOID(config.CommitOID) || !revisionbinding.ValidID(config.EnvironmentID) || !revisionbinding.ValidID(config.AttestationRef) || config.TargetAlias == "" || config.TargetURL == "" || config.PolicyID == "" || !config.AttestationValidUntil.After(time.Now()) || (config.TargetKind != "direct" && config.TargetKind != "preview") {
 		return workflowConfig{}, errors.New("invalid workflow configuration")
 	}
+	sealedEnvironmentCatalog, environmentCatalogErr := environment.SealCatalog(config.EnvironmentCatalog)
+	selection, selectionErr := sealedEnvironmentCatalog.Resolve(config.TargetAlias)
+	if environmentCatalogErr != nil || selectionErr != nil || selection.Kind != environment.KindExistingURL || selection.ProjectID != config.RepositoryID || selection.RepositoryID != config.RepositoryID || selection.NetworkPolicyID != config.PolicyID {
+		return workflowConfig{}, errors.New("invalid environment catalog configuration")
+	}
+	config.EnvironmentCatalog = sealedEnvironmentCatalog
 	if config.ContractSource != "" && config.ContractSource != "openapi" && config.ContractSource != goinspector.SourceKind && config.ContractSource != springinspector.SourceKind && config.ContractSource != "combined" {
 		return workflowConfig{}, errors.New("invalid workflow configuration")
 	}
@@ -389,7 +397,6 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if err != nil {
 		return nil, err
 	}
-	var previewPort validationworkflow.PreviewPort
 	var workflowPreview *workflowPreviewPort
 	if config.TargetKind == "preview" {
 		configured, present, previewErr := composeConfiguredPreview(ctx, root)
@@ -397,7 +404,6 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 			return nil, errors.New("preview workflow configuration unavailable")
 		}
 		workflowPreview = &workflowPreviewPort{configured: configured, target: config.TargetURL, attestors: map[string]revisionbinding.EnvironmentAttestor{}}
-		previewPort = workflowPreview
 	}
 	current, err := user.Current()
 	if err != nil || current.Uid == "" {
@@ -468,9 +474,25 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if err != nil {
 		return nil, err
 	}
-	targetContext := validationworkflow.TargetContext{Kind: config.TargetKind, Alias: config.TargetAlias, URL: config.TargetURL, EnvironmentID: config.EnvironmentID, Attestation: validationworkflow.AttestationContext{EnvironmentID: config.EnvironmentID, RepositoryID: config.RepositoryID, CommitOID: config.CommitOID, Reference: config.AttestationRef, ValidUntil: config.AttestationValidUntil, Verified: true}, Network: network}
+	environmentSelection, err := config.EnvironmentCatalog.Resolve(config.TargetAlias)
+	if err != nil {
+		return nil, errors.New("environment selection unavailable")
+	}
+	targetContext := validationworkflow.TargetContext{Kind: config.TargetKind, Alias: config.TargetAlias, URL: config.TargetURL, SelectionDigest: environmentSelection.Digest, ProviderID: environmentSelection.ProviderID, ProviderVersion: environmentSelection.ProviderVersion, EnvironmentRef: environmentSelection.TemplateReference, ProfileID: environmentSelection.ProfileID, EnvironmentID: config.EnvironmentID, Capabilities: append([]string(nil), environmentSelection.Capabilities...), Attestation: validationworkflow.AttestationContext{EnvironmentID: config.EnvironmentID, RepositoryID: config.RepositoryID, CommitOID: config.CommitOID, Reference: config.AttestationRef, ValidUntil: config.AttestationValidUntil, Verified: true}, Network: network}
 	if workflowPreview != nil {
-		targetContext.ProviderID, targetContext.EnvironmentRef, targetContext.ProfileID = workflowPreview.configured.Config.ProviderID, workflowPreview.configured.Config.EnvironmentRef, workflowPreview.configured.Config.ProfileID
+		if targetContext.ProviderID != workflowPreview.configured.Config.ProviderID || targetContext.EnvironmentRef != workflowPreview.configured.Config.EnvironmentRef || targetContext.ProfileID != workflowPreview.configured.Config.ProfileID {
+			return nil, errors.New("preview environment selection mismatch")
+		}
+	}
+	if targetContext.ObservedVersion == "" {
+		targetContext.ObservedVersion = "configured-v1"
+	}
+	if targetContext.Fingerprint == "" {
+		targetContext.Fingerprint = workflowDigest("environment", targetContext.EnvironmentID, targetContext.URL, targetContext.Attestation.Reference)
+	}
+	environmentPort, err := composeWorkflowEnvironment(root, config, targetContext, workflowPreview)
+	if err != nil {
+		return nil, err
 	}
 	revisionContext := validationworkflow.RevisionContext{RepositoryID: config.RepositoryID, CommitOID: config.CommitOID}
 	if config.GoInspector != nil {
@@ -654,7 +676,7 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	}
 	contextRegistry := validationworkflow.CurrentContextProducerRegistry{Workflows: store, Admission: admission, GitHub: githubContextSource}
 	contextPort := &validationworkflow.ContextAssemblyAdapter{Profiles: contextProfiles, Registry: contextRegistry, Secrets: contextassembly.NewCanaryGate(nil), Tokens: contextassembly.ByteTokenCounter{Selections: map[string]bool{config.Provider + "/" + config.Model: true}}, Store: contextStore, Observer: validationworkflow.ContextObserver{}, Clock: wallClock, GitHub: githubContextSource}
-	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Preview: previewPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, Memory: memoryPort, MemoryObserver: memoryObserver, Context: contextPort})
+	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Environment: environmentPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, Memory: memoryPort, MemoryObserver: memoryObserver, Context: contextPort})
 	if err != nil {
 		return nil, err
 	}
@@ -1284,6 +1306,86 @@ func (p workflowAutoPolicy) Authorize(context.Context, validationworkflow.StartC
 // workflowFinalizer owns no resources for a static configured target.
 type workflowFinalizer struct{}
 
+// composeWorkflowEnvironment builds the sealed catalog, durable lifecycle and sole workflow environment port.
+func composeWorkflowEnvironment(root string, config workflowConfig, target validationworkflow.TargetContext, preview *workflowPreviewPort) (validationworkflow.EnvironmentPort, error) {
+	selection, err := config.EnvironmentCatalog.Resolve(config.TargetAlias)
+	if err != nil {
+		return nil, err
+	}
+	if selection.ProviderID != target.ProviderID || selection.TemplateReference != target.EnvironmentRef || selection.ProfileID != target.ProfileID || selection.NetworkPolicyID != target.Network.PolicyID {
+		return nil, errors.New("environment target authority mismatch")
+	}
+	existing, err := environment.NewExistingURLProvider(&workflowExistingLifecycle{target: target, preview: preview})
+	if err != nil {
+		return nil, err
+	}
+	registry, err := environment.NewRegistry(map[string]environment.EnvironmentProvider{selection.ProviderID + "@" + selection.ProviderVersion: existing})
+	if err != nil {
+		return nil, err
+	}
+	store, err := environment.OpenLocalStore(filepath.Join(root, ".featureproof", "environment"))
+	if err != nil {
+		return nil, err
+	}
+	clock := environment.WallClock{}
+	lifecycle, err := environment.NewLifecycleService(environment.Dependencies{Catalog: config.EnvironmentCatalog, Providers: registry, Store: store, Network: environment.AllowlistedNetworkAuthorizer{}, Clock: clock, Waiter: clock, Observer: &environment.MemoryObserver{}, Owner: "workflow-composition", Limits: environment.Limits{AcquireTimeout: 30 * time.Second, ObserveTimeout: 10 * time.Second, ReleaseTimeout: 10 * time.Second, NetworkTimeout: 10 * time.Second, ObserverTimeout: 5 * time.Second, LeaseTTL: 10 * time.Minute, MaxAttempts: 3, MaxReadiness: 10, MaxElapsed: 2 * time.Minute, MaxCumulativeWait: 30 * time.Second, InitialBackoff: time.Second}})
+	if err != nil {
+		return nil, err
+	}
+	return validationworkflow.LifecycleEnvironmentPort{Lifecycle: lifecycle, Projects: map[string]string{config.TargetAlias: config.RepositoryID}}, nil
+}
+
+// workflowExistingLifecycle adapts configured direct targets and feature 19 previews without provisioning effects.
+type workflowExistingLifecycle struct {
+	target  validationworkflow.TargetContext
+	preview *workflowPreviewPort
+}
+
+// AcquireExisting returns current trusted direct authority or delegates one preview reservation.
+func (l *workflowExistingLifecycle) AcquireExisting(ctx context.Context, runID string, selection environment.Selection, repositoryID, commitOID string) (environment.ExistingBinding, error) {
+	if l.preview == nil {
+		return l.directBinding(selection, repositoryID, commitOID)
+	}
+	binding, err := l.preview.Acquire(ctx, runID, validationworkflow.StartCommand{RepositoryID: repositoryID, Revision: commitOID, Target: validationworkflow.TargetSelection{Preview: &validationworkflow.PreviewTarget{Alias: selection.Alias, Digest: selection.Digest}}})
+	if err != nil {
+		return environment.ExistingBinding{}, err
+	}
+	return existingBindingFromWorkflow(binding.Target, selection), nil
+}
+
+// RestoreExisting reconstructs preview authority or rechecks the immutable configured direct binding.
+func (l *workflowExistingLifecycle) RestoreExisting(ctx context.Context, runID string, selection environment.Selection, repositoryID, commitOID string) (environment.ExistingBinding, error) {
+	if l.preview == nil {
+		return l.directBinding(selection, repositoryID, commitOID)
+	}
+	binding, err := l.preview.Restore(ctx, runID, validationworkflow.StartCommand{RepositoryID: repositoryID, Revision: commitOID, Target: validationworkflow.TargetSelection{Preview: &validationworkflow.PreviewTarget{Alias: selection.Alias, Digest: selection.Digest}}})
+	if err != nil {
+		return environment.ExistingBinding{}, err
+	}
+	return existingBindingFromWorkflow(binding.Target, selection), nil
+}
+
+// ReleaseExisting performs the feature 19 logical release once and leaves direct infrastructure untouched.
+func (l *workflowExistingLifecycle) ReleaseExisting(ctx context.Context, runID string) error {
+	if l.preview == nil {
+		return nil
+	}
+	return l.preview.Release(ctx, runID)
+}
+
+// directBinding rejects cross-revision reuse before projecting the configured existing URL.
+func (l *workflowExistingLifecycle) directBinding(selection environment.Selection, repositoryID, commitOID string) (environment.ExistingBinding, error) {
+	if l.target.Attestation.RepositoryID != repositoryID || l.target.Attestation.CommitOID != commitOID {
+		return environment.ExistingBinding{}, errors.New("configured target revision mismatch")
+	}
+	return existingBindingFromWorkflow(l.target, selection), nil
+}
+
+// existingBindingFromWorkflow translates the complete approved target without exposing credentials.
+func existingBindingFromWorkflow(target validationworkflow.TargetContext, selection environment.Selection) environment.ExistingBinding {
+	return environment.ExistingBinding{ProviderID: selection.ProviderID, ProviderVersion: selection.ProviderVersion, EnvironmentID: target.EnvironmentID, EnvironmentRef: target.EnvironmentRef, ProfileID: target.ProfileID, ReservationID: target.ReservationID, Fingerprint: target.Fingerprint, LifecycleHandle: workflowDigest("lifecycle", selection.Digest, target.EnvironmentID, target.ReservationID), Endpoint: target.URL, ObservedVersion: target.ObservedVersion, ObservationDigest: workflowDigest("observation", target.EnvironmentID, target.ObservedVersion, target.Fingerprint), Availability: environment.AvailabilityReady, Attestation: environment.Attestation{EnvironmentID: target.Attestation.EnvironmentID, RepositoryID: target.Attestation.RepositoryID, CommitOID: target.Attestation.CommitOID, Reference: target.Attestation.Reference, ValidUntil: target.Attestation.ValidUntil, Verified: target.Attestation.Verified}, Network: environment.NetworkPolicy{PolicyID: target.Network.PolicyID, Schemes: append([]string(nil), target.Network.Schemes...), Hosts: append([]string(nil), target.Network.Hosts...), Ports: append([]int(nil), target.Network.Ports...), BasePaths: append([]string(nil), target.Network.BasePaths...), MaxURLBytes: target.Network.MaxURLBytes}, Capabilities: append([]string(nil), selection.Capabilities...)}
+}
+
 // workflowPreviewPort connects workflow preview selections to the existing durable preview coordinator.
 type workflowPreviewPort struct {
 	configured *configuredPreview
@@ -1293,13 +1395,13 @@ type workflowPreviewPort struct {
 }
 
 // Acquire reserves and verifies the configured preview and returns its complete safe target object.
-func (p *workflowPreviewPort) Acquire(ctx context.Context, handle string, command validationworkflow.StartCommand) (validationworkflow.PreviewBinding, error) {
+func (p *workflowPreviewPort) Acquire(ctx context.Context, handle string, command validationworkflow.StartCommand) (validationworkflow.EnvironmentBinding, error) {
 	if p.configured == nil || command.Target.Preview == nil || command.Target.Preview.Alias != p.configured.Request.Selection.Alias {
-		return validationworkflow.PreviewBinding{}, errors.New("preview selection unavailable")
+		return validationworkflow.EnvironmentBinding{}, errors.New("preview selection unavailable")
 	}
 	authorized, err := p.configured.Coordinator.Acquire(ctx, handle, p.configured.Request.Selection, p.configured.Request.Expected)
 	if err != nil || authorized.Target.BaseURL != p.target {
-		return validationworkflow.PreviewBinding{}, errors.New("preview target drift")
+		return validationworkflow.EnvironmentBinding{}, errors.New("preview target drift")
 	}
 	p.mu.Lock()
 	p.attestors[authorized.Snapshot.EnvironmentID] = authorized.Attestor
@@ -1308,13 +1410,13 @@ func (p *workflowPreviewPort) Acquire(ctx context.Context, handle string, comman
 }
 
 // Restore reconstructs the acquired preview attestor from the coordinator's sealed durable snapshot.
-func (p *workflowPreviewPort) Restore(ctx context.Context, handle string, command validationworkflow.StartCommand) (validationworkflow.PreviewBinding, error) {
+func (p *workflowPreviewPort) Restore(ctx context.Context, handle string, command validationworkflow.StartCommand) (validationworkflow.EnvironmentBinding, error) {
 	if p.configured == nil || command.Target.Preview == nil || command.Target.Preview.Alias != p.configured.Request.Selection.Alias {
-		return validationworkflow.PreviewBinding{}, errors.New("preview selection unavailable")
+		return validationworkflow.EnvironmentBinding{}, errors.New("preview selection unavailable")
 	}
 	authorized, err := p.configured.Coordinator.RestoreAcquired(ctx, handle, p.configured.Request.Selection, p.configured.Request.Expected)
 	if err != nil || authorized.Target.BaseURL != p.target {
-		return validationworkflow.PreviewBinding{}, errors.New("preview target drift")
+		return validationworkflow.EnvironmentBinding{}, errors.New("preview target drift")
 	}
 	p.mu.Lock()
 	p.attestors[authorized.Snapshot.EnvironmentID] = authorized.Attestor
@@ -1323,10 +1425,10 @@ func (p *workflowPreviewPort) Restore(ctx context.Context, handle string, comman
 }
 
 // previewBinding projects the sealed provider observation and effective network rules without credentials.
-func (p *workflowPreviewPort) previewBinding(authorized previewenv.AuthorizedExecution) validationworkflow.PreviewBinding {
+func (p *workflowPreviewPort) previewBinding(authorized previewenv.AuthorizedExecution) validationworkflow.EnvironmentBinding {
 	configured := p.configured.Config
 	snapshot := authorized.Snapshot
-	return validationworkflow.PreviewBinding{Target: validationworkflow.TargetContext{Kind: "preview", Alias: configured.Alias, URL: authorized.Target.BaseURL, ProviderID: configured.ProviderID, EnvironmentRef: configured.EnvironmentRef, ProfileID: configured.ProfileID, EnvironmentID: snapshot.EnvironmentID, ReservationID: snapshot.ReservationID, ObservedVersion: snapshot.ObservedVersion, Fingerprint: snapshot.Fingerprint, Attestation: validationworkflow.AttestationContext{EnvironmentID: snapshot.EnvironmentID, RepositoryID: snapshot.RepositoryID, CommitOID: snapshot.CommitOID, Reference: snapshot.AttestationRef, ValidUntil: snapshot.AttestationValidUntil, Verified: true}, Network: validationworkflow.NetworkContext{PolicyID: configured.NetworkPolicyID, Schemes: []string{configured.Scheme}, Hosts: []string{configured.Host}, Ports: []int{configured.Port}, BasePaths: []string{configured.BasePath}, MaxURLBytes: 2048}}}
+	return validationworkflow.EnvironmentBinding{Target: validationworkflow.TargetContext{Kind: "preview", Alias: configured.Alias, URL: authorized.Target.BaseURL, ProviderID: configured.ProviderID, EnvironmentRef: configured.EnvironmentRef, ProfileID: configured.ProfileID, EnvironmentID: snapshot.EnvironmentID, ReservationID: snapshot.ReservationID, ObservedVersion: snapshot.ObservedVersion, Fingerprint: snapshot.Fingerprint, Attestation: validationworkflow.AttestationContext{EnvironmentID: snapshot.EnvironmentID, RepositoryID: snapshot.RepositoryID, CommitOID: snapshot.CommitOID, Reference: snapshot.AttestationRef, ValidUntil: snapshot.AttestationValidUntil, Verified: true}, Network: validationworkflow.NetworkContext{PolicyID: configured.NetworkPolicyID, Schemes: []string{configured.Scheme}, Hosts: []string{configured.Host}, Ports: []int{configured.Port}, BasePaths: []string{configured.BasePath}, MaxURLBytes: 2048}}}
 }
 
 // Release confirms logical release through the same preview coordinator identity.

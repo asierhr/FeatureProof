@@ -19,6 +19,18 @@ type packageCommitFault struct {
 	corrupt bool
 }
 
+// TestPublisherRejectsInvalidPromotionIdentities proves hidden and canonical bundle names cannot alias or escape their runs directory.
+func TestPublisherRejectsInvalidPromotionIdentities(t *testing.T) {
+	root := t.TempDir()
+	if _, err := NewPublisherWithFinalName(root, "run", "../escape"); err == nil {
+		t.Fatal("publisher accepted an escaping final name")
+	}
+	path := filepath.Join(root, ".featureproof", "runs", "run")
+	if err := PromoteBundleNoReplace(path, path); err == nil {
+		t.Fatal("promotion accepted identical staging and final paths")
+	}
+}
+
 func (f packageCommitFault) CommitNoReplace(from, to string) error {
 	if strings.HasSuffix(to, f.failAt) && !f.corrupt {
 		return errors.New("injected write failure")

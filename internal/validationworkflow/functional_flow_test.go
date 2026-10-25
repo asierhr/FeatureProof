@@ -594,15 +594,23 @@ func (f *flowExecutionPortFake) RecordPreparation(_ context.Context, _ string, s
 }
 
 // Execute returns the package location expected by the existing package reader.
-func (f *flowExecutionPortFake) Execute(context.Context, ExecutionRequest, agentplanning.PreparedSnapshot) (Outcome, error) {
+func (f *flowExecutionPortFake) Execute(context.Context, ExecutionRequest, agentplanning.PreparedSnapshot) (FunctionalFlowPrimary, error) {
 	f.calls++
 	if f.trace != nil {
 		*f.trace = append(*f.trace, "flow")
 	}
 	if f.outcome == "" {
-		return OutcomePassed, nil
+		return FunctionalFlowPrimary{Outcome: OutcomePassed, runID: "fake"}, nil
 	}
-	return f.outcome, nil
+	return FunctionalFlowPrimary{Outcome: f.outcome, runID: "fake"}, nil
+}
+
+// Promote records that primary visibility occurred after the service checkpoint.
+func (f *flowExecutionPortFake) Promote(context.Context, FunctionalFlowPrimary) error {
+	if f.trace != nil {
+		*f.trace = append(*f.trace, "promote")
+	}
+	return nil
 }
 
 // Finalize records post-cleanup package completion and returns the immutable primary outcome.
@@ -899,7 +907,13 @@ func TestFunctionalFlowExecutionAdapterUsesApprovedMaterial(t *testing.T) {
 		t.Fatalf("approval for artifact A executed artifact B: calls=%d err=%v", executor.calls, wrongErr)
 	}
 	outcome, err := adapter.Execute(context.Background(), request, snapshot)
-	projection, finalizeErr := adapter.Finalize(context.Background(), "run", outcome, fixture.FixtureSummary{})
+	if err == nil && publisher.stageCalls != 0 {
+		t.Fatalf("functional primary visible before environment checkpoint: %d", publisher.stageCalls)
+	}
+	if err == nil {
+		err = adapter.Promote(context.Background(), outcome)
+	}
+	projection, finalizeErr := adapter.Finalize(context.Background(), "run", outcome.Outcome, fixture.FixtureSummary{})
 	if err != nil || finalizeErr != nil || projection.PackageDir != "package-safe" || composer.calls != 4 || executor.calls != 1 || publisher.stageCalls != 1 || publisher.finalizeCalls != 1 {
 		t.Fatalf("projection=%#v calls=%d/%d/%d/%d err=%v/%v", projection, composer.calls, executor.calls, publisher.stageCalls, publisher.finalizeCalls, err, finalizeErr)
 	}
@@ -1029,7 +1043,7 @@ func TestFixturesPrepareBeforeAnyBusinessStep(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := service.Decide(context.Background(), DecisionCommand{Principal: "user-1", Handle: view.Handle, Revision: view.ApprovalRevision, DecisionID: "flow-decision", Action: DecisionApprove})
-	if err != nil || result.Outcome == nil || *result.Outcome != OutcomePassed || oldExecution.callCount() != 0 || flowPort.admitCalls != 1 || flowPort.calls != 1 || flowPort.finalizeCalls != 1 || strings.Join(trace, ",") != "admit,prepare,flow,cleanup,finalize" {
+	if err != nil || result.Outcome == nil || *result.Outcome != OutcomePassed || oldExecution.callCount() != 0 || flowPort.admitCalls != 1 || flowPort.calls != 1 || flowPort.finalizeCalls != 1 || strings.Join(trace, ",") != "admit,prepare,flow,promote,cleanup,finalize" {
 		t.Fatalf("result=%#v trace=%v old=%d flow=%d err=%v", result, trace, oldExecution.callCount(), flowPort.calls, err)
 	}
 }

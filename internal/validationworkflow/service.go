@@ -32,7 +32,7 @@ type Dependencies struct {
 	Packages        PackageReader
 	Authorization   AutoAuthorizationPolicy
 	Finalizer       Finalizer
-	Preview         PreviewPort
+	Environment     EnvironmentPort
 	Store           WorkflowStore
 	Artifacts       PlanArtifactStore
 	Executables     ExecutablePlanStore
@@ -142,23 +142,28 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		return WorkflowView{}, err
 	}
 	defer s.endWork(handle, worker)
-	if command.Target.Preview != nil {
-		if s.deps.Preview == nil {
-			return WorkflowView{}, &Error{Code: CodeInvalid, Operation: "preview_composition"}
-		}
-		preview, previewErr := s.deps.Preview.Acquire(workCtx, handle, command)
-		previewDigest, digestErr := TargetContextDigest(preview.Target)
-		if previewErr != nil || digestErr != nil || !validAcquiredPreview(preview.Target, snapshot.Binding, command) {
-			record, err = s.terminal(workCtx, record, OutcomeInconclusive, "preview_acquisition_failed")
-			if err != nil {
-				return WorkflowView{}, err
-			}
-			return viewOf(record), nil
-		}
-		snapshot.Binding.Target = canonicalBindingContext(BindingContext{Target: preview.Target}).Target
-		snapshot.TargetDigest = previewDigest
-		record.PreviewDigest = previewDigest
+	if s.deps.Environment == nil {
+		return WorkflowView{}, &Error{Code: CodeInvalid, Operation: "environment_composition"}
 	}
+	environment, environmentErr := s.deps.Environment.Acquire(workCtx, handle, command)
+	environmentDigest, digestErr := TargetContextDigest(environment.Target)
+	if environmentErr != nil || digestErr != nil || !validAcquiredEnvironment(environment.Target, snapshot.Binding, command) {
+		outcome, category := classifyEnvironmentFailure(workCtx, environmentErr)
+		if environmentErr == nil {
+			category = "integrity"
+		}
+		record.OperationalCategory = category
+		terminalCtx, terminalCancel := context.WithTimeout(context.WithoutCancel(workCtx), s.config.FinalizeTimeout)
+		record, err = s.terminal(terminalCtx, record, outcome, "environment_acquisition_failed")
+		terminalCancel()
+		if err != nil {
+			return WorkflowView{}, err
+		}
+		return viewOf(record), nil
+	}
+	snapshot.Binding.Target = canonicalBindingContext(BindingContext{Target: environment.Target}).Target
+	snapshot.TargetDigest = environmentDigest
+	record.EnvironmentDigest = environmentDigest
 	snapshot.Generation.RunID, snapshot.Generation.PlanID = handle, handle+"-plan"
 	if s.deps.Context != nil && command.FunctionalFlow == nil {
 		selection, contextErr := s.deps.Context.Prepare(workCtx, handle, snapshot.Clone(), command)
@@ -365,16 +370,20 @@ func (s *Service) revalidateGeneratedPlan(ctx context.Context, command StartComm
 	current.Generation.ContextDigest = expected.Generation.ContextDigest
 	current.Generation.ContextSeal = expected.Generation.ContextSeal
 	current.Generation.ContextEnvelope = append(json.RawMessage(nil), expected.Generation.ContextEnvelope...)
-	if command.Target.Preview != nil {
-		current.Binding.Target = expected.Binding.Target
-		current.TargetDigest = expected.TargetDigest
+	if s.deps.Environment == nil {
+		return &Error{Code: CodeConflict, Operation: "environment_drift"}
 	}
+	environment, environmentErr := s.deps.Environment.Revalidate(ctx, expected.Generation.RunID, command, EnvironmentBinding{Target: expected.Binding.Target})
+	environmentDigest, environmentDigestErr := TargetContextDigest(environment.Target)
+	if environmentErr != nil || environmentDigestErr != nil || environmentDigest != expected.TargetDigest {
+		return &Error{Code: CodeConflict, Operation: "environment_drift"}
+	}
+	current.Binding.Target = canonicalBindingContext(BindingContext{Target: environment.Target}).Target
+	current.TargetDigest = environmentDigest
 	currentContextDigest, currentContextErr := canonicalContextDigest(current)
 	expectedContextDigest, expectedContextErr := canonicalContextDigest(expected)
 	unchanged := currentContextErr == nil && expectedContextErr == nil && currentContextDigest == expectedContextDigest && current.SpecificationDigest == expected.SpecificationDigest && current.ContractDigest == expected.ContractDigest && current.CatalogDigest == expected.CatalogDigest && current.ContractPolicyDigest == expected.ContractPolicyDigest && current.RevisionDigest == expected.RevisionDigest && current.RuntimeDigest == expected.RuntimeDigest && current.Provider == expected.Provider && current.Model == expected.Model
-	if command.Target.Direct != nil {
-		unchanged = unchanged && current.TargetDigest == expected.TargetDigest
-	}
+	unchanged = unchanged && current.TargetDigest == expected.TargetDigest
 	if !unchanged || !prepared.MatchesProvenance(agentplanning.ProvenanceInput{Constraints: current.Generation.Constraints, Contract: current.Generation.Contract, Capabilities: current.Generation.Capabilities, Identities: current.Generation.Identities, ContextDigest: current.Generation.ContextDigest, ContextEnvelope: current.Generation.ContextEnvelope, ContextInstructions: current.Generation.ContextInstructions, ContextSeal: current.Generation.ContextSeal}) {
 		return &Error{Code: CodeConflict, Operation: "admission_drift"}
 	}
@@ -811,12 +820,13 @@ func (s *Service) execute(ctx context.Context, record Record, snapshot Admission
 		return Record{}, err
 	}
 	var packageDir string
-	var flowOutcome Outcome
+	var executionPreparation ExecutionPreparation
+	var flowPrimary FunctionalFlowPrimary
 	var executionErr error
 	if s.deps.FunctionalFlow != nil {
-		flowOutcome, executionErr = s.deps.FunctionalFlow.Execute(ctx, executionRequest, material.Snapshot)
+		flowPrimary, executionErr = s.deps.FunctionalFlow.Execute(ctx, executionRequest, material.Snapshot)
 	} else {
-		packageDir, executionErr = s.deps.Execution.Execute(ctx, executionRequest)
+		executionPreparation, executionErr = s.deps.Execution.Execute(ctx, executionRequest)
 	}
 	if executionErr != nil {
 		if s.deps.FunctionalFlow != nil && IsRecoverableFunctionalFlowError(executionErr) {
@@ -829,12 +839,27 @@ func (s *Service) execute(ctx context.Context, record Record, snapshot Admission
 		return s.terminal(ctx, record, outcome, "execution_finished")
 	}
 	if s.deps.FunctionalFlow != nil {
+		if checkpointErr := s.checkpointEnvironment(ctx, record); checkpointErr != nil {
+			record.FunctionalFlowExecutionPending, record.OperationalCategory = false, "integrity"
+			return s.terminal(ctx, record, OutcomeInconclusive, "environment_publication_drift")
+		}
+		if promoteErr := s.deps.FunctionalFlow.Promote(ctx, flowPrimary); promoteErr != nil {
+			return s.terminal(ctx, record, OutcomeInconclusive, "functional_flow_publication_failed")
+		}
 		record.FunctionalFlowExecutionPending, record.FunctionalFlowPrimaryDurable = false, true
 		record, err = s.transition(ctx, record, PhaseFinalizing, "primary_result_staged", record.Artifact.ArtifactSHA256)
 		if err != nil {
 			return Record{}, err
 		}
-		return s.terminal(ctx, record, flowOutcome, "package_verified")
+		return s.terminal(ctx, record, flowPrimary.Outcome, "package_verified")
+	}
+	if checkpointErr := s.checkpointEnvironment(ctx, record); checkpointErr != nil {
+		record.OperationalCategory = "integrity"
+		return s.terminal(ctx, record, OutcomeInconclusive, "environment_publication_drift")
+	}
+	packageDir, executionErr = s.deps.Execution.Promote(ctx, executionPreparation)
+	if executionErr != nil {
+		return s.terminal(ctx, record, OutcomeInconclusive, "package_publication_failed")
 	}
 	record.PackageDir = packageDir
 	record, err = s.transition(ctx, record, PhaseFinalizing, "package_intent_committed", record.Artifact.ArtifactSHA256)
@@ -876,19 +901,26 @@ func (s *Service) resumeFunctionalFlow(ctx context.Context, record Record, snaps
 		executionCtx, cancel = context.WithCancel(ctx)
 		cancel()
 	}
-	outcome, executionErr := s.deps.FunctionalFlow.Execute(executionCtx, request, material.Snapshot)
+	primary, executionErr := s.deps.FunctionalFlow.Execute(executionCtx, request, material.Snapshot)
 	if executionErr != nil {
 		if IsRecoverableFunctionalFlowError(executionErr) {
 			return record, executionErr
 		}
 		return s.terminal(ctx, record, OutcomeError, "functional_flow_unrecoverable")
 	}
+	if checkpointErr := s.checkpointEnvironment(ctx, record); checkpointErr != nil {
+		record.FunctionalFlowExecutionPending, record.OperationalCategory = false, "integrity"
+		return s.terminal(ctx, record, OutcomeInconclusive, "environment_publication_drift")
+	}
+	if promoteErr := s.deps.FunctionalFlow.Promote(ctx, primary); promoteErr != nil {
+		return s.terminal(ctx, record, OutcomeInconclusive, "functional_flow_publication_failed")
+	}
 	record.FunctionalFlowExecutionPending, record.FunctionalFlowPrimaryDurable = false, true
 	record, err = s.transition(ctx, record, PhaseFinalizing, "primary_result_staged", record.Artifact.ArtifactSHA256)
 	if err != nil {
 		return Record{}, err
 	}
-	return s.terminal(ctx, record, outcome, "package_verified")
+	return s.terminal(ctx, record, primary.Outcome, "package_verified")
 }
 
 // checkpointApprovedContract resolves exact review authority and validates repository, commit and digest before approval or tools.
@@ -952,18 +984,16 @@ func (s *Service) restorePrepared(ctx context.Context, record Record) (Admission
 	if err = validateSnapshot(snapshot, record.Command); err != nil {
 		return AdmissionSnapshot{}, agentplanning.PreparedPlan{}, &Error{Code: CodeConflict, Operation: "admission_drift"}
 	}
-	if record.Command.Target.Preview != nil {
-		if s.deps.Preview == nil || record.PreviewDigest == "" {
-			return AdmissionSnapshot{}, agentplanning.PreparedPlan{}, &Error{Code: CodeConflict, Operation: "preview_restore"}
-		}
-		preview, restoreErr := s.deps.Preview.Restore(ctx, record.Handle, record.Command)
-		digest, digestErr := TargetContextDigest(preview.Target)
-		if restoreErr != nil || digestErr != nil || !validAcquiredPreview(preview.Target, snapshot.Binding, record.Command) || digest != record.PreviewDigest || record.Artifact == nil || digest != record.Artifact.TargetDigest {
-			return AdmissionSnapshot{}, agentplanning.PreparedPlan{}, &Error{Code: CodeConflict, Operation: "preview_restore"}
-		}
-		snapshot.Binding.Target = canonicalBindingContext(BindingContext{Target: preview.Target}).Target
-		snapshot.TargetDigest = digest
+	if s.deps.Environment == nil || record.EnvironmentDigest == "" {
+		return AdmissionSnapshot{}, agentplanning.PreparedPlan{}, &Error{Code: CodeConflict, Operation: "environment_restore"}
 	}
+	environment, restoreErr := s.deps.Environment.Revalidate(ctx, record.Handle, record.Command, EnvironmentBinding{Target: snapshot.Binding.Target})
+	digest, digestErr := TargetContextDigest(environment.Target)
+	if restoreErr != nil || digestErr != nil || !validAcquiredEnvironment(environment.Target, snapshot.Binding, record.Command) || digest != record.EnvironmentDigest || record.Artifact == nil || digest != record.Artifact.TargetDigest {
+		return AdmissionSnapshot{}, agentplanning.PreparedPlan{}, &Error{Code: CodeConflict, Operation: "environment_restore"}
+	}
+	snapshot.Binding.Target = canonicalBindingContext(BindingContext{Target: environment.Target}).Target
+	snapshot.TargetDigest = digest
 	snapshot.Generation.RunID, snapshot.Generation.PlanID = record.Handle, record.Handle+"-plan"
 	if s.deps.Context != nil && record.Command.FunctionalFlow == nil {
 		selection, contextErr := s.deps.Context.Prepare(ctx, record.Handle, snapshot.Clone(), record.Command)
@@ -995,9 +1025,15 @@ func (s *Service) restorePrepared(ctx context.Context, record Record) (Admission
 	return snapshot, prepared, nil
 }
 
-// validAcquiredPreview ensures the provider observation preserves the selected alias and source identity.
-func validAcquiredPreview(target TargetContext, admitted BindingContext, command StartCommand) bool {
-	return command.Target.Preview != nil && target.Kind == "preview" && target.Alias == command.Target.Preview.Alias && target.URL != "" && target.EnvironmentID != "" && len(target.Fingerprint) == 64 && target.Attestation.Verified && target.Attestation.EnvironmentID == target.EnvironmentID && target.Attestation.RepositoryID == admitted.Revision.RepositoryID && target.Attestation.CommitOID == admitted.Revision.CommitOID && validNetworkContext(target.Network)
+// validAcquiredEnvironment ensures provider observations preserve the selected alias and source identity.
+func validAcquiredEnvironment(target TargetContext, admitted BindingContext, command StartCommand) bool {
+	wantedKind, wantedAlias := "", ""
+	if command.Target.Direct != nil {
+		wantedKind, wantedAlias = "direct", command.Target.Direct.Alias
+	} else if command.Target.Preview != nil {
+		wantedKind, wantedAlias = "preview", command.Target.Preview.Alias
+	}
+	return target.Kind == wantedKind && target.Alias == wantedAlias && target.URL != "" && target.EnvironmentID != "" && (target.Kind != "preview" || len(target.Fingerprint) == 64) && target.Attestation.Verified && target.Attestation.EnvironmentID == target.EnvironmentID && target.Attestation.RepositoryID == admitted.Revision.RepositoryID && target.Attestation.CommitOID == admitted.Revision.CommitOID && validNetworkContext(target.Network)
 }
 
 // verifyExecutableMaterial proves that private executable semantics still match the public committed artifact.
@@ -1055,6 +1091,36 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.config.FinalizeTimeout)
 	defer cancel()
+	environmentReleased := false
+	if requiresEnvironmentPublicationCheckpoint(record) && record.OperationalCategory == "integrity" {
+		updated, saveErr := s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: "environment_publication_blocked", Category: "integrity"})
+		if saveErr != nil {
+			return Record{}, saveErr
+		}
+		record = updated
+		if s.deps.Environment != nil {
+			if releaseErr := s.deps.Environment.Release(cleanupCtx, record.Handle); releaseErr != nil {
+				return record, &Error{Code: CodeUnavailable, Operation: "environment_drift_cleanup_pending"}
+			}
+		}
+		environmentReleased = true
+	}
+	if requiresEnvironmentPublicationCheckpoint(record) && !environmentReleased {
+		if checkpointErr := s.checkpointEnvironment(cleanupCtx, record); checkpointErr != nil {
+			record.OperationalCategory = "integrity"
+			updated, saveErr := s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: "environment_publication_blocked", Category: "integrity"})
+			if saveErr != nil {
+				return Record{}, saveErr
+			}
+			record = updated
+			if s.deps.Environment != nil {
+				if releaseErr := s.deps.Environment.Release(cleanupCtx, record.Handle); releaseErr != nil {
+					return record, &Error{Code: CodeUnavailable, Operation: "environment_drift_cleanup_pending"}
+				}
+			}
+			environmentReleased = true
+		}
+	}
 	if record.FunctionalFlowAdmitted && record.FixtureSummary == nil {
 		status, preparationErr := s.deps.FunctionalFlow.RecordPreparation(cleanupCtx, record.Handle, fixture.PreparationRejected)
 		if preparationErr != nil {
@@ -1086,7 +1152,7 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 			}
 		}
 	}
-	if record.FunctionalFlowAdmitted && record.Package == nil {
+	if record.FunctionalFlowAdmitted && record.Package == nil && record.OperationalCategory != "integrity" {
 		summary := fixture.FixtureSummary{PreparationStatus: fixture.PreparationNotRequired, Cleanup: fixture.CleanupReport{Status: fixture.CleanupNotRequired}}
 		if record.FixtureSummary != nil {
 			summary = *record.FixtureSummary
@@ -1107,9 +1173,30 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 			return Record{}, &Error{Code: CodeUnavailable, Operation: "memory_observation_pending"}
 		}
 	}
-	if record.Command.Target.Preview != nil && s.deps.Preview != nil {
-		if err := s.deps.Preview.Release(cleanupCtx, record.Handle); err != nil {
-			return Record{}, &Error{Code: CodeUnavailable, Operation: "preview_cleanup_pending"}
+	if requiresEnvironmentPublicationCheckpoint(record) && !environmentReleased {
+		if checkpointErr := s.checkpointEnvironment(cleanupCtx, record); checkpointErr != nil {
+			record.OperationalCategory = "integrity"
+			updated, saveErr := s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: "environment_finalization_blocked", Category: "integrity"})
+			if saveErr != nil {
+				return Record{}, saveErr
+			}
+			record = updated
+			if s.deps.Environment != nil {
+				if releaseErr := s.deps.Environment.Release(cleanupCtx, record.Handle); releaseErr != nil {
+					return record, &Error{Code: CodeUnavailable, Operation: "environment_drift_cleanup_pending"}
+				}
+			}
+			environmentReleased = true
+		}
+	}
+	if s.deps.Environment != nil && !environmentReleased {
+		if err := s.deps.Environment.Release(cleanupCtx, record.Handle); err != nil {
+			record.OperationalCategory = "cleanup_pending"
+			updated, saveErr := s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: "environment_cleanup_pending", Category: "cleanup_pending"})
+			if saveErr != nil {
+				return Record{}, saveErr
+			}
+			return updated, &Error{Code: CodeUnavailable, Operation: "environment_cleanup_pending"}
 		}
 	}
 	if err := s.deps.Finalizer.Release(cleanupCtx, record.Handle); err != nil {
@@ -1119,6 +1206,9 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 		return Record{}, &Error{Code: CodeUnavailable, Operation: "executable_cleanup_pending"}
 	}
 	record.CleanupPending, record.Outcome, record.Phase = false, &outcome, PhaseTerminal
+	if record.OperationalCategory != "integrity" {
+		record.OperationalCategory = ""
+	}
 	updated, err := s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: eventType, Category: string(outcome)})
 	if err != nil {
 		return Record{}, err
@@ -1127,6 +1217,31 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 	delete(s.snapshots, record.Handle)
 	s.mu.Unlock()
 	return updated, nil
+}
+
+// requiresEnvironmentPublicationCheckpoint limits authority reconstruction to flows that can publish execution evidence.
+func requiresEnvironmentPublicationCheckpoint(record Record) bool {
+	return record.Phase == PhaseExecuting || record.Phase == PhaseFinalizing || record.FunctionalFlowPrimaryDurable || record.Package != nil || record.PackageDir != ""
+}
+
+// checkpointEnvironment reconstructs current composition authority immediately before publication or finalization.
+func (s *Service) checkpointEnvironment(ctx context.Context, record Record) error {
+	if record.EnvironmentDigest == "" {
+		return nil
+	}
+	if s.deps.Environment == nil {
+		return &Error{Code: CodeInvalid, Operation: "environment_composition"}
+	}
+	snapshot, err := s.deps.Admission.Build(ctx, record.Command)
+	if err != nil || validateSnapshot(snapshot, record.Command) != nil {
+		return &Error{Code: CodeConflict, Operation: "environment_publication"}
+	}
+	current, err := s.deps.Environment.Revalidate(ctx, record.Handle, record.Command, EnvironmentBinding{Target: snapshot.Binding.Target})
+	digest, digestErr := TargetContextDigest(current.Target)
+	if err != nil || digestErr != nil || !validAcquiredEnvironment(current.Target, snapshot.Binding, record.Command) || digest != record.EnvironmentDigest {
+		return &Error{Code: CodeConflict, Operation: "environment_publication"}
+	}
+	return nil
 }
 
 // approvalExpired reports whether a durable human-decision window has reached its inclusive boundary.
@@ -1207,7 +1322,12 @@ func allowedTransition(from, to Phase) bool {
 
 // viewOf builds the common safe adapter projection from durable state.
 func viewOf(record Record) WorkflowView {
-	return WorkflowView{ContractVersion: ContractVersion, Handle: record.Handle, RepositoryID: record.RepositoryID, Revision: record.Revision, Phase: record.Phase, Outcome: record.Outcome, UpdatedAt: record.UpdatedAt, ApprovalRevision: record.ApprovalRevision, Fixtures: record.FixtureSummary}
+	outcome := record.Outcome
+	if outcome == nil && record.DesiredOutcome != nil {
+		value := *record.DesiredOutcome
+		outcome = &value
+	}
+	return WorkflowView{ContractVersion: ContractVersion, Handle: record.Handle, RepositoryID: record.RepositoryID, Revision: record.Revision, Phase: record.Phase, Outcome: outcome, CleanupPending: record.CleanupPending, OperationalState: record.OperationalCategory, UpdatedAt: record.UpdatedAt, ApprovalRevision: record.ApprovalRevision, Fixtures: record.FixtureSummary}
 }
 
 // mapBoundaryError prevents raw dependency text from crossing the public API.

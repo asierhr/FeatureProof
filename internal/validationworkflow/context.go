@@ -40,9 +40,11 @@ type NetworkContext struct {
 
 // TargetContext records the effective direct or acquired preview target without credentials.
 type TargetContext struct {
-	Kind, Alias, URL                                           string
-	ProviderID, EnvironmentRef, ProfileID                      string
+	Kind, Alias, URL, SelectionDigest                          string
+	ProviderID, ProviderVersion, EnvironmentRef, ProfileID     string
 	EnvironmentID, ReservationID, ObservedVersion, Fingerprint string
+	LifecycleDigest                                            string
+	Capabilities                                               []string
 	Attestation                                                AttestationContext
 	Network                                                    NetworkContext
 }
@@ -96,6 +98,7 @@ func canonicalBindingContext(value BindingContext) BindingContext {
 	value.Revision.Roots = sortedStrings(value.Revision.Roots, nil)
 	value.Revision.ChangedPaths = sortedStrings(value.Revision.ChangedPaths, nil)
 	value.Target.Attestation.ValidUntil = value.Target.Attestation.ValidUntil.UTC()
+	value.Target.Capabilities = sortedStrings(value.Target.Capabilities, nil)
 	value.Target.Network = canonicalNetworkContext(value.Target.Network)
 	return value
 }

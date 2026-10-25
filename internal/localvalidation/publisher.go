@@ -31,14 +31,27 @@ func NewPublisher(root, runID string) (*Publisher, error) {
 	return NewPublisherWithFilesystem(root, runID, OSFileSystem{})
 }
 
+// NewPublisherWithFinalName keeps binding identity at runID while staging a hidden complete bundle for later promotion.
+func NewPublisherWithFinalName(root, runID, finalName string) (*Publisher, error) {
+	return newPublisherWithFilesystem(root, runID, finalName, OSFileSystem{})
+}
+
 // NewPublisherWithFilesystem prepares staging through the injected durable filesystem boundary.
 func NewPublisherWithFilesystem(root, runID string, fs FileSystem) (*Publisher, error) {
+	return newPublisherWithFilesystem(root, runID, runID, fs)
+}
+
+// newPublisherWithFilesystem validates the internal visible name independently from the bound run identity.
+func newPublisherWithFilesystem(root, runID, finalName string, fs FileSystem) (*Publisher, error) {
 	if fs == nil {
 		return nil, fmt.Errorf("filesystem is required")
 	}
+	if finalName == "" || filepath.Base(finalName) != finalName || finalName == "." || finalName == ".." {
+		return nil, fmt.Errorf("invalid final bundle name")
+	}
 	parent := filepath.Join(root, ".featureproof", "runs")
-	staging := filepath.Join(parent, runID+".incomplete")
-	final := filepath.Join(parent, runID)
+	staging := filepath.Join(parent, finalName+".incomplete")
+	final := filepath.Join(parent, finalName)
 	if err := fs.MkdirAll(parent, 0700); err != nil {
 		return nil, fmt.Errorf("create runs directory: %w", err)
 	}
@@ -53,6 +66,19 @@ func NewPublisherWithFilesystem(root, runID string, fs FileSystem) (*Publisher, 
 		return nil, fmt.Errorf("create staging bundle: %w", err)
 	}
 	return &Publisher{parent: parent, runID: runID, staging: staging, final: final, fs: fs}, nil
+}
+
+// PromoteBundleNoReplace atomically exposes a complete staged bundle without replacing a prior canonical run.
+func PromoteBundleNoReplace(staging, final string) error {
+	if filepath.Dir(staging) != filepath.Dir(final) || filepath.Base(staging) == filepath.Base(final) {
+		return fmt.Errorf("invalid bundle promotion")
+	}
+	if _, stagingErr := os.Lstat(staging); os.IsNotExist(stagingErr) {
+		if _, finalErr := os.Lstat(final); finalErr == nil {
+			return nil
+		}
+	}
+	return commitNoReplace(staging, final)
 }
 
 // EvidenceStore prepares the only directory in which the executor may confirm treated evidence.

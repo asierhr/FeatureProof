@@ -3802,3 +3802,101 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - El usuario aprobó explícitamente la especificación de `environment-provider`.
 - Aprobación registrada a las `2026-10-25T15:47:03+01:00`; estado cambiado de `spec_ready` a `in_progress`.
 - Comienza la implementación ordenada de T1–T16; el cierre requiere gates completos y review independiente aprobada.
+
+## Feature 31 — implementación iniciada (2026-10-25)
+
+- T1–T3 iniciadas: modelo canónico, catálogo sellado y puerto provider-neutral añadidos en `internal/environment`.
+- El workflow está migrándose de `PreviewPort` a un único `EnvironmentPort`; direct y preview compartirán adquisición, restauración y cleanup.
+- El alcance continúa cerrado: `ExistingURLProvider` solo delega el lifecycle existente y el provider gestionado será exclusivamente un fake contractual.
+
+## Feature 31 — implementación lista para review (2026-10-25)
+
+- T1–T16 completadas: modelo/catálogo canónicos, lifecycle provider-neutral durable, adapter `ExistingURLProvider`, store CAS append-only y un único `EnvironmentPort` integrado en workflow/composición.
+- Direct y preview usan la misma adquisición, revalidación y liberación; feature 19 conserva una sola reserva/release lógica y no se añadió infraestructura gestionada real.
+- Gates verdes: formato, diff, vet, compile-only, focal repetido, suite global normal, race focal/alta, cross-build Windows/Linux/Darwin y runtime Linux del paquete nuevo.
+- Coverage exacta de `internal/environment`: `610/704 = 86,647727 %`; coverage global: `86,0 %`.
+- La race global se intentó tres veces: los paquetes afectados pasan, pero la ejecución conjunta conserva timeouts no deterministas preexistentes en `localvalidation`, `contextassembly`, `functionalflow` y `githubpr`; cada fallo aislado comprobado pasa.
+- WSL2 no pudo crear VM por `ERROR_NO_SYSTEM_RESOURCES`; Alpine WSL1 verificó `internal/environment`, mientras suites históricas de workflow/cmd fallan en publicación durable bajo WSL1. Los nueve cross-builds sí pasan.
+
+## Feature 31 — remediación de review 1 iniciada (2026-10-25)
+
+- Reabiertas T1–T10, T12–T16 por REV-1–REV-10; T11 permanece cerrada.
+- El alcance de remediación queda limitado a catálogo explícito, acquire incierto/release, store durable, leases, revalidación terminal, outcomes operacionales, contrato común, vertical de superficies, coverage completa y runtime Linux.
+- `feature_list.json`, providers gestionados reales, Kubernetes y features posteriores permanecen fuera de alcance.
+
+## Feature 31 — remediación de review 1, código y gates Windows completados (2026-10-25)
+
+- REV-1–REV-4: la composición exige catálogo explícito sellado; acquire incierto deja obligación durable, reconcilia la misma identidad y libera con contexto derivado/finito; el store encadena receipts con head anti-rollback y publica record/event/head con sync; owner/lease usa CAS y adopción sin I/O provider duplicado.
+- REV-5–REV-8: el entorno se revalida antes de ejecución y publicación; outcome primario y estado operacional se proyectan por separado; managed fake y `ExistingURLProvider` ejecutan la misma matriz completa; CLI/API/MCP/GitHub comparten un único `EnvironmentPort` para direct y preview.
+- REV-9: `scripts/feature31_coverage.py` mide el diff productivo completo desde `6e8742f`, autentica ambos build tags y obtiene `1002/1160 = 86,379310 %` sin redondear.
+- Gates Windows verdes: formato/diff, vet, compile-only, focales x3, global normal, race focal, environment race x20, race global completa y cross-builds Windows/Linux/Darwin 9/9.
+- REV-10 permanece abierto únicamente mientras se recupera un runtime Linux soportado: WSL1 devuelve `ENOSYS` en el `renameat2(RENAME_NOREPLACE)` histórico de publicación; no se debilitó esa garantía ni se amplió scope. T1–T15 están cerradas y T16 sigue abierta hasta completar runtime Linux y limpieza final.
+
+## Feature 31 — remediación de review 1 completada (2026-10-25)
+
+- REV-10 se cerró con compatibilidad Linux mínima ante `ENOSYS`: `localvalidation` conserva publicación atómica/no-clobber para archivos y bundles no vacíos; `contractreview` usa `linkat/unlinkat` para no-replace y `renameat` solo para replacement explícito. Tests Linux específicos verifican que un destino confirmado no se sobrescribe.
+- Runtime Alpine WSL1 verde con binarios Linux frescos: `internal/environment`, `internal/validationworkflow` y `cmd/featureproof` pasan 3/3; también pasan completas `internal/localvalidation` y `internal/contractreview`.
+- Coverage exacta final del diff desde `6e8742f`, combinando profile Windows y statements Linux autenticados por hash: `1026/1191 = 86,146096 %`.
+- Todos los gates obligatorios quedan verdes y T1–T16 vuelven a `[x]`. Los temporales y la distro efímera se eliminan antes de entregar; `feature_list.json` permanece intacto.
+
+## Feature 31 — remediación de review 2 iniciada (2026-10-25)
+
+- Reabiertas T4, T7, T8, T10, T15 y T16 por REV2-1–REV2-7; los hallazgos cerrados de reviews anteriores permanecen cerrados.
+- Alcance limitado a double-uncertain acquire/release autoritativa, lease segura, promoción posterior a checkpoint, contrato común completo, fallback `ENOSYS` fail-closed o con claim atómico, coverage multiplataforma exacta y temporales verificados.
+- `feature_list.json`, providers reales, Kubernetes y features posteriores permanecen fuera de alcance.
+
+## Feature 31 — remediación de review 2 completada (2026-10-25)
+
+- REV2-1–REV2-4: acquire doblemente incierto conserva authority y queda pending hasta reconcile autoritativo; leases cubren todos los boundaries; ejecución privada se promociona solo tras revalidación; la misma matriz durable corre contra existing y managed fake.
+- REV2-5: los fallbacks Linux preservan no-clobber y recovery con claim descriptor-relative/flock para bundles y hard-link convergente para archivos; tests coordinados cubren crash, concurrencia, winner único y redelivery.
+- REV2-6: coverage exacta del diff completo desde `6e8742f`, con columnas y profiles Windows/Linux autenticados: `1122/1313 = 85,453161 %`.
+- Gates verdes: formato/comments/diff, vet, compile-only, focal ×3, global normal, race focal/environment ×20/global UCRT64, Linux 5/5 y cross-builds 9/9. Un primer race global bajo cross-build concurrente falló aisladamente en `functionalflow`; el test ×3 y el global repetido sin carga pasaron.
+- T4/T7/T8/T10/T15/T16 vuelven a `[x]`; temporales verificados se retiran y `feature_list.json` permanece intacto.
+
+## Feature 31 — remediación de review 3 iniciada (2026-10-25)
+
+- Reabiertas T4, T7, T15 y T16 por REV3-1–REV3-4; hallazgos cerrados anteriores permanecen cerrados.
+- Alcance limitado a lease agregada, autenticación completa de reconcile de cleanup, matriz contractual durable idéntica y cobertura con toolchain/plataforma autenticados.
+- `feature_list.json`, providers reales, Kubernetes y features posteriores permanecen fuera de alcance.
+
+## Feature 31 — remediación de review 3 completada (2026-10-25)
+
+- REV3-1: la lease cubre la cadena provider completa y usa aritmética fail-closed; TTL mayor que cada boundary pero menor/igual que la suma se rechaza sin I/O.
+- REV3-2: reconcile de cleanup autentica provider/version/profile, handle, availability, capabilities, repo/commit, attestation y network; authority tampered permanece recoverable sin release.
+- REV3-3: la misma matriz `LifecycleService` + `LocalStore`, sin branches por adapter, corre contra ExistingURLProvider y managed fake con cancel/deadline, faults/reopen, incertidumbre doble, tamper, recovery y concurrency.
+- REV3-4: coverage fija Go 1.25.1 desde `go.mod`, autentica manifest de plataforma/hash y rechaza mismatch/layout incompatible; resultado fresco `1166/1364 = 85,483871 %`.
+- Gates verdes: formato/comments/diff, vet, compile-only, focal ×3, global normal/race UCRT64, matriz contractual race ×20, Linux 5/5 y cross-builds 9/9. T4/T7/T15/T16 vuelven a `[x]`; `feature_list.json` permanece intacto.
+
+## Feature 31 — remediación de review 4 iniciada (2026-10-25)
+
+- Reabiertas T2, T5, T10, T14 y T16 por REV4-1/REV4-2; los hallazgos anteriores permanecen cerrados.
+- Alcance limitado a ligar template/profile/network policy de Selection con Observation antes de persistir/bind/release, y a budgets finitos de Network/Observer incluidos en la lease agregada.
+- `feature_list.json`, providers reales, Kubernetes y features posteriores permanecen fuera de alcance.
+
+## Feature 31 — remediación de review 4 completada (2026-10-25)
+
+- REV4-1: template/profile/network policy y toda authority de Selection se validan antes de persistir lifecycle, bind y cleanup; tamper en acquire/reopen queda recoverable sin Release para ambos adapters.
+- REV4-2: Network/Observer tienen budgets propios, child contexts con cause y participación explícita en la lease; callbacks bloqueados prueban timeout/cancel, join y no adopción.
+- Gates Go 1.25.1 verdes: formato/comments/diff, vet, compile-only, focal ×3, global normal/race UCRT64, matriz contractual race ×20, Linux 5/5 y cross 9/9.
+- Coverage pinned fresh: `1181/1384 = 85,332370 %`; T2/T5/T10/T14/T16 vuelven a `[x]`, temporales se retiran y `feature_list.json` permanece intacto.
+
+## Feature 31 — remediación de review 5 iniciada (2026-10-25)
+
+- Reabiertas T15 y T16 por REV5-1; la implementación productiva permanece sin cambios.
+- El caso deadline de la matriz se coordina con `started` y expira exclusivamente el child budget de Acquire; budgets generales del fixture quedan holgados para I/O durable/observer.
+- Se repetirán matriz normal/race altas, global default múltiple/serial/race, Linux y cross antes del cierre; `feature_list.json` permanece fuera de cambios.
+
+## Feature 31 — remediación de review 5 completada (2026-10-25)
+
+- REV5-1: cada escenario/adaptador de la matriz contractual crea fixture, context y budgets propios; cancel/deadline esperan el canal que confirma entrada en `Acquire`, y el timeout expira exclusivamente el child budget de esa frontera.
+- La matriz común pasa 20/20 normal y 20/20 race; la auditoría del diff confirma que los tests feature 31 no añaden `time.Sleep`, `time.After` ni parent deadlines cortos. No se modificaron tests históricos para ocultar flakes.
+- Gates Go 1.25.1 verdes: global default ×2, global serial, global race serial UCRT64, Linux repetido en 5/5 paquetes (`cmd/featureproof` ×3), y cross-builds 9/9.
+- Coverage pinned fresh: `1181/1384 = 85,332370 %`; T15/T16 vuelven a `[x]`, los temporales propios se retiran y `feature_list.json` permanece intacto.
+
+## Feature 31 — cierre aprobado (2026-10-25)
+
+- La revisión independiente 6 aprobó el diff completo: R1–R15, T1–T16 y todos los hallazgos REV quedan cerrados.
+- El smoke final del leader pasó en `environment`, `validationworkflow` y `cmd/featureproof`; `git diff --check` también pasó.
+- Gates independientes: global normal repetido/serial, global race serial, matriz contractual normal ×30/race ×20, Linux 5/5 repetido y cross-builds 9/9.
+- Cobertura fresca exacta y toolchain-pinned del diff productivo: `1182/1384 = 85,404624 %`.
+- Feature 31 marcada `done`; queda commit y push de `feature-31-environment-provider`.

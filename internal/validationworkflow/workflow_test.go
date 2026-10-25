@@ -25,6 +25,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
+	"github.com/asierhr/featureProof/internal/environment"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/githubpr"
@@ -285,10 +286,11 @@ func (planningClock) Now() time.Time { return time.Unix(0, 0).UTC() }
 
 // fakeExecution records canonical execution requests and returns a package path.
 type fakeExecution struct {
-	mu      sync.Mutex
-	calls   int
-	request ExecutionRequest
-	err     error
+	mu       sync.Mutex
+	calls    int
+	promotes int
+	request  ExecutionRequest
+	err      error
 }
 
 // blockingExecution exposes deterministic start and stop barriers for cancellation tests.
@@ -328,27 +330,46 @@ func (b *blockingGeneration) Generate(ctx context.Context, _ AdmissionSnapshot) 
 }
 
 // Execute blocks until the worker context is cancelled and confirms it observed the signal.
-func (b *blockingExecution) Execute(ctx context.Context, _ ExecutionRequest) (string, error) {
+func (b *blockingExecution) Execute(ctx context.Context, _ ExecutionRequest) (ExecutionPreparation, error) {
 	close(b.started)
 	<-ctx.Done()
 	close(b.stopped)
-	return "", ctx.Err()
+	return ExecutionPreparation{}, ctx.Err()
+}
+
+// Promote is unreachable because blocking execution only returns after cancellation.
+func (b *blockingExecution) Promote(context.Context, ExecutionPreparation) (string, error) {
+	return "", errors.New("unexpected promotion")
 }
 
 // Execute captures one authorized runner invocation.
-func (f *fakeExecution) Execute(ctx context.Context, request ExecutionRequest) (string, error) {
+func (f *fakeExecution) Execute(ctx context.Context, request ExecutionRequest) (ExecutionPreparation, error) {
 	if ctx.Err() != nil {
-		return "", ctx.Err()
+		return ExecutionPreparation{}, ctx.Err()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.request = request
-	return "package-safe", f.err
+	return ExecutionPreparation{StagedDir: "package-private", FinalDir: "package-safe"}, f.err
+}
+
+// Promote exposes only the prepared fake package after the service checkpoint.
+func (f *fakeExecution) Promote(ctx context.Context, preparation ExecutionPreparation) (string, error) {
+	if ctx.Err() != nil || preparation.FinalDir == "" {
+		return "", ctx.Err()
+	}
+	f.mu.Lock()
+	f.promotes++
+	f.mu.Unlock()
+	return preparation.FinalDir, nil
 }
 
 // callCount reports execution invocations safely.
 func (f *fakeExecution) callCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.calls }
+
+// promoteCount reports visible package promotions safely.
+func (f *fakeExecution) promoteCount() int { f.mu.Lock(); defer f.mu.Unlock(); return f.promotes }
 
 // fakePackages returns a configured verified package projection.
 type fakePackages struct {
@@ -383,38 +404,107 @@ type fakeFinalizer struct {
 type fakePreview struct {
 	mu                     sync.Mutex
 	digest, alias          string
+	repository, commit     string
 	acquires, releases     int
+	revalidations          int
 	acquireErr, releaseErr error
+	revalidate             func(int, EnvironmentBinding) EnvironmentBinding
+}
+
+// lifecycleEnvironmentStub programs the provider-neutral lifecycle adapter without provider or network effects.
+type lifecycleEnvironmentStub struct {
+	acquisition environment.Acquisition
+	err         error
+	releases    int
+}
+
+// Acquire returns the configured canonical environment projection.
+func (s *lifecycleEnvironmentStub) Acquire(context.Context, environment.Request) (environment.Acquisition, error) {
+	return s.acquisition, s.err
+}
+
+// Restore returns the same configured authority for recovery checks.
+func (s *lifecycleEnvironmentStub) Restore(context.Context, environment.Request) (environment.Acquisition, error) {
+	return s.acquisition, s.err
+}
+
+// Release records one logical lifecycle cleanup.
+func (s *lifecycleEnvironmentStub) Release(context.Context, string) error {
+	s.releases++
+	return s.err
 }
 
 // Acquire returns one programmed complete sealed target object.
-func (f *fakePreview) Acquire(_ context.Context, _ string, command StartCommand) (PreviewBinding, error) {
+func (f *fakePreview) Acquire(_ context.Context, _ string, command StartCommand) (EnvironmentBinding, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.acquires++
 	if command.Target.Preview != nil {
 		f.alias = command.Target.Preview.Alias
+	} else if command.Target.Direct != nil {
+		f.alias = command.Target.Direct.Alias
+	}
+	f.repository, f.commit = command.RepositoryID, command.Revision
+	if command.Target.Direct != nil {
+		return f.directBinding(command), f.acquireErr
 	}
 	return f.binding(), f.acquireErr
 }
 
 // Restore reconstructs the fake preview target for recovery and cross-owner tests.
-func (f *fakePreview) Restore(_ context.Context, _ string, command StartCommand) (PreviewBinding, error) {
+func (f *fakePreview) Restore(_ context.Context, _ string, command StartCommand) (EnvironmentBinding, error) {
 	if command.Target.Preview != nil {
 		f.mu.Lock()
 		f.alias = command.Target.Preview.Alias
+		f.repository, f.commit = command.RepositoryID, command.Revision
 		f.mu.Unlock()
+	} else if command.Target.Direct != nil {
+		f.mu.Lock()
+		f.alias = command.Target.Direct.Alias
+		f.repository, f.commit = command.RepositoryID, command.Revision
+		f.mu.Unlock()
+	}
+	if command.Target.Direct != nil {
+		return f.directBinding(command), f.acquireErr
 	}
 	return f.binding(), f.acquireErr
 }
 
+// Revalidate reconstructs current fake authority; the workflow verifies it against its durable digest.
+func (f *fakePreview) Revalidate(ctx context.Context, handle string, command StartCommand, _ EnvironmentBinding) (EnvironmentBinding, error) {
+	binding, err := f.Restore(ctx, handle, command)
+	if err != nil {
+		return EnvironmentBinding{}, err
+	}
+	f.mu.Lock()
+	f.revalidations++
+	count, mutate := f.revalidations, f.revalidate
+	f.mu.Unlock()
+	if mutate != nil {
+		binding = mutate(count, binding)
+	}
+	return binding, nil
+}
+
 // binding builds one safe preview observation whose fingerprint remains independently mutable.
-func (f *fakePreview) binding() PreviewBinding {
+func (f *fakePreview) binding() EnvironmentBinding {
 	alias := f.alias
+	repository, commit := f.repository, f.commit
 	if alias == "" {
 		alias = "target-1"
 	}
-	return PreviewBinding{Target: TargetContext{Kind: "preview", Alias: alias, URL: "https://preview.example/", ProviderID: "fake-provider", EnvironmentRef: "fake-ref", ProfileID: "runtime-1", EnvironmentID: "environment-1", ReservationID: "reservation-1", ObservedVersion: "v1", Fingerprint: f.digest, Attestation: AttestationContext{EnvironmentID: "environment-1", RepositoryID: "repo-1", CommitOID: strings.Repeat("a", 40), Reference: "proof-1", ValidUntil: time.Unix(10000, 0).UTC(), Verified: true}, Network: NetworkContext{PolicyID: "network-1", Schemes: []string{"https"}, Hosts: []string{"preview.example"}, Ports: []int{443}, BasePaths: []string{"/"}, MaxURLBytes: 2048}}}
+	if repository == "" {
+		repository = "repo-1"
+	}
+	if commit == "" {
+		commit = strings.Repeat("a", 40)
+	}
+	return EnvironmentBinding{Target: TargetContext{Kind: "preview", Alias: alias, URL: "https://preview.example/", ProviderID: "fake-provider", EnvironmentRef: "fake-ref", ProfileID: "runtime-1", EnvironmentID: "environment-1", ReservationID: "reservation-1", ObservedVersion: "v1", Fingerprint: f.digest, Attestation: AttestationContext{EnvironmentID: "environment-1", RepositoryID: repository, CommitOID: commit, Reference: "proof-1", ValidUntil: time.Unix(10000, 0).UTC(), Verified: true}, Network: NetworkContext{PolicyID: "network-1", Schemes: []string{"https"}, Hosts: []string{"preview.example"}, Ports: []int{443}, BasePaths: []string{"/"}, MaxURLBytes: 2048}}}
+}
+
+// directBinding builds the configured direct target for the exact admitted repository revision.
+func (f *fakePreview) directBinding(command StartCommand) EnvironmentBinding {
+	return EnvironmentBinding{Target: TargetContext{Kind: "direct", Alias: f.alias, URL: "https://target.example/", EnvironmentID: "environment-1", Attestation: AttestationContext{EnvironmentID: "environment-1", RepositoryID: command.RepositoryID, CommitOID: command.Revision, Reference: "proof-1", ValidUntil: time.Unix(10000, 0).UTC(), Verified: true}, Network: NetworkContext{PolicyID: "network-1", Schemes: []string{"https"}, Hosts: []string{"target.example"}, Ports: []int{443}, BasePaths: []string{"/"}, MaxURLBytes: 2048}}}
 }
 
 // expectedDigest derives the fake preview identity from the same complete projection as production.
@@ -580,7 +670,7 @@ func workflowFixture(t *testing.T, raw []byte) (*Service, *fakeAdmission, *fakeE
 		t.Fatal(err)
 	}
 	approval := &PlanApprovalBridge{Store: planapproval.NewMemoryStore(), Sanitizer: testApprovalSanitizer{}, Clock: clock, Limits: planapproval.Limits{MaxBytes: 1 << 20, MaxDepth: 32, MaxEvents: 100, MaxConstraints: 10, MaxChecks: 10, MaxSteps: 100, MaxAssertions: 100, MaxEvidence: 100}}
-	service, err := NewService(Config{LeaseTTL: time.Minute, HeartbeatInterval: 10 * time.Second, FinalizeTimeout: time.Second, ApprovalTTL: time.Hour}, Dependencies{Admission: admission, Generation: GeneratorAdapter{Generator: generator}, Preparation: PreparationAdapter{Assertions: fakeAssertions{}, Policy: fakePolicy{}}, Approval: approval, Execution: execution, Packages: fakePackages{projection: PackageProjection{RunID: "workflow-1", BindingSHA256: strings.Repeat("a", 64), PackageDir: "package-safe", Outcome: OutcomePassed}}, Authorization: fakeAuto{}, Finalizer: &fakeFinalizer{}, Store: store, Artifacts: artifacts, Executables: executables, Clock: clock, Waiter: clock, IDs: &testIDs{}, Owner: "owner-1"})
+	service, err := NewService(Config{LeaseTTL: time.Minute, HeartbeatInterval: 10 * time.Second, FinalizeTimeout: time.Second, ApprovalTTL: time.Hour}, Dependencies{Admission: admission, Generation: GeneratorAdapter{Generator: generator}, Preparation: PreparationAdapter{Assertions: fakeAssertions{}, Policy: fakePolicy{}}, Approval: approval, Execution: execution, Packages: fakePackages{projection: PackageProjection{RunID: "workflow-1", BindingSHA256: strings.Repeat("a", 64), PackageDir: "package-safe", Outcome: OutcomePassed}}, Authorization: fakeAuto{}, Finalizer: &fakeFinalizer{}, Environment: &fakePreview{}, Store: store, Artifacts: artifacts, Executables: executables, Clock: clock, Waiter: clock, IDs: &testIDs{}, Owner: "owner-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -839,6 +929,60 @@ func TestRequiredApprovalBindsExactCurrentHashesAndOneUseGrant(t *testing.T) {
 	}
 }
 
+// TestEnvironmentDriftStopsExecutionRecoveryAndPublication checks every sealed authority dimension immediately before evidence publication.
+func TestEnvironmentDriftStopsExecutionRecoveryAndPublication(t *testing.T) {
+	mutations := map[string]func(*TargetContext){
+		"selection":        func(target *TargetContext) { target.SelectionDigest = strings.Repeat("f", 64) },
+		"provider_version": func(target *TargetContext) { target.ProviderVersion = "v2" },
+		"template":         func(target *TargetContext) { target.EnvironmentRef = "other-template" },
+		"lifecycle":        func(target *TargetContext) { target.LifecycleDigest = strings.Repeat("f", 64) },
+		"environment":      func(target *TargetContext) { target.EnvironmentID = "environment-2" },
+		"repository":       func(target *TargetContext) { target.Attestation.RepositoryID = "repo-2" },
+		"commit":           func(target *TargetContext) { target.Attestation.CommitOID = strings.Repeat("b", 40) },
+		"attestation":      func(target *TargetContext) { target.Attestation.Reference = "proof-2" },
+		"endpoint":         func(target *TargetContext) { target.URL = "https://other.example/" },
+		"capabilities":     func(target *TargetContext) { target.Capabilities = []string{"admin"} },
+		"network_policy":   func(target *TargetContext) { target.Network.PolicyID = "network-2" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			baseline := (&fakePreview{}).directBinding(validCommand())
+			changed := baseline
+			mutate(&changed.Target)
+			baselineDigest, _ := TargetContextDigest(baseline.Target)
+			changedDigest, _ := TargetContextDigest(changed.Target)
+			if baselineDigest == changedDigest {
+				t.Fatal("drift dimension is not part of the canonical target")
+			}
+			service, _, execution, store, _ := workflowFixture(t, validPlanResponse())
+			environmentPort := &fakePreview{revalidate: func(count int, binding EnvironmentBinding) EnvironmentBinding {
+				if count >= 4 {
+					mutate(&binding.Target)
+				}
+				return binding
+			}}
+			service.deps.Environment = environmentPort
+			started, err := service.Start(context.Background(), validCommand())
+			if err != nil || started.Phase != PhaseAwaitingApproval {
+				t.Fatalf("start failed: %#v %v", started, err)
+			}
+			approval, err := service.ApprovalView(context.Background(), started.Handle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = service.Decide(context.Background(), DecisionCommand{Principal: "user-1", Handle: started.Handle, Revision: approval.Revision, DecisionID: "decision-drift", Action: DecisionApprove})
+			if err != nil {
+				t.Fatalf("confirmed drift cleanup did not converge terminally: %v", err)
+			}
+			view, statusErr := service.Status(context.Background(), started.Handle)
+			record, loadErr := store.Load(context.Background(), started.Handle)
+			if statusErr != nil || loadErr != nil || execution.callCount() != 1 || execution.promoteCount() != 0 || view.Phase != PhaseTerminal || view.CleanupPending || view.Outcome == nil || *view.Outcome != OutcomeInconclusive || view.OperationalState != "integrity" || record.Package != nil || environmentPort.releases != 1 {
+				t.Fatalf("drift state not isolated: view=%+v record=%+v status=%v load=%v tools=%d promotions=%d releases=%d", view, record, statusErr, loadErr, execution.callCount(), execution.promoteCount(), environmentPort.releases)
+			}
+		})
+	}
+}
+
 // TestSeparateServiceOwnersApproveAndRejectDurableWork proves passive approval commands cross process-local ownership safely.
 func TestSeparateServiceOwnersApproveAndRejectDurableWork(t *testing.T) {
 	first, _, _, store, _ := workflowFixture(t, validPlanResponse())
@@ -910,7 +1054,7 @@ func TestPreviewApprovalRestoresSealedAuthorizationAcrossOwners(t *testing.T) {
 		t.Run(map[bool]string{false: "same_owner", true: "cross_owner"}[crossOwner], func(t *testing.T) {
 			first, _, execution, store, _ := workflowFixture(t, validPlanResponse())
 			preview := &fakePreview{digest: strings.Repeat("9", 64)}
-			first.deps.Preview = preview
+			first.deps.Environment = preview
 			approvalRoot := filepath.Join(store.root, "preview-approvals")
 			approvalStore, err := planapproval.NewLocalStore(approvalRoot)
 			if err != nil {
@@ -1602,6 +1746,122 @@ func TestWorkflowCLIAPIAndMCPContractParity(t *testing.T) {
 	projected, ok := response.Value.(WorkflowView)
 	if !ok || projected.Handle != expected.Handle || projected.Phase != expected.Phase {
 		t.Fatalf("MCP mismatch: %#v", response)
+	}
+}
+
+// TestFourSurfacesShareOneEnvironmentLifecycleAndDigest proves API, CLI, MCP and GitHub use the same port for direct and preview targets.
+func TestFourSurfacesShareOneEnvironmentLifecycleAndDigest(t *testing.T) {
+	for _, targetKind := range []string{"direct", "preview"} {
+		t.Run(targetKind, func(t *testing.T) {
+			environmentPort := &fakePreview{digest: strings.Repeat("f", 64)}
+			digests := []string{}
+			transitions := [][]string{}
+			for _, surface := range []string{"api", "cli", "mcp", "github"} {
+				service, _, _, store, _ := workflowFixture(t, validPlanResponse())
+				service.deps.Environment = environmentPort
+				command := validCommand()
+				command.RepositoryID = "7"
+				command.IdempotencyKey = "request-" + surface + "-" + targetKind
+				if targetKind == "preview" {
+					command.Target = TargetSelection{Preview: &PreviewTarget{Alias: "target-1", Digest: strings.Repeat("6", 64)}}
+				}
+				handle := ""
+				switch surface {
+				case "api":
+					view, err := service.Start(context.Background(), command)
+					if err != nil {
+						t.Fatal(err)
+					}
+					handle = view.Handle
+					if _, err = service.Cancel(context.Background(), "user-1", handle); err != nil {
+						t.Fatal(err)
+					}
+				case "cli":
+					cli := CLI{Service: service, Principal: "user-1", AuthProfiles: map[string]string{"profile-1": strings.Repeat("8", 64)}, DirectTargets: map[string]DirectTarget{}, PreviewTargets: map[string]PreviewTarget{}}
+					targetFlag := "--target"
+					if targetKind == "direct" {
+						cli.DirectTargets["target-1"] = *command.Target.Direct
+					} else {
+						targetFlag = "--preview"
+						cli.PreviewTargets["target-1"] = *command.Target.Preview
+					}
+					args := []string{"start", "--spec", "spec-1", "--contract", "contract-1", "--provider", "fake", "--model", "selected", "--profile", "profile-1", "--runtime-profile", "runtime-1", "--repository", "7", "--revision", strings.Repeat("a", 40), "--approval", "required", "--idempotency-key", command.IdempotencyKey, targetFlag, "target-1"}
+					var output strings.Builder
+					if cli.Run(context.Background(), args, &output) != 0 {
+						t.Fatal(output.String())
+					}
+					var view WorkflowView
+					if json.Unmarshal([]byte(output.String()), &view) != nil {
+						t.Fatal(output.String())
+					}
+					handle = view.Handle
+					if cli.Run(context.Background(), []string{"cancel", handle}, io.Discard) != 0 {
+						t.Fatal("CLI cleanup failed")
+					}
+				case "mcp":
+					server := MCPServer{Service: service, Principal: "user-1", AuthProfiles: map[string]string{"profile-1": strings.Repeat("8", 64)}, DirectTargets: map[string]DirectTarget{}, PreviewTargets: map[string]PreviewTarget{}}
+					if targetKind == "direct" {
+						server.DirectTargets["target-1"] = *command.Target.Direct
+					} else {
+						server.PreviewTargets["target-1"] = *command.Target.Preview
+					}
+					arguments, _ := json.Marshal(map[string]any{"idempotency_key": command.IdempotencyKey, "specification_ref": "spec-1", "contract_ref": "contract-1", "provider": "fake", "model": "selected", "auth_profile": "profile-1", "runtime_profile": "runtime-1", "repository_id": "7", "revision": strings.Repeat("a", 40), "approval": "required", "target_alias": "target-1"})
+					if targetKind == "preview" {
+						arguments, _ = json.Marshal(map[string]any{"idempotency_key": command.IdempotencyKey, "specification_ref": "spec-1", "contract_ref": "contract-1", "provider": "fake", "model": "selected", "auth_profile": "profile-1", "runtime_profile": "runtime-1", "repository_id": "7", "revision": strings.Repeat("a", 40), "approval": "required", "preview_alias": "target-1"})
+					}
+					response := server.Handle(context.Background(), MCPRequest{Version: ContractVersion, Operation: "workflow.start", Arguments: arguments})
+					view, ok := response.Value.(WorkflowView)
+					if response.Error != "" || !ok {
+						t.Fatalf("MCP start failed: %#v", response)
+					}
+					handle = view.Handle
+					response = server.Handle(context.Background(), MCPRequest{Version: ContractVersion, Operation: "workflow.cancel", Arguments: json.RawMessage(`{"handle":"` + handle + `"}`)})
+					if response.Error != "" {
+						t.Fatalf("MCP cleanup failed: %#v", response)
+					}
+				case "github":
+					command.IdempotencyKey = "template"
+					snapshot, err := githubpr.SealSnapshot(githubpr.PullRequestSnapshot{Version: 1, InstallationID: 1, RepositoryID: 7, Number: 2, AuthorID: 9, State: "open", HeadOID: strings.Repeat("a", 40), HeadRepositoryID: 7})
+					if err != nil {
+						t.Fatal(err)
+					}
+					gateway := GitHubGateway{Service: service, Principal: "user-1", Commands: map[string]StartCommand{"default": command}}
+					state, err := gateway.Submit(context.Background(), githubpr.Selection{Alias: "default"}, snapshot, "request-github-"+targetKind)
+					if err != nil {
+						t.Fatal(err)
+					}
+					handle = state.RunHandle
+					if err = gateway.Cancel(context.Background(), handle, "test"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				record, err := store.Load(context.Background(), handle)
+				if err != nil || record.EnvironmentDigest == "" || record.Phase != PhaseTerminal {
+					t.Fatalf("surface lifecycle incomplete: %+v %v", record, err)
+				}
+				digests = append(digests, record.EnvironmentDigest)
+				events, err := store.Events(context.Background(), handle)
+				if err != nil {
+					t.Fatal(err)
+				}
+				types := make([]string, len(events))
+				for index := range events {
+					types[index] = events[index].Type
+				}
+				transitions = append(transitions, types)
+			}
+			for index := 1; index < len(digests); index++ {
+				if digests[index] != digests[0] || !reflect.DeepEqual(transitions[index], transitions[0]) {
+					t.Fatalf("surface lifecycle diverged: digests=%v transitions=%v", digests, transitions)
+				}
+			}
+			environmentPort.mu.Lock()
+			acquires, releases := environmentPort.acquires, environmentPort.releases
+			environmentPort.mu.Unlock()
+			if acquires != 4 || releases != 4 {
+				t.Fatalf("lifecycle effects not exactly once per surface: acquire=%d release=%d", acquires, releases)
+			}
+		})
 	}
 }
 
@@ -2301,11 +2561,98 @@ func TestCleanupIntentRecoversBeforeTerminal(t *testing.T) {
 	}
 }
 
+// TestEnvironmentOperationalFailuresAndPrimaryOutcomeProjectSeparately verifies closed classifications and cleanup projection.
+func TestEnvironmentOperationalFailuresAndPrimaryOutcomeProjectSeparately(t *testing.T) {
+	for _, scenario := range []struct {
+		name    string
+		err     error
+		outcome Outcome
+	}{
+		{name: "cancelled", err: &environment.Error{Category: environment.CategoryCancelled, Operation: "acquire"}, outcome: OutcomeCancelled},
+		{name: "timeout", err: &environment.Error{Category: environment.CategoryTimeout, Operation: "acquire"}, outcome: OutcomeInconclusive},
+		{name: "unavailable", err: errors.New("opaque provider failure"), outcome: OutcomeInconclusive},
+		{name: "invalid", err: &environment.Error{Category: environment.CategoryInvalid, Operation: "acquire"}, outcome: OutcomeError},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			service, _, execution, _, _ := workflowFixture(t, validPlanResponse())
+			service.deps.Environment = &fakePreview{acquireErr: scenario.err}
+			view, err := service.Start(context.Background(), validCommand())
+			if err != nil || view.Outcome == nil || *view.Outcome != scenario.outcome || execution.callCount() != 0 {
+				t.Fatalf("operational error changed functional semantics: %+v %v tools=%d", view, err, execution.callCount())
+			}
+		})
+	}
+
+	service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+	environmentPort := &fakePreview{releaseErr: errors.New("release unavailable")}
+	service.deps.Environment = environmentPort
+	command := validCommand()
+	command.Approval = ApprovalDisabled
+	if _, err := service.Start(context.Background(), command); !IsCode(err, CodeUnavailable) {
+		t.Fatalf("cleanup failure hidden: %v", err)
+	}
+	view, err := service.Status(context.Background(), "workflow-1")
+	if err != nil || view.Outcome == nil || *view.Outcome != OutcomePassed || !view.CleanupPending || view.OperationalState != "cleanup_pending" {
+		t.Fatalf("primary outcome was hidden by cleanup state: %+v %v", view, err)
+	}
+}
+
+// TestLifecycleEnvironmentPortClosedBranches verifies request ownership, projection and dependency failures at the workflow boundary.
+func TestLifecycleEnvironmentPortClosedBranches(t *testing.T) {
+	target := environment.ValidationTarget{Endpoint: "https://target.example/", ProviderID: "provider", ProviderVersion: "v1", SelectionDigest: strings.Repeat("d", 64), EnvironmentRef: "template", ProfileID: "profile", EnvironmentID: "environment", ReservationID: "reservation", ObservedVersion: "observed", Fingerprint: strings.Repeat("f", 64), LifecycleDigest: strings.Repeat("e", 64), Capabilities: []string{"http"}, Attestation: environment.Attestation{EnvironmentID: "environment", RepositoryID: "repo-1", CommitOID: strings.Repeat("a", 40), Reference: "proof", ValidUntil: time.Unix(10000, 0).UTC(), Verified: true}, Network: environment.NetworkPolicy{PolicyID: "network", Schemes: []string{"https"}, Hosts: []string{"target.example"}, Ports: []int{443}, BasePaths: []string{"/"}, MaxURLBytes: 2048}}
+	lifecycle := &lifecycleEnvironmentStub{acquisition: environment.Acquisition{Target: target}}
+	port := LifecycleEnvironmentPort{Lifecycle: lifecycle, Projects: map[string]string{"target-1": "project-1"}}
+	command := validCommand()
+	acquired, err := port.Acquire(context.Background(), "run-port", command)
+	if err != nil || acquired.Target.ProviderVersion != "v1" || acquired.Target.SelectionDigest != target.SelectionDigest || len(acquired.Target.Capabilities) != 1 {
+		t.Fatalf("canonical target was not projected: %+v %v", acquired, err)
+	}
+	if _, err = port.Restore(context.Background(), "run-port", command); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = port.Revalidate(context.Background(), "run-port", command, acquired); err != nil {
+		t.Fatal(err)
+	}
+	if err = port.Release(context.Background(), "run-port"); err != nil || lifecycle.releases != 1 {
+		t.Fatalf("release was not delegated: %v %d", err, lifecycle.releases)
+	}
+	previewCommand := command
+	previewCommand.Target = TargetSelection{Preview: &PreviewTarget{Alias: "target-1", Digest: strings.Repeat("6", 64)}}
+	preview := workflowEnvironmentBinding(lifecycle.acquisition, previewCommand)
+	if preview.Target.Kind != "preview" || preview.Target.Alias != "target-1" {
+		t.Fatalf("preview projection diverged: %+v", preview)
+	}
+
+	failure := errors.New("lifecycle unavailable")
+	failing := LifecycleEnvironmentPort{Lifecycle: &lifecycleEnvironmentStub{err: failure}, Projects: map[string]string{"target-1": "project-1"}}
+	if _, err = failing.Acquire(context.Background(), "run-port", command); !errors.Is(err, failure) {
+		t.Fatalf("acquire error hidden: %v", err)
+	}
+	if _, err = failing.Restore(context.Background(), "run-port", command); !errors.Is(err, failure) {
+		t.Fatalf("restore error hidden: %v", err)
+	}
+	if _, err = failing.Revalidate(context.Background(), "run-port", command, acquired); !errors.Is(err, failure) {
+		t.Fatalf("revalidate error hidden: %v", err)
+	}
+	if err = failing.Release(context.Background(), "run-port"); !errors.Is(err, failure) {
+		t.Fatalf("release error hidden: %v", err)
+	}
+	if _, err = (LifecycleEnvironmentPort{}).Acquire(context.Background(), "run-port", command); err == nil {
+		t.Fatal("missing composition accepted")
+	}
+	if err = (LifecycleEnvironmentPort{}).Release(context.Background(), "run-port"); err == nil {
+		t.Fatal("missing lifecycle release accepted")
+	}
+	if outcome, category := classifyEnvironmentFailure(context.Background(), nil); outcome != OutcomeInconclusive || category != string(environment.CategoryIntegrity) {
+		t.Fatalf("nil boundary classification widened: %s/%s", outcome, category)
+	}
+}
+
 // TestPreviewLifecycleBindsArtifactAndCleanup proves preview acquisition precedes inference and release is confirmed before terminal cancellation.
 func TestPreviewLifecycleBindsArtifactAndCleanup(t *testing.T) {
 	service, _, _, _, _ := workflowFixture(t, validPlanResponse())
 	preview := &fakePreview{digest: strings.Repeat("9", 64)}
-	service.deps.Preview = preview
+	service.deps.Environment = preview
 	command := validCommand()
 	command.Target.Direct = nil
 	command.Target.Preview = &PreviewTarget{Alias: "preview-1", Digest: strings.Repeat("8", 64)}
@@ -2410,7 +2757,7 @@ func TestPrivateStoreAndLeaseCorrectionBranches(t *testing.T) {
 func TestPreviewAcquisitionFailureBranches(t *testing.T) {
 	for _, scenario := range []struct {
 		name      string
-		preview   PreviewPort
+		preview   EnvironmentPort
 		wantError bool
 	}{
 		{name: "missing", preview: nil, wantError: true},
@@ -2419,7 +2766,7 @@ func TestPreviewAcquisitionFailureBranches(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			service, _, execution, _, _ := workflowFixture(t, validPlanResponse())
-			service.deps.Preview = scenario.preview
+			service.deps.Environment = scenario.preview
 			command := validCommand()
 			command.Target.Direct = nil
 			command.Target.Preview = &PreviewTarget{Alias: "preview-1", Digest: strings.Repeat("8", 64)}
@@ -2441,7 +2788,7 @@ func TestPreviewAcquisitionFailureBranches(t *testing.T) {
 func TestPreviewReleasePendingRecovers(t *testing.T) {
 	service, _, _, store, clock := workflowFixture(t, validPlanResponse())
 	preview := &fakePreview{digest: strings.Repeat("9", 64), releaseErr: errors.New("release pending")}
-	service.deps.Preview = preview
+	service.deps.Environment = preview
 	command := validCommand()
 	command.Target.Direct = nil
 	command.Target.Preview = &PreviewTarget{Alias: "preview-1", Digest: strings.Repeat("8", 64)}
@@ -2503,9 +2850,26 @@ func TestAuthorizedGeneratedPlanUsesExistingRunnerAndPackage(t *testing.T) {
 	port := LocalExecutionPort{Configurations: map[string]LocalRunnerConfiguration{runtimeDigest: {Digest: runtimeDigest, Request: localvalidation.PreparedRequest{Specification: spec, Runtime: manifest, Target: server.URL, RepositoryID: "repo", Revision: "main", EnvironmentID: "preview"}, Dependencies: deps}}}
 	artifact := PlanArtifact{Version: ArtifactVersion, WorkflowID: "workflow-vertical", PlanID: "generated", Provider: "fake", Model: "selected", PromptVersion: "v1", ProtocolVersion: "v1", Plans: localvalidation.ProjectPlans([]planning.ValidationPlan{plan}, commitmentKey), ContextDigest: strings.Repeat("1", 64), RevisionDigest: strings.Repeat("2", 64), TargetDigest: strings.Repeat("3", 64), RuntimeDigest: runtimeDigest, ContextInstructionsHash: strings.Repeat("5", 64)}
 	artifact.ArtifactSHA256, _ = artifactDigest(artifact)
-	packageDir, err := port.Execute(context.Background(), ExecutionRequest{Handle: "workflow-vertical", Plans: []planning.ValidationPlan{plan}, Snapshot: AdmissionSnapshot{RuntimeDigest: runtimeDigest}, ArtifactSHA256: artifact.ArtifactSHA256, CommitmentKey: commitmentKey})
+	preparation, err := port.Execute(context.Background(), ExecutionRequest{Handle: "workflow-vertical", Plans: []planning.ValidationPlan{plan}, Snapshot: AdmissionSnapshot{RuntimeDigest: runtimeDigest}, ArtifactSHA256: artifact.ArtifactSHA256, CommitmentKey: commitmentKey})
 	if err != nil {
 		t.Fatalf("%v: %s", err, diagnostic.String())
+	}
+	if _, statErr := os.Stat(preparation.StagedDir); statErr != nil {
+		t.Fatalf("private runner bundle missing before promotion: %v", statErr)
+	}
+	if _, statErr := os.Stat(preparation.FinalDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("runner bundle visible before environment checkpoint: %v", statErr)
+	}
+	repeated, repeatErr := port.Execute(context.Background(), ExecutionRequest{Handle: "workflow-vertical", Plans: []planning.ValidationPlan{plan}, Snapshot: AdmissionSnapshot{RuntimeDigest: runtimeDigest}, ArtifactSHA256: artifact.ArtifactSHA256, CommitmentKey: commitmentKey})
+	if repeatErr != nil || repeated != preparation {
+		t.Fatalf("private runner redelivery diverged: %#v %v", repeated, repeatErr)
+	}
+	packageDir, err := port.Promote(context.Background(), preparation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeatedDir, repeatErr := port.Promote(context.Background(), preparation); repeatErr != nil || repeatedDir != packageDir {
+		t.Fatalf("runner promotion redelivery diverged: %s %v", repeatedDir, repeatErr)
 	}
 	artifacts, err := OpenLocalArtifactStore(filepath.Join(root, ".featureproof", "workflow-plans"))
 	if err != nil {
