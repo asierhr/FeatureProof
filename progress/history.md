@@ -711,3 +711,15 @@ Bitácora append-only de features completadas.
 - Tasks T1–T15 completas; R1–R15 y REV-1–REV-10 trazados en `progress/kubernetes-environment/{implementation,review}.md`.
 - Review independiente aprobada en la cuarta revisión. Pasan smoke del leader, global normal/race, Kubernetes race ×20, focales repetidos, cross-builds 9/9 y runtime Alpine 3/3.
 - Cobertura statement-weighted exacta del diff productivo con Go 1.25.1: `1005/1155 = 87,012987 %`.
+
+## 2026-10-26 — kubernetes-validation-tool
+
+- Estado final: `done`.
+- Resultado: `kubernetes.observe` ofrece comprobaciones read-only de Deployment, Pods, Job, Service/EndpointSlices, Events y conectividad declarada mediante checks y aliases de un catálogo sellado; el modelo no aporta nombres, namespaces, selectors ni queries.
+- Autoridad y seguridad: target, binding, capability, namespace UID, catálogo, ServiceAccount y RBAC mínimo se verifican antes del API; el adapter solo expone `get/list`, sin Secrets, mutaciones, exec, logs, watch ni descubrimiento de credenciales.
+- Evidencia: outputs normalizados, redactados y acotados conservan versiones opacas y categorías deterministas; paginación, drift, cancelación, contadores inválidos, overflow y orden canónico fallan cerrados antes de evidence/contexto.
+- Integración: Registry, PlanExecutor, FileStore y `assertion.Engine` reales distinguen observación, ausencia, evidencia insuficiente, acceso e integridad sin aceptar verdicts del modelo.
+- Spec aprobada por el usuario el `2026-10-26T12:59:16+01:00`.
+- Tasks T1–T11 completas; R1–R15 y REV-1–REV-13 trazados en `progress/kubernetes-validation-tool/{implementation,review}.md`.
+- Review independiente aprobada en la cuarta revisión. Pasan smoke del leader, formato, diff check, vet, suite global, race global y Kubernetes race ×20.
+- Coverage focal exacta del paquete nuevo: `734/854 = 85,94847775175644 %`.

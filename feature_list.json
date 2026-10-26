@@ -595,7 +595,7 @@
           "Timeout, cancelación, paginación y cambios concurrentes del cluster se manejan de forma acotada y se registra la versión observada cuando está disponible",
           "Los tests usan un API server falso y cubren cada recurso soportado, aislamiento de namespace, permisos denegados, truncado, cancelación y ausencia de secretos"
         ],
-        "status": "in_progress"
+        "status": "done"
     },
     {
         "id": 34,

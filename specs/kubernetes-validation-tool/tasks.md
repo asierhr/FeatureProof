@@ -6,7 +6,7 @@ alcance aprobado. Al modificar o crear código, toda entidad, constante,
 variable, función, método y helper de test llevará un comentario sobre su
 responsabilidad sistémica.
 
-- [ ] T1. Definir y sellar el contrato de catálogo, configuración, outcomes y ToolSpec. [R1, R2, R10, R15]
+- [x] T1. Definir y sellar el contrato de catálogo, configuración, outcomes y ToolSpec. [R1, R2, R10, R15]
   - Escribir tests de catálogo canónico/inmutable, digests, duplicados,
     relaciones incompatibles, límites obligatorios y metadata
     `Effects=false`/`Idempotent=true`.
@@ -14,14 +14,14 @@ responsabilidad sistémica.
   - Implementar constructor fail-closed sin defaults y registro único de
     `kubernetes.observe`.
 
-- [ ] T2. Construir la autoridad desde ValidationTarget/Binding y el namespace atestado. [R1, R9]
+- [x] T2. Construir la autoridad desde ValidationTarget/Binding y el namespace atestado. [R1, R9]
   - Escribir tests para target/binding válidos, expirados, alterados, cross-run,
     provider distinto, ReservationID ausente y catálogo incompatible.
   - Derivar namespace y UID solo del target; copiar catálogo/target y revalidar
     vigencia al ejecutar.
   - Confirmar mediante tests que ningún fallo previo a autoridad llama al API.
 
-- [ ] T3. Implementar input exacto, paginador, límites, snapshot y taxonomía de errores. [R2, R10, R11, R12, R13]
+- [x] T3. Implementar input exacto, paginador, límites, snapshot y taxonomía de errores. [R2, R10, R11, R12, R13]
   - Escribir tests que acepten solo check+alias y rechacen names, namespaces,
     selectors, queries, manifests, JSONPath y claves extra antes de I/O.
   - Escribir tests de múltiples páginas, token repetido/vacío, límite exacto,
@@ -32,7 +32,7 @@ responsabilidad sistémica.
   - Escribir tests coordinados por canales para cancelación y timeout, sin
     `time.Sleep`, confirmando que no comienzan lecturas posteriores.
 
-- [ ] T4. Implementar la comprobación de disponibilidad de Deployment. [R3, R11, R13]
+- [x] T4. Implementar la comprobación de disponibilidad de Deployment. [R3, R11, R13]
   - Escribir tests de generation/observedGeneration, réplicas
     desired/updated/available, conditions allowlisted, NotFound y estados
     incompletos.
@@ -41,7 +41,7 @@ responsabilidad sistémica.
   - Probar que rollout incompleto sigue siendo observación y que la tool no
     genera assertion ni verdict.
 
-- [ ] T5. Implementar la comprobación paginada de Pods y reinicios. [R4, R10, R11, R13]
+- [x] T5. Implementar la comprobación paginada de Pods y reinicios. [R4, R10, R11, R13]
   - Escribir tests con varios Pods/contenedores, distintos órdenes, owner ajeno,
     restart counts, readiness, terminating, cero items y página truncada.
   - Filtrar defensivamente por owner/selector precompilado, crear aliases
@@ -49,14 +49,14 @@ responsabilidad sistémica.
   - Confirmar que ausencia, evidencia parcial y datos inválidos permanecen
     categorías distintas.
 
-- [ ] T6. Implementar la comprobación de estado de Jobs. [R5, R11, R13]
+- [x] T6. Implementar la comprobación de estado de Jobs. [R5, R11, R13]
   - Escribir tests para Job activo, completo, fallido, ausente, reemplazado y
     conditions con reason conocido/desconocido y message canario.
   - Proyectar contadores y conditions allowlisted sin logs, messages ni acceso a
     Pods interactivo.
   - Verificar anchor/UID y clasificación de integridad antes del retorno.
 
-- [ ] T7. Implementar la comprobación de Services y EndpointSlices. [R6, R10, R11, R13]
+- [x] T7. Implementar la comprobación de Services y EndpointSlices. [R6, R10, R11, R13]
   - Escribir tests de Service interno, puertos declarados, múltiples páginas de
     EndpointSlices, owners/service labels ajenos, ready/not-ready, ausencia y
     truncación.
@@ -65,7 +65,7 @@ responsabilidad sistémica.
   - Releer Service/namespace y distinguir cero endpoints confirmado de conjunto
     parcial.
 
-- [ ] T8. Implementar la comprobación acotada de Events. [R7, R10, R13]
+- [x] T8. Implementar la comprobación acotada de Events. [R7, R10, R13]
   - Escribir tests con recursos autorizados/ajenos, APIs de Events soportadas,
     duplicados, reasons desconocidos, messages/notes canario, paginación y
     MaxEvents.
@@ -73,7 +73,7 @@ responsabilidad sistémica.
     todo texto/reporting identity no confiable.
   - Marcar pérdida de exhaustividad como insufficient evidence con truncación.
 
-- [ ] T9. Implementar conectividad declarada sin probe activo. [R8, R11, R13]
+- [x] T9. Implementar conectividad declarada sin probe activo. [R8, R11, R13]
   - Escribir tests de relaciones y puertos catalogados/no catalogados, Service,
     EndpointSlices, NetworkPolicy presente/ausente/alterada y drift concurrente.
   - Resolver origen/destino exclusivamente por relationship alias y comparar
@@ -81,7 +81,7 @@ responsabilidad sistémica.
   - Confirmar mediante fake que no existe dial, exec, port-forward ni request de
     red y que el output no afirma reachability real.
 
-- [ ] T10. Implementar el adapter productivo read-only y la integración con planning/evidence/assertions. [R9, R12, R14, R15]
+- [x] T10. Implementar el adapter productivo read-only y la integración con planning/evidence/assertions. [R9, R12, R14, R15]
   - Escribir tests del cliente fake/API server que registren cada verbo,
     resource, namespace y selector; exigir solo `get/list` allowlisted y cero
     Secrets, logs, subrecursos o mutaciones.
@@ -93,7 +93,7 @@ responsabilidad sistémica.
   - Verificar que retries pertenecen al executor y cada intento empieza un
     snapshot nuevo.
 
-- [ ] T11. Completar pruebas de seguridad, trazabilidad y gates de verificación. [R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15]
+- [x] T11. Completar pruebas de seguridad, trazabilidad y gates de verificación. [R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15]
   - Ejecutar la matriz hermética sobre Deployment, Pods, Job, Service,
     EndpointSlice, Events y NetworkPolicy, incluyendo aislamiento de namespace,
     Forbidden, pagination, truncation, drift, timeout y cancelación.

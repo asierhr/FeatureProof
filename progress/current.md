@@ -4017,6 +4017,86 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Registrada la aprobación en `requirements.md` con timestamp `2026-10-26T12:59:16+01:00`.
 - `kubernetes-validation-tool` pasa de `spec_ready` a `in_progress`; se delegan T1–T11 al implementer especializado.
 
+## Feature 33 — review 1 rechazada (2026-10-26)
+
+- Los gates automáticos pasan y la cobertura focal reproducida es `508/591 = 85,9560067681895 %`, pero el reviewer identifica nueve hallazgos high en R1, R4 y R8–R14.
+- Deben corregirse: vacío/ownership/anchor de Pods; resourceVersion y páginas inválidas; categorías de conectividad; budget de bytes en todos los outcomes; allowlist y orden total; binding explícito de identidad/RBAC; cancelación antes de cada I/O; uso de `Target.EnvironmentID` como namespace; e integración vertical con `assertion.Engine` real.
+- La feature permanece `in_progress`; se reabre la remediación y se exigirá una segunda review independiente después de repetir todos los gates.
+
+## Feature 33 — review 2 rechazada (2026-10-26)
+
+- La segunda review confirma cerrados REV-2–REV-9 salvo la categoría pendiente de REV-1; todos los gates continúan verdes con coverage focal `709/832 = 85,21634615384615 %`.
+- Quedan cuatro correcciones focales: identidad/owner insuficiente de Pod debe ser `insufficient_evidence`; validar contadores e invariantes imposibles con overflow seguro; exigir `kubernetes.observe` en capabilities del target; y conservar versiones ya observadas en todos los outcomes incompletos de connectivity.
+- La feature sigue `in_progress`; se abre remediación 2 y posteriormente review 3 completa.
+
+## Feature 33 — review 3 rechazada (2026-10-26)
+
+- La tercera review confirma cerrados REV-1–REV-12 y reproduce todos los gates verdes con coverage focal `725/848 = 85,49528301886792 %`.
+- REV-13 permanece abierto: Pods y Events pueden perder versiones ya observadas al terminar con error, y los outcomes operativos no pasan todos por una finalización canónica común antes de digest/bound.
+- Se reabren T3, T5, T8 y T11 para conservar versiones seguras en fallos y centralizar orden total, digest y byte bound para éxito, ausencia y todos los errores.
+
+## Feature 33 — cierre aprobado (2026-10-26)
+
+- La cuarta review independiente aprueba R1–R15 y T1–T11 y confirma cerrados REV-1–REV-13 sin hallazgos accionables.
+- Los gates reproducidos pasan: formato, diff check, vet, suite global, race global y Kubernetes race ×20; el smoke final del leader pasa en `internal/tools/kubernetes` e `internal/assertion`.
+- Coverage focal exacta del paquete nuevo: `734/854 = 85,94847775175644 %`, superior al 85 % sin redondear.
+- `kubernetes-validation-tool` pasa de `in_progress` a `done`; queda commit y push de la rama de feature.
+
+## Feature 33 — implementación funcional preparada para gates (2026-10-26)
+
+- Implementadas T1–T10 en `internal/tools/kubernetes`: catálogo y autoridad sellados, input cerrado, snapshots/versiones, seis checks read-only, límites, redacción y adapter `client-go` sobre un puerto consumidor sin Secrets ni mutaciones.
+- Añadido el contrato de RBAC mínimo: permiso `get` cluster-scoped limitado al nombre exacto del namespace para verificar su UID y permisos namespaced `get/list` únicamente para Deployments, Pods, Jobs, Services, EndpointSlices, Events y NetworkPolicies.
+- La integración real con `planning.PlanExecutor` prueba assertions deterministas, evidencia insuficiente, acceso denegado y ausencia explícita sin verdict del modelo.
+- Pruebas focales y `go vet` focal pasan; cobertura del paquete nuevo `85,9 %`. `go test ./...` pasa. T11 permanece abierta hasta completar race y el resto de gates canónicos.
+
+## Feature 33 — implementación preparada para review (2026-10-26)
+
+- T1–T11 quedan marcadas `[x]` con trazabilidad R1–R15 en `progress/kubernetes-validation-tool/implementation.md`.
+- Gates finales sobre el estado entregado: gofmt/diff check, `go vet ./...`, `go test ./...`, `go test -race ./...`, paquete Kubernetes race ×20 e integración vertical de planning.
+- Cobertura exacta fresca del paquete nuevo: `508/591 = 85,956007 %`; la ejecución global de cobertura final aprobada informó `86,2 %` total.
+- Dos flakes temporales preexistentes fuera del diff aparecieron en intentos instrumentados; cada caso pasó 10/10 aislado y las reejecuciones globales de race y coverage terminaron verdes. La feature continúa `in_progress` a la espera de review independiente.
+
+## Feature 33 — review 1 rechazada; remediación iniciada (2026-10-26)
+
+- La review independiente registró REV-1–REV-9 en `progress/kubernetes-validation-tool/review.md`; la feature continúa `in_progress`.
+- Se reabren T1–T5 y T7–T11 para corregir autoridad literal de namespace, identidad/RBAC verificable, colecciones y anchors, paginación versionada, categorías de conectividad, bounding universal, canonicalización, cancelación y assertions con el engine real.
+- T6 permanece cerrada porque el hallazgo no afecta el contrato funcional de Jobs; sus rereads se auditarán dentro de T3/T11.
+
+## Feature 33 — remediación REV-1–REV-9 preparada para review 2 (2026-10-26)
+
+- La autoridad usa literalmente `ValidationTarget.EnvironmentID`; `EnvironmentRef` permanece como referencia de template. El constructor exige un binding sellado de ServiceAccount y RBAC efectivo exacto, y rechaza permisos ampliados antes del registro.
+- Pods distinguen conjunto propio vacío, objetos extranjeros, identidad incompleta y drift del Deployment owner. Pods, EndpointSlices y Events fijan y registran la `resourceVersion` de lista, rechazan páginas vacías con continuation y preservan límites fail-closed.
+- Conectividad diferencia falta de endpoints, policy ausente, policy contradictoria y drift; Services proyectan puertos exclusivamente desde catálogo y todas las colecciones tienen orden total canónico.
+- Todos los outcomes operativos pasan por el mismo budget de `MaxOutputBytes`; la cancelación se comprueba antes de cada página, I/O posterior y reread de anchors.
+- La integración vertical usa `internal/assertion.Engine` real para fallo funcional, existencia requerida ausente e inconclusive por drift, truncación y acceso.
+- T1–T11 vuelven a `[x]` con tests de regresión. Gates frescos: gofmt/diff, vet, suite global, race global UCRT64 y race focal ×20, todos pass. Cobertura exacta focal: `709/832 = 85,216346154 %`.
+
+## Feature 33 — review 2 rechazada; remediación 2 iniciada (2026-10-26)
+
+- La segunda review conserva cerrados REV-2–REV-9 y abre exclusivamente REV-1, REV-10, REV-11 y REV-12.
+- Se reabren T1–T9 y T11 para corregir la categoría de identidad incompleta de Pods, validar contadores e invariantes en cada evaluator, exigir la capability sellada y conservar versiones parciales de connectivity.
+- T10 permanece cerrada: el adapter e integración vertical no requieren cambios para estos cuatro hallazgos. `feature_list.json` permanece intacto.
+
+## Feature 33 — remediación 2 preparada para review 3 (2026-10-26)
+
+- REV-1 clasifica UID/owner de Pod insuficiente como `insufficient_evidence`; owners ajenos se excluyen y sustituciones reales de autoridad permanecen `integrity_error`.
+- REV-10 valida generaciones/réplicas, restart counts, contadores de Job, endpoints y Events antes de proyectar. Negativos, relaciones imposibles y overflow de agregados producen `integrity_error` content-free.
+- REV-11 impide registrar `kubernetes.observe` si la capability no forma parte del target sellado, aunque binding, catálogo e identidad sean válidos.
+- REV-12 conserva Service, EndpointSliceList, EndpointSlices y NetworkPolicy ya observados en outcomes truncados, sin endpoints, policy ausente o policy contradictoria.
+- T1–T11 quedan nuevamente cerradas. Gates frescos pasan: gofmt/diff, vet, suite global, race global UCRT64 y race focal ×20. Cobertura exacta focal: `725/848 = 85,495283018868 %`.
+
+## Feature 33 — review 3 rechazada; remediación 3 iniciada (2026-10-26)
+
+- REV-1–REV-12 permanecen cerrados; la tercera review abre únicamente REV-13 sobre acumulación y finalización canónica de versiones en outcomes operativos.
+- Se reabren T3, T5, T8 y T11. El trabajo se limita a conservar versiones seguras de Pods/Events y unificar orden, deduplicación, digest y byte bound para éxito, ausencia y errores.
+
+## Feature 33 — remediación 3 preparada para review 4 (2026-10-26)
+
+- REV-13 queda corregido: toda lectura con identidad segura registra su versión de inmediato, incluidos items previos a errores de Pods/Events y los anchors finales de Deployment, owner, Job, Service y policy.
+- `finalize` es la única frontera de documento: ordena y deduplica versions, calcula el digest canónico y aplica `MaxOutputBytes`/fallback para éxito, ausencia y outcomes operativos.
+- `TestOperationalVersionFinalizationIsCanonical` prueba items válidos seguidos de Pod incompleto/Event inválido, duplicados y permutaciones; ambos órdenes generan exactamente el mismo documento y digest con todas las versiones seguras.
+- T3, T5, T8 y T11 vuelven a `[x]`. Gates frescos pasan: gofmt/diff, vet, suite global, race global UCRT64 y race focal ×20. Cobertura exacta focal: `734/854 = 85,948477751756 %`.
+
 ## Feature 32 — remediación 2 finalizada tras registro de rechazo (2026-10-26)
 
 - La implementación y evidencia posteriores al rechazo cierran REV-4, REV-5, REV-8, REV-9 y REV-10; el detalle trazable está en `progress/kubernetes-environment/implementation.md`.
