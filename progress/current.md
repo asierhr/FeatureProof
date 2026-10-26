@@ -3997,6 +3997,20 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Coverage exacta fresca del diff productivo: `1005/1155 = 87,012987 %`.
 - `kubernetes-environment` pasa de `in_progress` a `done`; queda commit y push de la rama de feature.
 
+## Feature 33 — especificación iniciada (2026-10-26)
+
+- Seleccionada únicamente `kubernetes-validation-tool` (ID 33), en estado `pending` y con SDD obligatorio.
+- No existe otra feature `in_progress`; los criterios de aceptación permiten redactar una spec verificable.
+- Creada la rama `feature-33-kubernetes-validation-tool` desde feature 32, porque la tool debe consumir su entorno, namespace, identidad y transporte Kubernetes autorizados.
+- Se delega al `spec_author` la definición de requirements, diseño y tasks; no se escribirá código ni tests antes de aprobación humana.
+
+## Feature 33 — especificación preparada (2026-10-26)
+
+- El `spec_author` produjo `requirements.md`, `design.md` y `tasks.md` en `specs/kubernetes-validation-tool/`.
+- La revisión del leader confirma 15 requirements y 11 tareas trazables, autoridad derivada del target/binding vigente, input cerrado por alias, RBAC namespaced de solo lectura, resultados acotados/redactados y assertions deterministas.
+- La spec mantiene fuera de alcance provisioning, cleanup, control plane, operaciones mutables, Secrets, exec, logs, watches y probes activos de red.
+- `kubernetes-validation-tool` pasa de `pending` a `spec_ready`; la implementación queda pausada hasta recibir aprobación humana explícita.
+
 ## Feature 32 — remediación 2 finalizada tras registro de rechazo (2026-10-26)
 
 - La implementación y evidencia posteriores al rechazo cierran REV-4, REV-5, REV-8, REV-9 y REV-10; el detalle trazable está en `progress/kubernetes-environment/implementation.md`.
