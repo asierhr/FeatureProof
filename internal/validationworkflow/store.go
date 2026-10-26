@@ -18,9 +18,10 @@ var ErrNotFound = errors.New("validation workflow not found")
 
 // LocalStore persists secret-free workflow records and journals under one trusted directory.
 type LocalStore struct {
-	root  string
-	mu    sync.Mutex
-	fault func(string) error
+	root            string
+	mu              sync.Mutex
+	fault           func(string) error
+	cleanupScanHook func(string)
 }
 
 // workflowCheckpoint atomically couples the durable projection with its complete event journal.
@@ -204,6 +205,55 @@ func (s *LocalStore) Pending(ctx context.Context, now time.Time) ([]Record, erro
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Handle < records[j].Handle })
 	return records, nil
+}
+
+// CleanupPending lists terminal or recovery-phase records whose durable desired outcome still owns environment cleanup.
+func (s *LocalStore) CleanupPending(ctx context.Context, cursor string, limit int) ([]Record, string, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", false, classifyStoreError(err, "cleanup_pending")
+	}
+	if limit <= 0 || cursor != "" && !safeID.MatchString(cursor) {
+		return nil, "", false, &Error{Code: CodeInvalid, Operation: "cleanup_pending"}
+	}
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return nil, "", false, &Error{Code: CodeUnavailable, Operation: "cleanup_pending"}
+	}
+	handles := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".state.json") {
+			handle := strings.TrimSuffix(entry.Name(), ".state.json")
+			if handle > cursor {
+				handles = append(handles, handle)
+			}
+		}
+	}
+	sort.Strings(handles)
+	complete := len(handles) <= limit
+	if len(handles) > limit {
+		handles = handles[:limit]
+	}
+	next := ""
+	if !complete && len(handles) > 0 {
+		next = handles[len(handles)-1]
+	}
+	records := []Record{}
+	for _, handle := range handles {
+		if err = ctx.Err(); err != nil {
+			return nil, "", false, classifyStoreError(err, "cleanup_pending")
+		}
+		if s.cleanupScanHook != nil {
+			s.cleanupScanHook("before_load")
+		}
+		record, loadErr := s.Load(ctx, handle)
+		if loadErr != nil {
+			return nil, "", false, loadErr
+		}
+		if record.CleanupPending && record.DesiredOutcome != nil {
+			records = append(records, record)
+		}
+	}
+	return records, next, complete, nil
 }
 
 // Claim atomically reclaims one expired nonterminal workflow for recovery.

@@ -4063,6 +4063,81 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Registrada la aprobación en `requirements.md` con timestamp `2026-10-26T15:47:25+01:00`.
 - `environment-cleanup-controller` pasa de `spec_ready` a `in_progress`; se delegan T1–T16 al implementer especializado.
 
+## Feature 34 — review 1 rechazada (2026-10-26)
+
+- Los gates y coverage pasan, pero la review abre REV-1–REV-6 en R1, R3, R5, R8–R10, R13 y R14.
+- Deben corregirse: composición productiva compartida y caller-owned; filesystem I/O fuera de locks; rollback completo ante publicación fallida; conflictos/eventos de auditoría integrales; confirmación exacta ligada al receipt; y autoridad Kubernetes privada durable entre páginas/restarts.
+- La feature permanece `in_progress`; se reabren las tasks afectadas y se exigirá una nueva review independiente tras remediación y gates completos.
+
+## Feature 34 — review 2 rechazada (2026-10-26)
+
+- La review 2 confirma gates y coverage verdes, pero reabre REV-1–REV-6 por ventanas durables aún no cubiertas.
+- Quedan: scan real de receipts huérfanos de lifecycle; intent scan paginado sin I/O bajo lock; stores con CAS/file-lock/fsync multiproceso; evento atómico de claim; digest completo de autoridad lifecycle inmutable; y store privado Kubernetes con las mismas garantías crash/CAS que cursor e item.
+- La feature sigue `in_progress`; se reabren T1–T3, T7, T12, T14–T16 para remediación y review 3.
+
+## Feature 34 — review 3 rechazada (2026-10-26)
+
+- La review 3 confirma coordinación multiproceso, claim atómico, autoridad lifecycle completa y gates verdes, pero abre tres ventanas adicionales.
+- Deben corregirse: redelivery de receipts después de Bind/Confirm y crash antes de guardar el digest; avance durable de páginas workflow filtradas vacías con continuation; y detección fail-closed de head durable ausente/rollback, incluyendo genesis y autoridad Kubernetes.
+- La feature permanece `in_progress`; se reabren T2–T5, T7, T12 y T16 para remediación y review 4.
+
+## Feature 34 — review 4 rechazada (2026-10-26)
+
+- La review 4 confirma cerradas redelivery de capacity y paginación filtrada nominal, con gates y coverage verdes.
+- Quedan dos correcciones: detectar ciclos de cursor A→B→A también entre reinicios; y recuperar determinísticamente el commit anchor→head tras crash, con strict decode/tamper fail-closed de wrappers durables.
+- La feature sigue `in_progress`; se reabren T2, T3, T7, T12, T14 y T16 para remediación y review 5.
+
+## Feature 34 — review 5 rechazada (2026-10-26)
+
+- La review 5 aprueba recovery anchor→head, strict decode y todos los hallazgos anteriores; los gates permanecen verdes.
+- Queda un único blocker: el high-watermark workflow no inicia una nueva pasada, por lo que un run escaneado activo que terminaliza después puede quedar permanentemente detrás del cursor.
+- La feature continúa `in_progress`; se reabren T5, T7 y T16 para introducir pasadas durables completas sin permitir rewind/ciclos dentro de una pasada.
+
+## Feature 34 — cierre aprobado (2026-10-26)
+
+- La sexta review independiente aprueba R1–R15 y T1–T16 sin hallazgos accionables; quedan cerradas todas las ventanas detectadas en REV-1–REV-6 y revisiones posteriores.
+- El scan workflow usa epochs durables: cursor monotónico dentro de la pasada y completion CAS a la siguiente epoch, sin ciclos ni starvation de runs que terminalizan después.
+- Gates finales: formato, diff, vet, compile, global normal/race, cleanup race ×20, verticales race ×20 y builds Windows/Linux/Darwin; smoke final del leader pasa en cleanup, environment, validationworkflow y cmd.
+- Coverage exacta del diff productivo: `1812/2130 = 85,07042253521127 %`; `environment-cleanup-controller` pasa de `in_progress` a `done`.
+
+## Feature 34 — implementación en curso (2026-10-26)
+
+- Iniciada T1–T3: modelo canónico, binding destructivo sellado, store durable con CAS/leases y ledger de capacidad por proyecto.
+- La implementación se concentra en `internal/environment/cleanup`; las integraciones lifecycle, workflow y Kubernetes consumirán puertos estrechos sin adelantar el control plane distribuido.
+
+## Feature 34 — primera iteración no preparada para review (2026-10-26)
+
+- Implementados modelo, bindings, store/leases, ledger, controller, adapters e inventario Kubernetes en `internal/environment/cleanup`, con tests focales y coverage `85,4 %`.
+- La entrega permanece bloqueada dentro de implementación: faltan integración real antes de Acquire, intents del workflow, ledger local durable, discovery completo de huérfanos y composición/status en `cmd/featureproof`.
+- Ninguna task se marca `[x]` y la feature permanece `in_progress`; el detalle está en `progress/environment-cleanup-controller/implementation.md`.
+
+## Feature 34 — bloque T2–T4 completado (2026-10-26)
+
+- Store/ledger locales reabribles, receipts sellados, CAS/leases, límites y liberación exactly-once quedan cubiertos por tests.
+- `LifecycleService` reserva capacidad antes de Acquire, confirma identidad después del efecto y solo libera tras `StateReleased` durable; denial impide provider I/O y redelivery recupera release.
+- Tests focales de environment, cleanup, Kubernetes y `cmd/featureproof` pasan; T2–T4 quedan `[x]` y la implementación continúa con T5/T7–T16.
+
+## Feature 34 — bloque T5–T10 completado (2026-10-26)
+
+- El store real de `validationworkflow` proyecta todos los desired outcomes sin autoridad de mutación y distingue NotFound autoritativo de indisponibilidad.
+- Discovery combina intents, índices lifecycle/capacity e inventarios mediante cursors CAS sellados y reabribles, con budgets, deduplicación y rechazo de tokens/snapshots ambiguos.
+- TTL/lease, adopción orphan fail-closed, capacidad unknown, binding incierto Reconcile-only y confirmación previa a capacity release quedan cubiertos por tests de restart, drift, cross-project y crash tras ausencia.
+- T5–T10 quedan `[x]`. Focales y vet pasan; la cobertura provisional del paquete ampliado es `82,4 %`, por lo que el gate ≥85 % permanece abierto para T16 junto con T1/T11–T15.
+
+## Feature 34 — T1 y bloque T11–T15 completados (2026-10-26)
+
+- El modelo canónico queda cerrado y strict-decode; retry/cumulative wait/requeue, leases/fencing/handoff, cancelación caller-owned y status/audit tienen tests sustantivos.
+- Kubernetes solo ejecuta List/Get/Delete Namespace owner-scoped con UID precondition; Forbidden/timeout/response loss/Terminating fallan cerrados y sin canarios.
+- `cmd/featureproof` dispone composición local explícita de controller/store/ledger sin goroutines ocultas y rechaza dependencias ausentes.
+- T1–T15 están `[x]`; `go test -count=1 ./...` pasa. T16 sigue abierta porque la cobertura provisional es `82,7 %` y aún faltan gates race ×20/runtime/cross-build y auditoría final.
+
+## Feature 34 — implementación preparada para review (2026-10-26)
+
+- T1–T16 quedan `[x]` con trazabilidad R1–R15 en `progress/environment-cleanup-controller/implementation.md`.
+- Gates finales pasan: formato/diff, vet, compile-only, global serial, focales repetidos, race global UCRT64, race cleanup ×20, environment ×5, cross-build 12/12 y runtime Linux 3/3.
+- Coverage exacta del código de producción añadido/modificado: `996/1163 = 85,640584694755 %`; paquete principal nuevo `830/975 = 85,1282051282051 %`; global final `36546/42430 = 86,132453452746 %`.
+- La auditoría cerró owner/project durable y journals content-free para cleanup/capacity. Distro WSL efímera, rootfs, binarios, cross-builds y perfiles fueron eliminados; `feature_list.json` permanece intacto.
+
 ## Feature 33 — implementación funcional preparada para gates (2026-10-26)
 
 - Implementadas T1–T10 en `internal/tools/kubernetes`: catálogo y autoridad sellados, input cerrado, snapshots/versiones, seis checks read-only, límites, redacción y adapter `client-go` sobre un puerto consumidor sin Secrets ni mutaciones.
@@ -4136,3 +4211,101 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Tests verticales prueban Finalize fallido, persistencia posterior fallida, cleanup fallido, terminal integrity sin Finalize, redelivery idempotente y 128 runs con cardinalidad final cero.
 - T8 y T13–T15 se cierran nuevamente solo tras gates frescos: focales x10, global serial, race Kubernetes x20 y global UCRT64, coverage exacta `1005/1155 = 87,012987 %`, cross-builds 9/9 y tres binarios Linux reales sobre Alpine 3.22.2 autenticado.
 - `feature_list.json` permanece intacto; la distro WSL, rootfs, binarios, cross-builds y directorios temporales se eliminaron y no quedan procesos Go de los gates.
+## Feature 34 — review 1 rechazada; remediación REV-2–REV-6 iniciada (2026-10-26)
+
+- La review independiente abrió REV-1–REV-6; este bloque corrige REV-2–REV-6 y deja REV-1 para el siguiente bloque solicitado por el leader.
+- Se reabren T2–T4, T7, T9–T10 y T14–T16: publicación sin locks de filesystem, rollback integral, journals sellados, confirmation digest ligada y autoridad Kubernetes privada durable.
+- `feature_list.json` permanece intacto y no se adelantan PostgreSQL, queue/workers, config versionada ni tenant/RBAC.
+
+## Feature 34 — bloque REV-2–REV-6 corregido (2026-10-26)
+
+- REV-2/REV-3: cleanup store y capacity ledger preparan snapshots separados, escriben fuera del mutex y publican por versión; una barrera demuestra progreso de otro item/proyecto y la matriz Reserve/Claim/Renew/SaveOwned/ReleaseOwner/Requeue/cursor demuestra rollback byte-exacto vivo y tras reopen ante write/publish failure.
+- REV-4/REV-5: ambos journals sellan payload integral y rechazan IDs contradictorios; capacity persiste owner/attempt/category/timestamp. La liberación liga y persiste exactamente cleanup/environment/UID/receipt y rechaza proofs conflictivas antes/después de release/reopen, también en `MemoryCapacityAdmission`.
+- REV-6: el adapter Kubernetes persiste nombre/UID raw en store privado ligado a cleanup/binding digest antes de entregar la página; un restart con continuation pendiente conserva delete con UID precondition exacta.
+- T2, T9, T10 y T14 vuelven a `[x]`. T3, T4, T7, T15 y T16 continúan abiertas porque REV-1 productiva se abordará en el siguiente bloque. Focales, vet y race cleanup ×20/environment ×5 pasan.
+
+## Feature 34 — REV-1 corregida verticalmente (2026-10-26)
+
+- La composición managed exige policy, demand, TTL y budgets cleanup sellados explícitos; desaparecen `MemoryCapacityAdmission` y cuotas hardcoded por llamada.
+- Un registro process-local por root/proyecto comparte el mismo ledger durable entre `LifecycleService` y controller; restart explícito reabre receipts, y el adapter lifecycle difiere la liberación física hasta confirmación del controller.
+- El runtime conecta `CleanupIntentSource` sobre `validationworkflow.LocalStore`, índices lifecycle/capacity conjuntos con cursores independientes, lifecycle adapter, orphan authority e inventario Kubernetes real cuando corresponde.
+- El entrypoint invoca `Start` y posee `Cancel`/`Join`; constructores y attach no crean goroutines. El vertical concurrente prueba un único ganador de quota, restart que conserva la reserva, intent terminal real, liberación posterior y preservación byte-exacta del record/package/outcome.
+- T3, T4, T7 y T15 vuelven a `[x]`; solo T16 queda abierta para repetir coverage y gates finales completos.
+- Evidencia fresca: paquetes focales pass, vertical x10 pass, `go vet ./...` y compile-only global pass, `git diff --check` pass, y vertical UCRT64 race x10 pass.
+
+## Feature 34 — T16 cerrada tras review 1 (2026-10-26)
+
+- REV-1–REV-6 quedan revalidadas contra tests concretos. La auditoría añadió un vertical donde el controller libera un lifecycle todavía vivo y confirmó que el binding conserva autoridad estable durante la transición present→absent.
+- Gates frescos: formato/diff/vet/compile-only/global, focales repetidos, race global UCRT64, cleanup race ×20, composición vertical race ×20, bridge race ×20, cross-builds 12/12 y runtime Linux Alpine 4/4.
+- Coverage exacta del diff productivo: `1357/1586 = 85,56116015132408575031525851 %`; global: `36887/42834 = 86,11616939814166316477564552 %`.
+- T1–T16 quedan `[x]`; temporales y distro efímera eliminados, sin procesos residuales, `feature_list.json` intacto y sin commit/push.
+
+## Feature 34 — review 2 rechazada; bloque A iniciado (2026-10-26)
+
+- Se reabren T2, T3, T12, T14 y T16 para REV-3/REV-6. El backend whole-snapshot con CAS solo en memoria se sustituye por receipts de versión inmutables, head durable y file lock crash-released compartido entre procesos.
+- El bloque se limita a coordinación multiproceso/crash-consistent de cleanup store, capacity ledger y autoridad privada Kubernetes. REV-1/REV-2/REV-4/REV-5 se mantienen para bloques posteriores.
+
+## Feature 34 — review 2 bloque A cerrado (2026-10-26)
+
+- REV-3/REV-6 corregidas con receipts de versión inmutables, cadena verificada, head durable y file lock crash-released. Dos instancias observan cada commit sin CAS basado solo en memoria y todo I/O queda fuera de mutex Go.
+- Tests cruzan Reserve/Claim/Renew/SaveOwned/ReleaseOwner/Requeue/cursor/events, todas las mutaciones capacity, autoridad Kubernetes UID-safe, versión/cadena corruptas y faults before/after event/index/receipt/head/publish.
+- Pasan paquetes focales, vet, focales nuevas ×10, race de las matrices nuevas ×20 y race completo cleanup ×10. T2/T3/T12/T14 vuelven a `[x]`; T16 sigue abierta para el cierre global posterior.
+
+## Feature 34 — review 2 bloque B cerrado (2026-10-26)
+
+- REV-1: capacity discovery pagina receipts reales; el handoff lifecycle se sella antes de provider I/O y el controller resuelve tras reopen únicamente receipts que nunca quedaron bound.
+- REV-2: CleanupPending aplica cursor/limit dentro del workflow store, carga como máximo la página y no sostiene mutex Go/file lock durante ReadDir ni durante toda la carga; una barrera demuestra progreso de otro run.
+- REV-4: Claim y `cleanup_claimed` se publican en el mismo receipt/head, con payload integral, crash/reopen, redelivery exactly-once y conflicto probado.
+- REV-5: lifecycle record digest cubre commit, selección completa, tiempos/TTL, demand, receipt e identidades; la tabla tamper conserva solo mutaciones operativas legítimas.
+- Suites focales/vet y races UCRT64 ×20 pasan. T1/T7/T15 quedan revalidadas `[x]`; T16 sigue abierta para gates globales y coverage finales.
+
+## Feature 34 — T16 cerrado tras review 2 (2026-10-26)
+
+- REV-1–REV-6 quedan revalidadas sobre dos instancias de cleanup store, capacity ledger y autoridad Kubernetes, receipt-only recovery, scan workflow bounded, Claim+evento atómico y tabla tamper lifecycle.
+- Se añadieron matrices sustantivas de handoff lifecycle frente a receipt-only y corrupción de head/receipt/cadena durable; cleanup alcanza 86,7 % y el diff productivo exacto `1643/1926 = 85,306334371754932502596054 %`.
+- Pasan formato/diff, vet, compile-only, global normal/cobertura, focales repetidos, race global UCRT64, cleanup race ×20, verticales race ×20, cross-builds 12/12 y runtime Alpine 4/4.
+- T1–T16 quedan `[x]`; distro, rootfs, perfiles y binarios eliminados, sin procesos residuales, `feature_list.json` intacto y sin commit/push.
+
+## Feature 34 — review 3 rechazada; remediación iniciada (2026-10-26)
+
+- Se reabren T2–T5, T7, T12 y T16 para corregir redelivery de capacity tras Bind/Confirm, paginación de intents con página filtrada vacía y pérdida del durable head.
+- La corrección preservará equivalencia solo sobre campos inmutables de solicitud, cursor auténticamente escaneado y anchor crash-consistent que diferencia store nunca publicado de rollback de un head confirmado.
+- `feature_list.json` permanece intacto; no se adelanta alcance de features 35–37.
+
+## Feature 34 — remediación review 3 preparada para review 4 (2026-10-26)
+
+- REV-1: Reserve reconoce receipts legalmente avanzados por Bind/Confirm comparando solo autoridad inmutable; la composición real recupera un crash post-Bind y la redelivery post-Confirm no repite provider I/O.
+- REV-2: páginas workflow filtradas avanzan solo con `Scanned` durable, cursor válido y detección previa de ciclos; un vertical active→restart→terminal prueba cursor e intent.
+- REV-3: anchor durable previo al head distingue orphan pre-head de pérdida/rollback confirmado, valida genesis y falla cerrado en dos instancias de store/ledger/Kubernetes.
+- Gates frescos pasan: global normal/race UCRT64, focales/races ×20, coverage diff exacta `1713/2009 = 85,26630164260826281732205077 %`, cross-builds 12/12 y Linux 4/4.
+- T1–T16 quedan `[x]`; temporales eliminados, `feature_list.json` intacto y sin commit/push.
+
+## Feature 34 — review 4 rechazada; remediación iniciada (2026-10-26)
+
+- Se reabren T2/T3/T7/T12/T14/T16: el cursor workflow debe impedir ciclos A→B→A también entre restarts y el anchor adelantado debe completar el head determinísticamente.
+- Head, receipt y anchor pasarán a strict decode con EOF y matriz unknown/duplicate/null/trailing.
+- `feature_list.json` permanece intacto; no se amplía el scope de features 35–37.
+
+## Feature 34 — remediación review 4 preparada para review 5 (2026-10-26)
+
+- REV-1: workflow discovery conserva un high-watermark lexicográfico durable, rechaza cualquier rewind entre `RunOnce`/reopen y mantiene además el conjunto de tokens vistos dentro de cada scan; páginas filtradas vacías solo avanzan con `Scanned` auténtico.
+- REV-2: el anchor publicado selecciona el receipt exacto; bajo el file lock, un head ausente o atrasado se reconstruye solo después de verificar digest, cadena completa y genesis. Head, receipt y anchor usan decode estricto con EOF, campos conocidos y claves únicas.
+- Tests nuevos prueban A→B→A en un ciclo y a través de tres reopens, trabajo no hambriento, `after_anchor`/`before_head` con dos instancias de store/ledger/Kubernetes, pérdida de respuesta live+reopen y la matriz unknown/duplicate/null/trailing.
+- Pasan formato/diff-check, vet, compile-only, global normal, focales ×20, race global UCRT64, cleanup race ×20, verticales race ×20, coverage global `37302/43329 = 86,09014747628609 %` y diff productivo `1771/2081 = 85,10331571359923 %` exacto.
+- Pasan cross-builds 12/12 y cuatro binarios Linux reales en Alpine 3.22.2 autenticado; distro, rootfs, profiles y binarios fueron eliminados, sin procesos residuales, secretos, cluster/red de tests ni cambios de `feature_list.json`.
+- T1–T16 quedan `[x]`; no hubo commit ni push y la feature queda lista para review independiente 5.
+
+## Feature 34 — review 5 rechazada; remediación iniciada (2026-10-26)
+
+- Se reabren T5/T7/T16 para sustituir el high-watermark permanente por pasadas durables con epoch, continuation monotónica y completion explícito.
+- La corrección debe permitir reevaluar handles que terminalizan o aparecen detrás del cursor tras completar una pasada, sin aceptar rewind/ciclos dentro de una epoch y conservando `MaxPages=1`/restart.
+- Anchor/head, capacity, Kubernetes y el resto de la feature permanecen cerrados; `feature_list.json` sigue intacto.
+
+## Feature 34 — remediación review 5 preparada para review 6 (2026-10-26)
+
+- Workflow discovery usa ahora `CursorPass{Epoch, Value}`: continuation avanza estrictamente dentro de la epoch y solo un EOF `Complete` auténtico publica atómicamente la epoch siguiente con cursor vacío.
+- `CleanupPending` distingue continuation de final exhaustivo aunque la página filtrada no contenga intents. Así una pasada posterior vuelve a evaluar handles activos que terminalizaron y runs nuevos lexicográficamente menores.
+- La vertical productiva prueba `active-a` filtrado, `terminal-b`, restart por página con `MaxPages=1`, completion, terminalización posterior de `active-a`, inserción de `aaa-new` y descubrimiento de ambos en la epoch siguiente.
+- Matrices adicionales rechazan A→B→A intra-run/reopen, rewind/epoch skip/CAS stale y prueban crash before-write/after-publish del completion sin pérdida ni loop.
+- Pasan formato/diff/vet/compile/global, focales/races ×20, race global UCRT64, coverage global `37344/43378 = 86,08972290100973 %` y diff productivo exacto `1812/2130 = 85,07042253521127 %`.
+- Pasan cross-builds 12/12 y runtime real Alpine 3.22.2 4/4; temporales/distro eliminados, sin procesos, secretos, red de tests, cambios de `feature_list.json`, commit o push. T1–T16 quedan `[x]` para review 6.

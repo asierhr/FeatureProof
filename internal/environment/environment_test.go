@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	environmentcleanup "github.com/asierhr/featureProof/internal/environment/cleanup"
 )
 
 // testClock supplies deterministic lifecycle time without sleeping.
@@ -25,6 +28,306 @@ type testWaiter struct {
 	waits []time.Duration
 }
 
+// TestManagedCapacitySurroundsProviderLifecycle verifies reserve-confirm-release ordering.
+func TestManagedCapacitySurroundsProviderLifecycle(t *testing.T) {
+	now := time.Unix(1000, 0).UTC()
+	provider := &managedFake{observation: validObservation(now)}
+	service, store, _, _ := serviceFixture(t, provider, KindManaged)
+	capacity := service.deps.Capacity.(*testCapacity)
+	if _, err := service.Acquire(context.Background(), validRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if capacity.reserves != 1 || capacity.binds != 1 || capacity.confirms != 1 || capacity.releases != 0 {
+		t.Fatalf("before release=%#v", capacity)
+	}
+	record, err := store.Load(context.Background(), "run-1")
+	if err != nil || record.ProjectID != "project-1" || record.Selection.ProjectID != record.ProjectID {
+		t.Fatalf("managed project authority was not persisted: %#v err=%v", record, err)
+	}
+	if err := service.Release(context.Background(), "run-1"); err != nil {
+		t.Fatal(err)
+	}
+	if capacity.releases != 1 || provider.releases != 1 {
+		t.Fatalf("after release capacity=%#v provider=%d", capacity, provider.releases)
+	}
+	if err := service.Release(context.Background(), "run-1"); err != nil || capacity.releases != 2 {
+		t.Fatalf("recovery release=%v calls=%d", err, capacity.releases)
+	}
+}
+
+// TestCleanupBridgeProjectsAndReleasesDurableLifecycleAuthority verifies the productive bridge discovers paged records, preserves sealed bindings, and delegates release through the lifecycle service.
+func TestCleanupBridgeProjectsAndReleasesDurableLifecycleAuthority(t *testing.T) {
+	ctx := context.Background()
+	provider := &managedFake{observation: validObservation(time.Unix(1000, 0).UTC())}
+	service, store, _, _ := contractServiceFixture(t, provider, KindManaged)
+	first := validRequest()
+	if _, err := service.Acquire(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	second := validRequest()
+	second.RunID = "run-2"
+	second.IdempotencyKey = "surface-key-2"
+	if _, err := service.Acquire(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	bridge := &CleanupBridge{Store: store, Service: service, Owner: "cleanup-owner"}
+	item, err := bridge.ResolveCleanupAuthority(ctx, first.RunID, "cleanup-run-1")
+	if err != nil || item.RunID != first.RunID || item.Source != "workflow" || item.Binding.Digest == "" {
+		t.Fatalf("workflow authority was not projected: %#v %v", item, err)
+	}
+	page, cursor, err := bridge.ScanLifecycleCleanup(ctx, "", 1)
+	if err != nil || len(page) != 1 || cursor != first.RunID || page[0].Item.Source != "lifecycle" {
+		t.Fatalf("first lifecycle page diverged: %#v %q %v", page, cursor, err)
+	}
+	page, cursor, err = bridge.ScanLifecycleCleanup(ctx, cursor, 10)
+	if err != nil || len(page) != 1 || cursor != "" || page[0].Item.RunID != second.RunID {
+		t.Fatalf("second lifecycle page diverged: %#v %q %v", page, cursor, err)
+	}
+	loaded, err := bridge.LoadCleanupBinding(ctx, item.Binding.Digest)
+	if err != nil || loaded.Status != environmentcleanup.LifecyclePresent || loaded.Binding.Digest != item.Binding.Digest {
+		t.Fatalf("sealed binding was not loaded: %#v %v", loaded, err)
+	}
+	reconciled, err := bridge.ReconcileCleanupBinding(ctx, item.Binding)
+	if err != nil || reconciled != loaded {
+		t.Fatalf("binding reconcile diverged: %#v %v", reconciled, err)
+	}
+	absent, err := bridge.LifecycleAbsent(ctx, item.Binding)
+	if err != nil || absent {
+		t.Fatalf("live lifecycle reported absent: %v %v", absent, err)
+	}
+	if err = bridge.ReleaseCleanupBinding(ctx, item.Binding); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = bridge.LoadCleanupBinding(ctx, item.Binding.Digest)
+	if err != nil || loaded.Status != environmentcleanup.LifecycleAbsent {
+		t.Fatalf("released lifecycle remained present: %#v %v", loaded, err)
+	}
+	absent, err = bridge.LifecycleAbsent(ctx, item.Binding)
+	if err != nil || !absent {
+		t.Fatalf("released lifecycle did not confirm absence: %v %v", absent, err)
+	}
+
+	missing := item.Binding
+	missing.Digest = strings.Repeat("f", 64)
+	if _, err = bridge.ReconcileCleanupBinding(ctx, missing); !IsCategory(err, CategoryConflict) {
+		t.Fatalf("unknown binding reconciled: %v", err)
+	}
+	if err = bridge.ReleaseCleanupBinding(ctx, missing); !IsCategory(err, CategoryConflict) {
+		t.Fatalf("unknown binding released: %v", err)
+	}
+	if _, err = (&CleanupBridge{}).ResolveCleanupAuthority(ctx, first.RunID, "cleanup-run-1"); !IsCategory(err, CategoryInvalid) {
+		t.Fatalf("incomplete bridge accepted: %v", err)
+	}
+}
+
+// TestCleanupLifecycleRecordDigestCoversEveryImmutableAuthorityField rejects authority drift while permitting documented scheduler transitions.
+func TestCleanupLifecycleRecordDigestCoversEveryImmutableAuthorityField(t *testing.T) {
+	provider := &managedFake{observation: validObservation(time.Unix(1000, 0).UTC())}
+	service, store, _, _ := contractServiceFixture(t, provider, KindManaged)
+	if _, err := service.Acquire(context.Background(), validRequest()); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load(context.Background(), "run-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := cleanupLifecycleRecordDigest(record)
+	mutable := record
+	mutable.Revision++
+	mutable.State = StateReleasePending
+	mutable.Owner, mutable.LeaseUntil = "other-owner", mutable.LeaseUntil.Add(time.Minute)
+	mutable.Attempts++
+	mutable.UpdatedAt = mutable.UpdatedAt.Add(time.Minute)
+	mutable.ReleaseRequired = true
+	if cleanupLifecycleRecordDigest(mutable) != base {
+		t.Fatal("documented mutable lifecycle state changed destructive authority")
+	}
+	// authorityMutation names one immutable field substitution expected to alter the seal.
+	cases := []struct {
+		name   string
+		mutate func(*Record)
+	}{
+		{name: "commit", mutate: func(value *Record) { value.CommitOID = strings.Repeat("b", 40) }},
+		{name: "selection", mutate: func(value *Record) {
+			value.Selection.ProfileID = "other-profile"
+			value.Selection.Digest = ""
+			value.Selection, _ = SealSelection(value.Selection)
+		}},
+		{name: "created", mutate: func(value *Record) { value.CreatedAt = value.CreatedAt.Add(time.Second) }},
+		{name: "expires", mutate: func(value *Record) { value.ExpiresAt = value.ExpiresAt.Add(time.Second) }},
+		{name: "ttl", mutate: func(value *Record) { value.TTL++ }},
+		{name: "demand", mutate: func(value *Record) { value.Demand.CPUMilli++ }},
+		{name: "receipt-id", mutate: func(value *Record) { value.CapacityReceipt.ID = "other-receipt" }},
+		{name: "receipt-digest", mutate: func(value *Record) { value.CapacityReceipt.Digest = strings.Repeat("f", 64) }},
+		{name: "environment", mutate: func(value *Record) { value.CapacityEnvironmentDigest = strings.Repeat("a", 64) }},
+		{name: "resource", mutate: func(value *Record) { value.CapacityResourceDigest = strings.Repeat("b", 64) }},
+		{name: "lifecycle", mutate: func(value *Record) { value.LifecycleDigest = strings.Repeat("c", 64) }},
+		{name: "cleanup-key", mutate: func(value *Record) { value.ReleaseKey = strings.Repeat("d", 64) }},
+	}
+	for _, current := range cases {
+		t.Run(current.name, func(t *testing.T) {
+			changed := record
+			current.mutate(&changed)
+			if cleanupLifecycleRecordDigest(changed) == base {
+				t.Fatalf("immutable %s was omitted from authority", current.name)
+			}
+		})
+	}
+}
+
+// TestManagedCapacityDenialPreventsProviderIO proves admission precedes acquisition.
+func TestManagedCapacityDenialPreventsProviderIO(t *testing.T) {
+	provider := &managedFake{observation: validObservation(time.Unix(1000, 0).UTC())}
+	service, _, _, _ := serviceFixture(t, provider, KindManaged)
+	service.deps.Capacity = rejectingCapacity{}
+	if _, err := service.Acquire(context.Background(), validRequest()); err == nil {
+		t.Fatal("denial accepted")
+	}
+	if provider.acquires != 0 || provider.reconciles != 0 {
+		t.Fatalf("provider reached: %d/%d", provider.acquires, provider.reconciles)
+	}
+}
+
+// TestMemoryCapacityAdmissionSerializesConcurrentLimit verifies one winner under project contention.
+func TestMemoryCapacityAdmissionSerializesConcurrentLimit(t *testing.T) {
+	admission, _ := NewMemoryCapacityAdmission(map[string]CapacityLimits{"project-1": {Environments: 1, CPUMilli: 100, MemoryBytes: 100, ObjectCount: 10, MaxTTL: time.Hour}})
+	requests := []CapacityRequest{{ProjectID: "project-1", RunID: "run-a", AcquisitionKey: "a", SelectionDigest: strings.Repeat("a", 64), Demand: ResourceDemand{Environments: 1, CPUMilli: 100, MemoryBytes: 100, ObjectCount: 10}, TTL: time.Hour, PolicyDigest: strings.Repeat("b", 64)}, {ProjectID: "project-1", RunID: "run-b", AcquisitionKey: "b", SelectionDigest: strings.Repeat("a", 64), Demand: ResourceDemand{Environments: 1, CPUMilli: 100, MemoryBytes: 100, ObjectCount: 10}, TTL: time.Hour, PolicyDigest: strings.Repeat("b", 64)}}
+	var wg sync.WaitGroup
+	wins := 0
+	var mu sync.Mutex
+	for _, request := range requests {
+		wg.Add(1)
+		go func(request CapacityRequest) {
+			defer wg.Done()
+			if _, err := admission.Reserve(context.Background(), request); err == nil {
+				mu.Lock()
+				wins++
+				mu.Unlock()
+			}
+		}(request)
+	}
+	wg.Wait()
+	if wins != 1 {
+		t.Fatalf("wins=%d", wins)
+	}
+}
+
+// TestMemoryCapacityAdmissionRecoveryMatrix verifies cancellation, sealed redelivery, confirmation, release, and overflow fail closed on the real local admission implementation.
+func TestMemoryCapacityAdmissionRecoveryMatrix(t *testing.T) {
+	if _, err := NewMemoryCapacityAdmission(nil); !IsCategory(err, CategoryInvalid) {
+		t.Fatalf("empty limits accepted: %v", err)
+	}
+	if _, err := NewMemoryCapacityAdmission(map[string]CapacityLimits{"bad project": {Environments: 1, CPUMilli: 1, MemoryBytes: 1, ObjectCount: 1, MaxTTL: time.Hour}}); !IsCategory(err, CategoryInvalid) {
+		t.Fatalf("invalid project accepted: %v", err)
+	}
+
+	policy := strings.Repeat("b", 64)
+	selection := validSelection(KindManaged)
+	demand := ResourceDemand{Environments: 1, CPUMilli: 100, MemoryBytes: 100, ObjectCount: 10}
+	resolver := StaticDemandResolver{Demands: map[string]ResourceDemand{selection.Digest: demand}, TTLs: map[string]time.Duration{selection.Digest: time.Hour}, PolicyDigests: map[string]string{selection.Digest: policy}}
+	resolved, ttl, resolvedPolicy, err := resolver.Resolve(context.Background(), selection)
+	if err != nil || resolved != demand || ttl != time.Hour || resolvedPolicy != policy {
+		t.Fatalf("demand resolution diverged: %#v %v %q %v", resolved, ttl, resolvedPolicy, err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, _, err = resolver.Resolve(canceled, selection); !errors.Is(err, context.Canceled) {
+		t.Fatalf("resolver ignored cancellation: %v", err)
+	}
+	unknown := selection
+	unknown.Digest = strings.Repeat("f", 64)
+	if _, _, _, err = resolver.Resolve(context.Background(), unknown); !IsCategory(err, CategoryUnauthorized) {
+		t.Fatalf("unknown demand accepted: %v", err)
+	}
+
+	admission, err := NewMemoryCapacityAdmission(map[string]CapacityLimits{"project-1": {Environments: 1, CPUMilli: 100, MemoryBytes: 100, ObjectCount: 10, MaxTTL: time.Hour}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := CapacityRequest{ProjectID: "project-1", RunID: "run-a", AcquisitionKey: "acquisition-a", SelectionDigest: selection.Digest, Demand: demand, TTL: time.Hour, PolicyDigest: policy}
+	environmentID := strings.Repeat("a", 64)
+	resourceID := strings.Repeat("e", 64)
+	if _, err = admission.Reserve(canceled, request); !errors.Is(err, context.Canceled) {
+		t.Fatalf("reserve ignored cancellation: %v", err)
+	}
+	unauthorized := request
+	unauthorized.TTL = 2 * time.Hour
+	if _, err = admission.Reserve(context.Background(), unauthorized); !IsCategory(err, CategoryUnauthorized) {
+		t.Fatalf("oversized ttl accepted: %v", err)
+	}
+	receipt, err := admission.Reserve(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	redelivered, err := admission.Reserve(context.Background(), request)
+	if err != nil || redelivered != receipt {
+		t.Fatalf("exact redelivery diverged: %#v %v", redelivered, err)
+	}
+	conflicting := request
+	conflicting.RunID = "run-b"
+	if _, err = admission.Reserve(context.Background(), conflicting); !IsCategory(err, CategoryConflict) {
+		t.Fatalf("conflicting redelivery accepted: %v", err)
+	}
+	if err = admission.Release(context.Background(), receipt, "cleanup-a", strings.Repeat("c", 64)); !IsCategory(err, CategoryConflict) {
+		t.Fatalf("unconfirmed receipt released: %v", err)
+	}
+	if _, err = admission.Confirm(canceled, receipt, environmentID, resourceID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("confirm ignored cancellation: %v", err)
+	}
+	if _, err = admission.Confirm(context.Background(), receipt, "bad environment", resourceID); !IsCategory(err, CategoryIntegrity) {
+		t.Fatalf("invalid provider identity accepted: %v", err)
+	}
+	unknownReceipt := CapacityReceipt{ID: "missing", Digest: strings.Repeat("d", 64)}
+	if _, err = admission.Confirm(context.Background(), unknownReceipt, environmentID, resourceID); !IsCategory(err, CategoryConflict) {
+		t.Fatalf("unknown receipt confirmed: %v", err)
+	}
+	if _, err = admission.Confirm(context.Background(), receipt, environmentID, resourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = admission.Confirm(context.Background(), receipt, strings.Repeat("b", 64), strings.Repeat("f", 64)); !IsCategory(err, CategoryConflict) {
+		t.Fatalf("provider identity rebound: %v", err)
+	}
+	if err = admission.Release(canceled, receipt, "cleanup-a", strings.Repeat("c", 64)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("release ignored cancellation: %v", err)
+	}
+	if err = admission.Release(context.Background(), receipt, "cleanup-a", "bad confirmation"); !IsCategory(err, CategoryIntegrity) {
+		t.Fatalf("invalid confirmation accepted: %v", err)
+	}
+	confirmation := capacityReleaseConfirmation("cleanup-a", environmentID, resourceID, receipt.ID)
+	if err = admission.Release(context.Background(), receipt, "cleanup-a", confirmation); err != nil {
+		t.Fatal(err)
+	}
+	if err = admission.Release(context.Background(), receipt, "cleanup-a", confirmation); err != nil {
+		t.Fatalf("release redelivery diverged: %v", err)
+	}
+	if err = admission.Release(context.Background(), receipt, "cleanup-a", strings.Repeat("c", 64)); !IsCategory(err, CategoryConflict) {
+		t.Fatalf("conflicting release proof converged: %v", err)
+	}
+	request.AcquisitionKey = "acquisition-b"
+	request.RunID = "run-b"
+	if _, err = admission.Reserve(context.Background(), request); err != nil {
+		t.Fatalf("released capacity remained accounted: %v", err)
+	}
+
+	overflowAdmission, err := NewMemoryCapacityAdmission(map[string]CapacityLimits{"project-1": {Environments: 2, CPUMilli: math.MaxUint64, MemoryBytes: 2, ObjectCount: 2, MaxTTL: time.Hour}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	overflowRequest := CapacityRequest{ProjectID: "project-1", RunID: "overflow-a", AcquisitionKey: "overflow-a", SelectionDigest: selection.Digest, Demand: ResourceDemand{Environments: 1, CPUMilli: math.MaxUint64, MemoryBytes: 1, ObjectCount: 1}, TTL: time.Hour, PolicyDigest: policy}
+	if _, err = overflowAdmission.Reserve(context.Background(), overflowRequest); err != nil {
+		t.Fatal(err)
+	}
+	overflowRequest.RunID, overflowRequest.AcquisitionKey = "overflow-b", "overflow-b"
+	overflowRequest.Demand.CPUMilli = 1
+	if _, err = overflowAdmission.Reserve(context.Background(), overflowRequest); !IsCategory(err, CategoryConflict) {
+		t.Fatalf("aggregate overflow accepted: %v", err)
+	}
+	if _, overflow := addResourceDemand(ResourceDemand{CPUMilli: math.MaxUint64}, ResourceDemand{CPUMilli: 1}); !overflow {
+		t.Fatal("resource vector overflow was not detected")
+	}
+}
+
 // Wait advances logical time or preserves caller cancellation.
 func (w *testWaiter) Wait(ctx context.Context, duration time.Duration) error {
 	if err := ctx.Err(); err != nil {
@@ -33,6 +336,71 @@ func (w *testWaiter) Wait(ctx context.Context, duration time.Duration) error {
 	w.waits = append(w.waits, duration)
 	w.clock.now = w.clock.now.Add(duration)
 	return nil
+}
+
+// testDemandResolver derives a fixed trusted managed demand for lifecycle tests.
+type testDemandResolver struct{}
+
+// Resolve returns one bounded managed environment demand and policy seal.
+func (testDemandResolver) Resolve(context.Context, Selection) (ResourceDemand, time.Duration, string, error) {
+	return ResourceDemand{Environments: 1, CPUMilli: 100, MemoryBytes: 1024, ObjectCount: 5}, time.Hour, strings.Repeat("d", 64), nil
+}
+
+// testCapacity records admission boundaries without provider effects under concurrent lifecycle recovery.
+type testCapacity struct {
+	mu                 sync.Mutex
+	reserves, binds    int
+	confirms, releases int
+}
+
+// BindLifecycle records the durable store handoff that must precede provider acquisition.
+func (c *testCapacity) BindLifecycle(_ context.Context, receipt CapacityReceipt) (CapacityReceipt, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.binds++
+	return receipt, nil
+}
+
+// Reserve persists one stable test receipt before provider acquisition.
+func (c *testCapacity) Reserve(_ context.Context, request CapacityRequest) (CapacityReceipt, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reserves++
+	return CapacityReceipt{ID: "capacity-receipt", Digest: strings.Repeat("e", 64)}, nil
+}
+
+// Confirm binds the receipt to the observed provider identity idempotently.
+func (c *testCapacity) Confirm(_ context.Context, receipt CapacityReceipt, _, _ string) (CapacityReceipt, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.confirms++
+	return receipt, nil
+}
+
+// Release records quota release only after durable environment cleanup.
+func (c *testCapacity) Release(_ context.Context, _ CapacityReceipt, _, _ string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.releases++
+	return nil
+}
+
+// rejectingCapacity proves admission denial happens before provider I/O.
+type rejectingCapacity struct{}
+
+// Reserve rejects the capacity request deterministically.
+func (rejectingCapacity) Reserve(context.Context, CapacityRequest) (CapacityReceipt, error) {
+	return CapacityReceipt{}, &Error{Category: CategoryConflict, Operation: "capacity_limit"}
+}
+
+// Confirm is unreachable after denied admission.
+func (rejectingCapacity) Confirm(context.Context, CapacityReceipt, string, string) (CapacityReceipt, error) {
+	return CapacityReceipt{}, errors.New("unexpected confirm")
+}
+
+// Release is unreachable after denied admission.
+func (rejectingCapacity) Release(context.Context, CapacityReceipt, string, string) error {
+	return errors.New("unexpected release")
 }
 
 // managedFake is the hermetic provider used only by the reusable contract suite.
@@ -361,12 +729,26 @@ func validSelection(kind ProviderKind) Selection {
 
 // validObservation builds one ready provider-neutral observation.
 func validObservation(now time.Time) Observation {
-	return Observation{ProviderID: "provider", ProviderVersion: "v1", EnvironmentID: "environment-1", EnvironmentRef: "template-v1", Endpoint: "https://target.example/base", ProfileID: "profile-1", LifecycleHandle: "opaque-handle", ObservedVersion: "observed-v1", ObservationDigest: strings.Repeat("b", 64), Availability: AvailabilityReady, Attestation: Attestation{EnvironmentID: "environment-1", RepositoryID: "repo-1", CommitOID: strings.Repeat("a", 40), Reference: "attestation-1", ValidUntil: now.Add(time.Hour), Verified: true}, Network: NetworkPolicy{PolicyID: "network-1", Schemes: []string{"https"}, Hosts: []string{"target.example"}, Ports: []int{443}, BasePaths: []string{"/base"}, MaxURLBytes: 2048}, Capabilities: []string{"http"}}
+	return Observation{ProviderID: "provider", ProviderVersion: "v1", EnvironmentID: "environment-1", EnvironmentRef: "template-v1", Endpoint: "https://target.example/base", ProfileID: "profile-1", Fingerprint: strings.Repeat("f", 64), LifecycleHandle: "opaque-handle", ObservedVersion: "observed-v1", ObservationDigest: strings.Repeat("b", 64), Availability: AvailabilityReady, Attestation: Attestation{EnvironmentID: "environment-1", RepositoryID: "repo-1", CommitOID: strings.Repeat("a", 40), Reference: "attestation-1", ValidUntil: now.Add(time.Hour), Verified: true}, Network: NetworkPolicy{PolicyID: "network-1", Schemes: []string{"https"}, Hosts: []string{"target.example"}, Ports: []int{443}, BasePaths: []string{"/base"}, MaxURLBytes: 2048}, Capabilities: []string{"http"}}
 }
 
 // validRequest builds one trusted workflow request with no provider authority.
 func validRequest() Request {
 	return Request{RunID: "run-1", SelectionAlias: "test-env", ProjectID: "project-1", RepositoryID: "repo-1", CommitOID: strings.Repeat("a", 40), IdempotencyKey: "surface-key-1"}
+}
+
+// managedRecord adds the durable pre-acquire capacity authority required by managed store fixtures.
+func managedRecord(value Record) Record {
+	if value.Selection.Kind != KindManaged {
+		return value
+	}
+	value.ProjectID = value.Selection.ProjectID
+	value.CreatedAt = time.Unix(900, 0).UTC()
+	value.TTL = time.Hour
+	value.ExpiresAt = value.CreatedAt.Add(value.TTL)
+	value.Demand = ResourceDemand{Environments: 1, CPUMilli: 100, MemoryBytes: 1024, ObjectCount: 5}
+	value.CapacityReceipt = CapacityReceipt{ID: "capacity-receipt", Digest: strings.Repeat("e", 64)}
+	return value
 }
 
 // serviceFixture composes a hermetic lifecycle service around one provider.
@@ -384,7 +766,7 @@ func serviceFixture(t *testing.T, provider EnvironmentProvider, kind ProviderKin
 	clock := &testClock{now: time.Unix(1000, 0).UTC()}
 	store := NewMemoryStore()
 	observer := &MemoryObserver{}
-	service, err := NewLifecycleService(Dependencies{Catalog: catalog, Providers: registry, Store: store, Network: AllowlistedNetworkAuthorizer{}, Clock: clock, Waiter: &testWaiter{clock: clock}, Observer: observer, Owner: "owner-1", Limits: Limits{AcquireTimeout: 10 * time.Second, ObserveTimeout: 10 * time.Second, ReleaseTimeout: 10 * time.Second, NetworkTimeout: 10 * time.Second, ObserverTimeout: 10 * time.Second, LeaseTTL: 10 * time.Minute, MaxAttempts: 3, MaxReadiness: 3, MaxElapsed: time.Minute, MaxCumulativeWait: time.Second, InitialBackoff: time.Millisecond}})
+	service, err := NewLifecycleService(Dependencies{Catalog: catalog, Providers: registry, Store: store, Network: AllowlistedNetworkAuthorizer{}, Clock: clock, Waiter: &testWaiter{clock: clock}, Observer: observer, Owner: "owner-1", Demand: testDemandResolver{}, Capacity: &testCapacity{}, Limits: Limits{AcquireTimeout: 10 * time.Second, ObserveTimeout: 10 * time.Second, ReleaseTimeout: 10 * time.Second, NetworkTimeout: 10 * time.Second, ObserverTimeout: 10 * time.Second, LeaseTTL: 10 * time.Minute, MaxAttempts: 3, MaxReadiness: 3, MaxElapsed: time.Minute, MaxCumulativeWait: time.Second, InitialBackoff: time.Millisecond}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,7 +1024,7 @@ func TestEnvironmentProviderFullContractMatrix(t *testing.T) {
 				request := validRequest()
 				request.RunID = "run-contract-crash"
 				selection := validSelection(family.kind)
-				seed := Record{Version: 1, RunID: request.RunID, RequestDigest: digestOf(request), AcquisitionKey: stableKey("acquire", request.RunID, selection.Digest, request.RepositoryID, request.CommitOID), CommitOID: request.CommitOID, Selection: selection, State: StateSelected, UpdatedAt: clock.now}
+				seed := managedRecord(Record{Version: 1, RunID: request.RunID, RequestDigest: digestOf(request), AcquisitionKey: stableKey("acquire", request.RunID, selection.Digest, request.RepositoryID, request.CommitOID), CommitOID: request.CommitOID, Selection: selection, State: StateSelected, UpdatedAt: clock.now})
 				if _, created, err := store.Reserve(context.Background(), seed); err != nil || !created {
 					t.Fatalf("durable seed failed: %v", err)
 				}
@@ -930,7 +1312,7 @@ func TestEnvironmentRecordsAreExactlyOnceContentFreeAndRecoverable(t *testing.T)
 		t.Fatal(err)
 	}
 	selection := validSelection(KindManaged)
-	record := Record{Version: 1, RunID: "run-1", RequestDigest: strings.Repeat("a", 64), AcquisitionKey: strings.Repeat("b", 64), ReleaseKey: strings.Repeat("c", 64), CommitOID: strings.Repeat("a", 40), Selection: selection, State: StateSelected}
+	record := managedRecord(Record{Version: 1, RunID: "run-1", RequestDigest: strings.Repeat("a", 64), AcquisitionKey: strings.Repeat("b", 64), ReleaseKey: strings.Repeat("c", 64), CommitOID: strings.Repeat("a", 40), Selection: selection, State: StateSelected})
 	reserved, created, err := store.Reserve(context.Background(), record)
 	if err != nil || !created {
 		t.Fatalf("reserve failed: %v", err)
@@ -1273,7 +1655,7 @@ func TestEnvironmentOperationalFailureMatrix(t *testing.T) {
 // TestEnvironmentStoreRedeliveryAndEventConflicts covers same-content recovery and conflicting records.
 func TestEnvironmentStoreRedeliveryAndEventConflicts(t *testing.T) {
 	selection := validSelection(KindManaged)
-	record := Record{Version: 1, RunID: "run-1", RequestDigest: strings.Repeat("a", 64), AcquisitionKey: strings.Repeat("b", 64), ReleaseKey: strings.Repeat("c", 64), CommitOID: strings.Repeat("a", 40), Selection: selection, State: StateSelected}
+	record := managedRecord(Record{Version: 1, RunID: "run-1", RequestDigest: strings.Repeat("a", 64), AcquisitionKey: strings.Repeat("b", 64), ReleaseKey: strings.Repeat("c", 64), CommitOID: strings.Repeat("a", 40), Selection: selection, State: StateSelected})
 	memory := NewMemoryStore()
 	reserved, created, err := memory.Reserve(context.Background(), record)
 	if err != nil || !created {
@@ -1390,7 +1772,7 @@ func TestEnvironmentAcquireResponseLossRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	acquireKey := stableKey("acquire", request.RunID, selection.Digest, request.RepositoryID, request.CommitOID)
-	record := Record{Version: 1, RunID: request.RunID, RequestDigest: digestOf(request), AcquisitionKey: acquireKey, CommitOID: request.CommitOID, Selection: selection, State: StateAcquiring, ReleaseRequired: true, Owner: "owner-1", LeaseUntil: now.Add(-time.Second), UpdatedAt: now}
+	record := managedRecord(Record{Version: 1, RunID: request.RunID, RequestDigest: digestOf(request), AcquisitionKey: acquireKey, CommitOID: request.CommitOID, Selection: selection, State: StateAcquiring, ReleaseRequired: true, Owner: "owner-1", LeaseUntil: now.Add(-time.Second), UpdatedAt: now})
 	if _, created, reserveErr := store.Reserve(context.Background(), record); reserveErr != nil || !created {
 		t.Fatalf("recovery fixture reserve: %v", reserveErr)
 	}
@@ -1500,7 +1882,7 @@ func TestLifecycleLeaseOwnershipPreventsDuplicateProviderIO(t *testing.T) {
 	selection := validSelection(KindManaged)
 	requestDigest := digestOf(adoptRequest)
 	acquisitionKey := stableKey("acquire", adoptRequest.RunID, selection.Digest, adoptRequest.RepositoryID, adoptRequest.CommitOID)
-	expired := Record{Version: 1, RunID: adoptRequest.RunID, RequestDigest: requestDigest, AcquisitionKey: acquisitionKey, CommitOID: adoptRequest.CommitOID, Selection: selection, State: StateAcquiring, ReleaseRequired: true, Owner: "crashed-owner:1:1", LeaseUntil: now.Add(-time.Second), UpdatedAt: now}
+	expired := managedRecord(Record{Version: 1, RunID: adoptRequest.RunID, RequestDigest: requestDigest, AcquisitionKey: acquisitionKey, CommitOID: adoptRequest.CommitOID, Selection: selection, State: StateAcquiring, ReleaseRequired: true, Owner: "crashed-owner:1:1", LeaseUntil: now.Add(-time.Second), UpdatedAt: now})
 	if _, created, err := store.Reserve(context.Background(), expired); err != nil || !created {
 		t.Fatalf("failed to seed crashed owner: %v", err)
 	}
@@ -1628,7 +2010,7 @@ func TestLocalStoreCrashBoundariesConvergeRecordAndEvent(t *testing.T) {
 			}
 			now := time.Unix(1000, 0).UTC()
 			selection := validSelection(KindManaged)
-			initial := Record{Version: 1, RunID: "run-crash", RequestDigest: strings.Repeat("d", 64), AcquisitionKey: strings.Repeat("e", 64), CommitOID: strings.Repeat("a", 40), Selection: selection, State: StateSelected, Owner: "owner:1:1", LeaseUntil: now.Add(time.Minute), UpdatedAt: now}
+			initial := managedRecord(Record{Version: 1, RunID: "run-crash", RequestDigest: strings.Repeat("d", 64), AcquisitionKey: strings.Repeat("e", 64), CommitOID: strings.Repeat("a", 40), Selection: selection, State: StateSelected, Owner: "owner:1:1", LeaseUntil: now.Add(time.Minute), UpdatedAt: now})
 			current, created, reserveErr := store.Reserve(context.Background(), initial)
 			if reserveErr != nil || !created {
 				t.Fatalf("reserve failed: %v", reserveErr)
@@ -1673,7 +2055,7 @@ func TestLocalStoreRejectsRollbackHolesAndImpossibleState(t *testing.T) {
 	}
 	now := time.Unix(1000, 0).UTC()
 	selection := validSelection(KindManaged)
-	initial := Record{Version: 1, RunID: "run-integrity", RequestDigest: strings.Repeat("d", 64), AcquisitionKey: strings.Repeat("e", 64), CommitOID: strings.Repeat("a", 40), Selection: selection, State: StateSelected, Owner: "owner:1:1", LeaseUntil: now.Add(time.Minute), UpdatedAt: now}
+	initial := managedRecord(Record{Version: 1, RunID: "run-integrity", RequestDigest: strings.Repeat("d", 64), AcquisitionKey: strings.Repeat("e", 64), CommitOID: strings.Repeat("a", 40), Selection: selection, State: StateSelected, Owner: "owner:1:1", LeaseUntil: now.Add(time.Minute), UpdatedAt: now})
 	current, _, err := store.Reserve(context.Background(), initial)
 	if err != nil {
 		t.Fatal(err)

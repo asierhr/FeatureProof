@@ -27,6 +27,7 @@ import (
 	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/environment"
+	environmentcleanup "github.com/asierhr/featureProof/internal/environment/cleanup"
 	kubernetesenvironment "github.com/asierhr/featureProof/internal/environment/kubernetes"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
@@ -299,6 +300,7 @@ func TestWorkflowEnvironmentCompositionRegistersOnlyExplicitManagedProvider(t *t
 		t.Fatal(err)
 	}
 	config := workflowConfig{TargetAlias: selection.Alias, RepositoryID: selection.RepositoryID, EnvironmentCatalog: catalog}
+	config.ManagedCapacity, config.EnvironmentCleanup = workflowManagedTestAuthority(t, selection)
 	target := validationworkflow.TargetContext{ProviderID: selection.ProviderID, EnvironmentRef: selection.TemplateReference, ProfileID: selection.ProfileID, Network: validationworkflow.NetworkContext{PolicyID: selection.NetworkPolicyID}}
 	if _, err = composeWorkflowEnvironment(t.TempDir(), config, target, nil, nil); err == nil {
 		t.Fatal("missing managed provider accepted")
@@ -357,6 +359,17 @@ func TestComposeWorkflowCLIResolvesCompleteKubernetesAuthorityThroughMainConstru
 		managed := workflowEnvironmentCatalogFixture("kubernetes", "v1", "target", "target-ref", "runtime", "network", "repo")
 		managed["items"].([]any)[0].(map[string]any)["kind"] = "managed"
 		value["environment_catalog"] = managed
+		sealedSelection, selectionErr := environment.SealSelection(environment.Selection{Version: 1, Alias: "target", ProviderID: "kubernetes", ProviderVersion: "v1", Kind: environment.KindManaged, TemplateReference: "target-ref", ProfileID: "runtime", NetworkPolicyID: "network", Secretless: true, ProjectID: "repo", RepositoryID: "repo", Capabilities: []string{"http"}})
+		if selectionErr != nil {
+			t.Fatal(selectionErr)
+		}
+		selectionDigest := sealedSelection.Digest
+		policy, policyErr := environmentcleanup.SealCapacityPolicy(environmentcleanup.CapacityPolicy{ProjectID: "repo", MaxEnvironments: 1, MaxCPUMilli: 1000, MaxMemoryBytes: 1 << 30, MaxObjectCount: 100, MaxTTL: time.Hour})
+		if policyErr != nil {
+			t.Fatal(policyErr)
+		}
+		value["managed_capacity"] = workflowManagedCapacityConfig{Policy: policy, Demands: map[string]environment.ResourceDemand{selectionDigest: {Environments: 1, CPUMilli: 100, MemoryBytes: 1 << 20, ObjectCount: 10}}, TTLs: map[string]time.Duration{selectionDigest: time.Hour}}
+		value["environment_cleanup"] = workflowCleanupRuntimeConfig{PageSize: 10, MaxPages: 2, MaxItems: 20, MaxClaims: 10, MaxAttempts: 3, Interval: time.Minute, LeaseTTL: time.Minute, ProviderTimeout: time.Second, MaxBackoff: time.Minute, MaxCumulativeWait: time.Hour, MaxCycleDuration: time.Minute, OrphanGrace: time.Minute, Owner: "workflow-cleanup"}
 		value["kubernetes"] = map[string]any{"api_server": tlsServer.URL, "bearer_token_environment": "FEATUREPROOF_TEST_KUBERNETES_TOKEN", "ca_file": caPath, "server_name": "cluster.test", "catalog_path": catalogPath, "owner": "owner", "cluster_id": "cluster", "secret_environments": map[string]string{}, "max_list": 10}
 	})
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)

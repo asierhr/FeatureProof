@@ -150,6 +150,18 @@ type CLI struct {
 	PreviewTargets map[string]PreviewTarget
 	FlowManifests  LocalFlowManifestResolver
 	FlowAliases    map[string]string
+	Runtime        CallerOwnedRuntime
+}
+
+// CallerOwnedRuntime starts background recovery only when the executable explicitly assumes lifecycle ownership.
+type CallerOwnedRuntime interface {
+	Start(context.Context) (RuntimeHandle, error)
+}
+
+// RuntimeHandle exposes coordinated cancellation and join without hiding goroutine ownership in composition.
+type RuntimeHandle interface {
+	Cancel()
+	Join() error
 }
 
 // LocalFlowManifestResolver admits one CLI-only local manifest and returns its safe persisted artifact coordinate.

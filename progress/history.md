@@ -723,3 +723,15 @@ Bitácora append-only de features completadas.
 - Tasks T1–T11 completas; R1–R15 y REV-1–REV-13 trazados en `progress/kubernetes-validation-tool/{implementation,review}.md`.
 - Review independiente aprobada en la cuarta revisión. Pasan smoke del leader, formato, diff check, vet, suite global, race global y Kubernetes race ×20.
 - Coverage focal exacta del paquete nuevo: `734/854 = 85,94847775175644 %`.
+
+## 2026-10-26 — environment-cleanup-controller
+
+- Estado final: `done`.
+- Resultado: controller local caller-owned que descubre y reconcilia intents, lifecycles, capacity receipts y huérfanos hasta confirmar ausencia; TTL, retries, backoff, cancelación y status permanecen durables y separados del veredicto funcional.
+- Capacidad: ledger multiproceso reserva antes de Acquire, conserva receipts durante incertidumbre y libera exactamente una vez solo tras `StateReleased`/absence con proof ligada a cleanup, environment, UID y receipt.
+- Concurrencia y recovery: receipts/versiones inmutables, file lock, heads/anchors CAS, fsync, leases/fencing y epochs de cursor permiten restart/handoff sin lost updates, ciclos ni starvation; fault matrices cubren cada frontera de publicación.
+- Kubernetes: inventario owner-scoped y autoridad privada durable; cleanup limitado a list/get/delete Namespace con precondición UID, sin force-finalizer, Secrets ni autoridad del modelo.
+- Spec aprobada por el usuario el `2026-10-26T15:47:25+01:00`.
+- Tasks T1–T16 y R1–R15 trazados en `progress/environment-cleanup-controller/{implementation,review}.md`; review independiente aprobada en la sexta revisión.
+- Pasan global normal/race, cleanup race ×20, verticales race ×20, builds Windows/Linux/Darwin y runtime Linux autenticado.
+- Coverage exacta del diff productivo: `1812/2130 = 85,07042253521127 %`; global `37344/43378 = 86,08972290100973 %`.

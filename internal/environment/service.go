@@ -25,6 +25,37 @@ type Waiter interface {
 	Wait(context.Context, time.Duration) error
 }
 
+// ResourceDemand is the fixed managed-capacity vector resolved by trusted composition.
+type ResourceDemand struct{ Environments, CPUMilli, MemoryBytes, ObjectCount uint64 }
+
+// CapacityRequest binds one pre-acquire reservation to sealed lifecycle authority.
+type CapacityRequest struct {
+	ProjectID, RunID, AcquisitionKey, SelectionDigest string
+	Demand                                            ResourceDemand
+	TTL                                               time.Duration
+	PolicyDigest                                      string
+}
+
+// CapacityReceipt is the opaque durable reservation retained until confirmed cleanup.
+type CapacityReceipt struct{ ID, Digest string }
+
+// DemandResolver derives managed demand and TTL without caller/model numbers.
+type DemandResolver interface {
+	Resolve(context.Context, Selection) (ResourceDemand, time.Duration, string, error)
+}
+
+// CapacityAdmission reserves before Acquire, binds provider identity and releases after confirmed absence.
+type CapacityAdmission interface {
+	Reserve(context.Context, CapacityRequest) (CapacityReceipt, error)
+	Confirm(context.Context, CapacityReceipt, string, string) (CapacityReceipt, error)
+	Release(context.Context, CapacityReceipt, string, string) error
+}
+
+// CapacityLifecycleBinder marks that the lifecycle record exists before any provider acquisition can begin.
+type CapacityLifecycleBinder interface {
+	BindLifecycle(context.Context, CapacityReceipt) (CapacityReceipt, error)
+}
+
 // NetworkAuthorizer validates the exact endpoint before the target becomes addressable.
 type NetworkAuthorizer interface {
 	Authorize(context.Context, NetworkPolicy, string) error
@@ -102,19 +133,24 @@ type Event struct {
 
 // Record is private durable lifecycle state; safe projections never expose LifecycleHandle.
 type Record struct {
-	Version                                          int
-	RunID, RequestDigest, AcquisitionKey, ReleaseKey string
-	CommitOID                                        string
-	Selection                                        Selection
-	State                                            LifecycleState
-	EnvironmentID, LifecycleHandle, LifecycleDigest  string
-	Target                                           ValidationTarget
-	Binding                                          Binding
-	Attempts                                         int
-	Owner                                            string
-	LeaseUntil, UpdatedAt                            time.Time
-	Revision                                         uint64
-	ReleaseRequired, ReleaseConfirmed                bool
+	Version                                                     int
+	RunID, ProjectID, RequestDigest, AcquisitionKey, ReleaseKey string
+	CommitOID                                                   string
+	Selection                                                   Selection
+	State                                                       LifecycleState
+	EnvironmentID, LifecycleHandle, LifecycleDigest             string
+	Target                                                      ValidationTarget
+	Binding                                                     Binding
+	Attempts                                                    int
+	Owner                                                       string
+	LeaseUntil, UpdatedAt                                       time.Time
+	Revision                                                    uint64
+	ReleaseRequired, ReleaseConfirmed                           bool
+	CreatedAt, ExpiresAt                                        time.Time
+	TTL                                                         time.Duration
+	Demand                                                      ResourceDemand
+	CapacityReceipt                                             CapacityReceipt
+	CapacityEnvironmentDigest, CapacityResourceDigest           string
 }
 
 // Store owns idempotent reservation, CAS state and append-only event publication.
@@ -136,6 +172,8 @@ type Dependencies struct {
 	Observer  Observer
 	Owner     string
 	Limits    Limits
+	Demand    DemandResolver
+	Capacity  CapacityAdmission
 }
 
 // LifecycleService coordinates provider-neutral acquisition, revalidation and cleanup.
@@ -238,10 +276,45 @@ func (s *LifecycleService) Acquire(ctx context.Context, request Request) (Acquis
 	acquireKey := stableKey("acquire", request.RunID, selection.Digest, request.RepositoryID, request.CommitOID)
 	claimOwner := s.nextOwner()
 	now := s.deps.Clock.Now().UTC()
-	record := Record{Version: 1, RunID: request.RunID, RequestDigest: requestDigest, AcquisitionKey: acquireKey, CommitOID: request.CommitOID, Selection: selection, State: StateSelected, Owner: claimOwner, LeaseUntil: now.Add(s.deps.Limits.LeaseTTL), UpdatedAt: now}
+	var demand ResourceDemand
+	var ttl time.Duration
+	var capacityReceipt CapacityReceipt
+	var createdAt, expiresAt time.Time
+	if selection.Kind == KindManaged {
+		if s.deps.Demand == nil || s.deps.Capacity == nil {
+			return Acquisition{}, &Error{Category: CategoryInvalid, Operation: "capacity_composition"}
+		}
+		var policyDigest string
+		demand, ttl, policyDigest, err = s.deps.Demand.Resolve(ctx, selection)
+		if err != nil || demand.Environments != 1 || ttl <= 0 || !digestPattern.MatchString(policyDigest) {
+			return Acquisition{}, &Error{Category: CategoryInvalid, Operation: "capacity_demand", Cause: err}
+		}
+		capacityReceipt, err = s.deps.Capacity.Reserve(ctx, CapacityRequest{ProjectID: request.ProjectID, RunID: request.RunID, AcquisitionKey: acquireKey, SelectionDigest: selection.Digest, Demand: demand, TTL: ttl, PolicyDigest: policyDigest})
+		if err != nil || !safeID.MatchString(capacityReceipt.ID) || !digestPattern.MatchString(capacityReceipt.Digest) {
+			return Acquisition{}, &Error{Category: CategoryConflict, Operation: "capacity_reserve", Cause: err}
+		}
+		createdAt, expiresAt = now, now.Add(ttl)
+	}
+	recordProjectID := ""
+	if selection.Kind == KindManaged {
+		recordProjectID = request.ProjectID
+	}
+	record := Record{Version: 1, RunID: request.RunID, ProjectID: recordProjectID, RequestDigest: requestDigest, AcquisitionKey: acquireKey, CommitOID: request.CommitOID, Selection: selection, State: StateSelected, Owner: claimOwner, LeaseUntil: now.Add(s.deps.Limits.LeaseTTL), UpdatedAt: now, CreatedAt: createdAt, ExpiresAt: expiresAt, TTL: ttl, Demand: demand, CapacityReceipt: capacityReceipt}
 	record, created, err := s.deps.Store.Reserve(ctx, record)
 	if err != nil {
 		return Acquisition{}, contextFailure(ctx, "reserve", CategoryPersistence, err)
+	}
+	if selection.Kind == KindManaged {
+		if binder, ok := s.deps.Capacity.(CapacityLifecycleBinder); ok {
+			if record.CapacityReceipt.ID != capacityReceipt.ID {
+				return Acquisition{}, &Error{Category: CategoryConflict, Operation: "capacity_lifecycle_identity"}
+			}
+			capacityReceipt, err = binder.BindLifecycle(ctx, capacityReceipt)
+			if err != nil {
+				return Acquisition{}, &Error{Category: CategoryPersistence, Operation: "capacity_bind_lifecycle", Cause: err}
+			}
+			record.CapacityReceipt = capacityReceipt
+		}
 	}
 	if !created {
 		if record.RequestDigest != requestDigest || record.AcquisitionKey != acquireKey {
@@ -317,6 +390,23 @@ func (s *LifecycleService) Acquire(ctx context.Context, request Request) (Acquis
 		record.EnvironmentID, record.LifecycleHandle = observation.EnvironmentID, observation.LifecycleHandle
 		record.LifecycleDigest = lifecycleDigest(selection, observation)
 		record.ReleaseKey = stableKey("release", record.AcquisitionKey, record.LifecycleDigest)
+		if selection.Kind == KindManaged {
+			resourceIdentity := observation.ReservationID
+			if resourceIdentity == "" {
+				resourceIdentity = observation.Fingerprint
+			}
+			if resourceIdentity == "" {
+				s.recoverUncertainAcquire(ctx, record, provider, providerRequest)
+				return Acquisition{}, &Error{Category: CategoryIntegrity, Operation: "capacity_identity"}
+			}
+			record.CapacityEnvironmentDigest = stableKey("environment", observation.EnvironmentID)
+			record.CapacityResourceDigest = stableKey("resource", resourceIdentity)
+			record.CapacityReceipt, err = s.deps.Capacity.Confirm(ctx, record.CapacityReceipt, record.CapacityEnvironmentDigest, record.CapacityResourceDigest)
+			if err != nil {
+				s.recoverUncertainAcquire(ctx, record, provider, providerRequest)
+				return Acquisition{}, &Error{Category: CategoryPersistence, Operation: "capacity_confirm", Cause: err}
+			}
+		}
 		record, err = s.save(ctx, record, "environment_acquired", observation.EnvironmentID, attempts)
 		if err != nil {
 			return Acquisition{}, err
@@ -447,7 +537,7 @@ func (s *LifecycleService) Release(ctx context.Context, runID string) error {
 		return contextFailure(ctx, "release_load", CategoryPersistence, err)
 	}
 	if record.State == StateReleased || record.ReleaseConfirmed {
-		return nil
+		return s.releaseCapacity(ctx, record)
 	}
 	claimOwner := s.nextOwner()
 	record, err = s.claim(ctx, record, claimOwner)
@@ -509,6 +599,7 @@ func (s *LifecycleService) acquireObservation(ctx context.Context, provider Envi
 func (s *LifecycleService) cleanupDetached(parent context.Context, record Record, provider EnvironmentProvider) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), s.deps.Limits.ReleaseTimeout)
 	defer cancel()
+	var reconciled Observation
 	if record.LifecycleHandle == "" {
 		reconcileRequest := AcquisitionRequest{RunID: record.RunID, IdempotencyKey: record.AcquisitionKey, ProjectID: record.Selection.ProjectID, RepositoryID: record.Selection.RepositoryID, CommitOID: record.CommitOID, Selection: record.Selection}
 		observation, reconcileErr := provider.Reconcile(cleanupCtx, reconcileRequest)
@@ -521,6 +612,23 @@ func (s *LifecycleService) cleanupDetached(parent context.Context, record Record
 		}
 		record.EnvironmentID, record.LifecycleHandle = observation.EnvironmentID, observation.LifecycleHandle
 		record.LifecycleDigest = lifecycleDigest(record.Selection, observation)
+		reconciled = observation
+	}
+	if record.Selection.Kind == KindManaged && record.CapacityEnvironmentDigest == "" {
+		resourceIdentity := reconciled.ReservationID
+		if resourceIdentity == "" {
+			resourceIdentity = reconciled.Fingerprint
+		}
+		if resourceIdentity == "" {
+			return &Error{Category: CategoryIntegrity, Operation: "capacity_identity"}
+		}
+		record.CapacityEnvironmentDigest = stableKey("environment", record.EnvironmentID)
+		record.CapacityResourceDigest = stableKey("resource", resourceIdentity)
+		confirmed, confirmErr := s.deps.Capacity.Confirm(cleanupCtx, record.CapacityReceipt, record.CapacityEnvironmentDigest, record.CapacityResourceDigest)
+		if confirmErr != nil {
+			return &Error{Category: CategoryPersistence, Operation: "capacity_confirm", Cause: confirmErr}
+		}
+		record.CapacityReceipt = confirmed
 	}
 	record.State, record.ReleaseRequired = StateReleaseIntent, true
 	if record.ReleaseKey == "" {
@@ -537,8 +645,26 @@ func (s *LifecycleService) cleanupDetached(parent context.Context, record Record
 		return contextFailure(cleanupCtx, "release", CategoryCleanupPending, err)
 	}
 	record.State, record.ReleaseConfirmed, record.Owner, record.LeaseUntil = StateReleased, true, "", time.Time{}
-	_, err = s.save(cleanupCtx, record, "environment_released", record.EnvironmentID, record.Attempts)
-	return err
+	record, err = s.save(cleanupCtx, record, "environment_released", record.EnvironmentID, record.Attempts)
+	if err != nil {
+		return err
+	}
+	return s.releaseCapacity(cleanupCtx, record)
+}
+
+// releaseCapacity frees a managed receipt only after the released record is durable.
+func (s *LifecycleService) releaseCapacity(ctx context.Context, record Record) error {
+	if record.Selection.Kind != KindManaged {
+		return nil
+	}
+	if s.deps.Capacity == nil || record.State != StateReleased || !record.ReleaseConfirmed || !safeID.MatchString(record.CapacityReceipt.ID) || !digestPattern.MatchString(record.CapacityReceipt.Digest) {
+		return &Error{Category: CategoryIntegrity, Operation: "capacity_release_authority"}
+	}
+	confirmation := capacityReleaseConfirmation(record.ReleaseKey, record.CapacityEnvironmentDigest, record.CapacityResourceDigest, record.CapacityReceipt.ID)
+	if err := s.deps.Capacity.Release(ctx, record.CapacityReceipt, record.ReleaseKey, confirmation); err != nil {
+		return &Error{Category: CategoryPersistence, Operation: "capacity_release", Cause: err}
+	}
+	return nil
 }
 
 // validateObservationAuthority binds every provider projection to the sealed selection and repository revision.

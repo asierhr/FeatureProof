@@ -25,6 +25,7 @@ import (
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/contractreview"
 	"github.com/asierhr/featureProof/internal/environment"
+	environmentcleanup "github.com/asierhr/featureProof/internal/environment/cleanup"
 	kubernetesenvironment "github.com/asierhr/featureProof/internal/environment/kubernetes"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
@@ -50,6 +51,7 @@ import (
 	"github.com/asierhr/featureProof/internal/springinspector"
 	"github.com/asierhr/featureProof/internal/testidentity"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
+	kubernetesclient "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
@@ -93,7 +95,16 @@ type workflowConfig struct {
 	FunctionalFlowAliases         map[string]string                       `json:"functional_flow_aliases,omitempty"`
 	GitHubContext                 *githubcontext.Policy                   `json:"github_context,omitempty"`
 	EnvironmentCatalog            environment.Catalog                     `json:"environment_catalog"`
+	ManagedCapacity               *workflowManagedCapacityConfig          `json:"managed_capacity,omitempty"`
+	EnvironmentCleanup            *workflowCleanupRuntimeConfig           `json:"environment_cleanup,omitempty"`
 	Kubernetes                    *workflowKubernetesRuntimeConfig        `json:"kubernetes,omitempty"`
+}
+
+// workflowManagedCapacityConfig carries sealed project policy and per-selection demand without request/model defaults.
+type workflowManagedCapacityConfig struct {
+	Policy  environmentcleanup.CapacityPolicy     `json:"policy"`
+	Demands map[string]environment.ResourceDemand `json:"demands"`
+	TTLs    map[string]time.Duration              `json:"ttls"`
 }
 
 // workflowFixtureRuntimeConfig is the trusted operator-owned authority for every finite fixture effect and wait.
@@ -761,9 +772,23 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if targetContext.Fingerprint == "" {
 		targetContext.Fingerprint = workflowDigest("environment", targetContext.EnvironmentID, targetContext.URL, targetContext.Attestation.Reference)
 	}
-	environmentPort, err := composeWorkflowEnvironment(root, config, targetContext, workflowPreview, options.environmentProviders)
+	environmentPort, environmentRuntime, err := composeWorkflowEnvironmentWithRuntime(root, config, targetContext, workflowPreview, options.environmentProviders)
 	if err != nil {
 		return nil, err
+	}
+	if environmentRuntime != nil && environmentSelection.ProviderID == "kubernetes" {
+		if options.kubernetes == nil {
+			return nil, errors.New("cleanup inventory composition unavailable")
+		}
+		clientset, clientErr := kubernetesclient.NewForConfig(options.kubernetes.RESTConfig)
+		if clientErr != nil {
+			return nil, clientErr
+		}
+		inventory, inventoryErr := environmentcleanup.NewKubernetesInventory(environmentcleanup.KubernetesInventoryConfig{ProviderID: environmentSelection.ProviderID, ProviderVersion: environmentSelection.ProviderVersion, Owner: options.kubernetes.Owner, IdentityPath: filepath.Join(root, ".featureproof", "cleanup", "kubernetes-identities.json"), Client: clientset, MaxPages: environmentRuntime.config.MaxPages, PageSize: int(options.kubernetes.MaxList)})
+		if inventoryErr != nil {
+			return nil, inventoryErr
+		}
+		environmentRuntime.inventories = map[string]environmentcleanup.ManagedInventory{environmentSelection.ProviderID + "@" + environmentSelection.ProviderVersion: inventory}
 	}
 	revisionContext := validationworkflow.RevisionContext{RepositoryID: config.RepositoryID, CommitOID: config.CommitOID}
 	if config.GoInspector != nil {
@@ -873,6 +898,11 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 		return nil, err
 	}
 	wallClock := githubpr.WallClock{}
+	if environmentRuntime != nil {
+		if err = environmentRuntime.attachWorkflow(store, wallClock); err != nil {
+			return nil, err
+		}
+	}
 	var fixturePort validationworkflow.FixtureLifecyclePort
 	var fixtureState fixture.Store
 	var auditSigner localvalidation.FixtureAuditSigner
@@ -964,7 +994,11 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 			return nil, err
 		}
 	}
-	cli := &validationworkflow.CLI{Service: service, Principal: current.Uid, AuthProfiles: map[string]string{config.AuthProfile: compositionRef}, DirectTargets: map[string]validationworkflow.DirectTarget{}, PreviewTargets: map[string]validationworkflow.PreviewTarget{}, FlowManifests: flowCatalog, FlowAliases: cloneWorkflowAliases(config.FunctionalFlowAliases)}
+	var callerRuntime validationworkflow.CallerOwnedRuntime
+	if environmentRuntime != nil {
+		callerRuntime = environmentRuntime
+	}
+	cli := &validationworkflow.CLI{Service: service, Principal: current.Uid, AuthProfiles: map[string]string{config.AuthProfile: compositionRef}, DirectTargets: map[string]validationworkflow.DirectTarget{}, PreviewTargets: map[string]validationworkflow.PreviewTarget{}, FlowManifests: flowCatalog, FlowAliases: cloneWorkflowAliases(config.FunctionalFlowAliases), Runtime: callerRuntime}
 	if config.TargetKind == "direct" {
 		cli.DirectTargets[config.TargetAlias] = validationworkflow.DirectTarget{Alias: config.TargetAlias, Digest: targetDigest}
 	} else {
@@ -1595,43 +1629,96 @@ type workflowFinalizer struct{}
 
 // composeWorkflowEnvironment builds the sealed catalog, durable lifecycle and sole workflow environment port.
 func composeWorkflowEnvironment(root string, config workflowConfig, target validationworkflow.TargetContext, preview *workflowPreviewPort, managedProviders map[string]environment.EnvironmentProvider) (validationworkflow.EnvironmentPort, error) {
+	port, _, err := composeWorkflowEnvironmentWithRuntime(root, config, target, preview, managedProviders)
+	return port, err
+}
+
+// composeWorkflowEnvironmentWithRuntime opens one shared durable capacity authority for lifecycle and cleanup composition.
+func composeWorkflowEnvironmentWithRuntime(root string, config workflowConfig, target validationworkflow.TargetContext, preview *workflowPreviewPort, managedProviders map[string]environment.EnvironmentProvider) (validationworkflow.EnvironmentPort, *workflowEnvironmentRuntime, error) {
 	selection, err := config.EnvironmentCatalog.Resolve(config.TargetAlias)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if selection.ProviderID != target.ProviderID || selection.TemplateReference != target.EnvironmentRef || selection.ProfileID != target.ProfileID || selection.NetworkPolicyID != target.Network.PolicyID {
-		return nil, errors.New("environment target authority mismatch")
+		return nil, nil, errors.New("environment target authority mismatch")
 	}
 	providerKey := selection.ProviderID + "@" + selection.ProviderVersion
 	var provider environment.EnvironmentProvider
 	if selection.Kind == environment.KindExistingURL {
 		if len(managedProviders) != 0 {
-			return nil, errors.New("unexpected managed environment composition")
+			return nil, nil, errors.New("unexpected managed environment composition")
 		}
 		provider, err = environment.NewExistingURLProvider(&workflowExistingLifecycle{target: target, preview: preview})
 	} else {
 		provider = managedProviders[providerKey]
 		if provider == nil || preview != nil || len(managedProviders) != 1 {
-			return nil, errors.New("managed environment composition unavailable")
+			return nil, nil, errors.New("managed environment composition unavailable")
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	registry, err := environment.NewRegistry(map[string]environment.EnvironmentProvider{providerKey: provider})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	store, err := environment.OpenLocalStore(filepath.Join(root, ".featureproof", "environment"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	clock := environment.WallClock{}
-	lifecycle, err := environment.NewLifecycleService(environment.Dependencies{Catalog: config.EnvironmentCatalog, Providers: registry, Store: store, Network: environment.AllowlistedNetworkAuthorizer{}, Clock: clock, Waiter: clock, Observer: &environment.MemoryObserver{}, Owner: "workflow-composition", Limits: environment.Limits{AcquireTimeout: 30 * time.Second, ObserveTimeout: 10 * time.Second, ReleaseTimeout: 10 * time.Second, NetworkTimeout: 10 * time.Second, ObserverTimeout: 5 * time.Second, LeaseTTL: 10 * time.Minute, MaxAttempts: 3, MaxReadiness: 10, MaxElapsed: 2 * time.Minute, MaxCumulativeWait: 30 * time.Second, InitialBackoff: time.Second}})
-	if err != nil {
-		return nil, err
+	var demand environment.DemandResolver
+	var capacity environment.CapacityAdmission
+	var runtime *workflowEnvironmentRuntime
+	runtimeKey := ""
+	if selection.Kind == environment.KindManaged {
+		if config.ManagedCapacity == nil || config.EnvironmentCleanup == nil {
+			return nil, nil, errors.New("managed capacity composition unavailable")
+		}
+		policy, policyErr := environmentcleanup.SealCapacityPolicy(config.ManagedCapacity.Policy)
+		demandValue, demandOK := config.ManagedCapacity.Demands[selection.Digest]
+		ttl := config.ManagedCapacity.TTLs[selection.Digest]
+		if policyErr != nil || policy.Digest != config.ManagedCapacity.Policy.Digest || policy.ProjectID != selection.ProjectID || !demandOK || demandValue.Environments != 1 || ttl <= 0 || ttl > policy.MaxTTL {
+			return nil, nil, errors.New("managed capacity authority invalid")
+		}
+		runtimeKey, err = workflowEnvironmentRuntimeKey(root, selection.ProjectID)
+		if err != nil {
+			return nil, nil, err
+		}
+		workflowEnvironmentRuntimes.Lock()
+		existingRuntime := workflowEnvironmentRuntimes.values[runtimeKey]
+		workflowEnvironmentRuntimes.Unlock()
+		if existingRuntime != nil {
+			return existingRuntime.port, existingRuntime, nil
+		}
+		ledger, ledgerErr := environmentcleanup.OpenCapacityLedger(filepath.Join(root, ".featureproof", "cleanup", "capacity.json"))
+		if ledgerErr != nil {
+			return nil, nil, ledgerErr
+		}
+		demand = environment.StaticDemandResolver{Demands: map[string]environment.ResourceDemand{selection.Digest: demandValue}, TTLs: map[string]time.Duration{selection.Digest: ttl}, PolicyDigests: map[string]string{selection.Digest: policy.Digest}}
+		durableCapacity := &workflowDurableCapacity{ledger: ledger, policies: map[string]environmentcleanup.CapacityPolicy{policy.Digest: policy}}
+		capacity = durableCapacity
+		runtime = &workflowEnvironmentRuntime{root: root, project: selection.ProjectID, config: *config.EnvironmentCleanup, ledger: ledger, capacity: durableCapacity}
 	}
-	return validationworkflow.LifecycleEnvironmentPort{Lifecycle: lifecycle, Projects: map[string]string{config.TargetAlias: config.RepositoryID}}, nil
+	lifecycle, err := environment.NewLifecycleService(environment.Dependencies{Catalog: config.EnvironmentCatalog, Providers: registry, Store: store, Network: environment.AllowlistedNetworkAuthorizer{}, Clock: clock, Waiter: clock, Observer: &environment.MemoryObserver{}, Owner: "workflow-composition", Demand: demand, Capacity: capacity, Limits: environment.Limits{AcquireTimeout: 30 * time.Second, ObserveTimeout: 10 * time.Second, ReleaseTimeout: 10 * time.Second, NetworkTimeout: 10 * time.Second, ObserverTimeout: 5 * time.Second, LeaseTTL: 10 * time.Minute, MaxAttempts: 3, MaxReadiness: 10, MaxElapsed: 2 * time.Minute, MaxCumulativeWait: 30 * time.Second, InitialBackoff: time.Second}})
+	if err != nil {
+		return nil, nil, err
+	}
+	if runtime != nil {
+		runtime.bridge = &environment.CleanupBridge{Store: store, Service: lifecycle, Owner: config.EnvironmentCleanup.Owner}
+	}
+	port := validationworkflow.LifecycleEnvironmentPort{Lifecycle: lifecycle, Projects: map[string]string{config.TargetAlias: selection.ProjectID}}
+	if runtime != nil {
+		runtime.port = port
+		workflowEnvironmentRuntimes.Lock()
+		if existingRuntime := workflowEnvironmentRuntimes.values[runtimeKey]; existingRuntime != nil {
+			workflowEnvironmentRuntimes.Unlock()
+			return existingRuntime.port, existingRuntime, nil
+		}
+		workflowEnvironmentRuntimes.values[runtimeKey] = runtime
+		workflowEnvironmentRuntimes.Unlock()
+	}
+	return port, runtime, nil
 }
 
 // workflowExistingLifecycle adapts configured direct targets and feature 19 previews without provisioning effects.

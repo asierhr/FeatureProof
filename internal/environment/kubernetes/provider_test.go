@@ -532,7 +532,9 @@ func TestKubernetesProviderSatisfiesNeutralLifecycleContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	service, err := environment.NewLifecycleService(environment.Dependencies{Catalog: catalog, Providers: registry, Store: environment.NewMemoryStore(), Network: environment.AllowlistedNetworkAuthorizer{}, Clock: clock, Waiter: clock, Observer: &environment.MemoryObserver{}, Owner: "kubernetes-contract", Limits: environment.Limits{AcquireTimeout: time.Second, ObserveTimeout: time.Second, ReleaseTimeout: time.Second, NetworkTimeout: time.Second, ObserverTimeout: time.Second, LeaseTTL: time.Minute, MaxAttempts: 2, MaxReadiness: 2, MaxElapsed: 10 * time.Second, MaxCumulativeWait: time.Second, InitialBackoff: time.Millisecond}})
+	capacity, _ := environment.NewMemoryCapacityAdmission(map[string]environment.CapacityLimits{selection.ProjectID: {Environments: 1, CPUMilli: 1000, MemoryBytes: 1 << 30, ObjectCount: 100, MaxTTL: time.Hour}})
+	demand := environment.StaticDemandResolver{Demands: map[string]environment.ResourceDemand{selection.Digest: {Environments: 1, CPUMilli: 100, MemoryBytes: 1 << 20, ObjectCount: 10}}, TTLs: map[string]time.Duration{selection.Digest: time.Hour}, PolicyDigests: map[string]string{selection.Digest: fmt.Sprintf("%064x", 1)}}
+	service, err := environment.NewLifecycleService(environment.Dependencies{Catalog: catalog, Providers: registry, Store: environment.NewMemoryStore(), Network: environment.AllowlistedNetworkAuthorizer{}, Clock: clock, Waiter: clock, Observer: &environment.MemoryObserver{}, Owner: "kubernetes-contract", Demand: demand, Capacity: capacity, Limits: environment.Limits{AcquireTimeout: time.Second, ObserveTimeout: time.Second, ReleaseTimeout: time.Second, NetworkTimeout: time.Second, ObserverTimeout: time.Second, LeaseTTL: time.Minute, MaxAttempts: 2, MaxReadiness: 2, MaxElapsed: 10 * time.Second, MaxCumulativeWait: time.Second, InitialBackoff: time.Millisecond}})
 	if err != nil {
 		t.Fatalf("compose lifecycle: %v", err)
 	}

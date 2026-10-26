@@ -566,6 +566,16 @@ func validateRecord(value Record, runID string, revision uint64) error {
 	if value.Version != 1 || value.RunID != runID || value.Revision != revision || !safeID.MatchString(value.RunID) || !digestPattern.MatchString(value.RequestDigest) || !digestPattern.MatchString(value.AcquisitionKey) || !fullOID.MatchString(value.CommitOID) || selectionErr != nil || sealed.Digest != value.Selection.Digest || !validLifecycleState(value.State) || !ownerValid {
 		return &Error{Category: CategoryIntegrity, Operation: "record"}
 	}
+	if value.Selection.Kind == KindManaged {
+		if !safeID.MatchString(value.ProjectID) || value.ProjectID != value.Selection.ProjectID || value.CreatedAt.IsZero() || value.TTL <= 0 || value.CreatedAt.Add(value.TTL) != value.ExpiresAt || value.Demand.Environments != 1 || !safeID.MatchString(value.CapacityReceipt.ID) || !digestPattern.MatchString(value.CapacityReceipt.Digest) {
+			return &Error{Category: CategoryIntegrity, Operation: "record_capacity"}
+		}
+		if value.LifecycleHandle != "" && (!digestPattern.MatchString(value.CapacityEnvironmentDigest) || !digestPattern.MatchString(value.CapacityResourceDigest)) {
+			return &Error{Category: CategoryIntegrity, Operation: "record_capacity_identity"}
+		}
+	} else if value.ProjectID != "" || !value.CreatedAt.IsZero() || !value.ExpiresAt.IsZero() || value.TTL != 0 || value.Demand != (ResourceDemand{}) || value.CapacityReceipt != (CapacityReceipt{}) {
+		return &Error{Category: CategoryIntegrity, Operation: "record_capacity"}
+	}
 	hasLifecycle := value.LifecycleHandle != "" && safeID.MatchString(value.EnvironmentID) && digestPattern.MatchString(value.LifecycleDigest) && digestPattern.MatchString(value.ReleaseKey)
 	hasTarget := value.Target.Version != ""
 	if value.LifecycleHandle != "" && !hasLifecycle {
