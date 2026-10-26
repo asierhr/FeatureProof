@@ -3913,3 +3913,9 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - El spec author produjo `specs/kubernetes-environment/{requirements,design,tasks}.md` sin modificar código ni tests.
 - La revisión del leader confirma 15 requirements verificables, 15 tasks trazables, separación de fallos operacionales y límites explícitos respecto a las features 33–36.
 - `kubernetes-environment` pasa de `pending` a `spec_ready`; la implementación queda detenida hasta aprobación humana explícita.
+
+## Feature 32 — implementación autorizada (2026-10-26)
+
+- El usuario aprobó explícitamente la especificación; la aprobación queda registrada en `requirements.md`.
+- `kubernetes-environment` pasa de `spec_ready` a `in_progress`.
+- Se delega T1–T15 al agente implementador, incluyendo tests herméticos, trazabilidad, cobertura del diff y gates multiplataforma.

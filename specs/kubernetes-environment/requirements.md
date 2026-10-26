@@ -388,9 +388,9 @@ del cliente oficial de Kubernetes sin convertir sus DTOs en contratos internos.
 ## Aprobación humana
 
 ```yaml
-status: pending
-approved_by:
-approved_at:
+status: approved
+approved_by: user
+approved_at: 2026-10-26T08:32:56+01:00
 ```
 
 La implementación no puede comenzar hasta aprobación humana explícita y cambio
