@@ -4042,6 +4042,21 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Coverage focal exacta del paquete nuevo: `734/854 = 85,94847775175644 %`, superior al 85 % sin redondear.
 - `kubernetes-validation-tool` pasa de `in_progress` a `done`; queda commit y push de la rama de feature.
 
+## Feature 34 — especificación iniciada (2026-10-26)
+
+- Seleccionada únicamente `environment-cleanup-controller` (ID 34), en estado `pending` y con SDD obligatorio.
+- No existe otra feature `in_progress`; los ocho criterios de aceptación cubren lifecycle durable, ownership, cuotas, retries, auditoría y concurrencia.
+- Creada la rama `feature-34-environment-cleanup-controller` desde feature 33 para conservar el estado acumulado y reutilizar los contratos durables de entorno y Kubernetes ya aprobados.
+- Se delega al `spec_author` la definición de requirements, diseño y tasks; no se escribirá código ni tests antes de aprobación humana.
+
+## Feature 34 — especificación preparada (2026-10-26)
+
+- El `spec_author` produjo `requirements.md`, `design.md` y `tasks.md` en `specs/environment-cleanup-controller/`.
+- La revisión del leader confirma 15 requirements y 16 tareas trazables para intents durables, expiración, huérfanos, cuotas, leases/CAS, retries, auditoría, cancelación e inventario Kubernetes UID-safe.
+- Se reforzó la frontera destructiva: un lifecycle conocido exige un `LifecycleCleanupBinding` integral sellado; adquisiciones inciertas solo admiten Reconcile y nunca resuelven autoridad desde un `RunID` aislado.
+- PostgreSQL, colas, workers, configuración versionada y tenant/RBAC permanecen fuera de alcance para las features 35–37.
+- `environment-cleanup-controller` pasa de `pending` a `spec_ready`; la implementación queda pausada hasta aprobación humana explícita.
+
 ## Feature 33 — implementación funcional preparada para gates (2026-10-26)
 
 - Implementadas T1–T10 en `internal/tools/kubernetes`: catálogo y autoridad sellados, input cerrado, snapshots/versiones, seis checks read-only, límites, redacción y adapter `client-go` sobre un puerto consumidor sin Secrets ni mutaciones.

@@ -612,7 +612,7 @@
           "Dos controladores concurrentes coordinan ownership mediante leases o CAS y no limpian dos veces ni pierden un entorno entre handoffs",
           "Los tests usan reloj y provider falsos para cubrir TTL, restart, cancelación, huérfano, retry, conflicto de ownership, límites y convergencia"
         ],
-        "status": "pending"
+        "status": "spec_ready"
     },
     {
         "id": 35,
