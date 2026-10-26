@@ -578,7 +578,7 @@
           "Cancelar o finalizar el run registra una intención durable de limpieza aunque el proceso principal se interrumpa",
           "Los tests usan un cliente Kubernetes falso o un entorno hermético controlado y cubren creación, aislamiento, límites, readiness, timeout, cancelación, atestación y secretos"
         ],
-        "status": "pending"
+        "status": "spec_ready"
     },
     {
         "id": 33,

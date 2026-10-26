@@ -3900,3 +3900,16 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Gates independientes: global normal repetido/serial, global race serial, matriz contractual normal ×30/race ×20, Linux 5/5 repetido y cross-builds 9/9.
 - Cobertura fresca exacta y toolchain-pinned del diff productivo: `1182/1384 = 85,404624 %`.
 - Feature 31 marcada `done`; queda commit y push de `feature-31-environment-provider`.
+
+## Feature 32 — especificación iniciada (2026-10-26)
+
+- Seleccionada únicamente `kubernetes-environment` (ID 32), en estado `pending` y con SDD obligatorio.
+- No existe otra feature `in_progress`; los criterios de aceptación son suficientes para iniciar la especificación.
+- Creada la rama `feature-32-kubernetes-environment` desde la feature 31 terminada, porque el provider de Kubernetes implementará su contrato `EnvironmentProvider`.
+- Se delega la redacción de `requirements.md`, `design.md` y `tasks.md` al agente `spec_author`; no se escribirá código ni tests antes de la aprobación humana.
+
+## Feature 32 — especificación preparada (2026-10-26)
+
+- El spec author produjo `specs/kubernetes-environment/{requirements,design,tasks}.md` sin modificar código ni tests.
+- La revisión del leader confirma 15 requirements verificables, 15 tasks trazables, separación de fallos operacionales y límites explícitos respecto a las features 33–36.
+- `kubernetes-environment` pasa de `pending` a `spec_ready`; la implementación queda detenida hasta aprobación humana explícita.
