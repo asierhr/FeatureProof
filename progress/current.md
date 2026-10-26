@@ -4057,6 +4057,12 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - PostgreSQL, colas, workers, configuración versionada y tenant/RBAC permanecen fuera de alcance para las features 35–37.
 - `environment-cleanup-controller` pasa de `pending` a `spec_ready`; la implementación queda pausada hasta aprobación humana explícita.
 
+## Feature 34 — implementación autorizada (2026-10-26)
+
+- El usuario aprobó explícitamente la especificación al solicitar continuar con la implementación.
+- Registrada la aprobación en `requirements.md` con timestamp `2026-10-26T15:47:25+01:00`.
+- `environment-cleanup-controller` pasa de `spec_ready` a `in_progress`; se delegan T1–T16 al implementer especializado.
+
 ## Feature 33 — implementación funcional preparada para gates (2026-10-26)
 
 - Implementadas T1–T10 en `internal/tools/kubernetes`: catálogo y autoridad sellados, input cerrado, snapshots/versiones, seis checks read-only, límites, redacción y adapter `client-go` sobre un puerto consumidor sin Secrets ni mutaciones.

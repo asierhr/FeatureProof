@@ -409,8 +409,8 @@ composition-owned obligatoria, no defaults del controller.
 ## Aprobación humana
 
 ```yaml
-approved_by: null
-approved_at: null
+approved_by: user
+approved_at: 2026-10-26T15:47:25+01:00
 ```
 
 La implementación no puede comenzar hasta aprobación humana explícita y cambio
