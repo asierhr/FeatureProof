@@ -385,8 +385,8 @@ obligatoria de composición y no defaults de esta feature.
 ## Aprobación humana
 
 ```yaml
-approved_by: null
-approved_at: null
+approved_by: user
+approved_at: 2026-10-26T12:59:16+01:00
 ```
 
 La spec no autoriza implementación hasta que una persona complete este bloque y

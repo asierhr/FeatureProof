@@ -4011,6 +4011,12 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - La spec mantiene fuera de alcance provisioning, cleanup, control plane, operaciones mutables, Secrets, exec, logs, watches y probes activos de red.
 - `kubernetes-validation-tool` pasa de `pending` a `spec_ready`; la implementación queda pausada hasta recibir aprobación humana explícita.
 
+## Feature 33 — implementación autorizada (2026-10-26)
+
+- El usuario aprobó explícitamente la especificación al solicitar continuar con la implementación.
+- Registrada la aprobación en `requirements.md` con timestamp `2026-10-26T12:59:16+01:00`.
+- `kubernetes-validation-tool` pasa de `spec_ready` a `in_progress`; se delegan T1–T11 al implementer especializado.
+
 ## Feature 32 — remediación 2 finalizada tras registro de rechazo (2026-10-26)
 
 - La implementación y evidencia posteriores al rechazo cierran REV-4, REV-5, REV-8, REV-9 y REV-10; el detalle trazable está en `progress/kubernetes-environment/implementation.md`.
