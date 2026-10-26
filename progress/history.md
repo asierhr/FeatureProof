@@ -698,3 +698,16 @@ Bitácora append-only de features completadas.
 - Tasks T1–T16 completas; R1–R15 y hallazgos de seis revisiones trazados en `progress/environment-provider/{implementation,review}.md`.
 - Review independiente aprobada en la sexta revisión. Pasan global normal repetido/serial, global race, matriz contractual ×30/race ×20, Linux 5/5 repetido y cross-builds 9/9.
 - Cobertura statement-weighted multiplataforma con Go 1.25.1 y manifests autenticados: `1182/1384 = 85,404624 %`.
+
+## 2026-10-26 — kubernetes-environment
+
+- Estado final: `done`.
+- Resultado: `KubernetesProvider` productivo sobre `client-go` crea un namespace aislado por run desde catálogo privado, plantilla versionada e imagen OCI canónica por digest, sin manifests, comandos ni autoridad Kubernetes aportada por caller o modelo.
+- Seguridad: Pod Security, ResourceQuota, LimitRange, service account sin token y NetworkPolicy deny-by-default se verifican antes del workload; readbacks de Deployment, Pod, Service, EndpointSlice, quota y policy son fail-closed.
+- Lifecycle: Acquire/Reconcile convergen tras respuestas inciertas; readiness y atestación ligan namespace UID, repo, commit, imagen/imageID y endpoint; Release usa precondición UID y digest lifecycle exacto.
+- Integración: planning, runner y functional-flow consumen únicamente el target adquirido/revalidado. La autoridad HTTP se revierte si la admisión no persiste, se conserva durante fallos reintentables y se libera idempotentemente solo después del terminal durable.
+- Secretos: credenciales y bundles se resuelven en composición, se ligan a la selección neutral y no cruzan modelo, evidencias, handles, eventos ni reportes.
+- Spec aprobada por el usuario el `2026-10-26T08:32:56+01:00`.
+- Tasks T1–T15 completas; R1–R15 y REV-1–REV-10 trazados en `progress/kubernetes-environment/{implementation,review}.md`.
+- Review independiente aprobada en la cuarta revisión. Pasan smoke del leader, global normal/race, Kubernetes race ×20, focales repetidos, cross-builds 9/9 y runtime Alpine 3/3.
+- Cobertura statement-weighted exacta del diff productivo con Go 1.25.1: `1005/1155 = 87,012987 %`.

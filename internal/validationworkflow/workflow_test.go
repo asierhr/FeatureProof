@@ -12,6 +12,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -405,10 +406,32 @@ type fakePreview struct {
 	mu                     sync.Mutex
 	digest, alias          string
 	repository, commit     string
+	directURL              string
 	acquires, releases     int
 	revalidations          int
 	acquireErr, releaseErr error
 	revalidate             func(int, EnvironmentBinding) EnvironmentBinding
+}
+
+// recordingTargetPlanningBinder captures every endpoint used to rebuild planner authority after acquisition.
+type recordingTargetPlanningBinder struct {
+	mu      sync.Mutex
+	targets []TargetContext
+}
+
+// Bind records the exact acquired target and returns the existing closed test capability.
+func (b *recordingTargetPlanningBinder) Bind(_ context.Context, target TargetContext) ([]agentplanning.CapabilityDescriptor, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.targets = append(b.targets, canonicalBindingContext(BindingContext{Target: target}).Target)
+	return append([]agentplanning.CapabilityDescriptor(nil), validSnapshot().Generation.Capabilities...), nil
+}
+
+// observedTargets returns a detached planner-target history for assertions.
+func (b *recordingTargetPlanningBinder) observedTargets() []TargetContext {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]TargetContext(nil), b.targets...)
 }
 
 // lifecycleEnvironmentStub programs the provider-neutral lifecycle adapter without provider or network effects.
@@ -504,7 +527,12 @@ func (f *fakePreview) binding() EnvironmentBinding {
 
 // directBinding builds the configured direct target for the exact admitted repository revision.
 func (f *fakePreview) directBinding(command StartCommand) EnvironmentBinding {
-	return EnvironmentBinding{Target: TargetContext{Kind: "direct", Alias: f.alias, URL: "https://target.example/", EnvironmentID: "environment-1", Attestation: AttestationContext{EnvironmentID: "environment-1", RepositoryID: command.RepositoryID, CommitOID: command.Revision, Reference: "proof-1", ValidUntil: time.Unix(10000, 0).UTC(), Verified: true}, Network: NetworkContext{PolicyID: "network-1", Schemes: []string{"https"}, Hosts: []string{"target.example"}, Ports: []int{443}, BasePaths: []string{"/"}, MaxURLBytes: 2048}}}
+	targetURL := f.directURL
+	if targetURL == "" {
+		targetURL = "https://target.example/"
+	}
+	host := strings.TrimSuffix(strings.TrimPrefix(targetURL, "https://"), "/")
+	return EnvironmentBinding{Target: TargetContext{Kind: "direct", Alias: f.alias, URL: targetURL, EnvironmentID: "environment-1", Attestation: AttestationContext{EnvironmentID: "environment-1", RepositoryID: command.RepositoryID, CommitOID: command.Revision, Reference: "proof-1", ValidUntil: time.Unix(10000, 0).UTC(), Verified: true}, Network: NetworkContext{PolicyID: "network-1", Schemes: []string{"https"}, Hosts: []string{host}, Ports: []int{443}, BasePaths: []string{"/"}, MaxURLBytes: 2048}}}
 }
 
 // expectedDigest derives the fake preview identity from the same complete projection as production.
@@ -756,6 +784,26 @@ func TestStartRequiresEveryExplicitSelectionAndPreservesPreAdmissionBoundary(t *
 	view, err := service.Start(context.Background(), command)
 	if !IsCode(err, CodeInvalid) || view.Handle != "" || admission.callCount() != 0 || execution.callCount() != 0 {
 		t.Fatalf("pre-admission boundary crossed: %#v %v", view, err)
+	}
+}
+
+// TestPlanningAuthorityIsRebuiltOnlyFromAcquiredTarget proves provisional admission URLs never reach model generation.
+func TestPlanningAuthorityIsRebuiltOnlyFromAcquiredTarget(t *testing.T) {
+	service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+	service.deps.Environment.(*fakePreview).directURL = "https://acquired.example/"
+	binder := &recordingTargetPlanningBinder{}
+	service.deps.TargetPlanning = binder
+	if _, err := service.Start(context.Background(), validCommand()); err != nil {
+		t.Fatal(err)
+	}
+	targets := binder.observedTargets()
+	if len(targets) == 0 {
+		t.Fatal("planning target was not rebound after acquisition")
+	}
+	for _, target := range targets {
+		if target.URL != "https://acquired.example/" || target.EnvironmentID != "environment-1" {
+			t.Fatalf("planner received provisional authority: %#v", target)
+		}
 	}
 }
 
@@ -2818,11 +2866,15 @@ func TestPreviewReleasePendingRecovers(t *testing.T) {
 
 // TestAuthorizedGeneratedPlanUsesExistingRunnerAndPackage executes a generated plan through the historical runner and verified package reader.
 func TestAuthorizedGeneratedPlanUsesExistingRunnerAndPackage(t *testing.T) {
+	var acquiredHits, configuredHits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		acquiredHits.Add(1)
 		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write([]byte(`{"ok":true}`))
 	}))
 	defer server.Close()
+	configured := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { configuredHits.Add(1) }))
+	defer configured.Close()
 	root := t.TempDir()
 	method, path := "GET", "/"
 	plan := planning.ValidationPlan{
@@ -2847,12 +2899,21 @@ func TestAuthorizedGeneratedPlanUsesExistingRunnerAndPackage(t *testing.T) {
 	deps.SafeProjector = testSafeProjector{}
 	runtimeDigest := strings.Repeat("5", 64)
 	commitmentKey := []byte(strings.Repeat("k", 32))
-	port := LocalExecutionPort{Configurations: map[string]LocalRunnerConfiguration{runtimeDigest: {Digest: runtimeDigest, Request: localvalidation.PreparedRequest{Specification: spec, Runtime: manifest, Target: server.URL, RepositoryID: "repo", Revision: "main", EnvironmentID: "preview"}, Dependencies: deps}}}
+	port := LocalExecutionPort{Configurations: map[string]LocalRunnerConfiguration{runtimeDigest: {Digest: runtimeDigest, Request: localvalidation.PreparedRequest{Specification: spec, Runtime: manifest, Target: configured.URL, RepositoryID: "repo", Revision: "main", EnvironmentID: "preview"}, Dependencies: deps}}}
+	target := TargetContext{Kind: "direct", Alias: "target", URL: server.URL, EnvironmentID: "preview", Attestation: AttestationContext{EnvironmentID: "preview", RepositoryID: "repo", CommitOID: commit, Reference: "proof", ValidUntil: time.Now().Add(time.Hour), Verified: true}, Network: NetworkContext{PolicyID: "network", Schemes: []string{"http"}, Hosts: []string{"127.0.0.1"}, Ports: []int{server.Listener.Addr().(*net.TCPAddr).Port}, BasePaths: []string{"/"}, MaxURLBytes: 2048}}
+	targetDigest, targetDigestErr := TargetContextDigest(target)
+	if targetDigestErr != nil {
+		t.Fatal(targetDigestErr)
+	}
+	executionSnapshot := AdmissionSnapshot{RuntimeDigest: runtimeDigest, TargetDigest: targetDigest, Binding: BindingContext{Revision: RevisionContext{RepositoryID: "repo", CommitOID: commit}, Target: target}}
 	artifact := PlanArtifact{Version: ArtifactVersion, WorkflowID: "workflow-vertical", PlanID: "generated", Provider: "fake", Model: "selected", PromptVersion: "v1", ProtocolVersion: "v1", Plans: localvalidation.ProjectPlans([]planning.ValidationPlan{plan}, commitmentKey), ContextDigest: strings.Repeat("1", 64), RevisionDigest: strings.Repeat("2", 64), TargetDigest: strings.Repeat("3", 64), RuntimeDigest: runtimeDigest, ContextInstructionsHash: strings.Repeat("5", 64)}
 	artifact.ArtifactSHA256, _ = artifactDigest(artifact)
-	preparation, err := port.Execute(context.Background(), ExecutionRequest{Handle: "workflow-vertical", Plans: []planning.ValidationPlan{plan}, Snapshot: AdmissionSnapshot{RuntimeDigest: runtimeDigest}, ArtifactSHA256: artifact.ArtifactSHA256, CommitmentKey: commitmentKey})
+	preparation, err := port.Execute(context.Background(), ExecutionRequest{Handle: "workflow-vertical", Plans: []planning.ValidationPlan{plan}, Snapshot: executionSnapshot, ArtifactSHA256: artifact.ArtifactSHA256, CommitmentKey: commitmentKey})
 	if err != nil {
 		t.Fatalf("%v: %s", err, diagnostic.String())
+	}
+	if acquiredHits.Load() != 1 || configuredHits.Load() != 0 {
+		t.Fatalf("execution did not use acquired target exclusively: acquired=%d configured=%d", acquiredHits.Load(), configuredHits.Load())
 	}
 	if _, statErr := os.Stat(preparation.StagedDir); statErr != nil {
 		t.Fatalf("private runner bundle missing before promotion: %v", statErr)
@@ -2860,7 +2921,7 @@ func TestAuthorizedGeneratedPlanUsesExistingRunnerAndPackage(t *testing.T) {
 	if _, statErr := os.Stat(preparation.FinalDir); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("runner bundle visible before environment checkpoint: %v", statErr)
 	}
-	repeated, repeatErr := port.Execute(context.Background(), ExecutionRequest{Handle: "workflow-vertical", Plans: []planning.ValidationPlan{plan}, Snapshot: AdmissionSnapshot{RuntimeDigest: runtimeDigest}, ArtifactSHA256: artifact.ArtifactSHA256, CommitmentKey: commitmentKey})
+	repeated, repeatErr := port.Execute(context.Background(), ExecutionRequest{Handle: "workflow-vertical", Plans: []planning.ValidationPlan{plan}, Snapshot: executionSnapshot, ArtifactSHA256: artifact.ArtifactSHA256, CommitmentKey: commitmentKey})
 	if repeatErr != nil || repeated != preparation {
 		t.Fatalf("private runner redelivery diverged: %#v %v", repeated, repeatErr)
 	}

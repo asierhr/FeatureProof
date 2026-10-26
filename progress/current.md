@@ -3919,3 +3919,99 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - El usuario aprobó explícitamente la especificación; la aprobación queda registrada en `requirements.md`.
 - `kubernetes-environment` pasa de `spec_ready` a `in_progress`.
 - Se delega T1–T15 al agente implementador, incluyendo tests herméticos, trazabilidad, cobertura del diff y gates multiplataforma.
+
+## Feature 32 — review 1 rechazada (2026-10-26)
+
+- La revisión independiente confirmó que los gates existentes pasan, pero rechazó la entrega por ocho hallazgos materiales en R1, R3–R10 y R12–R15.
+- Los bloqueos cubren composición productiva inaccesible, ejecución HTTP desligada del target adquirido, readback fail-open de Deployment/NetworkPolicy/Service/Quota, Pods/endpoints no exactos, autoridad de secretos, lifecycle digest y canonicalidad OCI.
+- La feature permanece `in_progress`; los hallazgos completos están en `progress/kubernetes-environment/review.md` y vuelven al implementador con tests adversarios obligatorios.
+
+## Feature 32 — implementación en curso (2026-10-26)
+
+- Contratos de feature 31 y fuentes oficiales Kubernetes contrastados: namespaces no bastan como aislamiento, quota/LimitRange requieren recursos explícitos, EndpointSlice aporta readiness y client-go se fijará con versión compatible.
+- Se implementará `internal/environment/kubernetes` con catálogo sellado, DTOs cerrados, puerto `ClusterClient`, provider idempotente, readiness/atestación y release UID-safe.
+- Los tests usarán un cliente hermético; ninguna suite contactará un cluster, registry, DNS o red externa.
+
+## Feature 32 — vertical Kubernetes implementada (2026-10-26)
+
+- Añadido `internal/environment/kubernetes`: catálogo privado sellado, renderer cerrado, `ClusterClient`, cliente oficial `client-go` v0.35.9, reconciliación create-or-get, readiness completa, atestación y release UID-safe.
+- Namespace, Pod Security, quota, LimitRange, service account sin token y NetworkPolicy default-deny se confirman antes de Secret, Deployment y Service.
+- Credenciales de cluster solo entran mediante `rest.Config` explícito; secretos de aplicación/image-pull se comparan dentro del transporte y nunca vuelven en observaciones, errores o estado durable.
+- La composición CLI admite únicamente el provider gestionado exacto `kubernetes@v1` inyectado con catálogo, transporte, bundles y límites explícitos; no usa kubeconfig, variables de entorno ni fallback.
+- Tests herméticos cubren aislamiento, orden seguro, drift, pérdidas de respuesta en cada create/delete, readiness, imageID, endpoint, secretos, cancelación, concurrencia y el contrato neutral de feature 31.
+
+## Feature 32 — implementación preparada para review (2026-10-26)
+
+- T1–T15 quedan completas tras evidencia real y trazabilidad R1–R15 en `progress/kubernetes-environment/implementation.md`; `feature_list.json` permanece intacto.
+- Pasan Go 1.25.1: formato, diff-check, módulos, vet, compile-only, focales ×10, suite global serial, race focal ×20, race de composición y race global serial con UCRT64.
+- Coverage exacta fresca del diff productivo: `747/872 = 85,665138 %`, autenticada contra base `a7b4a98` y toolchain `go1.25.1 windows/amd64`.
+- Pasan cross-builds Windows/Linux/Darwin 9/9 y runtime real Alpine 3.22.2 para Kubernetes ×3 y CLI; rootfs, binarios, cross-builds y distro efímera fueron eliminados.
+- Auditorías de secretos, canarios, operaciones prohibidas, scope y comentarios sistémicos pasan; no queda ningún temporal creado por feature 32.
+
+## Feature 32 — remediación de review 1 iniciada (2026-10-26)
+
+- La review independiente rechazó la entrega con REV-1–REV-8: composición productiva incompleta, target adquirido no autoritativo para HTTP, readbacks reducidos, conjuntos de readiness permisivos, secretos neutrales no ligados, lifecycle digest no autenticado e imagen OCI no canónica.
+- Se reabren T1 y T3–T15; T2 conserva evidencia porque el puerto cerrado y el fake no son el origen de ningún hallazgo.
+- La remediación cerrará cada frontera con tests adversarios del fake y cliente oficial antes de repetir coverage exacta, focal/global/race, Linux, cross-builds y limpieza.
+
+## Feature 32 — remediación de review 1 preparada para nueva review (2026-10-26)
+
+- REV-1–REV-8 quedan corregidos con composición real desde `main`, target adquirido como única autoridad HTTP también para functional-flow, readback API completo, readiness de conjuntos exactos, autoridad de secretos/lifecycle y parsing OCI canónico.
+- Los adversarios del cliente oficial y fake cubren widening en adopción y Observe, Pods/EndpointSlices ajenos, selección secreta inconsistente y lifecycle sustituido antes de I/O.
+- T1 y T3–T15 se cierran nuevamente solo tras gates frescos; T2 conservó su evidencia y no fue modificada conceptualmente.
+- Pasan formato, diff-check, módulos, vet, compile-only, focales ×10, global serial, global race serial UCRT64, cross-builds 9/9 y tres binarios Linux reales sobre Alpine 3.22.2 autenticado.
+- Coverage exacta del diff productivo completo, incluidas las fronteras de workflow: `970/1120 = 86,607143 %`; `feature_list.json` permanece intacto.
+- Se eliminaron rootfs, distro WSL, binarios Linux, cross-builds y profiles temporales; no quedan procesos de gate, temporales ni distros registrados.
+
+## Feature 32 — remediación de review 2 iniciada (2026-10-26)
+
+- La segunda review confirma cerrados REV-1, REV-2, REV-3, REV-6 y REV-7, y mantiene abiertos REV-4, REV-5 y REV-8 junto con los nuevos REV-9 y REV-10.
+- Se reabren T1, T3, T5, T7–T10 y T13–T15; las demás tareas conservan evidencia independiente no afectada.
+- La remediación cerrará toda la forma Service/EndpointSlice, la matriz adversaria oficial+fake de policy/workload, la exclusión `tag@digest` y la liberación terminal acotada del proxy functional-flow antes de repetir gates.
+
+## Feature 32 — remediación de review 2 preparada para review 3 (2026-10-26)
+
+- REV-4/5/8/9/10 quedan cerrados: ServiceSpec completo salvo defaults API enumerados, puerto/TargetRef EndpointSlice exactos, exclusión `tag@digest`, matriz adversaria oficial+fake completa y unbind terminal idempotente del proxy.
+- Los tests de `LimitRange` alteran type, listas, resource keys y ratio; Observe fake incluye LimitRange y Pod `ClosedShape=false`; 128 runs functional-flow prueban retención en fallo reintentable y cardinalidad cero al finalizar.
+- T1, T3, T5, T7–T10 y T13–T15 se cierran nuevamente únicamente tras gates frescos; las restantes conservan evidencia no afectada.
+- Pasan focales ×10, suite global serial, race Kubernetes ×20 y race global serial UCRT64, cross-builds 9/9 y tres binarios Linux reales sobre Alpine 3.22.2 autenticado.
+- Coverage exacta fresca del diff productivo: `991/1138 = 87,082601 %`; `feature_list.json` permanece intacto y no quedan procesos, distro, binarios, profiles ni directorios temporales.
+
+## Feature 32 — review 2 rechazada (2026-10-26)
+
+- La segunda review cerró REV-1, REV-2, REV-3, REV-6 y REV-7, pero mantuvo abiertos REV-4, REV-5 y REV-8 y añadió REV-9/REV-10.
+- Quedan por cerrar la forma completa de Service/EndpointSlice/LimitRange/Pod, el rechazo `tag@digest`, la matriz adversaria en adopción/Observe y la liberación acotada del tool functional-flow por run.
+- La feature permanece `in_progress`; los hallazgos vuelven al implementador con tests que deben fallar si se elimina cada garantía.
+
+## Feature 32 — review 3 rechazada (2026-10-26)
+
+- La tercera review confirmó cerrados REV-4, REV-5, REV-8 y REV-9; permanece únicamente REV-10.
+- El unbind del tool functional-flow debe ocurrir después del terminal durable real, cubrir integrity y rollback de admisión no persistida, y conservarse durante fallos reintentables.
+- La feature continúa `in_progress`; se exige una prueba vertical sobre `validationworkflow.Service`, no solo sobre el wrapper del entrypoint.
+
+## Feature 32 — cierre aprobado (2026-10-26)
+
+- La cuarta revisión independiente aprobó R1–R15, T1–T15 y el cierre de REV-1–REV-10 sin hallazgos accionables.
+- El smoke final del leader pasó en `internal/environment/kubernetes`, `internal/validationworkflow` y `cmd/featureproof`; `git diff --check` también pasó.
+- Gates finales: global normal/race, Kubernetes race ×20, focales repetidos, cross-builds 9/9 y runtime Alpine 3/3.
+- Coverage exacta fresca del diff productivo: `1005/1155 = 87,012987 %`.
+- `kubernetes-environment` pasa de `in_progress` a `done`; queda commit y push de la rama de feature.
+
+## Feature 32 — remediación 2 finalizada tras registro de rechazo (2026-10-26)
+
+- La implementación y evidencia posteriores al rechazo cierran REV-4, REV-5, REV-8, REV-9 y REV-10; el detalle trazable está en `progress/kubernetes-environment/implementation.md`.
+- Los gates finales auténticos permanecen verdes sobre el estado entregado: focales repetidos, global normal/race, coverage exacta `991/1138 = 87,082601 %`, cross-builds 9/9 y Linux 3/3.
+- T1–T15 quedan cerradas con evidencia real, `feature_list.json` intacto y workspace sin procesos ni temporales de verificación.
+
+## 2026-10-26 - Kubernetes environment: inicio de remediación 3
+
+- La review 3 conserva cerrados REV-1–REV-9 y reabre exclusivamente REV-10.
+- Se reabren T8, T13, T14 y T15 hasta demostrar con tests verticales que la autoridad HTTP funcional se libera solo tras un terminal durable, se revierte tras una admisión no persistida y permanece durante todos los fallos reintentables previos.
+- La corrección se limita al ownership application-level del lifecycle; no modifica las garantías Kubernetes ya aprobadas ni `feature_list.json`.
+
+## 2026-10-26 - Kubernetes environment: remediación 3 preparada para review 4
+
+- REV-10 queda cerrado en la frontera real de `validationworkflow.Service`: rollback tras admisión no persistida y confirmación de liberación solo después del `SaveOwned` terminal exitoso, también para integrity.
+- Tests verticales prueban Finalize fallido, persistencia posterior fallida, cleanup fallido, terminal integrity sin Finalize, redelivery idempotente y 128 runs con cardinalidad final cero.
+- T8 y T13–T15 se cierran nuevamente solo tras gates frescos: focales x10, global serial, race Kubernetes x20 y global UCRT64, coverage exacta `1005/1155 = 87,012987 %`, cross-builds 9/9 y tres binarios Linux reales sobre Alpine 3.22.2 autenticado.
+- `feature_list.json` permanece intacto; la distro WSL, rootfs, binarios, cross-builds y directorios temporales se eliminaron y no quedan procesos Go de los gates.

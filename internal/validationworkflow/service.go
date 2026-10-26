@@ -47,6 +47,8 @@ type Dependencies struct {
 	Memory          ProjectMemoryPort
 	MemoryObserver  ProjectMemoryObservationPort
 	Context         ContextAssemblyPort
+	TargetPlanning  TargetPlanningBinder
+	FlowAuthority   FunctionalFlowAuthorityLifecyclePort
 }
 
 // ProjectMemorySelection is the trusted planning projection and its exact historical seal.
@@ -65,6 +67,17 @@ type ProjectMemoryPort interface {
 // ProjectMemoryObservationPort converts only a verified terminal package into an idempotent observation.
 type ProjectMemoryObservationPort interface {
 	ObserveTerminal(context.Context, PackageProjection, string, string, string) error
+}
+
+// TargetPlanningBinder rebuilds planner-visible capabilities from the acquired target immediately before generation or recovery.
+type TargetPlanningBinder interface {
+	Bind(context.Context, TargetContext) ([]agentplanning.CapabilityDescriptor, error)
+}
+
+// FunctionalFlowAuthorityLifecyclePort lets application composition discard target-bound execution authority after rollback or confirmed durable terminal state.
+type FunctionalFlowAuthorityLifecyclePort interface {
+	RollbackAdmission(string)
+	ConfirmTerminal(string)
 }
 
 // Service is the shared application case use behind API, CLI, MCP and GitHub adapters.
@@ -135,6 +148,9 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		return WorkflowView{}, err
 	}
 	if !created {
+		if record.Phase == PhaseTerminal && record.FunctionalFlowAdmitted && s.deps.FlowAuthority != nil {
+			s.deps.FlowAuthority.ConfirmTerminal(record.Handle)
+		}
 		return viewOf(record), nil
 	}
 	workCtx, worker, err := s.beginWork(ctx, handle)
@@ -163,6 +179,9 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	}
 	snapshot.Binding.Target = canonicalBindingContext(BindingContext{Target: environment.Target}).Target
 	snapshot.TargetDigest = environmentDigest
+	if err = s.bindTargetPlanning(workCtx, &snapshot); err != nil {
+		return WorkflowView{}, err
+	}
 	record.EnvironmentDigest = environmentDigest
 	snapshot.Generation.RunID, snapshot.Generation.PlanID = handle, handle+"-plan"
 	if s.deps.Context != nil && command.FunctionalFlow == nil {
@@ -202,7 +221,7 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		if !ok || s.deps.FunctionalFlow == nil {
 			generationErr = &Error{Code: CodeInvalid, Operation: "provided_flow_preparation"}
 		} else {
-			flow, inspectErr := s.deps.FunctionalFlow.InspectProvided(workCtx, ExecutionRequest{Handle: handle, FunctionalFlow: cloneFunctionalFlowSelection(command.FunctionalFlow)})
+			flow, inspectErr := s.deps.FunctionalFlow.InspectProvided(workCtx, ExecutionRequest{Handle: handle, Snapshot: snapshot.Clone(), FunctionalFlow: cloneFunctionalFlowSelection(command.FunctionalFlow)})
 			if inspectErr != nil {
 				generationErr = inspectErr
 			} else {
@@ -309,10 +328,14 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		record.FunctionalFlowAdmitted = true
 		record.FunctionalFlowApproval = cloneApprovalFlow(&flowApproval)
 	}
-	record, err = s.transition(workCtx, record, PhasePlanReady, "plan_artifact_committed", artifact.ArtifactSHA256)
-	if err != nil {
-		return WorkflowView{}, err
+	updatedRecord, transitionErr := s.transition(workCtx, record, PhasePlanReady, "plan_artifact_committed", artifact.ArtifactSHA256)
+	if transitionErr != nil {
+		if record.FunctionalFlowAdmitted && s.deps.FlowAuthority != nil {
+			s.deps.FlowAuthority.RollbackAdmission(record.Handle)
+		}
+		return WorkflowView{}, transitionErr
 	}
+	record = updatedRecord
 	if command.Approval == ApprovalRequired {
 		if err = s.checkpointMemory(workCtx, command); err != nil {
 			return WorkflowView{}, err
@@ -380,6 +403,9 @@ func (s *Service) revalidateGeneratedPlan(ctx context.Context, command StartComm
 	}
 	current.Binding.Target = canonicalBindingContext(BindingContext{Target: environment.Target}).Target
 	current.TargetDigest = environmentDigest
+	if err = s.bindTargetPlanning(ctx, &current); err != nil {
+		return &Error{Code: CodeConflict, Operation: "environment_drift"}
+	}
 	currentContextDigest, currentContextErr := canonicalContextDigest(current)
 	expectedContextDigest, expectedContextErr := canonicalContextDigest(expected)
 	unchanged := currentContextErr == nil && expectedContextErr == nil && currentContextDigest == expectedContextDigest && current.SpecificationDigest == expected.SpecificationDigest && current.ContractDigest == expected.ContractDigest && current.CatalogDigest == expected.CatalogDigest && current.ContractPolicyDigest == expected.ContractPolicyDigest && current.RevisionDigest == expected.RevisionDigest && current.RuntimeDigest == expected.RuntimeDigest && current.Provider == expected.Provider && current.Model == expected.Model
@@ -994,6 +1020,9 @@ func (s *Service) restorePrepared(ctx context.Context, record Record) (Admission
 	}
 	snapshot.Binding.Target = canonicalBindingContext(BindingContext{Target: environment.Target}).Target
 	snapshot.TargetDigest = digest
+	if err = s.bindTargetPlanning(ctx, &snapshot); err != nil {
+		return AdmissionSnapshot{}, agentplanning.PreparedPlan{}, &Error{Code: CodeConflict, Operation: "environment_restore"}
+	}
 	snapshot.Generation.RunID, snapshot.Generation.PlanID = record.Handle, record.Handle+"-plan"
 	if s.deps.Context != nil && record.Command.FunctionalFlow == nil {
 		selection, contextErr := s.deps.Context.Prepare(ctx, record.Handle, snapshot.Clone(), record.Command)
@@ -1023,6 +1052,19 @@ func (s *Service) restorePrepared(ctx context.Context, record Record) (Admission
 		return AdmissionSnapshot{}, agentplanning.PreparedPlan{}, err
 	}
 	return snapshot, prepared, nil
+}
+
+// bindTargetPlanning replaces provisional admission capabilities with descriptors validated against the acquired endpoint.
+func (s *Service) bindTargetPlanning(ctx context.Context, snapshot *AdmissionSnapshot) error {
+	if s.deps.TargetPlanning == nil {
+		return nil
+	}
+	capabilities, err := s.deps.TargetPlanning.Bind(ctx, snapshot.Binding.Target)
+	if err != nil || len(capabilities) == 0 {
+		return &Error{Code: CodeInvalid, Operation: "target_planning"}
+	}
+	snapshot.Generation.Capabilities = append([]agentplanning.CapabilityDescriptor(nil), capabilities...)
+	return nil
 }
 
 // validAcquiredEnvironment ensures provider observations preserve the selected alias and source identity.
@@ -1074,6 +1116,9 @@ func (s *Service) transition(ctx context.Context, record Record, phase Phase, ev
 // terminal durably records cleanup intent, confirms idempotent release and only then commits a terminal outcome.
 func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, eventType string) (Record, error) {
 	if record.Phase == PhaseTerminal {
+		if record.FunctionalFlowAdmitted && s.deps.FlowAuthority != nil {
+			s.deps.FlowAuthority.ConfirmTerminal(record.Handle)
+		}
 		return record, nil
 	}
 	if record.FunctionalFlowAdmitted && record.FunctionalFlowExecutionPending && !record.FunctionalFlowPrimaryDurable {
@@ -1212,6 +1257,9 @@ func (s *Service) terminal(ctx context.Context, record Record, outcome Outcome, 
 	updated, err := s.deps.Store.SaveOwned(cleanupCtx, record, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now(), s.config.LeaseTTL, Event{Type: eventType, Category: string(outcome)})
 	if err != nil {
 		return Record{}, err
+	}
+	if updated.FunctionalFlowAdmitted && s.deps.FlowAuthority != nil {
+		s.deps.FlowAuthority.ConfirmTerminal(updated.Handle)
 	}
 	s.mu.Lock()
 	delete(s.snapshots, record.Handle)

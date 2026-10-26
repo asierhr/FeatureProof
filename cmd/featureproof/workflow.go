@@ -25,6 +25,7 @@ import (
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/contractreview"
 	"github.com/asierhr/featureProof/internal/environment"
+	kubernetesenvironment "github.com/asierhr/featureProof/internal/environment/kubernetes"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/fixture"
@@ -49,7 +50,11 @@ import (
 	"github.com/asierhr/featureProof/internal/springinspector"
 	"github.com/asierhr/featureProof/internal/testidentity"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
+	"k8s.io/client-go/rest"
 )
+
+// workflowProvisionalPlanningTarget is a non-routable validation placeholder replaced by acquired authority before model generation.
+const workflowProvisionalPlanningTarget = "https://composition.invalid/"
 
 // workflowConfig is the trusted local composition record; it contains references but no credential bytes.
 type workflowConfig struct {
@@ -88,6 +93,7 @@ type workflowConfig struct {
 	FunctionalFlowAliases         map[string]string                       `json:"functional_flow_aliases,omitempty"`
 	GitHubContext                 *githubcontext.Policy                   `json:"github_context,omitempty"`
 	EnvironmentCatalog            environment.Catalog                     `json:"environment_catalog"`
+	Kubernetes                    *workflowKubernetesRuntimeConfig        `json:"kubernetes,omitempty"`
 }
 
 // workflowFixtureRuntimeConfig is the trusted operator-owned authority for every finite fixture effect and wait.
@@ -126,7 +132,249 @@ type workflowCredentialResolverFactory func(reference, environment string) testi
 type workflowCompositionOptions struct {
 	githubAuthority           validationworkflow.GitHubPullRequestAuthority
 	credentialResolverFactory workflowCredentialResolverFactory
+	environmentProviders      map[string]environment.EnvironmentProvider
+	kubernetes                *workflowKubernetesComposition
 	recoverPending            bool
+}
+
+// workflowKubernetesComposition carries explicit cluster transport, sealed catalog, secrets, and safety bounds outside workflow input.
+type workflowKubernetesComposition struct {
+	RESTConfig       *rest.Config
+	Catalog          kubernetesenvironment.Catalog
+	Secrets          map[string][]byte
+	Owner, ClusterID string
+	MaxList          int64
+}
+
+// workflowKubernetesRuntimeConfig names every product-owned file, credential location, cluster identity, and safety bound needed to build Kubernetes authority.
+type workflowKubernetesRuntimeConfig struct {
+	APIServer              string            `json:"api_server"`
+	BearerTokenEnvironment string            `json:"bearer_token_environment"`
+	CAFile                 string            `json:"ca_file"`
+	ServerName             string            `json:"server_name"`
+	CatalogPath            string            `json:"catalog_path"`
+	Owner                  string            `json:"owner"`
+	ClusterID              string            `json:"cluster_id"`
+	SecretEnvironments     map[string]string `json:"secret_environments"`
+	MaxList                int64             `json:"max_list"`
+}
+
+// workflowTargetPlanningBinder derives the planner's HTTP validator from the acquired provider target at the final planning boundary.
+type workflowTargetPlanningBinder struct {
+	spec     specification.Specification
+	manifest planmanifest.Manifest
+	deps     localvalidation.RuntimeDependencies
+}
+
+// workflowTargetHTTPTool routes functional-flow calls only through tools rebuilt from acquired per-run targets.
+type workflowTargetHTTPTool struct {
+	mu       sync.RWMutex
+	spec     specification.Specification
+	manifest planmanifest.Manifest
+	deps     localvalidation.RuntimeDependencies
+	tools    map[string]harness.Tool
+	digests  map[string]string
+}
+
+// workflowFunctionalFlowTargetPort binds acquired target authority and releases it only when the application service confirms rollback or terminal durability.
+type workflowFunctionalFlowTargetPort struct {
+	inner validationworkflow.FunctionalFlowExecutionPort
+	tool  *workflowTargetHTTPTool
+}
+
+// workflowTargetFunctionalFlowComposer seals functional artifacts to the acquired target digest instead of composition-time coordinates.
+type workflowTargetFunctionalFlowComposer struct {
+	inner         validationworkflow.CanonicalFunctionalFlowComposer
+	runtimeDigest string
+}
+
+// Bind rejects an invalid target projection and builds the sole HTTP capability against its endpoint.
+func (b workflowTargetPlanningBinder) Bind(ctx context.Context, target validationworkflow.TargetContext) ([]agentplanning.CapabilityDescriptor, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := validationworkflow.TargetContextDigest(target); err != nil {
+		return nil, err
+	}
+	capability, err := localvalidation.BuildHTTPPlanningCapability(b.spec, b.manifest, target.URL, b.deps)
+	if err != nil {
+		return nil, err
+	}
+	return []agentplanning.CapabilityDescriptor{capability}, nil
+}
+
+// Bind replaces one run's functional HTTP tool with a capability built from its exact acquired target.
+func (t *workflowTargetHTTPTool) Bind(ctx context.Context, runID string, target validationworkflow.TargetContext) error {
+	if t == nil || runID == "" {
+		return errors.New("functional target unavailable")
+	}
+	digest, err := validationworkflow.TargetContextDigest(target)
+	if err != nil {
+		return errors.New("functional target unavailable")
+	}
+	t.mu.RLock()
+	current := t.digests[runID]
+	t.mu.RUnlock()
+	if current == digest {
+		return nil
+	}
+	spec := t.spec
+	spec.Target.BaseURL = target.URL
+	tool, _, err := localvalidation.BuildFixtureHTTPRuntime(spec, t.manifest, t.deps)
+	if err != nil || ctx.Err() != nil {
+		return errors.New("functional target unavailable")
+	}
+	t.mu.Lock()
+	t.tools[runID], t.digests[runID] = tool, digest
+	t.mu.Unlock()
+	return nil
+}
+
+// Execute rejects unbound runs and delegates only to the acquired-target tool selected for the call's workflow identity.
+func (t *workflowTargetHTTPTool) Execute(ctx context.Context, call harness.ToolCall) (harness.ToolResult, error) {
+	if t == nil {
+		return harness.ToolResult{}, errors.New("functional target unavailable")
+	}
+	t.mu.RLock()
+	tool := t.tools[call.RunID]
+	t.mu.RUnlock()
+	if tool == nil {
+		return harness.ToolResult{}, errors.New("functional target unavailable")
+	}
+	return tool.Execute(ctx, call)
+}
+
+// Unbind idempotently releases both endpoint tool and digest after a run reaches a durable terminal.
+func (t *workflowTargetHTTPTool) Unbind(runID string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	delete(t.tools, runID)
+	delete(t.digests, runID)
+	t.mu.Unlock()
+}
+
+// Compose rebuilds target-dependent artifact bindings from the latest acquired workflow snapshot.
+func (c workflowTargetFunctionalFlowComposer) Compose(ctx context.Context, request validationworkflow.ExecutionRequest, snapshot agentplanning.PreparedSnapshot) (functionalflow.ValidatedFlow, functionalflow.Artifact, error) {
+	digest, err := validationworkflow.TargetContextDigest(request.Snapshot.Binding.Target)
+	if err != nil || digest != request.Snapshot.TargetDigest {
+		return functionalflow.ValidatedFlow{}, functionalflow.Artifact{}, errors.New("functional target unavailable")
+	}
+	inner := c.inner
+	inner.Binding.Bindings.Target = digest
+	inner.Generated.ContextDigest = workflowDigest("functional-context", c.runtimeDigest, digest)
+	return inner.Compose(ctx, request, snapshot)
+}
+
+// InspectProvided validates an operator-selected flow without retaining an executable target tool before admission.
+func (p workflowFunctionalFlowTargetPort) InspectProvided(ctx context.Context, request validationworkflow.ExecutionRequest) (functionalflow.Flow, error) {
+	return p.inner.InspectProvided(ctx, request)
+}
+
+// Admit binds target authority before sealing the functional-flow artifact.
+func (p workflowFunctionalFlowTargetPort) Admit(ctx context.Context, request validationworkflow.ExecutionRequest, snapshot agentplanning.PreparedSnapshot) (planapproval.FunctionalFlowSnapshot, error) {
+	if err := p.tool.Bind(ctx, request.Handle, request.Snapshot.Binding.Target); err != nil {
+		return planapproval.FunctionalFlowSnapshot{}, err
+	}
+	admitted, err := p.inner.Admit(ctx, request, snapshot)
+	if err != nil {
+		p.tool.Unbind(request.Handle)
+	}
+	return admitted, err
+}
+
+// RecordPreparation delegates the durable fixture terminal to the already target-bound runtime.
+func (p workflowFunctionalFlowTargetPort) RecordPreparation(ctx context.Context, handle string, status fixture.PreparationStatus) (fixture.PreparationStatus, error) {
+	return p.inner.RecordPreparation(ctx, handle, status)
+}
+
+// Execute rebinds from the latest revalidated snapshot immediately before any functional network call.
+func (p workflowFunctionalFlowTargetPort) Execute(ctx context.Context, request validationworkflow.ExecutionRequest, snapshot agentplanning.PreparedSnapshot) (validationworkflow.FunctionalFlowPrimary, error) {
+	if err := p.tool.Bind(ctx, request.Handle, request.Snapshot.Binding.Target); err != nil {
+		return validationworkflow.FunctionalFlowPrimary{}, err
+	}
+	return p.inner.Execute(ctx, request, snapshot)
+}
+
+// Promote delegates publication after Service has revalidated the same acquired target.
+func (p workflowFunctionalFlowTargetPort) Promote(ctx context.Context, primary validationworkflow.FunctionalFlowPrimary) error {
+	return p.inner.Promote(ctx, primary)
+}
+
+// Finalize delegates packaging without releasing target authority before the application persists its terminal state.
+func (p workflowFunctionalFlowTargetPort) Finalize(ctx context.Context, handle string, outcome validationworkflow.Outcome, summary fixture.FixtureSummary) (validationworkflow.PackageProjection, error) {
+	return p.inner.Finalize(ctx, handle, outcome, summary)
+}
+
+// RollbackAdmission releases target authority whose successful admission could not be made durable by the workflow store.
+func (p workflowFunctionalFlowTargetPort) RollbackAdmission(handle string) {
+	p.tool.Unbind(handle)
+}
+
+// ConfirmTerminal releases target authority only after the workflow service confirms the terminal SaveOwned succeeded.
+func (p workflowFunctionalFlowTargetPort) ConfirmTerminal(handle string) {
+	p.tool.Unbind(handle)
+}
+
+// validate rejects partial runtime authority without reading credentials or contacting the cluster.
+func (c *workflowKubernetesRuntimeConfig) validate() error {
+	if c == nil {
+		return errors.New("invalid kubernetes runtime configuration")
+	}
+	endpoint, endpointErr := url.Parse(c.APIServer)
+	if endpointErr != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil || endpoint.Path != "" || endpoint.RawQuery != "" || endpoint.Fragment != "" || c.BearerTokenEnvironment == "" || c.CAFile == "" || c.ServerName == "" || c.CatalogPath == "" || c.Owner == "" || c.ClusterID == "" || c.SecretEnvironments == nil || c.MaxList <= 0 {
+		return errors.New("invalid kubernetes runtime configuration")
+	}
+	for reference, environmentName := range c.SecretEnvironments {
+		if reference == "" || environmentName == "" {
+			return errors.New("invalid kubernetes runtime configuration")
+		}
+	}
+	return nil
+}
+
+// composeWorkflowKubernetesRuntime resolves only explicitly named product authority during composition and performs no cluster I/O.
+func composeWorkflowKubernetesRuntime(config *workflowKubernetesRuntimeConfig) (*workflowKubernetesComposition, error) {
+	if config == nil || config.validate() != nil {
+		return nil, errors.New("kubernetes environment composition unavailable")
+	}
+	catalogRaw, catalogErr := os.ReadFile(config.CatalogPath)
+	caData, caErr := os.ReadFile(config.CAFile)
+	token, tokenPresent := os.LookupEnv(config.BearerTokenEnvironment)
+	if catalogErr != nil || caErr != nil || len(catalogRaw) == 0 || len(catalogRaw) > 1<<20 || len(caData) == 0 || len(caData) > 1<<20 || !tokenPresent || token == "" {
+		return nil, errors.New("kubernetes environment composition unavailable")
+	}
+	catalog, err := kubernetesenvironment.DecodeCatalog(catalogRaw)
+	if err != nil {
+		return nil, errors.New("kubernetes environment composition unavailable")
+	}
+	secrets := make(map[string][]byte, len(config.SecretEnvironments))
+	for reference, environmentName := range config.SecretEnvironments {
+		value, present := os.LookupEnv(environmentName)
+		if !present || value == "" {
+			return nil, errors.New("kubernetes environment composition unavailable")
+		}
+		secrets[reference] = []byte(value)
+	}
+	restConfig := &rest.Config{Host: config.APIServer, BearerToken: token, TLSClientConfig: rest.TLSClientConfig{CAData: append([]byte(nil), caData...), ServerName: config.ServerName}}
+	return &workflowKubernetesComposition{RESTConfig: restConfig, Catalog: catalog, Secrets: secrets, Owner: config.Owner, ClusterID: config.ClusterID, MaxList: config.MaxList}, nil
+}
+
+// composeWorkflowKubernetesProvider builds the real Kubernetes adapter without kubeconfig, environment, or fallback discovery.
+func composeWorkflowKubernetesProvider(config *workflowKubernetesComposition) (environment.EnvironmentProvider, error) {
+	if config == nil {
+		return nil, errors.New("kubernetes environment composition unavailable")
+	}
+	client, err := kubernetesenvironment.NewAPIClient(config.RESTConfig)
+	if err != nil {
+		return nil, err
+	}
+	secrets, err := kubernetesenvironment.NewPrivateSecretBundle(config.Secrets)
+	if err != nil {
+		return nil, err
+	}
+	return kubernetesenvironment.NewProvider(kubernetesenvironment.Dependencies{Catalog: config.Catalog, Client: client, Clock: environment.WallClock{}, Secrets: secrets, Owner: config.Owner, ClusterID: config.ClusterID, MaxList: config.MaxList})
 }
 
 // Resolve copies late-bound material into an attempt-owned lease without exposing its environment location outside composition.
@@ -285,7 +533,8 @@ func loadWorkflowConfig() (workflowConfig, error) {
 	}
 	sealedEnvironmentCatalog, environmentCatalogErr := environment.SealCatalog(config.EnvironmentCatalog)
 	selection, selectionErr := sealedEnvironmentCatalog.Resolve(config.TargetAlias)
-	if environmentCatalogErr != nil || selectionErr != nil || selection.Kind != environment.KindExistingURL || selection.ProjectID != config.RepositoryID || selection.RepositoryID != config.RepositoryID || selection.NetworkPolicyID != config.PolicyID {
+	managedKubernetes := selection.Kind == environment.KindManaged && selection.ProviderID == kubernetesenvironment.ProviderID && selection.ProviderVersion == kubernetesenvironment.ProviderVersion
+	if environmentCatalogErr != nil || selectionErr != nil || (selection.Kind != environment.KindExistingURL && selection.Kind != environment.KindManaged) || selection.ProjectID != config.RepositoryID || selection.RepositoryID != config.RepositoryID || selection.NetworkPolicyID != config.PolicyID || (selection.Kind == environment.KindManaged && (config.TargetKind != "direct" || !managedKubernetes || config.Kubernetes == nil || config.Kubernetes.validate() != nil)) || (selection.Kind != environment.KindManaged && config.Kubernetes != nil) {
 		return workflowConfig{}, errors.New("invalid environment catalog configuration")
 	}
 	config.EnvironmentCatalog = sealedEnvironmentCatalog
@@ -393,6 +642,28 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if err != nil {
 		return nil, err
 	}
+	selection, selectionErr := config.EnvironmentCatalog.Resolve(config.TargetAlias)
+	if selectionErr != nil {
+		return nil, selectionErr
+	}
+	if selection.Kind == environment.KindManaged {
+		if len(options.environmentProviders) != 0 {
+			return nil, errors.New("duplicate managed environment composition")
+		}
+		if options.kubernetes == nil {
+			options.kubernetes, err = composeWorkflowKubernetesRuntime(config.Kubernetes)
+			if err != nil {
+				return nil, err
+			}
+		}
+		provider, providerErr := composeWorkflowKubernetesProvider(options.kubernetes)
+		if providerErr != nil {
+			return nil, providerErr
+		}
+		options.environmentProviders = map[string]environment.EnvironmentProvider{selection.ProviderID + "@" + selection.ProviderVersion: provider}
+	} else if options.kubernetes != nil {
+		return nil, errors.New("unexpected kubernetes environment composition")
+	}
 	root, err := os.Getwd()
 	if err != nil {
 		return nil, err
@@ -461,7 +732,7 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	assertions := assertion.DefinitionValidator{Policy: redaction}
 	runtimeDeps := localvalidation.DefaultDependencies(root, stdout, stderr)
 	runtimeDeps.CredentialResolvers, runtimeDeps.IdentityObserver, runtimeDeps.IdentityObservationTimeout = identityResolvers, identityObserver, identityObservationTimeout
-	capability, err := localvalidation.BuildHTTPPlanningCapability(spec, manifest, config.TargetURL, runtimeDeps)
+	capability, err := localvalidation.BuildHTTPPlanningCapability(spec, manifest, workflowProvisionalPlanningTarget, runtimeDeps)
 	if err != nil {
 		return nil, err
 	}
@@ -490,7 +761,7 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if targetContext.Fingerprint == "" {
 		targetContext.Fingerprint = workflowDigest("environment", targetContext.EnvironmentID, targetContext.URL, targetContext.Attestation.Reference)
 	}
-	environmentPort, err := composeWorkflowEnvironment(root, config, targetContext, workflowPreview)
+	environmentPort, err := composeWorkflowEnvironment(root, config, targetContext, workflowPreview, options.environmentProviders)
 	if err != nil {
 		return nil, err
 	}
@@ -620,6 +891,14 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if err != nil {
 		return nil, err
 	}
+	var flowAuthority validationworkflow.FunctionalFlowAuthorityLifecyclePort
+	if functionalPort != nil {
+		var ok bool
+		flowAuthority, ok = functionalPort.(validationworkflow.FunctionalFlowAuthorityLifecyclePort)
+		if !ok {
+			return nil, errors.New("functional target lifecycle unavailable")
+		}
+	}
 	var memoryPort validationworkflow.ProjectMemoryPort
 	var memoryObserver validationworkflow.ProjectMemoryObservationPort
 	var contextWitness projectmemory.MonotonicWitness
@@ -676,7 +955,7 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	}
 	contextRegistry := validationworkflow.CurrentContextProducerRegistry{Workflows: store, Admission: admission, GitHub: githubContextSource}
 	contextPort := &validationworkflow.ContextAssemblyAdapter{Profiles: contextProfiles, Registry: contextRegistry, Secrets: contextassembly.NewCanaryGate(nil), Tokens: contextassembly.ByteTokenCounter{Selections: map[string]bool{config.Provider + "/" + config.Model: true}}, Store: contextStore, Observer: validationworkflow.ContextObserver{}, Clock: wallClock, GitHub: githubContextSource}
-	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Environment: environmentPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, Memory: memoryPort, MemoryObserver: memoryObserver, Context: contextPort})
+	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Environment: environmentPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, FlowAuthority: flowAuthority, Memory: memoryPort, MemoryObserver: memoryObserver, Context: contextPort, TargetPlanning: workflowTargetPlanningBinder{spec: spec, manifest: manifest, deps: runtimeDeps}})
 	if err != nil {
 		return nil, err
 	}
@@ -787,7 +1066,9 @@ func composeWorkflowFunctionalFlow(root, storeRoot, owner string, spec specifica
 	if len(operations) == 0 {
 		return nil, nil, nil
 	}
-	httpTool, identityCatalog, err := localvalidation.BuildFixtureHTTPRuntime(spec, manifest, deps)
+	identitySpec := spec
+	identitySpec.Target.BaseURL = workflowProvisionalPlanningTarget
+	_, identityCatalog, err := localvalidation.BuildFixtureHTTPRuntime(identitySpec, manifest, deps)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -817,11 +1098,17 @@ func composeWorkflowFunctionalFlow(root, storeRoot, owner string, spec specifica
 	confirmation := 10 * time.Second
 	executionConfig := functionalflow.ExecutionConfig{Owner: owner, MaxCalls: limits.MaxToolCalls, MaxRetries: limits.MaxRetries, MaxWork: limits.MaxWork, StepTimeout: limits.StepTimeout, RunTimeout: limits.RunTimeout, ConfirmationTimeout: confirmation, RetryDelay: 100 * time.Millisecond}
 	leaseTTL := time.Duration(executionConfig.MaxRetries+1)*executionConfig.StepTimeout + time.Duration(executionConfig.MaxRetries)*executionConfig.RetryDelay + executionConfig.ConfirmationTimeout + time.Minute
-	runtime, catalog, err := validationworkflow.ComposeLocalFunctionalFlowRuntime(validationworkflow.LocalFunctionalFlowRuntimeConfig{Root: filepath.Join(storeRoot, "functional-flow"), PublicIdentity: publicIdentity, AttemptJournalRoot: filepath.Join(root, ".featureproof", "runs"), AllowedManifestRoots: []string{root}, Aliases: config.FunctionalFlowAliases, Limits: limits, Validation: functionalflow.ValidationAuthority{Constraints: constraints, FixtureCaptures: captures}, Binding: functionalflow.BindingAuthority{Operations: operations, Identities: descriptors, Bindings: bindings}, Generated: functionalflow.GeneratedAuthority{ContextDigest: workflowDigest("functional-context", runtimeDigest, targetDigest), TargetID: spec.Target.ID, ContractDigest: contractDigest, Effects: map[string]bool{"http.request": true}, OperationEffects: operationEffects}, Execution: executionConfig, LeaseTTL: leaseTTL, Tool: httpTool, PolicyFactory: deps.PolicyFactory, Sanitizer: evidence.NewSanitizer(redaction), Evaluator: deps.Evaluator, Identities: identityCatalog, Clock: deps.Clock, IDs: deps.IDs, Waiter: deps.Waiter, Fixtures: fixtureResolver})
+	targetTool := &workflowTargetHTTPTool{spec: spec, manifest: manifest, deps: deps, tools: map[string]harness.Tool{}, digests: map[string]string{}}
+	runtime, catalog, err := validationworkflow.ComposeLocalFunctionalFlowRuntime(validationworkflow.LocalFunctionalFlowRuntimeConfig{Root: filepath.Join(storeRoot, "functional-flow"), PublicIdentity: publicIdentity, AttemptJournalRoot: filepath.Join(root, ".featureproof", "runs"), AllowedManifestRoots: []string{root}, Aliases: config.FunctionalFlowAliases, Limits: limits, Validation: functionalflow.ValidationAuthority{Constraints: constraints, FixtureCaptures: captures}, Binding: functionalflow.BindingAuthority{Operations: operations, Identities: descriptors, Bindings: bindings}, Generated: functionalflow.GeneratedAuthority{ContextDigest: workflowDigest("functional-context", runtimeDigest, targetDigest), TargetID: spec.Target.ID, ContractDigest: contractDigest, Effects: map[string]bool{"http.request": true}, OperationEffects: operationEffects}, Execution: executionConfig, LeaseTTL: leaseTTL, Tool: targetTool, PolicyFactory: deps.PolicyFactory, Sanitizer: evidence.NewSanitizer(redaction), Evaluator: deps.Evaluator, Identities: identityCatalog, Clock: deps.Clock, IDs: deps.IDs, Waiter: deps.Waiter, Fixtures: fixtureResolver})
 	if err != nil {
 		return nil, nil, err
 	}
-	return runtime, catalog, nil
+	canonicalComposer, ok := runtime.Composer.(validationworkflow.CanonicalFunctionalFlowComposer)
+	if !ok {
+		return nil, nil, errors.New("functional target composition unavailable")
+	}
+	runtime.Composer = workflowTargetFunctionalFlowComposer{inner: canonicalComposer, runtimeDigest: runtimeDigest}
+	return workflowFunctionalFlowTargetPort{inner: runtime, tool: targetTool}, catalog, nil
 }
 
 // composeWorkflowFixtures builds one consumer-owned lifecycle shared by every productive workflow surface.
@@ -1307,7 +1594,7 @@ func (p workflowAutoPolicy) Authorize(context.Context, validationworkflow.StartC
 type workflowFinalizer struct{}
 
 // composeWorkflowEnvironment builds the sealed catalog, durable lifecycle and sole workflow environment port.
-func composeWorkflowEnvironment(root string, config workflowConfig, target validationworkflow.TargetContext, preview *workflowPreviewPort) (validationworkflow.EnvironmentPort, error) {
+func composeWorkflowEnvironment(root string, config workflowConfig, target validationworkflow.TargetContext, preview *workflowPreviewPort, managedProviders map[string]environment.EnvironmentProvider) (validationworkflow.EnvironmentPort, error) {
 	selection, err := config.EnvironmentCatalog.Resolve(config.TargetAlias)
 	if err != nil {
 		return nil, err
@@ -1315,11 +1602,23 @@ func composeWorkflowEnvironment(root string, config workflowConfig, target valid
 	if selection.ProviderID != target.ProviderID || selection.TemplateReference != target.EnvironmentRef || selection.ProfileID != target.ProfileID || selection.NetworkPolicyID != target.Network.PolicyID {
 		return nil, errors.New("environment target authority mismatch")
 	}
-	existing, err := environment.NewExistingURLProvider(&workflowExistingLifecycle{target: target, preview: preview})
+	providerKey := selection.ProviderID + "@" + selection.ProviderVersion
+	var provider environment.EnvironmentProvider
+	if selection.Kind == environment.KindExistingURL {
+		if len(managedProviders) != 0 {
+			return nil, errors.New("unexpected managed environment composition")
+		}
+		provider, err = environment.NewExistingURLProvider(&workflowExistingLifecycle{target: target, preview: preview})
+	} else {
+		provider = managedProviders[providerKey]
+		if provider == nil || preview != nil || len(managedProviders) != 1 {
+			return nil, errors.New("managed environment composition unavailable")
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	registry, err := environment.NewRegistry(map[string]environment.EnvironmentProvider{selection.ProviderID + "@" + selection.ProviderVersion: existing})
+	registry, err := environment.NewRegistry(map[string]environment.EnvironmentProvider{providerKey: provider})
 	if err != nil {
 		return nil, err
 	}

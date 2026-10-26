@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,15 +27,20 @@ import (
 	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/environment"
+	kubernetesenvironment "github.com/asierhr/featureProof/internal/environment/kubernetes"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/externalagent"
+	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/githubcontext"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/goinspector"
+	"github.com/asierhr/featureProof/internal/harness"
+	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/model"
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/specification"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
+	"k8s.io/client-go/rest"
 )
 
 // staticWorkflowSpecification keeps the admission test focused on productive contract composition while returning an isolated trusted spec.
@@ -50,6 +56,40 @@ type rejectingWorkflowTransport struct{ calls atomic.Int32 }
 
 // workflowGitHubContextAuthority implements both admitted identity refresh and bounded context reads for composition tests.
 type workflowGitHubContextAuthority struct{}
+
+// managedEnvironmentProviderStub proves composition registers an explicitly supplied managed adapter without infrastructure I/O.
+type managedEnvironmentProviderStub struct{}
+
+// workflowFunctionalFinalizeStub supplies all functional-flow methods while programming finalization retries for target-tool lifecycle tests.
+type workflowFunctionalFinalizeStub struct {
+	validationworkflow.FunctionalFlowExecutionAdapter
+	err error
+}
+
+// Finalize returns the programmed retryable or durable terminal result without filesystem effects.
+func (s *workflowFunctionalFinalizeStub) Finalize(context.Context, string, validationworkflow.Outcome, fixture.FixtureSummary) (validationworkflow.PackageProjection, error) {
+	return validationworkflow.PackageProjection{}, s.err
+}
+
+// Acquire is unused by composition-only tests and fails closed if invoked unexpectedly.
+func (managedEnvironmentProviderStub) Acquire(context.Context, environment.AcquisitionRequest) (environment.Observation, error) {
+	return environment.Observation{}, errors.New("unexpected acquire")
+}
+
+// Reconcile is unused by composition-only tests and fails closed if invoked unexpectedly.
+func (managedEnvironmentProviderStub) Reconcile(context.Context, environment.AcquisitionRequest) (environment.Observation, error) {
+	return environment.Observation{}, errors.New("unexpected reconcile")
+}
+
+// Observe is unused by composition-only tests and fails closed if invoked unexpectedly.
+func (managedEnvironmentProviderStub) Observe(context.Context, environment.ObservationRequest) (environment.Observation, error) {
+	return environment.Observation{}, errors.New("unexpected observe")
+}
+
+// Release is unused by composition-only tests and fails closed if invoked unexpectedly.
+func (managedEnvironmentProviderStub) Release(context.Context, environment.ReleaseRequest) error {
+	return errors.New("unexpected release")
+}
 
 // PullRequest returns the structural authority used by the existing GitHub admission path.
 func (workflowGitHubContextAuthority) PullRequest(context.Context, int64, int64, int64) (githubpr.PullRequestSnapshot, error) {
@@ -175,9 +215,8 @@ func TestWorkflowConfigurationRequiresExplicitSnakeCaseSelections(t *testing.T) 
 	}
 	config["environment_catalog"] = workflowEnvironmentCatalogFixture("existing-url", "v1", "target", "target-ref", "runtime", "network", "repo")
 	for name, mutateCatalog := range map[string]func(map[string]any){
-		"provider_kind": func(item map[string]any) { item["kind"] = "managed" },
-		"project":       func(item map[string]any) { item["project_id"] = "other" },
-		"repository":    func(item map[string]any) { item["repository_id"] = "other" },
+		"project":    func(item map[string]any) { item["project_id"] = "other" },
+		"repository": func(item map[string]any) { item["repository_id"] = "other" },
 		"network_policy": func(item map[string]any) {
 			item["network_policy_id"] = "other"
 		},
@@ -192,6 +231,14 @@ func TestWorkflowConfigurationRequiresExplicitSnakeCaseSelections(t *testing.T) 
 				t.Fatal("catalog authority mismatch accepted")
 			}
 		})
+	}
+	managedCatalog := workflowEnvironmentCatalogFixture("kubernetes", "v1", "target", "target-ref", "runtime", "network", "repo")
+	managedCatalog["items"].([]any)[0].(map[string]any)["kind"] = "managed"
+	config["environment_catalog"] = managedCatalog
+	config["kubernetes"] = map[string]any{"api_server": "https://cluster.example", "bearer_token_environment": "TEST_KUBERNETES_TOKEN", "ca_file": "cluster-ca.pem", "server_name": "cluster.example", "catalog_path": "kubernetes-catalog.json", "owner": "owner", "cluster_id": "cluster", "secret_environments": map[string]string{}, "max_list": 10}
+	write(config)
+	if loaded, managedErr := loadWorkflowConfig(); managedErr != nil || loaded.EnvironmentCatalog.Items[0].Kind != environment.KindManaged {
+		t.Fatalf("managed environment catalog rejected: %v", managedErr)
 	}
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", filepath.Join(root, "missing.json"))
 	if _, err = loadWorkflowConfig(); err == nil {
@@ -213,19 +260,19 @@ func TestWorkflowEnvironmentCompositionFailsClosedAtAuthorityBoundaries(t *testi
 	config := workflowConfig{TargetAlias: selection.Alias, RepositoryID: selection.RepositoryID, EnvironmentCatalog: catalog}
 	missing := config
 	missing.EnvironmentCatalog = environment.Catalog{}
-	if _, err = composeWorkflowEnvironment(t.TempDir(), missing, target, nil); err == nil {
+	if _, err = composeWorkflowEnvironment(t.TempDir(), missing, target, nil, nil); err == nil {
 		t.Fatal("missing catalog authority accepted")
 	}
 	mismatched := target
 	mismatched.EnvironmentRef = "other-template"
-	if _, err = composeWorkflowEnvironment(t.TempDir(), config, mismatched, nil); err == nil {
+	if _, err = composeWorkflowEnvironment(t.TempDir(), config, mismatched, nil, nil); err == nil {
 		t.Fatal("target authority mismatch accepted")
 	}
 	fileRoot := filepath.Join(t.TempDir(), "not-a-directory")
 	if err = os.WriteFile(fileRoot, []byte("occupied"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = composeWorkflowEnvironment(fileRoot, config, target, nil); err == nil {
+	if _, err = composeWorkflowEnvironment(fileRoot, config, target, nil, nil); err == nil {
 		t.Fatal("unwritable lifecycle store accepted")
 	}
 	lifecycle := &workflowExistingLifecycle{target: validationworkflow.TargetContext{Attestation: validationworkflow.AttestationContext{RepositoryID: "repo", CommitOID: strings.Repeat("a", 40)}}}
@@ -238,6 +285,206 @@ func TestWorkflowEnvironmentCompositionFailsClosedAtAuthorityBoundaries(t *testi
 	}
 	if _, err = previewLifecycle.RestoreExisting(context.Background(), "run", selection, "repo", strings.Repeat("a", 40)); err == nil {
 		t.Fatal("unconfigured preview restore accepted")
+	}
+}
+
+// TestWorkflowEnvironmentCompositionRegistersOnlyExplicitManagedProvider covers the productive managed adapter injection boundary.
+func TestWorkflowEnvironmentCompositionRegistersOnlyExplicitManagedProvider(t *testing.T) {
+	selection, err := environment.SealSelection(environment.Selection{Version: 1, Alias: "target", ProviderID: "kubernetes", ProviderVersion: "v1", Kind: environment.KindManaged, TemplateReference: "template", ProfileID: "profile", NetworkPolicyID: "network", Secretless: true, ProjectID: "repo", RepositoryID: "repo", Capabilities: []string{"http"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := environment.SealCatalog(environment.Catalog{Version: 1, Items: []environment.Selection{selection}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := workflowConfig{TargetAlias: selection.Alias, RepositoryID: selection.RepositoryID, EnvironmentCatalog: catalog}
+	target := validationworkflow.TargetContext{ProviderID: selection.ProviderID, EnvironmentRef: selection.TemplateReference, ProfileID: selection.ProfileID, Network: validationworkflow.NetworkContext{PolicyID: selection.NetworkPolicyID}}
+	if _, err = composeWorkflowEnvironment(t.TempDir(), config, target, nil, nil); err == nil {
+		t.Fatal("missing managed provider accepted")
+	}
+	providers := map[string]environment.EnvironmentProvider{"kubernetes@v1": managedEnvironmentProviderStub{}}
+	if port, composeErr := composeWorkflowEnvironment(t.TempDir(), config, target, nil, providers); composeErr != nil || port == nil {
+		t.Fatalf("explicit managed provider rejected: %v", composeErr)
+	}
+	providers["other@v1"] = managedEnvironmentProviderStub{}
+	if _, err = composeWorkflowEnvironment(t.TempDir(), config, target, nil, providers); err == nil {
+		t.Fatal("extra managed provider accepted")
+	}
+}
+
+// TestWorkflowKubernetesCompositionBuildsRealClientFromExplicitAuthority covers productive adapter construction without discovery or network I/O.
+func TestWorkflowKubernetesCompositionBuildsRealClientFromExplicitAuthority(t *testing.T) {
+	entry := kubernetesenvironment.Entry{TemplateReference: "web-v1", TemplateDigest: strings.Repeat("a", 64), ProfileID: "profile", NetworkPolicyID: "network", ClusterID: "cluster", Image: "registry.example/app@sha256:" + strings.Repeat("b", 64), Replicas: 1, ContainerPort: 8080, ServicePort: 80, Scheme: "http", BasePath: "/", ReadinessPath: "/ready", InitialDelay: 1, Period: 2, Timeout: 1, FailureThreshold: 3, CPURequestMilli: 100, CPULimitMilli: 200, MemoryRequest: 64 << 20, MemoryLimit: 128 << 20, QuotaCPUMilli: 400, QuotaMemory: 256 << 20, MaxPods: 2, MaxServices: 1, TTL: time.Minute, MaxTTL: time.Hour, PodSecurity: "restricted", NetworkSupported: true, Capabilities: []string{"http"}}
+	catalog, err := kubernetesenvironment.SealCatalog(kubernetesenvironment.Catalog{Version: kubernetesenvironment.CatalogVersion, Entries: []kubernetesenvironment.Entry{entry}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = composeWorkflowKubernetesProvider(nil); err == nil {
+		t.Fatal("missing composition accepted")
+	}
+	provider, err := composeWorkflowKubernetesProvider(&workflowKubernetesComposition{RESTConfig: &rest.Config{Host: "https://cluster.invalid"}, Catalog: catalog, Secrets: map[string][]byte{}, Owner: "owner", ClusterID: "cluster", MaxList: 10})
+	if err != nil || provider == nil {
+		t.Fatalf("explicit Kubernetes composition rejected: %v", err)
+	}
+}
+
+// TestComposeWorkflowCLIResolvesCompleteKubernetesAuthorityThroughMainConstructor proves the constructor called by main accepts only explicit productive authority.
+func TestComposeWorkflowCLIResolvesCompleteKubernetesAuthorityThroughMainConstructor(t *testing.T) {
+	installProjectMemoryWitness(t)
+	root := t.TempDir()
+	t.Chdir(root)
+	configPath, _, _ := writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("composition contacted Kubernetes") }))
+	t.Cleanup(tlsServer.Close)
+	caPath := filepath.Join(root, "cluster-ca.pem")
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsServer.Certificate().Raw})
+	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entry := kubernetesenvironment.Entry{TemplateReference: "target-ref", TemplateDigest: strings.Repeat("a", 64), ProfileID: "runtime", NetworkPolicyID: "network", ClusterID: "cluster", Image: "registry.example/app@sha256:" + strings.Repeat("b", 64), Replicas: 1, ContainerPort: 8080, ServicePort: 80, Scheme: "http", BasePath: "/", ReadinessPath: "/ready", InitialDelay: 1, Period: 2, Timeout: 1, FailureThreshold: 3, CPURequestMilli: 100, CPULimitMilli: 200, MemoryRequest: 64 << 20, MemoryLimit: 128 << 20, QuotaCPUMilli: 400, QuotaMemory: 256 << 20, MaxPods: 2, MaxServices: 1, TTL: time.Minute, MaxTTL: time.Hour, PodSecurity: "restricted", NetworkSupported: true, Capabilities: []string{"http"}}
+	catalog, err := kubernetesenvironment.SealCatalog(kubernetesenvironment.Catalog{Version: kubernetesenvironment.CatalogVersion, Entries: []kubernetesenvironment.Entry{entry}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogRaw, _ := json.Marshal(catalog)
+	catalogPath := filepath.Join(root, "kubernetes-catalog.json")
+	if err = os.WriteFile(catalogPath, catalogRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FEATUREPROOF_TEST_KUBERNETES_TOKEN", "composition-token")
+	rewriteWorkflowConfig(t, configPath, func(value map[string]any) {
+		managed := workflowEnvironmentCatalogFixture("kubernetes", "v1", "target", "target-ref", "runtime", "network", "repo")
+		managed["items"].([]any)[0].(map[string]any)["kind"] = "managed"
+		value["environment_catalog"] = managed
+		value["kubernetes"] = map[string]any{"api_server": tlsServer.URL, "bearer_token_environment": "FEATUREPROOF_TEST_KUBERNETES_TOKEN", "ca_file": caPath, "server_name": "cluster.test", "catalog_path": catalogPath, "owner": "owner", "cluster_id": "cluster", "secret_environments": map[string]string{}, "max_list": 10}
+	})
+	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)
+	cli, err := composeWorkflowCLI(context.Background(), io.Discard, io.Discard)
+	if err != nil || cli == nil {
+		t.Fatalf("main constructor rejected complete Kubernetes authority: %v", err)
+	}
+	t.Setenv("FEATUREPROOF_TEST_KUBERNETES_TOKEN", "")
+	if _, err = composeWorkflowCLI(context.Background(), io.Discard, io.Discard); err == nil {
+		t.Fatal("main constructor accepted missing Kubernetes credential")
+	}
+}
+
+// TestWorkflowKubernetesRuntimeRequiresEveryExplicitDependency proves partial product authority fails before client or cluster construction.
+func TestWorkflowKubernetesRuntimeRequiresEveryExplicitDependency(t *testing.T) {
+	root := t.TempDir()
+	entry := kubernetesenvironment.Entry{TemplateReference: "target-ref", TemplateDigest: strings.Repeat("a", 64), ProfileID: "runtime", NetworkPolicyID: "network", ClusterID: "cluster", Image: "registry.example/app@sha256:" + strings.Repeat("b", 64), Replicas: 1, ContainerPort: 8080, ServicePort: 80, Scheme: "http", BasePath: "/", ReadinessPath: "/ready", InitialDelay: 1, Period: 2, Timeout: 1, FailureThreshold: 3, CPURequestMilli: 100, CPULimitMilli: 200, MemoryRequest: 64 << 20, MemoryLimit: 128 << 20, QuotaCPUMilli: 400, QuotaMemory: 256 << 20, MaxPods: 2, MaxServices: 1, TTL: time.Minute, MaxTTL: time.Hour, PodSecurity: "restricted", NetworkSupported: true, Capabilities: []string{"http"}}
+	catalog, err := kubernetesenvironment.SealCatalog(kubernetesenvironment.Catalog{Version: kubernetesenvironment.CatalogVersion, Entries: []kubernetesenvironment.Entry{entry}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogRaw, _ := json.Marshal(catalog)
+	catalogPath, caPath := filepath.Join(root, "catalog.json"), filepath.Join(root, "ca.pem")
+	if err = os.WriteFile(catalogPath, catalogRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(caPath, []byte("explicit-ca"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FEATUREPROOF_KUBERNETES_TOKEN_REQUIRED", "token")
+	valid := workflowKubernetesRuntimeConfig{APIServer: "https://cluster.example", BearerTokenEnvironment: "FEATUREPROOF_KUBERNETES_TOKEN_REQUIRED", CAFile: caPath, ServerName: "cluster.example", CatalogPath: catalogPath, Owner: "owner", ClusterID: "cluster", SecretEnvironments: map[string]string{}, MaxList: 10}
+	if authority, composeErr := composeWorkflowKubernetesRuntime(&valid); composeErr != nil || authority == nil {
+		t.Fatalf("complete authority rejected: %v", composeErr)
+	}
+	// cases removes each independent structural dependency while preserving every other authority field.
+	cases := map[string]func(*workflowKubernetesRuntimeConfig){
+		"api_server":          func(value *workflowKubernetesRuntimeConfig) { value.APIServer = "" },
+		"token_reference":     func(value *workflowKubernetesRuntimeConfig) { value.BearerTokenEnvironment = "" },
+		"ca_file":             func(value *workflowKubernetesRuntimeConfig) { value.CAFile = "" },
+		"server_name":         func(value *workflowKubernetesRuntimeConfig) { value.ServerName = "" },
+		"catalog_path":        func(value *workflowKubernetesRuntimeConfig) { value.CatalogPath = "" },
+		"owner":               func(value *workflowKubernetesRuntimeConfig) { value.Owner = "" },
+		"cluster_id":          func(value *workflowKubernetesRuntimeConfig) { value.ClusterID = "" },
+		"secret_environments": func(value *workflowKubernetesRuntimeConfig) { value.SecretEnvironments = nil },
+		"max_list":            func(value *workflowKubernetesRuntimeConfig) { value.MaxList = 0 },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			mutate(&candidate)
+			if authority, composeErr := composeWorkflowKubernetesRuntime(&candidate); composeErr == nil || authority != nil {
+				t.Fatal("partial Kubernetes authority accepted")
+			}
+		})
+	}
+}
+
+// TestWorkflowFunctionalHTTPUsesOnlyAcquiredTarget proves generated functional execution cannot retain its configured endpoint.
+func TestWorkflowFunctionalHTTPUsesOnlyAcquiredTarget(t *testing.T) {
+	var configuredHits, acquiredHits atomic.Int32
+	configured := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { configuredHits.Add(1) }))
+	t.Cleanup(configured.Close)
+	acquired := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		acquiredHits.Add(1)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(acquired.Close)
+	spec := specification.Specification{Version: 1, Feature: specification.Feature{ID: "feature"}, Target: specification.Target{ID: "deployed", BaseURL: configured.URL}, Constraints: []specification.Constraint{{ID: "reachable", Description: "reachable", TargetID: "deployed"}}, Limits: specification.Limits{MaxSteps: 1, MaxToolCalls: 1}}
+	manifest := planmanifest.Manifest{Version: 1, HTTP: planmanifest.HTTPConfig{AllowedMethods: []string{"GET"}, AllowedRequestHeaders: []string{}, AllowedResponseHeaders: []string{}, FollowRedirectsForMethods: []string{}, MaxRedirects: 0, TimeoutMS: 1000, MaxURLBytes: 2048, MaxRequestHeaderBytes: 8192, MaxRequestBodyBytes: 1024, MaxResponseHeaderBytes: 8192, MaxResponseBodyBytes: 8192}}
+	tool := &workflowTargetHTTPTool{spec: spec, manifest: manifest, deps: localvalidation.DefaultDependencies(t.TempDir(), io.Discard, io.Discard), tools: map[string]harness.Tool{}, digests: map[string]string{}}
+	if _, err := tool.Execute(context.Background(), harness.ToolCall{RunID: "run-unbound", Tool: "http.request"}); err == nil {
+		t.Fatal("unbound functional HTTP call accepted")
+	}
+	if err := tool.Bind(context.Background(), "run-acquired", validationworkflow.TargetContext{URL: acquired.URL}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := tool.Execute(context.Background(), harness.ToolCall{ID: "request", RunID: "run-acquired", Tool: "http.request", Attempt: 1, Input: map[string]any{"method": "GET", "path": "/", "headers": map[string]any{}}})
+	if err != nil || result.Output == nil || acquiredHits.Load() != 1 || configuredHits.Load() != 0 {
+		t.Fatalf("functional HTTP escaped acquired target: acquired=%d configured=%d result=%#v err=%v", acquiredHits.Load(), configuredHits.Load(), result, err)
+	}
+}
+
+// TestWorkflowFunctionalTargetToolsReleaseOnlyAfterServiceConfirmation proves Finalize cannot release authority and application lifecycle notifications remain idempotent.
+func TestWorkflowFunctionalTargetToolsReleaseOnlyAfterServiceConfirmation(t *testing.T) {
+	manifest := planmanifest.Manifest{Version: 1, HTTP: planmanifest.HTTPConfig{AllowedMethods: []string{"GET"}, AllowedRequestHeaders: []string{}, AllowedResponseHeaders: []string{}, FollowRedirectsForMethods: []string{}, MaxRedirects: 0, TimeoutMS: 1000, MaxURLBytes: 2048, MaxRequestHeaderBytes: 8192, MaxRequestBodyBytes: 1024, MaxResponseHeaderBytes: 8192, MaxResponseBodyBytes: 8192}}
+	spec := specification.Specification{Version: 1, Feature: specification.Feature{ID: "feature"}, Target: specification.Target{ID: "deployed", BaseURL: "https://configured.invalid/"}, Constraints: []specification.Constraint{{ID: "reachable", Description: "reachable", TargetID: "deployed"}}, Limits: specification.Limits{MaxSteps: 1, MaxToolCalls: 1}}
+	tool := &workflowTargetHTTPTool{spec: spec, manifest: manifest, deps: localvalidation.DefaultDependencies(t.TempDir(), io.Discard, io.Discard), tools: map[string]harness.Tool{}, digests: map[string]string{}}
+	finalizer := &workflowFunctionalFinalizeStub{err: errors.New("retryable finalize")}
+	port := workflowFunctionalFlowTargetPort{inner: finalizer, tool: tool}
+	const runs = 128
+	for index := 0; index < runs; index++ {
+		handle := fmt.Sprintf("run-%d", index)
+		if err := tool.Bind(context.Background(), handle, validationworkflow.TargetContext{URL: "https://acquired.invalid/"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := port.Finalize(context.Background(), handle, "", fixture.FixtureSummary{}); err == nil {
+			t.Fatal("retryable finalization unexpectedly succeeded")
+		}
+	}
+	tool.mu.RLock()
+	retainedTools, retainedDigests := len(tool.tools), len(tool.digests)
+	tool.mu.RUnlock()
+	if retainedTools != runs || retainedDigests != runs {
+		t.Fatalf("retryable finalization lost authority: tools=%d digests=%d", retainedTools, retainedDigests)
+	}
+	finalizer.err = nil
+	for index := 0; index < runs; index++ {
+		handle := fmt.Sprintf("run-%d", index)
+		if _, err := port.Finalize(context.Background(), handle, "", fixture.FixtureSummary{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tool.mu.RLock()
+	retainedAfterFinalizeTools, retainedAfterFinalizeDigests := len(tool.tools), len(tool.digests)
+	tool.mu.RUnlock()
+	if retainedAfterFinalizeTools != runs || retainedAfterFinalizeDigests != runs {
+		t.Fatalf("finalize released authority: tools=%d digests=%d", retainedAfterFinalizeTools, retainedAfterFinalizeDigests)
+	}
+	for index := 0; index < runs; index++ {
+		handle := fmt.Sprintf("run-%d", index)
+		port.ConfirmTerminal(handle)
+		port.ConfirmTerminal(handle)
+	}
+	tool.mu.RLock()
+	remainingTools, remainingDigests := len(tool.tools), len(tool.digests)
+	tool.mu.RUnlock()
+	if remainingTools != 0 || remainingDigests != 0 {
+		t.Fatalf("terminal authority leaked: tools=%d digests=%d", remainingTools, remainingDigests)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/revisionbinding"
 )
 
 // LocalRunnerConfiguration binds one safe runtime digest to existing runner inputs and dependencies.
@@ -31,11 +32,20 @@ func (p LocalExecutionPort) Execute(ctx context.Context, request ExecutionReques
 		return ExecutionPreparation{}, &Error{Code: CodeUnauthorized, Operation: "runtime_profile"}
 	}
 	prepared := configuration.Request
+	targetDigest, targetErr := TargetContextDigest(request.Snapshot.Binding.Target)
+	if targetErr != nil || targetDigest != request.Snapshot.TargetDigest {
+		return ExecutionPreparation{}, &Error{Code: CodeUnauthorized, Operation: "execution_target"}
+	}
+	prepared.Target = request.Snapshot.Binding.Target.URL
+	prepared.RepositoryID = request.Snapshot.Binding.Revision.RepositoryID
+	prepared.Revision = request.Snapshot.Binding.Revision.CommitOID
+	prepared.EnvironmentID = request.Snapshot.Binding.Target.EnvironmentID
 	prepared.Plans = append([]planning.ValidationPlan(nil), request.Plans...)
 	prepared.ApprovalMode, prepared.ApprovalReference = request.ApprovalMode, request.ApprovalReference
 	prepared.PlanArtifactSHA256 = request.ArtifactSHA256
 	prepared.PlanCommitmentKey = append([]byte(nil), request.CommitmentKey...)
 	deps := configuration.Dependencies
+	deps.EnvironmentAttestor = snapshotTargetAttestor{target: request.Snapshot.Binding.Target}
 	deps.IDs = &workflowRunIDs{first: request.Handle, next: deps.IDs}
 	hiddenName := "." + request.Handle + ".workflow-primary"
 	preparation := ExecutionPreparation{StagedDir: filepath.Join(deps.Root, ".featureproof", "runs", hiddenName), FinalDir: filepath.Join(deps.Root, ".featureproof", "runs", request.Handle)}
@@ -61,6 +71,20 @@ func (p LocalExecutionPort) Execute(ctx context.Context, request ExecutionReques
 		return ExecutionPreparation{}, &Error{Code: CodeUnavailable, Operation: "runner"}
 	}
 	return preparation, nil
+}
+
+// snapshotTargetAttestor revalidates the execution runner against the same acquired target already sealed into the workflow snapshot.
+type snapshotTargetAttestor struct{ target TargetContext }
+
+// Attest projects the acquired target proof only for its exact environment identity.
+func (a snapshotTargetAttestor) Attest(ctx context.Context, environmentID string) (revisionbinding.Attestation, error) {
+	if err := ctx.Err(); err != nil {
+		return revisionbinding.Attestation{}, err
+	}
+	if environmentID != a.target.EnvironmentID || !a.target.Attestation.Verified {
+		return revisionbinding.Attestation{}, errors.New("target attestation unavailable")
+	}
+	return revisionbinding.Attestation{EnvironmentID: a.target.Attestation.EnvironmentID, RepositoryID: a.target.Attestation.RepositoryID, CommitOID: a.target.Attestation.CommitOID, Reference: a.target.Attestation.Reference, ValidUntil: a.target.Attestation.ValidUntil, Verified: true}, nil
 }
 
 // Promote atomically exposes a complete hidden runner bundle under its canonical run identity.
