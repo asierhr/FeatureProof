@@ -4100,6 +4100,21 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Gates finales: formato, diff, vet, compile, global normal/race, cleanup race ×20, verticales race ×20 y builds Windows/Linux/Darwin; smoke final del leader pasa en cleanup, environment, validationworkflow y cmd.
 - Coverage exacta del diff productivo: `1812/2130 = 85,07042253521127 %`; `environment-cleanup-controller` pasa de `in_progress` a `done`.
 
+## Feature 35 — especificación iniciada (2026-10-27)
+
+- Seleccionada únicamente `persistent-control-plane` (ID 35), en estado `pending` y con SDD obligatorio.
+- No existe otra feature `in_progress`; los criterios cubren PostgreSQL, migraciones, cola durable, workers con leases, autoridad mínima, recovery y compatibilidad explícita con el modo local.
+- Creada la rama `feature-35-persistent-control-plane` desde feature 34 para conservar los contratos ya aprobados de lifecycle, cleanup, CAS, fencing e idempotencia.
+- Se delega al `spec_author` la definición de requirements, diseño y tasks; no se escribirá código ni tests antes de aprobación humana.
+
+## Feature 35 — especificación preparada (2026-10-27)
+
+- El `spec_author` produjo `requirements.md`, `design.md` y `tasks.md` en `specs/persistent-control-plane/`.
+- La revisión del leader confirma 16 requirements y 17 tareas trazables para PostgreSQL, migraciones, contratos consumer-owned, queue/leases/fencing, inbox/outbox, workers, cancelación, recovery, import local y retención.
+- Se resolvió la frontera local→PostgreSQL mediante backend bindings append-only por epoch, un único head CAS activo y cutover transaccional; no existe mutación del binding anterior, fallback ni dual-write.
+- Configuración versionada y seguridad multi-tenant permanecen fuera de alcance para las features 36 y 37; esta entrega usa exclusivamente `ProjectID` y authority ya existentes.
+- `persistent-control-plane` pasa de `pending` a `spec_ready`; la implementación queda pausada hasta aprobación humana explícita.
+
 ## Feature 34 — implementación en curso (2026-10-26)
 
 - Iniciada T1–T3: modelo canónico, binding destructivo sellado, store durable con CAS/leases y ledger de capacidad por proyecto.
