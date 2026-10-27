@@ -4115,6 +4115,12 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Configuración versionada y seguridad multi-tenant permanecen fuera de alcance para las features 36 y 37; esta entrega usa exclusivamente `ProjectID` y authority ya existentes.
 - `persistent-control-plane` pasa de `pending` a `spec_ready`; la implementación queda pausada hasta aprobación humana explícita.
 
+## Feature 35 — implementación autorizada (2026-10-27)
+
+- El usuario aprobó explícitamente la especificación al solicitar continuar con la implementación.
+- Registrada la aprobación en `requirements.md` con timestamp `2026-10-27T08:20:19+01:00`.
+- `persistent-control-plane` pasa de `spec_ready` a `in_progress`; se delegan T1–T17 al implementer especializado.
+
 ## Feature 34 — implementación en curso (2026-10-26)
 
 - Iniciada T1–T3: modelo canónico, binding destructivo sellado, store durable con CAS/leases y ledger de capacidad por proyecto.

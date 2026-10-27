@@ -455,8 +455,8 @@ los contratos de esta entrega.
 ## Aprobación humana
 
 ```yaml
-approved_by: null
-approved_at: null
+approved_by: user
+approved_at: 2026-10-27T08:20:19+01:00
 ```
 
 La implementación no puede comenzar hasta aprobación humana explícita y cambio
