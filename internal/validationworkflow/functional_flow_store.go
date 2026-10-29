@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	"github.com/asierhr/featureProof/internal/functionalflow"
 )
 
@@ -55,6 +56,11 @@ func (s *LocalFunctionalFlowArtifactStore) Load(ctx context.Context, handle stri
 
 // writeImmutableJSON atomically links one fully synced file and accepts only byte-identical concurrent redelivery.
 func writeImmutableJSON(destination string, value any, operation string) error {
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(context.Background(), filepath.Dir(destination))
+	if err != nil {
+		return &Error{Code: CodeUnavailable, Operation: "offline_import_freeze"}
+	}
+	defer releaseImportWrite()
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return &Error{Code: CodeInternal, Operation: operation}

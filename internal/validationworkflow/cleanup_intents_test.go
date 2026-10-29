@@ -12,8 +12,173 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	environmentcleanup "github.com/asierhr/featureProof/internal/environment/cleanup"
 )
+
+// reservationBlindWorkflowStore preserves the workflow persistence contract
+// while deliberately omitting the optional idempotency lookup capability.
+type reservationBlindWorkflowStore struct{ WorkflowStore }
+
+// TestImportConsumerValidatorsRejectDrift proves the exported PostgreSQL
+// materializer contracts preserve the local consumer's exact projection rules.
+func TestImportConsumerValidatorsRejectDrift(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	record := Record{Version: 1, Handle: "import-run", Principal: "principal", IdempotencyKey: "import-key", RequestDigest: strings.Repeat("a", 64), Phase: PhaseAdmitted, UpdatedAt: now, Sequence: 1, VersionCAS: 1}
+	event := Event{Version: 1, Sequence: 1, ID: "event-1", Handle: record.Handle, Type: "workflow_admitted", OccurredAt: now}
+	document, err := json.Marshal(workflowCheckpoint{Record: record, Events: []Event{event}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, events, err := DecodeWorkflowImportCheckpoint(document)
+	if err != nil || loaded.Handle != record.Handle || len(events) != 1 || events[0].ID != event.ID {
+		t.Fatalf("checkpoint=%#v events=%#v err=%v", loaded, events, err)
+	}
+	drifted := event
+	drifted.Handle = "other-run"
+	document, err = json.Marshal(workflowCheckpoint{Record: record, Events: []Event{drifted}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = DecodeWorkflowImportCheckpoint(document); !IsCode(err, CodeConflict) {
+		t.Fatal("cross-workflow journal accepted", err)
+	}
+	sequenceDrift := record
+	sequenceDrift.Sequence = 2
+	document, err = json.Marshal(workflowCheckpoint{Record: sequenceDrift, Events: []Event{event}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = DecodeWorkflowImportCheckpoint(document); !IsCode(err, CodeConflict) {
+		t.Fatal("workflow sequence drift accepted", err)
+	}
+	if _, _, err = DecodeWorkflowImportCheckpoint([]byte(`{"record":{}}`)); !IsCode(err, CodeConflict) {
+		t.Fatal("incomplete workflow projection accepted", err)
+	}
+	if err = ValidatePlanArtifactForStore(PlanArtifact{}, "import-run"); !IsCode(err, CodeConflict) {
+		t.Fatal("invalid artifact accepted", err)
+	}
+	if ValidExecutableMaterialForStore("import-run", ExecutableMaterial{}) {
+		t.Fatal("invalid executable material accepted")
+	}
+}
+
+// TestResolveReservationAndGitHubIdempotencyUseDurableProjection proves retry
+// reconciliation reads the original reservation without starting another run.
+func TestResolveReservationAndGitHubIdempotencyUseDurableProjection(t *testing.T) {
+	service, admission, _, store, _ := workflowFixture(t, validPlanResponse())
+	command := validCommand()
+	command.RepositoryID = "42"
+	view, err := service.Start(context.Background(), command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admissionCalls := admission.callCount()
+	resolved, found, err := service.ResolveReservation(context.Background(), command.Principal, command.IdempotencyKey)
+	if err != nil || !found || resolved.Handle != view.Handle {
+		t.Fatalf("reservation resolved=%#v found=%v err=%v", resolved, found, err)
+	}
+	if _, found, err = service.ResolveReservation(context.Background(), command.Principal, "missing-key"); err != nil || found {
+		t.Fatalf("missing reservation found=%v err=%v", found, err)
+	}
+	service.deps.Store = reservationBlindWorkflowStore{WorkflowStore: store}
+	if _, _, err = service.ResolveReservation(context.Background(), command.Principal, command.IdempotencyKey); !IsCode(err, CodeUnavailable) {
+		t.Fatalf("store without lookup capability produced %v", err)
+	}
+	service.deps.Store = store
+	gateway := GitHubGateway{Service: service, Principal: command.Principal}
+	state, found, err := gateway.ResolveIdempotency(context.Background(), command.IdempotencyKey)
+	if err != nil || !found || state.RunHandle != view.Handle || state.RepositoryID != 42 || admission.callCount() != admissionCalls {
+		t.Fatalf("gateway state=%#v found=%v calls=%d err=%v", state, found, admission.callCount(), err)
+	}
+	if _, _, err = (GitHubGateway{}).ResolveIdempotency(context.Background(), command.IdempotencyKey); err == nil {
+		t.Fatal("gateway without service accepted")
+	}
+	if _, _, err = gateway.ResolveIdempotency(context.Background(), "bad/key"); err == nil {
+		t.Fatal("gateway accepted malformed key")
+	}
+}
+
+// TestLocalWorkflowStoresHonorGlobalImportFreeze proves workflow projections
+// and private executable deletion cannot mutate an offline import source.
+func TestLocalWorkflowStoresHonorGlobalImportFreeze(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	workflowStore, err := OpenLocalStore(filepath.Join(root, "workflow"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	executableStore, err := OpenLocalExecutableStore(filepath.Join(root, "executables"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	importStore, err := controlplane.OpenLocalImportStore(root, "workflow-freeze")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = importStore.Freeze(ctx, "workflow-import", "workflow-run", "project-1", strings.Repeat("a", 64), 1, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	record := Record{Version: 1, Handle: "workflow-run", Principal: "principal-1", IdempotencyKey: "workflow-key", RequestDigest: strings.Repeat("b", 64), Phase: PhaseAdmitted}
+	if _, _, err = workflowStore.Reserve(ctx, record, "worker-1", time.Now().UTC(), time.Minute); !IsCode(err, CodeConflict) {
+		t.Fatal("frozen workflow writable", err)
+	}
+	if err = executableStore.Delete(ctx, record.Handle); !IsCode(err, CodeUnavailable) {
+		t.Fatal("frozen executable writable", err)
+	}
+}
+
+// TestPackageImportExportIsClosedAndFilesystemIndependent covers absent,
+// cancelled and malformed package roots before they can enter import staging.
+func TestPackageImportExportIsClosedAndFilesystemIndependent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "packages")
+	raw, err := ExportPackageImportSnapshot(context.Background(), root)
+	var empty PackageImportSnapshot
+	if err != nil || json.Unmarshal(raw, &empty) != nil || len(empty.Items) != 0 {
+		t.Fatalf("absent package export=%#v err=%v", empty, err)
+	}
+	packageDir := filepath.Join(root, "run-1")
+	if err = os.MkdirAll(packageDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(packageDir, "functional-flow-package.json"), []byte(`{"invalid":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ExportPackageImportSnapshot(context.Background(), root); !IsCode(err, CodeConflict) {
+		t.Fatal("malformed package accepted", err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err = ExportPackageImportSnapshot(cancelled, root); err == nil {
+		t.Fatal("cancelled package export accepted")
+	}
+	claimed := PackageImportClaimedPaths(root)
+	if len(claimed) != 1 || claimed[0] != root {
+		t.Fatalf("claimed paths=%v", claimed)
+	}
+}
+
+// TestFindReservationReadsWithoutMutationAndHonorsCancellation proves import
+// discovery can inspect idempotency authority without acquiring a workflow.
+func TestFindReservationReadsWithoutMutationAndHonorsCancellation(t *testing.T) {
+	store, err := OpenLocalStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, _, err := store.Reserve(context.Background(), Record{Version: 1, Handle: "reservation-lookup", Principal: "principal-lookup", IdempotencyKey: "key-lookup", RequestDigest: strings.Repeat("e", 64), Phase: PhaseAdmitted}, "lookup-owner", time.Unix(20, 0).UTC(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, exists, err := store.FindReservation(context.Background(), expected.Principal, expected.IdempotencyKey)
+	if err != nil || !exists || found.Handle != expected.Handle || found.VersionCAS != expected.VersionCAS {
+		t.Fatalf("reservation found=%#v exists=%t err=%v", found, exists, err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err = store.FindReservation(cancelled, expected.Principal, expected.IdempotencyKey); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled reservation lookup err=%v", err)
+	}
+}
 
 // TestLocalStoreCleanupPendingReturnsOnlyDurableCleanupObligations verifies the productive source is stable, filtered, cancellation-aware, and fails closed on corrupt authority.
 func TestLocalStoreCleanupPendingReturnsOnlyDurableCleanupObligations(t *testing.T) {
@@ -143,7 +308,7 @@ func (c cleanupIntentFixedClock) Now() time.Time { return c.now }
 // Wait implements the controller waiter boundary without starting timers during intent pagination tests.
 func (c cleanupIntentFixedClock) Wait(ctx context.Context, _ time.Duration) error { return ctx.Err() }
 
-// cleanupIntentNoopLifecycle keeps the pagination vertical below provider I/O while the discovered item retains a live foreign lease.
+// cleanupIntentNoopLifecycle prevents pagination tests from crossing a real provider boundary while preserving controller protocol shape.
 type cleanupIntentNoopLifecycle struct{}
 
 // ReconcileUncertain rejects unexpected uncertain work in the intent pagination vertical.

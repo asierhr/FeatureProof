@@ -13,6 +13,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // ErrNotFound indicates that no durable record exists for an opaque identity.
@@ -623,6 +625,11 @@ func (s *LocalStore) refreshLocked(ctx context.Context) (func(), error) {
 
 // commit appends and fsyncs the source event before atomically publishing its snapshot.
 func (s *LocalStore) commit(event StoreEvent) error {
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(context.Background(), s.dir)
+	if err != nil {
+		return &Error{Code: CodeConflict, Operation: "offline_import_freeze"}
+	}
+	defer releaseImportWrite()
 	event.Sequence = s.state.Sequence + 1
 	raw, err := json.Marshal(event)
 	if err != nil {

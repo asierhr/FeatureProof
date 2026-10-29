@@ -105,7 +105,7 @@ func TestSanitizerRunsWithoutLifecycleLock(t *testing.T) {
 	plan, snapshot := singleApprovalFixture(t)
 	run := approvalRun("run-1", harness.StatusPlanning)
 	sanitizer := &blockingSanitizer{entered: make(chan struct{}), release: make(chan struct{})}
-	workflow, err := NewWorkflow(NewMemoryStore(), sanitizer, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
+	workflow, err := NewWorkflow(context.Background(), NewMemoryStore(), sanitizer, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestStoreRunsWithoutLifecycleLock(t *testing.T) {
 	plan, snapshot := singleApprovalFixture(t)
 	run := approvalRun("run-1", harness.StatusPlanning)
 	store := &blockingApprovalStore{MemoryStore: NewMemoryStore(), entered: make(chan struct{}), release: make(chan struct{})}
-	workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
+	workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +174,7 @@ func TestAppendCASRunsWithoutLifecycleLock(t *testing.T) {
 	plan, snapshot := singleApprovalFixture(t)
 	run := approvalRun("run-1", harness.StatusPlanning)
 	store := &blockingAppendStore{MemoryStore: NewMemoryStore(), entered: make(chan struct{}), release: make(chan struct{})}
-	workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
+	workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
 	if err != nil {
 		t.Fatal(err)
 	}

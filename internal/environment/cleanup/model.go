@@ -303,6 +303,17 @@ func VerifyItem(value Item) error {
 	return nil
 }
 
+// EligibleForClaim is the consumer-owned scheduling predicate shared by every durable cleanup adapter.
+func EligibleForClaim(item Item, now time.Time) bool {
+	if !validDurableTime(now) || item.State == StateCapacityReleased || item.State == StateBlocked || item.State == StateQuarantine {
+		return false
+	}
+	if item.State == StateRetryWait {
+		return !now.Before(item.NextAttemptAt)
+	}
+	return item.State != StateDiscovered || !now.Before(item.ExpiresAt)
+}
+
 // Event is the allowlisted append-only cleanup audit projection.
 type Event struct {
 	ID, CleanupID, ProjectID, Owner, OwnerDigest string
@@ -312,6 +323,28 @@ type Event struct {
 	Attempt, FencingVersion                      uint64
 	At                                           time.Time
 	Digest                                       string
+}
+
+// BindEvent seals one caller event to the exact post-transition cleanup projection before journal persistence.
+func BindEvent(item Item, event Event) (Event, error) {
+	if event.ID == "" {
+		return Event{}, &Error{Category: CategoryInvalid, Operation: "event_bind"}
+	}
+	if event.Kind == "" {
+		event.Kind = "cleanup_state_changed"
+	}
+	event.CleanupID, event.ProjectID, event.OwnerDigest, event.State, event.Attempt, event.FencingVersion = item.CleanupID, item.ProjectID, item.OwnerDigest, item.State, item.Attempts, item.FencingVersion
+	if event.Owner == "" {
+		event.Owner = item.LeaseOwner
+	}
+	event.At = event.At.UTC()
+	event.Category = item.LastCategory
+	event.Digest = ""
+	if !safeID.MatchString(event.ID) || !safeID.MatchString(event.CleanupID) || !safeID.MatchString(event.ProjectID) || event.Owner != "" && !safeID.MatchString(event.Owner) || !validDurableTime(event.At) || !validState(event.State) || !validAuditCategory(event.Category) {
+		return Event{}, &Error{Category: CategoryInvalid, Operation: "event_bind"}
+	}
+	event.Digest = digestOf(event)
+	return event, nil
 }
 
 // Status is the safe operational cleanup view separate from functional verdicts.

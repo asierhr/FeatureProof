@@ -96,10 +96,22 @@ type Dependencies struct {
 	Orphans     OrphanAuthority
 	Sources     map[string]DiscoverySource
 	Observer    Observer
-	Ledger      *CapacityLedger
+	Ledger      CapacityLedgerPort
 	Clock       Clock
 	Waiter      Waiter
 }
+
+// CapacityLedgerPort is the cleanup-owned quota boundary required for orphan adoption and confirmed release.
+type CapacityLedgerPort interface {
+	AdoptUnknown(context.Context, string, string, string, string, ResourceDemand, time.Duration) (CapacityReceipt, bool, error)
+	BlockUnknown(context.Context, string, string) (CapacityReceipt, bool, error)
+	ConfirmEnvironment(context.Context, CapacityReceipt, string, string) (CapacityReceipt, error)
+	ReleaseConfirmed(context.Context, string, string, string, string, string) (CapacityReceipt, bool, error)
+	Snapshot(string) (CapacitySnapshot, error)
+}
+
+// localCapacityLedgerContract prevents the local implementation from drifting from controller semantics.
+var localCapacityLedgerContract CapacityLedgerPort = (*CapacityLedger)(nil)
 
 // Status reads the local operational projection without resolving lifecycle authority from a run ID.
 func (c *Controller) Status(ctx context.Context, cleanupID string) (Status, error) {
@@ -452,7 +464,6 @@ func (c *Controller) adoptOrphan(ctx context.Context, source string, candidate I
 	return err
 }
 
-// minInt keeps provider requests within both page and remaining item budgets.
 func minInt(left, right int) int {
 	if left < right {
 		return left
@@ -587,13 +598,7 @@ func (c *Controller) Requeue(ctx context.Context, authorization RequeueAuthoriza
 
 // eligible determines whether durable state may be claimed at the inclusive time boundary.
 func eligible(item Item, now time.Time) bool {
-	if item.State == StateCapacityReleased || item.State == StateBlocked || item.State == StateQuarantine {
-		return false
-	}
-	if item.State == StateRetryWait {
-		return !now.Before(item.NextAttemptAt)
-	}
-	return item.State != StateDiscovered || !now.Before(item.ExpiresAt)
+	return EligibleForClaim(item, now)
 }
 
 // classify maps cancellation and typed errors into the closed scheduler taxonomy.

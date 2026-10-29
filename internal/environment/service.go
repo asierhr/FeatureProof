@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"sync/atomic"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // Limits bounds every provider call, readiness loop and detached cleanup attempt.
@@ -159,6 +161,13 @@ type Store interface {
 	Load(context.Context, string) (Record, error)
 	Save(context.Context, Record, uint64, Event) (Record, error)
 	Events(context.Context, string) ([]Event, error)
+}
+
+// CausalStore extends lifecycle persistence with the atomic next-job and
+// effect-intent boundary used by restartable environment orchestration.
+type CausalStore interface {
+	Store
+	SaveCausal(context.Context, Record, uint64, Event, *controlplane.Job, *controlplane.EffectIntent) (Record, error)
 }
 
 // Dependencies contains all composition-owned lifecycle collaborators.
@@ -597,12 +606,14 @@ func (s *LifecycleService) acquireObservation(ctx context.Context, provider Envi
 
 // cleanupDetached first resolves uncertain acquisition identity and never releases an empty lifecycle handle.
 func (s *LifecycleService) cleanupDetached(parent context.Context, record Record, provider EnvironmentProvider) error {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), s.deps.Limits.ReleaseTimeout)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), s.deps.Limits.LeaseTTL)
 	defer cancel()
 	var reconciled Observation
 	if record.LifecycleHandle == "" {
 		reconcileRequest := AcquisitionRequest{RunID: record.RunID, IdempotencyKey: record.AcquisitionKey, ProjectID: record.Selection.ProjectID, RepositoryID: record.Selection.RepositoryID, CommitOID: record.CommitOID, Selection: record.Selection}
-		observation, reconcileErr := provider.Reconcile(cleanupCtx, reconcileRequest)
+		reconcileCtx, reconcileCancel := context.WithTimeout(cleanupCtx, s.deps.Limits.AcquireTimeout)
+		observation, reconcileErr := provider.Reconcile(reconcileCtx, reconcileRequest)
+		reconcileCancel()
 		_, authorityErr := validateObservationAuthority(record.RunID, record.Selection, record.Selection.RepositoryID, record.CommitOID, observation, s.deps.Clock.Now())
 		if reconcileErr != nil || authorityErr != nil {
 			record.State, record.ReleaseRequired = StateReleasePending, true
@@ -638,7 +649,9 @@ func (s *LifecycleService) cleanupDetached(parent context.Context, record Record
 	if err != nil {
 		return err
 	}
-	err = provider.Release(cleanupCtx, ReleaseRequest{RunID: record.RunID, AcquisitionKey: record.AcquisitionKey, IdempotencyKey: record.ReleaseKey, ProjectID: record.Selection.ProjectID, RepositoryID: record.Selection.RepositoryID, CommitOID: record.CommitOID, EnvironmentID: record.EnvironmentID, LifecycleHandle: record.LifecycleHandle, LifecycleDigest: record.LifecycleDigest, Selection: record.Selection})
+	releaseCtx, releaseCancel := context.WithTimeout(cleanupCtx, s.deps.Limits.ReleaseTimeout)
+	err = provider.Release(releaseCtx, ReleaseRequest{RunID: record.RunID, AcquisitionKey: record.AcquisitionKey, IdempotencyKey: record.ReleaseKey, ProjectID: record.Selection.ProjectID, RepositoryID: record.Selection.RepositoryID, CommitOID: record.CommitOID, EnvironmentID: record.EnvironmentID, LifecycleHandle: record.LifecycleHandle, LifecycleDigest: record.LifecycleDigest, Selection: record.Selection})
+	releaseCancel()
 	if err != nil && !IsCategory(err, CategoryAlreadyReleased) {
 		record.State, record.Owner, record.LeaseUntil = StateReleasePending, "", time.Time{}
 		_, _ = s.save(cleanupCtx, record, "release_pending", record.EnvironmentID, record.Attempts)

@@ -240,36 +240,50 @@ func (e *Executor) Execute(ctx context.Context, runID string, validated Validate
 		work++
 		if err != nil {
 			record := terminalForError(runID, flow.Revision, step.ID, err)
-			if saveErr := e.State.ConfirmTerminal(runCtx, record); saveErr != nil {
-				return Result{}, flowError(CategoryIntegrity, "state.resolve", saveErr)
-			}
-			if err := e.appendRuntimeEvent(runCtx, artifact, runID, Event{Type: "step_terminal", StepID: step.ID, Status: string(record.Status), Category: record.Category}); err != nil {
+			claim, err = e.renewClaimCheckpoint(runCtx, runID, flow.Revision, step.ID, claim)
+			if err != nil {
 				return Result{}, err
 			}
+			record.ClaimToken = claim.Token
+			confirmCtx, confirmCancel := e.confirmationContext(runCtx)
+			saveErr := e.State.ConfirmTerminal(confirmCtx, record)
+			confirmCancel()
+			if saveErr != nil {
+				return Result{}, flowError(CategoryIntegrity, "state.resolve", saveErr)
+			}
+			journalCtx, journalCancel := e.confirmationContext(runCtx)
+			if err := e.appendRuntimeEvent(journalCtx, artifact, runID, Event{Type: "step_terminal", StepID: step.ID, Status: string(record.Status), Category: record.Category}); err != nil {
+				journalCancel()
+				return Result{}, err
+			}
+			journalCancel()
+			record.ClaimToken = ""
 			records[step.ID] = record
 			continue
 		}
-		record, resultEntries, usedCalls, err := e.executeStep(runCtx, runID, flow.Revision, artifact, bound, input, key, claim, calls)
+		record, resultEntries, usedCalls, liveClaim, err := e.executeStep(runCtx, runID, flow.Revision, artifact, bound, input, key, claim, calls)
+		claim = liveClaim
 		record.ClaimToken = claim.Token
 		calls += usedCalls
 		if err != nil && record.StepID == "" {
 			return Result{}, err
 		}
-		confirmCtx, confirmCancel := context.WithTimeout(context.WithoutCancel(runCtx), e.Config.ConfirmationTimeout)
-		if _, renewErr := e.renewClaim(confirmCtx, runID, flow.Revision, step.ID, claim); renewErr != nil {
-			confirmCancel()
-			return Result{}, renewErr
-		}
-		saveErr := e.State.ConfirmTerminal(confirmCtx, record)
-		if saveErr != nil {
-			confirmCancel()
-			return Result{}, flowError(CategoryIntegrity, "state.confirm", saveErr)
-		}
-		if err := e.appendRuntimeEvent(confirmCtx, artifact, runID, Event{Type: "step_terminal", StepID: step.ID, Status: string(record.Status), Category: record.Category, EvidenceIDs: []string{record.EvidenceID}}); err != nil {
-			confirmCancel()
+		claim, err = e.renewClaimCheckpoint(runCtx, runID, flow.Revision, step.ID, claim)
+		if err != nil {
 			return Result{}, err
 		}
+		confirmCtx, confirmCancel := e.confirmationContext(runCtx)
+		saveErr := e.State.ConfirmTerminal(confirmCtx, record)
 		confirmCancel()
+		if saveErr != nil {
+			return Result{}, flowError(CategoryIntegrity, "state.confirm", saveErr)
+		}
+		journalCtx, journalCancel := e.confirmationContext(runCtx)
+		if err := e.appendRuntimeEvent(journalCtx, artifact, runID, Event{Type: "step_terminal", StepID: step.ID, Status: string(record.Status), Category: record.Category, EvidenceIDs: []string{record.EvidenceID}}); err != nil {
+			journalCancel()
+			return Result{}, err
+		}
+		journalCancel()
 		records[step.ID] = record
 		for _, entry := range resultEntries {
 			ledger, err = ledger.Append(entry)
@@ -356,49 +370,49 @@ func (e *Executor) appendRuntimeEvent(ctx context.Context, artifact Artifact, ru
 }
 
 // executeStep applies all runtime guards on every attempt and confirms evidence before assertions.
-func (e *Executor) executeStep(ctx context.Context, runID string, revision uint64, artifact Artifact, bound BoundStep, input map[string]any, key string, claim Claim, usedCalls int) (StepRecord, []LedgerEntry, int, error) {
+func (e *Executor) executeStep(ctx context.Context, runID string, revision uint64, artifact Artifact, bound BoundStep, input map[string]any, key string, claim Claim, usedCalls int) (StepRecord, []LedgerEntry, int, Claim, error) {
 	step := bound.Step
 	attempts := e.Config.MaxRetries + 1
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := e.appendRuntimeEvent(ctx, artifact, runID, Event{Type: "attempt_started", StepID: step.ID, Attempt: attempt, BindingDigest: bound.Operation.BindingDigest}); err != nil {
-			return StepRecord{}, nil, attempt - 1, err
+			return StepRecord{}, nil, attempt - 1, claim, err
 		}
 		stepCtx, cancel := context.WithTimeout(ctx, e.Config.StepTimeout)
 		if err := e.Revalidator.Revalidate(stepCtx, runID, bound); err != nil {
 			cancel()
-			return terminalForError(runID, revision, step.ID, flowError(CategoryAuthority, "binding", err)), nil, attempt - 1, nil
+			return terminalForError(runID, revision, step.ID, flowError(CategoryAuthority, "binding", err)), nil, attempt - 1, claim, nil
 		}
 		decision, err := e.Policy.Evaluate(stepCtx, runID, bound)
 		if err != nil || decision != PolicyAllowed {
 			cancel()
-			return terminalForError(runID, revision, step.ID, flowError(CategoryPolicy, "policy", err)), nil, attempt - 1, nil
+			return terminalForError(runID, revision, step.ID, flowError(CategoryPolicy, "policy", err)), nil, attempt - 1, claim, nil
 		}
 		if usedCalls+attempt > e.Config.MaxCalls {
 			cancel()
-			return terminalForError(runID, revision, step.ID, flowError(CategoryLimit, "calls", nil)), nil, attempt - 1, nil
+			return terminalForError(runID, revision, step.ID, flowError(CategoryLimit, "calls", nil)), nil, attempt - 1, claim, nil
 		}
 		if step.Kind == StepAct {
 			if err := e.markActionProgress(stepCtx, runID, revision, bound, key, claim.Token, true, ""); err != nil {
 				cancel()
-				return StepRecord{}, nil, attempt - 1, err
+				return StepRecord{}, nil, attempt - 1, claim, err
 			}
 		}
 		response, toolErr := e.Tool.Execute(stepCtx, ExecutionRequest{RunID: runID, Revision: revision, StepID: step.ID, Operation: bound.Operation, Input: input, IdempotencyKey: key, Attempt: attempt})
 		cancel()
 		if toolErr != nil {
 			if ctx.Err() != nil {
-				return terminalForError(runID, revision, step.ID, ctx.Err()), nil, attempt, nil
+				return terminalForError(runID, revision, step.ID, ctx.Err()), nil, attempt, claim, nil
 			}
 			canRetry := response.Transient && (step.Kind == StepObserve || bound.Operation.Idempotent || bound.Operation.ReconciliationSafe) && attempt < attempts
 			if canRetry {
 				if err := e.appendRuntimeEvent(ctx, artifact, runID, Event{Type: "retry_scheduled", StepID: step.ID, Attempt: attempt, Category: CategoryUncertain}); err != nil {
-					return StepRecord{}, nil, attempt, err
+					return StepRecord{}, nil, attempt, claim, err
 				}
 				if e.Waiter == nil {
-					return StepRecord{}, nil, attempt, flowError(CategoryInternal, "retry.waiter", nil)
+					return StepRecord{}, nil, attempt, claim, flowError(CategoryInternal, "retry.waiter", nil)
 				}
 				if err := e.Waiter.Wait(ctx, e.Config.RetryDelay); err != nil {
-					return terminalForError(runID, revision, step.ID, err), nil, attempt, nil
+					return terminalForError(runID, revision, step.ID, err), nil, attempt, claim, nil
 				}
 				continue
 			}
@@ -406,65 +420,65 @@ func (e *Executor) executeStep(ctx context.Context, runID string, revision uint6
 			if response.CrossedNetwork {
 				category = CategoryUncertain
 			}
-			return StepRecord{RunID: runID, Revision: revision, StepID: step.ID, Status: planning.StepInconclusive, Category: category}, nil, attempt, nil
+			return StepRecord{RunID: runID, Revision: revision, StepID: step.ID, Status: planning.StepInconclusive, Category: category}, nil, attempt, claim, nil
 		}
-		confirmationCtx, confirmationCancel := context.WithTimeout(context.WithoutCancel(ctx), e.Config.ConfirmationTimeout)
-		claim, err = e.renewClaim(confirmationCtx, runID, revision, step.ID, claim)
+		claim, err = e.renewClaimCheckpoint(ctx, runID, revision, step.ID, claim)
 		if err != nil {
-			confirmationCancel()
-			return StepRecord{}, nil, attempt, err
+			return StepRecord{}, nil, attempt, claim, err
 		}
 		evidence := SealEvidence(Evidence{ID: response.EvidenceID, RunID: runID, Revision: revision, StepID: step.ID, BindingDigest: bound.Operation.BindingDigest, ResourceBindingDigest: response.ResourceBindingDigest, Output: response.Output, Terminal: true, Truncated: response.Truncated})
-		confirmed, err := e.Evidence.Confirm(confirmationCtx, evidence)
+		evidenceCtx, evidenceCancel := e.confirmationContext(ctx)
+		confirmed, err := e.Evidence.Confirm(evidenceCtx, evidence)
+		evidenceCancel()
 		if err != nil || !validEvidence(confirmed, runID, revision, step.ID) {
-			confirmationCancel()
-			return StepRecord{}, nil, attempt, flowError(CategoryIntegrity, "evidence", err)
+			return StepRecord{}, nil, attempt, claim, flowError(CategoryIntegrity, "evidence", err)
 		}
-		claim, err = e.renewClaim(confirmationCtx, runID, revision, step.ID, claim)
+		claim, err = e.renewClaimCheckpoint(ctx, runID, revision, step.ID, claim)
 		if err != nil {
-			confirmationCancel()
-			return StepRecord{}, nil, attempt, err
+			return StepRecord{}, nil, attempt, claim, err
 		}
 		evidenceEvent, eventErr := evidenceConfirmedEvent(step.ID, attempt, confirmed)
 		if eventErr != nil {
-			confirmationCancel()
-			return StepRecord{}, nil, attempt, eventErr
+			return StepRecord{}, nil, attempt, claim, eventErr
 		}
-		if err := e.appendRuntimeEvent(confirmationCtx, artifact, runID, evidenceEvent); err != nil {
-			confirmationCancel()
-			return StepRecord{}, nil, attempt, err
+		evidenceJournalCtx, evidenceJournalCancel := e.confirmationContext(ctx)
+		if err := e.appendRuntimeEvent(evidenceJournalCtx, artifact, runID, evidenceEvent); err != nil {
+			evidenceJournalCancel()
+			return StepRecord{}, nil, attempt, claim, err
 		}
+		evidenceJournalCancel()
 		if step.Kind == StepAct {
-			claim, err = e.renewClaim(confirmationCtx, runID, revision, step.ID, claim)
+			claim, err = e.renewClaimCheckpoint(ctx, runID, revision, step.ID, claim)
 			if err != nil {
-				confirmationCancel()
-				return StepRecord{}, nil, attempt, err
+				return StepRecord{}, nil, attempt, claim, err
 			}
-			if err := e.markActionProgress(confirmationCtx, runID, revision, bound, key, claim.Token, true, confirmed.ID); err != nil {
-				confirmationCancel()
-				return StepRecord{}, nil, attempt, err
+			progressCtx, progressCancel := e.confirmationContext(ctx)
+			if err := e.markActionProgress(progressCtx, runID, revision, bound, key, claim.Token, true, confirmed.ID); err != nil {
+				progressCancel()
+				return StepRecord{}, nil, attempt, claim, err
 			}
+			progressCancel()
 		}
-		claim, err = e.renewClaim(confirmationCtx, runID, revision, step.ID, claim)
+		claim, err = e.renewClaimCheckpoint(ctx, runID, revision, step.ID, claim)
 		if err != nil {
-			confirmationCancel()
-			return StepRecord{}, nil, attempt, err
+			return StepRecord{}, nil, attempt, claim, err
 		}
-		assertions, err := e.Assertions.Evaluate(confirmationCtx, step.Assertions, confirmed)
+		assertionCtx, assertionCancel := e.confirmationContext(ctx)
+		assertions, err := e.Assertions.Evaluate(assertionCtx, step.Assertions, confirmed)
+		assertionCancel()
 		if err != nil {
-			confirmationCancel()
-			return StepRecord{}, nil, attempt, flowError(CategoryIntegrity, "assertions", err)
+			return StepRecord{}, nil, attempt, claim, flowError(CategoryIntegrity, "assertions", err)
 		}
-		claim, err = e.renewClaim(confirmationCtx, runID, revision, step.ID, claim)
+		claim, err = e.renewClaimCheckpoint(ctx, runID, revision, step.ID, claim)
 		if err != nil {
-			confirmationCancel()
-			return StepRecord{}, nil, attempt, err
+			return StepRecord{}, nil, attempt, claim, err
 		}
-		if err := e.appendRuntimeEvent(confirmationCtx, artifact, runID, Event{Type: "assertions_confirmed", StepID: step.ID, Attempt: attempt, EvidenceIDs: []string{confirmed.ID}}); err != nil {
-			confirmationCancel()
-			return StepRecord{}, nil, attempt, err
+		assertionJournalCtx, assertionJournalCancel := e.confirmationContext(ctx)
+		if err := e.appendRuntimeEvent(assertionJournalCtx, artifact, runID, Event{Type: "assertions_confirmed", StepID: step.ID, Attempt: attempt, EvidenceIDs: []string{confirmed.ID}}); err != nil {
+			assertionJournalCancel()
+			return StepRecord{}, nil, attempt, claim, err
 		}
-		confirmationCancel()
+		assertionJournalCancel()
 		status := planning.StepPassed
 		entries := make([]LedgerEntry, len(assertions))
 		for i, result := range assertions {
@@ -480,9 +494,9 @@ func (e *Executor) executeStep(ctx context.Context, runID string, revision uint6
 		if response.FunctionalFailure && status == planning.StepPassed {
 			status = planning.StepFailed
 		}
-		return StepRecord{RunID: runID, Revision: revision, StepID: step.ID, Status: status, EvidenceID: confirmed.ID, Assertions: assertions}, entries, attempt, nil
+		return StepRecord{RunID: runID, Revision: revision, StepID: step.ID, Status: status, EvidenceID: confirmed.ID, Assertions: assertions}, entries, attempt, claim, nil
 	}
-	return StepRecord{RunID: runID, Revision: revision, StepID: step.ID, Status: planning.StepInconclusive, Category: CategoryLimit}, nil, attempts, nil
+	return StepRecord{RunID: runID, Revision: revision, StepID: step.ID, Status: planning.StepInconclusive, Category: CategoryLimit}, nil, attempts, claim, nil
 }
 
 // renewClaim extends and verifies exclusive ownership before a blocking post-tool checkpoint.
@@ -492,6 +506,20 @@ func (e *Executor) renewClaim(ctx context.Context, runID string, revision uint64
 		return Claim{}, flowError(CategoryAuthority, "state.claim_renew", err)
 	}
 	return renewed, nil
+}
+
+// confirmationContext gives one durable checkpoint its full bounded timeout;
+// a slow prior checkpoint cannot consume the next claim-validation window.
+func (e *Executor) confirmationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), e.Config.ConfirmationTimeout)
+}
+
+// renewClaimCheckpoint renews the current immutable token in an independent
+// confirmation window and returns the latest lease expiry to its caller.
+func (e *Executor) renewClaimCheckpoint(ctx context.Context, runID string, revision uint64, stepID string, claim Claim) (Claim, error) {
+	confirmationCtx, cancel := e.confirmationContext(ctx)
+	defer cancel()
+	return e.renewClaim(confirmationCtx, runID, revision, stepID, claim)
 }
 
 // prepareActionIntent durably binds one effect before input resolution and returns any prior crash checkpoint.

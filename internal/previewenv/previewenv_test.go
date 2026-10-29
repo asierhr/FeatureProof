@@ -903,5 +903,5 @@ func mustJSON(t *testing.T, value any) string {
 	return string(raw)
 }
 
-// jsonMarshal is an injectable-looking narrow wrapper that keeps test diagnostics concise.
+// jsonMarshal gives secret-scan tests one replaceable serialization boundary without changing production encoding.
 func jsonMarshal(value any) ([]byte, error) { return json.Marshal(value) }

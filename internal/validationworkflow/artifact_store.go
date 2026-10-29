@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // LocalArtifactStore owns immutable canonical plan artifacts below one trusted root.
@@ -31,6 +33,11 @@ func (s *LocalArtifactStore) Commit(ctx context.Context, artifact PlanArtifact) 
 	if verifyArtifact(artifact, artifact.WorkflowID) != nil {
 		return &Error{Code: CodeInvalid, Operation: "artifact_commit"}
 	}
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(ctx, s.root)
+	if err != nil {
+		return &Error{Code: CodeUnavailable, Operation: "artifact_frozen"}
+	}
+	defer releaseImportWrite()
 	destination := filepath.Join(s.root, artifact.WorkflowID+".plan.json")
 	if raw, err := os.ReadFile(destination); err == nil {
 		var current PlanArtifact

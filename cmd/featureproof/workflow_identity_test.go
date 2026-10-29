@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -20,6 +21,7 @@ import (
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/evidence"
 	"github.com/asierhr/featureProof/internal/fixture"
+	"github.com/asierhr/featureProof/internal/githubcontext"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/localvalidation"
@@ -32,6 +34,63 @@ import (
 
 // workflowIdentityClock supplies a trusted fixed instant to the product transport composition test.
 type workflowIdentityClock struct{}
+
+// TestWorkflowPostgresContextObserverRetainsNoLocalState proves PostgreSQL
+// composition accepts the safe record without opening a filesystem journal.
+func TestWorkflowPostgresContextObserverRetainsNoLocalState(t *testing.T) {
+	if err := (workflowGitHubContextObserver{}).Observe(context.Background(), githubcontext.Record{}); err != nil {
+		t.Fatalf("PostgreSQL context observer err=%v", err)
+	}
+}
+
+// workflowFixtureSanitizerProbe returns one controlled projection or sanitizer failure.
+type workflowFixtureSanitizerProbe struct {
+	value any
+	err   error
+}
+
+// Sanitize exposes the configured safe projection without retaining input.
+func (probe workflowFixtureSanitizerProbe) Sanitize(context.Context, any) (any, error) {
+	return probe.value, probe.err
+}
+
+// workflowFixtureEvidenceProbe records the sanitized map delegated to durable evidence.
+type workflowFixtureEvidenceProbe struct{ value map[string]any }
+
+// Confirm captures the sanitized projection and returns one stable evidence ID.
+func (probe *workflowFixtureEvidenceProbe) Confirm(_ context.Context, _, _ string, value map[string]any) (map[string]any, string, error) {
+	probe.value = value
+	return value, "fixture-evidence", nil
+}
+
+// TestWorkflowFixtureEvidenceSanitizesBeforePersistence proves PostgreSQL-mode
+// composition never delegates raw or structurally ambiguous fixture output.
+func TestWorkflowFixtureEvidenceSanitizesBeforePersistence(t *testing.T) {
+	if err := (workflowGitHubContextObserver{}).Observe(context.Background(), githubcontext.Record{}); err != nil {
+		t.Fatal(err)
+	}
+	next := &workflowFixtureEvidenceProbe{}
+	sink := workflowSanitizedFixtureEvidence{next: next, sanitizer: workflowFixtureSanitizerProbe{err: errors.New("redaction unavailable")}}
+	if _, _, err := sink.Confirm(context.Background(), "run", "binding", map[string]any{"secret": "raw"}); err == nil || next.value != nil {
+		t.Fatal("sanitizer failure reached evidence persistence")
+	}
+	ambiguous := workflowSanitizedFixtureEvidence{next: next, sanitizer: workflowFixtureSanitizerProbe{value: "not-an-object"}}
+	if _, _, err := ambiguous.Confirm(context.Background(), "run", "binding", map[string]any{"secret": "raw"}); err == nil || next.value != nil {
+		t.Fatal("non-object sanitizer projection reached evidence persistence")
+	}
+	safe := map[string]any{"status": "ok"}
+	accepted := workflowSanitizedFixtureEvidence{next: next, sanitizer: workflowFixtureSanitizerProbe{value: safe}}
+	confirmed, evidenceID, err := accepted.Confirm(context.Background(), "run", "binding", map[string]any{"secret": "raw"})
+	if err != nil || evidenceID != "fixture-evidence" || !reflect.DeepEqual(confirmed, safe) || !reflect.DeepEqual(next.value, safe) {
+		t.Fatalf("confirmed=%#v id=%q persisted=%#v err=%v", confirmed, evidenceID, next.value, err)
+	}
+	if header := workflowFixtureIdempotencyHeader(planmanifest.Manifest{}); header != "" {
+		t.Fatalf("unapproved idempotency header=%q", header)
+	}
+	if _, err = composeWorkflowCLIWithGitHubAuthority(context.Background(), io.Discard, io.Discard, nil); err == nil {
+		t.Fatal("workflow composition accepted missing environment configuration")
+	}
+}
 
 // Now returns the deterministic instant used for lease validity and observation duration.
 func (workflowIdentityClock) Now() time.Time { return time.Unix(100, 0) }
@@ -337,6 +396,13 @@ func composeProductFixtureWorkflowWithOptions(t *testing.T, root string, targetU
 
 // composeProductWorkflowWithOptions creates controlled real composition with optional fixture lifecycle declarations.
 func composeProductWorkflowWithOptions(t *testing.T, root string, targetURL string, modelTransport *workflowProductModelTransport, spy *workflowProductResolverSpy, recoverPending, withFixtures bool) (*validationworkflow.CLI, string, string) {
+	return composeProductWorkflowWithOptionsAndPersistence(t, root, targetURL, modelTransport, spy, recoverPending, withFixtures, nil)
+}
+
+// composeProductWorkflowWithOptionsAndPersistence builds the same productive
+// identity workflow while allowing the PostgreSQL gate to inject one
+// backend-homogeneous consumer-owned persistence graph.
+func composeProductWorkflowWithOptionsAndPersistence(t *testing.T, root string, targetURL string, modelTransport *workflowProductModelTransport, spy *workflowProductResolverSpy, recoverPending, withFixtures bool, persistence *workflowPersistence) (*validationworkflow.CLI, string, string) {
 	if os.Getenv("FEATUREPROOF_MEMORY_WITNESS_URL") == "" {
 		installProjectMemoryWitness(t)
 	}
@@ -420,7 +486,7 @@ func composeProductWorkflowWithOptions(t *testing.T, root string, targetURL stri
 	if spy != nil {
 		factory = spy.Factory
 	}
-	cli, err := composeWorkflowCLIWithOptions(context.Background(), io.Discard, io.Discard, workflowCompositionOptions{credentialResolverFactory: factory, recoverPending: recoverPending})
+	cli, err := composeWorkflowCLIWithOptions(context.Background(), io.Discard, io.Discard, workflowCompositionOptions{credentialResolverFactory: factory, recoverPending: recoverPending, persistence: persistence})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,6 +509,24 @@ func recomposeProductIdentityWorkflowWithOptions(t *testing.T, modelTransport *w
 		factory = spy.Factory
 	}
 	cli, err := composeWorkflowCLIWithOptions(context.Background(), io.Discard, io.Discard, workflowCompositionOptions{credentialResolverFactory: factory, recoverPending: recoverPending})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cli
+}
+
+// recomposeProductIdentityWorkflowWithPersistence rebuilds the productive
+// service over a freshly opened PostgreSQL graph without touching local state.
+func recomposeProductIdentityWorkflowWithPersistence(t *testing.T, modelTransport *workflowProductModelTransport, spy *workflowProductResolverSpy, recoverPending bool, persistence *workflowPersistence) *validationworkflow.CLI {
+	t.Helper()
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = modelTransport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport })
+	factory := workflowCredentialResolverFactory(newWorkflowEnvironmentCredentialResolver)
+	if spy != nil {
+		factory = spy.Factory
+	}
+	cli, err := composeWorkflowCLIWithOptions(context.Background(), io.Discard, io.Discard, workflowCompositionOptions{credentialResolverFactory: factory, recoverPending: recoverPending, persistence: persistence})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -804,6 +888,7 @@ func TestProductIdentityFailureParityAcrossAllSurfaces(t *testing.T) {
 		identityID, bindingDigest, category, nativeCode string
 		modelCalls, resolverCalls, targetCalls          int32
 	}
+	runSuffix := strconv.FormatInt(time.Now().UnixNano(), 10)
 	results := map[string]failureResult{}
 	for _, surface := range []string{"api", "cli", "mcp", "github"} {
 		t.Run(surface, func(t *testing.T) {
@@ -818,7 +903,7 @@ func TestProductIdentityFailureParityAcrossAllSurfaces(t *testing.T) {
 			if err := os.Unsetenv("FEATUREPROOF_PRODUCT_IDENTITY"); err != nil {
 				t.Fatal(err)
 			}
-			command := productIdentityStartCommand(cli, specPath, contractPath, "product-failure-"+surface, validationworkflow.ApprovalDisabled)
+			command := productIdentityStartCommand(cli, specPath, contractPath, "product-failure-"+surface+"-"+runSuffix, validationworkflow.ApprovalDisabled)
 			handle, nativeCode := "", ""
 			switch surface {
 			case "api":

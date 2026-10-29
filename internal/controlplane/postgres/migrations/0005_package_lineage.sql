@@ -1,0 +1,10 @@
+ALTER TABLE packages ADD COLUMN run_id text;
+ALTER TABLE packages ADD COLUMN schema_version text;
+ALTER TABLE packages ADD COLUMN artifact_digest text;
+ALTER TABLE packages ADD COLUMN binding_digest text;
+UPDATE packages SET run_id=package_id, schema_version='legacy', artifact_digest=digest, binding_digest=digest;
+ALTER TABLE packages ALTER COLUMN run_id SET NOT NULL;
+ALTER TABLE packages ALTER COLUMN schema_version SET NOT NULL;
+ALTER TABLE packages ALTER COLUMN artifact_digest SET NOT NULL;
+ALTER TABLE packages ALTER COLUMN binding_digest SET NOT NULL;
+CREATE UNIQUE INDEX packages_run_lineage_idx ON packages(project_id,run_id,artifact_digest,binding_digest);

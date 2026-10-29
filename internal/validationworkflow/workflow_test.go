@@ -121,6 +121,88 @@ type testClock struct {
 	now time.Time
 }
 
+// boundGenerationKey identifies the immutable backend generation captured by
+// the test store's atomic read without exposing it through workflow commands.
+type boundGenerationKey struct{}
+
+// cutoverBoundStore models a backend cutover immediately after LoadBound so
+// application tests can prove every subsequent mutation reuses that stale read.
+type cutoverBoundStore struct {
+	WorkflowStore
+	generation    uint64
+	cutoverOnLoad bool
+	boundReads    int
+	mutations     int
+}
+
+// ReserveBound atomically attaches the current generation to a new reservation.
+func (store *cutoverBoundStore) ReserveBound(ctx context.Context, record Record, owner string, now time.Time, ttl time.Duration) (Record, bool, context.Context, error) {
+	reserved, created, err := store.WorkflowStore.Reserve(ctx, record, owner, now, ttl)
+	return reserved, created, context.WithValue(ctx, boundGenerationKey{}, store.generation), err
+}
+
+// LoadBound returns a record and its generation before the controlled cutover.
+func (store *cutoverBoundStore) LoadBound(ctx context.Context, handle string) (Record, context.Context, error) {
+	record, err := store.WorkflowStore.Load(ctx, handle)
+	bound := context.WithValue(ctx, boundGenerationKey{}, store.generation)
+	store.boundReads++
+	if err == nil && store.cutoverOnLoad {
+		store.generation++
+		store.cutoverOnLoad = false
+	}
+	return record, bound, err
+}
+
+// SaveOwned rejects work whose immutable read generation no longer owns the head.
+func (store *cutoverBoundStore) SaveOwned(ctx context.Context, record Record, owner string, version uint64, now time.Time, ttl time.Duration, event Event) (Record, error) {
+	if err := store.verifyMutation(ctx); err != nil {
+		return Record{}, err
+	}
+	return store.WorkflowStore.SaveOwned(ctx, record, owner, version, now, ttl, event)
+}
+
+// RequestCancel rejects a command prepared from a generation superseded after its read.
+func (store *cutoverBoundStore) RequestCancel(ctx context.Context, handle string, now time.Time, event Event) (Record, error) {
+	if err := store.verifyMutation(ctx); err != nil {
+		return Record{}, err
+	}
+	return store.WorkflowStore.RequestCancel(ctx, handle, now, event)
+}
+
+// Claim rejects recovery ownership acquired from a stale pending projection.
+func (store *cutoverBoundStore) Claim(ctx context.Context, handle, owner string, now time.Time, ttl time.Duration) (Record, bool, error) {
+	if err := store.verifyMutation(ctx); err != nil {
+		return Record{}, false, err
+	}
+	return store.WorkflowStore.Claim(ctx, handle, owner, now, ttl)
+}
+
+// Renew applies the same immutable generation check to heartbeat writes.
+func (store *cutoverBoundStore) Renew(ctx context.Context, handle, owner string, now time.Time, ttl time.Duration) (Record, error) {
+	if err := store.verifyMutation(ctx); err != nil {
+		return Record{}, err
+	}
+	return store.WorkflowStore.Renew(ctx, handle, owner, now, ttl)
+}
+
+// ReleaseOwner applies the same immutable generation check to lease release.
+func (store *cutoverBoundStore) ReleaseOwner(ctx context.Context, handle, owner string, version uint64, now time.Time) (Record, error) {
+	if err := store.verifyMutation(ctx); err != nil {
+		return Record{}, err
+	}
+	return store.WorkflowStore.ReleaseOwner(ctx, handle, owner, version, now)
+}
+
+// verifyMutation records the application write and fences a stale or absent generation.
+func (store *cutoverBoundStore) verifyMutation(ctx context.Context) error {
+	store.mutations++
+	generation, present := ctx.Value(boundGenerationKey{}).(uint64)
+	if !present || generation != store.generation {
+		return &Error{Code: CodeConflict, Operation: "test_backend_generation"}
+	}
+	return nil
+}
+
 // controlledWaiter exposes deterministic heartbeat boundaries to lease tests.
 type controlledWaiter struct {
 	ready chan struct{}
@@ -262,7 +344,7 @@ func (f *fakeModel) Generate(ctx context.Context, request agentplanning.Structur
 // fakeAssertions accepts structurally present test declarations.
 type fakeAssertions struct{}
 
-// ValidateDefinition keeps workflow tests focused on orchestration.
+// ValidateDefinition accepts structurally present declarations so workflow tests can isolate later admission boundaries.
 func (fakeAssertions) ValidateDefinition(planning.AssertionDeclaration, string) error { return nil }
 
 // fakePolicy authorizes every descriptor-only planning intent.
@@ -698,7 +780,7 @@ func workflowFixture(t *testing.T, raw []byte) (*Service, *fakeAdmission, *fakeE
 		t.Fatal(err)
 	}
 	approval := &PlanApprovalBridge{Store: planapproval.NewMemoryStore(), Sanitizer: testApprovalSanitizer{}, Clock: clock, Limits: planapproval.Limits{MaxBytes: 1 << 20, MaxDepth: 32, MaxEvents: 100, MaxConstraints: 10, MaxChecks: 10, MaxSteps: 100, MaxAssertions: 100, MaxEvidence: 100}}
-	service, err := NewService(Config{LeaseTTL: time.Minute, HeartbeatInterval: 10 * time.Second, FinalizeTimeout: time.Second, ApprovalTTL: time.Hour}, Dependencies{Admission: admission, Generation: GeneratorAdapter{Generator: generator}, Preparation: PreparationAdapter{Assertions: fakeAssertions{}, Policy: fakePolicy{}}, Approval: approval, Execution: execution, Packages: fakePackages{projection: PackageProjection{RunID: "workflow-1", BindingSHA256: strings.Repeat("a", 64), PackageDir: "package-safe", Outcome: OutcomePassed}}, Authorization: fakeAuto{}, Finalizer: &fakeFinalizer{}, Environment: &fakePreview{}, Store: store, Artifacts: artifacts, Executables: executables, Clock: clock, Waiter: clock, IDs: &testIDs{}, Owner: "owner-1"})
+	service, err := NewService(Config{LeaseTTL: time.Minute, HeartbeatInterval: 10 * time.Second, FinalizeTimeout: 10 * time.Second, ApprovalTTL: time.Hour}, Dependencies{Admission: admission, Generation: GeneratorAdapter{Generator: generator}, Preparation: PreparationAdapter{Assertions: fakeAssertions{}, Policy: fakePolicy{}}, Approval: approval, Execution: execution, Packages: fakePackages{projection: PackageProjection{RunID: "workflow-1", BindingSHA256: strings.Repeat("a", 64), PackageDir: "package-safe", Outcome: OutcomePassed}}, Authorization: fakeAuto{}, Finalizer: &fakeFinalizer{}, Environment: &fakePreview{}, Store: store, Artifacts: artifacts, Executables: executables, Clock: clock, Waiter: clock, IDs: &testIDs{}, Owner: "owner-1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -769,6 +851,46 @@ func validCommand() StartCommand {
 // validPlanResponse returns one complete protocol-v1 candidate plan.
 func validPlanResponse() []byte {
 	return []byte(`{"version":1,"kind":"plan","plan":{"id":"workflow-1-plan","scenarios":[{"constraint_id":"c1","scenario":"positive","status":"planned"},{"constraint_id":"c1","scenario":"negative","status":"not_applicable","reason":"not retained"},{"constraint_id":"c1","scenario":"error","status":"not_applicable","reason":"not retained"}],"checks":[{"id":"check-1","constraint_id":"c1","scenario":"positive","capability":"probe","steps":[{"id":"step-1","tool":"probe","input":{},"assertions":[{"id":"assert-1","definition":{"operator":"exists"}}]}],"evidence":[{"step_id":"step-1","assertion_ids":["assert-1"]}]}]}}`)
+}
+
+// TestMutatingUseCasesPropagateAtomicReadAuthority proves Decide, Cancel and
+// Recover keep the immutable coordinate returned by LoadBound until their
+// first write instead of rebinding after a concurrent backend cutover.
+func TestMutatingUseCasesPropagateAtomicReadAuthority(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func(*Service, WorkflowView, *testClock) error
+	}{
+		{name: "decide", run: func(service *Service, view WorkflowView, _ *testClock) error {
+			_, err := service.Decide(context.Background(), DecisionCommand{Principal: "user-1", Handle: view.Handle, Revision: view.ApprovalRevision, DecisionID: "bound-decision", Action: DecisionReject})
+			return err
+		}},
+		{name: "cancel", run: func(service *Service, view WorkflowView, _ *testClock) error {
+			_, err := service.Cancel(context.Background(), "user-1", view.Handle)
+			return err
+		}},
+		{name: "recover", run: func(service *Service, _ WorkflowView, clock *testClock) error {
+			clock.advance(2 * time.Minute)
+			return service.Recover(context.Background())
+		}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			service, _, _, local, clock := workflowFixture(t, validPlanResponse())
+			view, err := service.Start(context.Background(), validCommand())
+			if err != nil {
+				t.Fatal(err)
+			}
+			bounded := &cutoverBoundStore{WorkflowStore: local, generation: 1, cutoverOnLoad: true}
+			service.deps.Store = bounded
+			if err = test.run(service, view, clock); !IsCode(err, CodeConflict) {
+				t.Fatalf("stale %s mutation error = %v, want conflict", test.name, err)
+			}
+			if bounded.boundReads != 1 || bounded.mutations == 0 {
+				t.Fatalf("%s authority path reads=%d mutations=%d", test.name, bounded.boundReads, bounded.mutations)
+			}
+		})
+	}
 }
 
 // missingResponse returns one valid bounded insufficient-context result.

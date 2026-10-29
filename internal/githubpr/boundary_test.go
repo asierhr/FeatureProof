@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +62,15 @@ func TestCompositionAndModelFailureBoundaries(t *testing.T) {
 	dependencies := RuntimeDependencies{Credentials: &fakeTokenSource{clock: clock}, HTTP: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, errors.New("unused") }), Packages: fakePackageReader{}, Clock: clock, Jitter: fixedJitter{}, IDs: failingIDs{}}
 	if _, err := ComposeRuntime(context.Background(), config, CompositionSecrets{WebhookSecret: []byte("0123456789abcdef")}, dependencies); !IsCode(err, CodeInternal) {
 		t.Fatal(err)
+	}
+	blockedStore := filepath.Join(t.TempDir(), "blocked-store")
+	if err := os.WriteFile(blockedStore, []byte("not-a-directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.StoreDir = blockedStore
+	dependencies.IDs = &sequenceIDs{}
+	if _, err := ComposeRuntime(context.Background(), config, CompositionSecrets{WebhookSecret: []byte("0123456789abcdef")}, dependencies); err == nil {
+		t.Fatal("unwritable local GitHub store was accepted")
 	}
 }
 

@@ -156,6 +156,11 @@ func TestLocalFunctionalFlowArtifactsAndPackageConvergeAfterCleanup(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	importRaw, importErr := ExportPackageImportSnapshot(context.Background(), filepath.Dir(first.PackageDir))
+	var imported PackageImportSnapshot
+	if importErr != nil || json.Unmarshal(importRaw, &imported) != nil || len(imported.Items) != 1 || imported.Items[0].RunID != "run" || imported.Items[0].ArtifactDigest != artifact.ArtifactDigest {
+		t.Fatalf("package import=%#v err=%v", imported, importErr)
+	}
 	var pkg functionalflow.Package
 	if json.Unmarshal(packageRaw, &pkg) != nil || functionalflow.VerifyPackage(pkg) != nil || pkg.Cleanup.Status != fixture.CleanupPartial || pkg.Primary.Outcome != functionalflow.OutcomeInconclusive {
 		t.Fatalf("invalid package %#v", pkg)
@@ -618,7 +623,7 @@ func (f *flowExecutionPortFake) Finalize(_ context.Context, handle string, outco
 	return f.finalize(handle, outcome, summary)
 }
 
-// finalize retains the exact cleanup summary while making repeated package completion observable.
+// finalize records cleanup-aware packaging inputs and returns the controlled package projection used by service tests.
 func (f *flowExecutionPortFake) finalize(handle string, outcome Outcome, summary fixture.FixtureSummary) (PackageProjection, error) {
 	f.finalizeCalls++
 	f.finalized = append(f.finalized, summary)
@@ -1829,10 +1834,109 @@ func (functionalFixtureStoreStub) Save(context.Context, string, uint64, fixture.
 // functionalRuntimeIDs assigns bounded evidence identifiers to direct runtime adapter tests.
 type functionalRuntimeIDs struct{ next int }
 
+// compositionHarnessTool satisfies the productive tool port without crossing I/O during composition tests.
+type compositionHarnessTool struct{}
+
+// Execute is unreachable because the test verifies only durable runtime wiring.
+func (compositionHarnessTool) Execute(context.Context, harness.ToolCall) (harness.ToolResult, error) {
+	return harness.ToolResult{}, errors.New("unexpected composition tool execution")
+}
+
+// compositionPlanningEvaluator satisfies the deterministic assertion port without evaluating during composition.
+type compositionPlanningEvaluator struct{}
+
+// Evaluate is unreachable until a composed workflow is explicitly executed.
+func (compositionPlanningEvaluator) Evaluate(context.Context, planning.PlanStep, any, []string) (planning.StepEvaluation, error) {
+	return planning.StepEvaluation{}, errors.New("unexpected composition assertion evaluation")
+}
+
+// compositionWaiter makes the local runtime's retry dependency explicit without sleeping.
+type compositionWaiter struct{}
+
+// Wait observes cancellation and otherwise completes immediately.
+func (compositionWaiter) Wait(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+
+// rejectingIdentityAttemptSink simulates a durable audit boundary that refuses
+// an authenticated attempt before any evidence can be returned.
+type rejectingIdentityAttemptSink struct{}
+
+// AppendIdentityAttempt rejects the bounded identity fact without retaining request material.
+func (rejectingIdentityAttemptSink) AppendIdentityAttempt(context.Context, FunctionalIdentityAttempt) error {
+	return errors.New("identity attempt journal unavailable")
+}
+
 // Next returns one deterministic safe identifier without depending on external randomness.
 func (i *functionalRuntimeIDs) Next() string {
 	i.next++
 	return "flow-evidence-" + itoa(uint64(i.next))
+}
+
+// TestComposeLocalFunctionalFlowRuntimeOwnsEveryDefaultStore proves the local
+// product path composes its catalog, artifacts, evidence, state and publisher.
+func TestComposeLocalFunctionalFlowRuntimeOwnsEveryDefaultStore(t *testing.T) {
+	ids := &functionalRuntimeIDs{}
+	config := LocalFunctionalFlowRuntimeConfig{Root: t.TempDir(), PublicIdentity: "public", AllowedManifestRoots: []string{t.TempDir()}, Limits: functionalflow.Limits{MaxDocumentBytes: 1024, MaxSteps: 2, MaxAssertions: 2, MaxComparisons: 1, MaxReferences: 2, MaxDepth: 3, MaxResolvedBytes: 1024, MaxToolCalls: 2, MaxRetries: 1, MaxWork: 10, MaxRevisions: 1, StepTimeout: time.Second, RunTimeout: 2 * time.Second}, Tool: compositionHarnessTool{}, PolicyFactory: func() harness.Policy { return nil }, Evaluator: compositionPlanningEvaluator{}, Clock: planningClock{}, IDs: ids, Waiter: compositionWaiter{}, LeaseTTL: time.Minute, Execution: functionalflow.ExecutionConfig{Owner: "composition-owner", MaxCalls: 2, MaxRetries: 1, MaxWork: 10, StepTimeout: time.Second, RunTimeout: 2 * time.Second, ConfirmationTimeout: time.Second}}
+	adapter, catalog, err := ComposeLocalFunctionalFlowRuntime(config)
+	if err != nil || catalog == nil || adapter.Executor == nil || adapter.Artifacts == nil || adapter.Publisher == nil || adapter.Journal == nil {
+		t.Fatalf("adapter=%#v catalog=%#v err=%v", adapter, catalog, err)
+	}
+	partialEvidence := config
+	evidenceStore, openErr := OpenLocalFunctionalFlowEvidenceStore(filepath.Join(t.TempDir(), "evidence"))
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	partialEvidence.Evidence = evidenceStore
+	if _, _, err = ComposeLocalFunctionalFlowRuntime(partialEvidence); err == nil {
+		t.Fatal("partial evidence persistence accepted")
+	}
+	manifestOnly := config
+	manifestOnly.EvidenceManifest = evidenceStore
+	if _, _, err = ComposeLocalFunctionalFlowRuntime(manifestOnly); err == nil {
+		t.Fatal("manifest-only evidence persistence accepted")
+	}
+	partialState := config
+	stateStore, stateErr := functionalflow.NewLocalStore(filepath.Join(t.TempDir(), "state"), planningClock{}, time.Minute)
+	if stateErr != nil {
+		t.Fatal(stateErr)
+	}
+	partialState.State = stateStore
+	if _, _, err = ComposeLocalFunctionalFlowRuntime(partialState); err == nil {
+		t.Fatal("partial execution persistence accepted")
+	}
+	journalOnly := config
+	journalOnly.Journal = stateStore
+	if _, _, err = ComposeLocalFunctionalFlowRuntime(journalOnly); err == nil {
+		t.Fatal("journal-only execution persistence accepted")
+	}
+	blockedRoot := filepath.Join(t.TempDir(), "blocked-runtime-root")
+	if err = os.WriteFile(blockedRoot, []byte("not-a-directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	failing := config
+	failing.Root = blockedRoot
+	if _, _, err = ComposeLocalFunctionalFlowRuntime(failing); err == nil {
+		t.Fatal("catalog open failure hidden")
+	}
+	failing.Catalog = catalog
+	if _, _, err = ComposeLocalFunctionalFlowRuntime(failing); err == nil {
+		t.Fatal("artifact open failure hidden")
+	}
+	failing.Artifacts = adapter.Artifacts
+	if _, _, err = ComposeLocalFunctionalFlowRuntime(failing); err == nil {
+		t.Fatal("evidence open failure hidden")
+	}
+	failing.Evidence, failing.EvidenceManifest = evidenceStore, evidenceStore
+	if _, _, err = ComposeLocalFunctionalFlowRuntime(failing); err == nil {
+		t.Fatal("intent-store open failure hidden")
+	}
+	failing.State, failing.Journal = stateStore, stateStore
+	if _, _, err = ComposeLocalFunctionalFlowRuntime(failing); err == nil {
+		t.Fatal("publisher open failure hidden")
+	}
+	failing.Publisher = adapter.Publisher
+	if _, _, err = ComposeLocalFunctionalFlowRuntime(failing); err == nil {
+		t.Fatal("attempt journal open failure hidden")
+	}
 }
 
 // providedFlowCatalogStub injects one bounded provided-flow load result into composer boundary tests.
@@ -1966,6 +2070,12 @@ func TestFunctionalRuntimePrivateBoundariesAndConservativeFinalization(t *testin
 	journal, err := os.ReadFile(filepath.Join(journalRoot, "run", "events.jsonl"))
 	if err != nil || !strings.Contains(string(journal), `"outcome_category":"success"`) || strings.Contains(string(journal), "private-value") {
 		t.Fatalf("journal=%s err=%v", journal, err)
+	}
+	rejectedAuditAdapter := adapter
+	rejectedAuditAdapter.tool = &tools.Fake{Results: []harness.ToolResult{{Output: map[string]any{"status": 200}}}}
+	rejectedAuditAdapter.attemptSink = rejectingIdentityAttemptSink{}
+	if _, err = rejectedAuditAdapter.Execute(context.Background(), functionalflow.ExecutionRequest{RunID: "audit-rejected", Revision: 1, StepID: "observe", Operation: artifact.Steps[0].Operation, Input: map[string]any{}, Attempt: 1}); err == nil {
+		t.Fatal("failed identity attempt journal was ignored")
 	}
 	failedTool := &tools.Fake{Results: []harness.ToolResult{{Output: map[string]any{"error": map[string]any{"category": "identity_credential_unavailable"}}, ErrorClass: harness.ErrorPermanent}}, Errors: []error{&harness.OperationError{Class: harness.ErrorPermanent, Err: errors.New("external canary")}}}
 	adapter.tool = failedTool

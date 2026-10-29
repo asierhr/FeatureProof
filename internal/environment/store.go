@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // Registry is a composition-owned immutable provider lookup.
@@ -294,6 +296,11 @@ func (s *LocalStore) Events(ctx context.Context, runID string) ([]Event, error) 
 
 // publishVersion atomically claims one canonical revision path using hard-link publication.
 func (s *LocalStore) publishVersion(record Record, event Event) (bool, error) {
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(context.Background(), s.root)
+	if err != nil {
+		return false, &Error{Category: CategoryConflict, Operation: "offline_import_freeze", Cause: err}
+	}
+	defer releaseImportWrite()
 	if err := validateRecord(record, record.RunID, record.Revision); err != nil {
 		return false, err
 	}
@@ -479,7 +486,6 @@ type durableRecord struct {
 	Record         Record `json:"record"`
 }
 
-// durableHead is the mutable rollback witness for the latest fully published record/event pair.
 type durableHead struct {
 	RunID, RecordDigest, PreviousDigest, Digest string
 	Revision                                    uint64
@@ -617,6 +623,11 @@ func validateRecord(value Record, runID string, revision uint64) error {
 	return nil
 }
 
+// ValidateStoreRecord exposes the consumer-owned lifecycle invariant to infrastructure adapters.
+func ValidateStoreRecord(value Record, runID string, revision uint64) error {
+	return validateRecord(value, runID, revision)
+}
+
 // allowedRecordTransition is the complete lifecycle state machine including same-state lease renewals.
 func allowedRecordTransition(from, to LifecycleState) bool {
 	if from == to {
@@ -643,6 +654,9 @@ func allowedRecordTransition(from, to LifecycleState) bool {
 	return false
 }
 
+// AllowedStoreTransition exposes the closed lifecycle CAS matrix to persistence adapters.
+func AllowedStoreTransition(from, to LifecycleState) bool { return allowedRecordTransition(from, to) }
+
 // validLifecycleState accepts only the closed durable transition vocabulary.
 func validLifecycleState(value LifecycleState) bool {
 	switch value {
@@ -661,6 +675,23 @@ func validateEvent(value Event, runID string) error {
 		return &Error{Category: CategoryIntegrity, Operation: "event"}
 	}
 	return nil
+}
+
+// SealStoreEvent binds one content-free lifecycle event to the exact run and
+// consumer-owned digest schema used by every persistence backend.
+func SealStoreEvent(value Event, runID string) (Event, error) {
+	if value.RunID == "" {
+		value.RunID = runID
+	}
+	if value.RunID != runID {
+		return Event{}, &Error{Category: CategoryIntegrity, Operation: "event"}
+	}
+	value.Digest = ""
+	value.Digest = digestOf(value)
+	if err := validateEvent(value, runID); err != nil {
+		return Event{}, err
+	}
+	return value, nil
 }
 
 // cloneRecord detaches slices nested in safe target authority.

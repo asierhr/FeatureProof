@@ -12,10 +12,19 @@ import (
 
 // CleanupBridge projects private lifecycle records into sealed cleanup authority and delegates effects to the lifecycle service.
 type CleanupBridge struct {
-	Store   *LocalStore
+	Store   CleanupLifecycleStore
 	Service *LifecycleService
 	Owner   string
 }
+
+// CleanupLifecycleStore extends lifecycle persistence with the stable project-independent scan required by cleanup discovery.
+type CleanupLifecycleStore interface {
+	Store
+	ScanCleanupLifecycle(context.Context, string, int) ([]Record, string, error)
+}
+
+// localCleanupLifecycleContract proves the filesystem backend preserves the cleanup-owned scan contract.
+var localCleanupLifecycleContract CleanupLifecycleStore = (*LocalStore)(nil)
 
 // ResolveCleanupAuthority resolves one workflow intent only from the exact private lifecycle record.
 func (b *CleanupBridge) ResolveCleanupAuthority(ctx context.Context, runID, cleanupID string) (environmentcleanup.Item, error) {
@@ -34,7 +43,30 @@ func (b *CleanupBridge) ScanLifecycleCleanup(ctx context.Context, cursor string,
 	if b == nil || b.Store == nil || limit <= 0 {
 		return nil, "", &Error{Category: CategoryInvalid, Operation: "cleanup_scan"}
 	}
-	entries, err := os.ReadDir(b.Store.root + string(os.PathSeparator) + "records")
+	records, next, err := b.Store.ScanCleanupLifecycle(ctx, cursor, limit)
+	if err != nil {
+		return nil, "", err
+	}
+	result := make([]environmentcleanup.LifecycleIndexRecord, 0, len(records))
+	for _, record := range records {
+		if record.Selection.Kind != KindManaged || record.LifecycleHandle == "" {
+			continue
+		}
+		item, itemErr := b.item(record, "lifecycle-"+stableKey("cleanup", record.RunID)[:24], "lifecycle")
+		if itemErr != nil {
+			return nil, "", itemErr
+		}
+		result = append(result, environmentcleanup.LifecycleIndexRecord{Item: item, Released: record.State == StateReleased && record.ReleaseConfirmed, LeaseUntil: record.LeaseUntil})
+	}
+	return result, next, nil
+}
+
+// ScanCleanupLifecycle returns a stable bounded record page without leaking filesystem details to the bridge.
+func (s *LocalStore) ScanCleanupLifecycle(ctx context.Context, cursor string, limit int) ([]Record, string, error) {
+	if s == nil || limit <= 0 {
+		return nil, "", &Error{Category: CategoryInvalid, Operation: "cleanup_scan"}
+	}
+	entries, err := os.ReadDir(s.root + string(os.PathSeparator) + "records")
 	if err != nil {
 		return nil, "", err
 	}
@@ -49,22 +81,15 @@ func (b *CleanupBridge) ScanLifecycleCleanup(ctx context.Context, cursor string,
 	if len(ids) > limit {
 		next, ids = ids[limit-1], ids[:limit]
 	}
-	result := make([]environmentcleanup.LifecycleIndexRecord, 0, len(ids))
+	records := make([]Record, 0, len(ids))
 	for _, id := range ids {
-		record, loadErr := b.Store.Load(ctx, id)
+		record, loadErr := s.Load(ctx, id)
 		if loadErr != nil {
 			return nil, "", loadErr
 		}
-		if record.Selection.Kind != KindManaged || record.LifecycleHandle == "" {
-			continue
-		}
-		item, itemErr := b.item(record, "lifecycle-"+stableKey("cleanup", id)[:24], "lifecycle")
-		if itemErr != nil {
-			return nil, "", itemErr
-		}
-		result = append(result, environmentcleanup.LifecycleIndexRecord{Item: item, Released: record.State == StateReleased && record.ReleaseConfirmed, LeaseUntil: record.LeaseUntil})
+		records = append(records, record)
 	}
-	return result, next, nil
+	return records, next, nil
 }
 
 // LoadCleanupBinding finds only a byte-equivalent sealed binding in the private lifecycle store.
@@ -103,24 +128,23 @@ func (b *CleanupBridge) findBinding(ctx context.Context, digest string) (Record,
 	if b == nil || b.Store == nil || !digestPattern.MatchString(digest) {
 		return Record{}, environmentcleanup.LifecycleCleanupBinding{}, &Error{Category: CategoryInvalid, Operation: "cleanup_binding"}
 	}
-	entries, err := os.ReadDir(b.Store.root + string(os.PathSeparator) + "records")
-	if err != nil {
-		return Record{}, environmentcleanup.LifecycleCleanupBinding{}, err
+	cursor := ""
+	for {
+		records, next, err := b.Store.ScanCleanupLifecycle(ctx, cursor, 100)
+		if err != nil {
+			return Record{}, environmentcleanup.LifecycleCleanupBinding{}, err
+		}
+		for _, record := range records {
+			binding, bindingErr := b.binding(record)
+			if bindingErr == nil && binding.Digest == digest {
+				return record, binding, nil
+			}
+		}
+		if next == "" {
+			return Record{}, environmentcleanup.LifecycleCleanupBinding{}, os.ErrNotExist
+		}
+		cursor = next
 	}
-	for _, entry := range entries {
-		if !entry.IsDir() || !safeID.MatchString(entry.Name()) {
-			continue
-		}
-		record, loadErr := b.Store.Load(ctx, entry.Name())
-		if loadErr != nil {
-			return Record{}, environmentcleanup.LifecycleCleanupBinding{}, loadErr
-		}
-		binding, bindingErr := b.binding(record)
-		if bindingErr == nil && binding.Digest == digest {
-			return record, binding, nil
-		}
-	}
-	return Record{}, environmentcleanup.LifecycleCleanupBinding{}, os.ErrNotExist
 }
 
 // LifecycleAbsent reports authoritative local absence only when no exact lifecycle binding exists.

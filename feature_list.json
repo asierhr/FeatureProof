@@ -629,7 +629,7 @@
           "El almacenamiento local continúa disponible para ejecución de desarrollo o se migra mediante una frontera explícita sin mezclar ambos modos en un mismo run",
           "Los tests de integración cubren migraciones, concurrencia, restart, redelivery, lease expirada, cancelación, recuperación e idempotencia con PostgreSQL y workers controlados"
         ],
-        "status": "in_progress"
+        "status": "done"
     },
     {
         "id": 36,

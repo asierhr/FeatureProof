@@ -75,7 +75,7 @@ func TestLifecycleRejectsIncompleteCompositionAndEmptySets(t *testing.T) {
 		t.Fatal(summary, err)
 	}
 	lifecycle.scopes = fixedScopes{calls: -1}
-	if report, err := lifecycle.Cleanup(boundFixtureSet(t)); err == nil || report.Status != CleanupFailed {
+	if report, err := lifecycle.Cleanup(context.Background(), boundFixtureSet(t)); err == nil || report.Status != CleanupFailed {
 		t.Fatal(report, err)
 	}
 }
@@ -144,7 +144,7 @@ func TestCleanupRetriesTransientAndClassifiesDeadlineAndMissingInput(t *testing.
 	if _, err := lifecycle.Prepare(context.Background(), bound); err != nil {
 		t.Fatal(err)
 	}
-	report, err := lifecycle.Cleanup(bound)
+	report, err := lifecycle.Cleanup(context.Background(), bound)
 	if err != nil || report.Status != CleanupSucceeded || len(executor.requests) != 3 || executor.requests[1].IdempotencyKey != executor.requests[2].IdempotencyKey || len(guards.calls) != 3 {
 		t.Fatal(report, err)
 	}
@@ -160,7 +160,7 @@ func TestCleanupRetriesTransientAndClassifiesDeadlineAndMissingInput(t *testing.
 	state.ReportConfirmed = false
 	state, _ = SealState(state)
 	store.states[bound.RunID] = state
-	report, _ = lifecycle.Cleanup(bound)
+	report, _ = lifecycle.Cleanup(context.Background(), bound)
 	if len(report.Incidents) != 1 || report.Incidents[0].Category != CategoryInputUnavailable {
 		t.Fatal(report)
 	}
@@ -169,7 +169,7 @@ func TestCleanupRetriesTransientAndClassifiesDeadlineAndMissingInput(t *testing.
 	rawCapture, _ := json.Marshal("a")
 	digestCapture := sha256.Sum256(rawCapture)
 	deadlineStore.states[bound.RunID] = FixtureState{Version: 1, BoundDigest: bound.Digest, Intents: map[string]bool{"account": true}, Eligible: map[string]bool{"account": true}, Prepared: map[string]bool{"account": true}, Captures: map[string]Capture{captureKey("account", "id"): {RunID: bound.RunID, FixtureID: "account", Name: "id", ValueType: "string", Value: "a", Bytes: len(rawCapture), Digest: hex.EncodeToString(digestCapture[:]), BindingDigest: bound.Fixtures[0].Create.BindingDigest}}, CleanupTerminal: map[string]Category{}, CleanupClaims: map[string]CleanupClaim{}}
-	report, _ = deadlineLifecycle.Cleanup(bound)
+	report, _ = deadlineLifecycle.Cleanup(context.Background(), bound)
 	if report.Status != CleanupDeadlineExceeded {
 		t.Fatal(report)
 	}

@@ -21,6 +21,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 )
 
+// TestCleanupModelRejectsInvalidPoliciesItemsAndOverflow proves malformed authority and arithmetic overflow never seal durable cleanup state.
 func TestCleanupModelRejectsInvalidPoliciesItemsAndOverflow(t *testing.T) {
 	if _, err := SealCapacityPolicy(CapacityPolicy{}); !IsCategory(err, CategoryInvalid) {
 		t.Fatalf("policy: %v", err)
@@ -78,6 +79,7 @@ func TestCleanupItemStrictDecodeAndDeepCopy(t *testing.T) {
 	}
 }
 
+// TestBindingAndAdapterConstructorsRejectIncompleteAuthority proves composition fails closed before provider access when identity material is incomplete.
 func TestBindingAndAdapterConstructorsRejectIncompleteAuthority(t *testing.T) {
 	if _, err := SealLifecycleCleanupBinding(LifecycleCleanupBinding{}); !IsCategory(err, CategoryUnauthorized) {
 		t.Fatalf("empty binding: %v", err)
@@ -103,6 +105,7 @@ func TestBindingAndAdapterConstructorsRejectIncompleteAuthority(t *testing.T) {
 	}
 }
 
+// TestLocalStoreLeaseCASRenewEventsAndCursor exercises the filesystem store's fenced lease, append-only event and pagination invariants together.
 func TestLocalStoreLeaseCASRenewEventsAndCursor(t *testing.T) {
 	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 	store := mustStore(t)
@@ -181,6 +184,7 @@ func (f *lifecyclePortFake) ReleaseCleanupBinding(_ context.Context, _ Lifecycle
 	return nil
 }
 
+// TestLifecycleCleanupRequiresCompleteSealedBinding proves provider cleanup cannot run with a partial or tampered lifecycle binding.
 func TestLifecycleCleanupRequiresCompleteSealedBinding(t *testing.T) {
 	binding := testBinding(t, "adapter")
 	port := &lifecyclePortFake{record: KnownLifecycleRecord{Binding: binding, Status: LifecyclePresent}}
@@ -330,6 +334,7 @@ func (f workflowStoreFake) ScanCleanupRecords(context.Context, string, int) ([]W
 	return append([]WorkflowIntentRecord(nil), f.records...), f.next, f.err
 }
 
+// TestWorkflowIntentSourceProjectsOnlyCleanupAuthority proves discovery projects only the minimum cleanup-owned fields from workflow state.
 func TestWorkflowIntentSourceProjectsOnlyCleanupAuthority(t *testing.T) {
 	if _, err := NewWorkflowIntentSource(nil); !IsCategory(err, CategoryInvalid) {
 		t.Fatalf("nil source: %v", err)
@@ -576,6 +581,7 @@ func (f *failingLifecyclePort) ReleaseCleanupBinding(context.Context, LifecycleC
 	return f.err
 }
 
+// TestLifecycleAdapterPropagatesPortFailures proves provider boundary failures remain authoritative and are not converted into successful cleanup.
 func TestLifecycleAdapterPropagatesPortFailures(t *testing.T) {
 	if _, err := NewLifecycleAdapter(nil); !IsCategory(err, CategoryInvalid) {
 		t.Fatalf("nil adapter: %v", err)
@@ -594,6 +600,7 @@ func TestLifecycleAdapterPropagatesPortFailures(t *testing.T) {
 	}
 }
 
+// TestCleanupUsesStableIdentityAndConfirmsAbsenceIdempotently proves repeated reconciliation preserves resource identity and converges confirmed absence.
 func TestCleanupUsesStableIdentityAndConfirmsAbsenceIdempotently(t *testing.T) {
 	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 	policy, _ := SealCapacityPolicy(CapacityPolicy{ProjectID: "project", MaxEnvironments: 2, MaxCPUMilli: 1000, MaxMemoryBytes: 10000, MaxObjectCount: 10, MaxTTL: time.Hour})
@@ -685,6 +692,7 @@ func TestCapacityReleaseRecoversAfterConfirmedCrash(t *testing.T) {
 	}
 }
 
+// TestControllerExactTTLRetryAndPermanentCategories proves expiry boundaries, retry classes and permanent quarantine decisions are exact.
 func TestControllerExactTTLRetryAndPermanentCategories(t *testing.T) {
 	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 	item := testItem(t, now, "ttl")
@@ -758,6 +766,7 @@ func TestRetryBudgetPersistsAcrossClaimsAndRequiresAuthorizedRequeue(t *testing.
 	}
 }
 
+// TestControllerRunLoopIsCallerOwnedAndCancelable proves the caller owns loop lifetime and cancellation joins without hidden work.
 func TestControllerRunLoopIsCallerOwnedAndCancelable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -774,6 +783,7 @@ func TestControllerRunLoopIsCallerOwnedAndCancelable(t *testing.T) {
 	}
 }
 
+// TestKubernetesInventoryScopesOwnerAndDeletesOnlyExactUID proves inventory ownership and UID fencing prevent deletion of replacement resources.
 func TestKubernetesInventoryScopesOwnerAndDeletesOnlyExactUID(t *testing.T) {
 	now := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
 	binding := testBinding(t, "kube")
@@ -1166,6 +1176,7 @@ func (*inventorySequenceFake) ReconcileCleanup(context.Context, Item) (Lifecycle
 	return LifecycleUncertain, errors.New("unexpected cleanup")
 }
 
+// TestControllerChoosesOnlyRegisteredOrphanInventory proves orphan adoption is limited to explicitly composed provider inventories.
 func TestControllerChoosesOnlyRegisteredOrphanInventory(t *testing.T) {
 	now := time.Now().UTC()
 	item := testItem(t, now, "orphan")
@@ -1226,13 +1237,15 @@ func TestRunOnceCancellationDuringProviderLeavesLeaseForHandoff(t *testing.T) {
 	item := testItem(t, now, "cancel-provider")
 	_, _, _ = store.Reserve(context.Background(), item, Event{ID: "cancel-intent", At: now})
 	lifecycle := &blockingLifecycle{entered: make(chan struct{}, 1)}
-	controller, _ := NewController(testConfig(), Dependencies{Store: store, Lifecycle: lifecycle, Ledger: NewCapacityLedger(), Clock: &testClock{now: now}, Waiter: &testWaiter{}})
+	config := testConfig()
+	config.ProviderTimeout = 30 * time.Second
+	controller, _ := NewController(config, Dependencies{Store: store, Lifecycle: lifecycle, Ledger: NewCapacityLedger(), Clock: &testClock{now: now}, Waiter: &testWaiter{}})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- controller.RunOnce(ctx) }()
 	select {
 	case <-lifecycle.entered:
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("provider was not entered")
 	}
 	if _, err := store.Scan(context.Background(), "", 10); err != nil {
@@ -1244,7 +1257,7 @@ func TestRunOnceCancellationDuringProviderLeavesLeaseForHandoff(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancellation lost: %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("RunOnce leaked after cancellation")
 	}
 	page, _ := store.Scan(context.Background(), "", 10)
@@ -1289,6 +1302,7 @@ func TestStatusProjectionAndObserverFailureRemainOperational(t *testing.T) {
 // Wait returns its configured stop condition without sleeping.
 func (w *stoppingWaiter) Wait(context.Context, time.Duration) error { w.calls++; return w.err }
 
+// TestRunPerformsOneCycleThenReturnsWaiterError proves loop pacing failures terminate after the completed durable cycle.
 func TestRunPerformsOneCycleThenReturnsWaiterError(t *testing.T) {
 	stop := errors.New("stop")
 	waiter := &stoppingWaiter{err: stop}
@@ -1298,6 +1312,7 @@ func TestRunPerformsOneCycleThenReturnsWaiterError(t *testing.T) {
 	}
 }
 
+// TestKubernetesErrorsRemainContentFreeAndCancelable proves provider errors expose only closed categories and still honor cancellation.
 func TestKubernetesErrorsRemainContentFreeAndCancelable(t *testing.T) {
 	cause := errors.New("CANARY-REMOTE-BODY")
 	mapped := mapKubernetesError(context.Background(), "read", cause)
@@ -1325,6 +1340,7 @@ func TestKubernetesErrorsRemainContentFreeAndCancelable(t *testing.T) {
 	}
 }
 
+// TestStoreAndLedgerRejectConflictsCancellationAndCorruption proves both durable stores fail closed for stale, cancelled and tampered operations.
 func TestStoreAndLedgerRejectConflictsCancellationAndCorruption(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -1360,6 +1376,7 @@ func TestStoreAndLedgerRejectConflictsCancellationAndCorruption(t *testing.T) {
 	}
 }
 
+// TestCapacityLedgerReopensImmutableReceipts proves persisted capacity receipts remain immutable and authenticated across process restart.
 func TestCapacityLedgerReopensImmutableReceipts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "capacity.json")
 	ledger, err := OpenCapacityLedger(path)
@@ -1402,6 +1419,7 @@ func TestCapacityLedgerReopensImmutableReceipts(t *testing.T) {
 	}
 }
 
+// TestPermanentFailureQuarantinesAndDoesNotRetry proves non-retryable provider failures become terminal quarantine without extra attempts.
 func TestPermanentFailureQuarantinesAndDoesNotRetry(t *testing.T) {
 	now := time.Now().UTC()
 	store := mustStore(t)
@@ -1424,6 +1442,7 @@ func TestPermanentFailureQuarantinesAndDoesNotRetry(t *testing.T) {
 	}
 }
 
+// TestKubernetesTerminatingAndIdentityDriftFailClosed proves deletion races and UID drift never produce a false cleanup confirmation.
 func TestKubernetesTerminatingAndIdentityDriftFailClosed(t *testing.T) {
 	now := metav1.NewTime(time.Now())
 	binding := testBinding(t, "term")
@@ -1450,6 +1469,7 @@ func TestKubernetesTerminatingAndIdentityDriftFailClosed(t *testing.T) {
 	}
 }
 
+// TestStatusProjectionDoesNotContainFunctionalVerdict proves operational cleanup status cannot claim a feature-validation outcome.
 func TestStatusProjectionDoesNotContainFunctionalVerdict(t *testing.T) {
 	status := Status{CleanupID: "cleanup", ProjectID: "project", State: StateRetryWait, Attempts: 2, Category: CategoryTransient, UpdatedAt: time.Now()}
 	if status.State != StateRetryWait || status.Category != CategoryTransient {

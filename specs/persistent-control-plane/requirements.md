@@ -408,20 +408,36 @@ recovery e idempotencia con PostgreSQL real aislado y workers controlados.
 
 ## R16 — Comentarios de responsabilidad sistémica
 
-THE implementation SHALL documentar toda entidad, constante, variable, función,
-método y helper de test nuevo o modificado con un comentario breve que explique
-su responsabilidad dentro del sistema, la frontera que representa o el
-invariante que protege.
+THE implementation SHALL documentar toda entidad o tipo, función, método y
+helper de test nuevo o modificado con un comentario breve que explique su
+responsabilidad dentro del sistema, la frontera que representa o el invariante
+que protege. Constantes y variables de paquete requieren el mismo contexto
+cuando su responsabilidad no resulte evidente por el tipo, nombre y API que las
+contiene.
 
 ### Acceptance criteria
 
-- GIVEN símbolo exportado o no exportado modificado por la feature WHEN se
-  revisa THEN posee comentario útil, incluidas variables de paquete, errores,
-  migraciones embebidas, fakes, factories y helpers de assertion.
+- GIVEN una entidad o tipo, función, método o helper de test exportado o no
+  exportado modificado por la feature WHEN se revisa THEN posee un comentario
+  útil sobre su papel en FeatureProof, incluidos errores tipados, migraciones
+  embebidas, fakes, factories y helpers de assertion.
+- GIVEN una constante o variable de paquete nueva o modificada cuyo papel no es
+  evidente por su tipo, nombre y API contenedora WHEN se revisa THEN posee un
+  comentario que identifica su consumidor o el invariante compartido que
+  representa.
+- GIVEN una variable local, parámetro o receiver WHEN se audita THEN no requiere
+  un comentario por pertenecer a esa categoría. Si representa autoridad,
+  fencing, durabilidad u ownership no evidentes en el tipo y la operación, esa
+  decisión se documenta puntualmente junto a la frontera o se expresa mediante
+  un tipo u operación más explícitos.
 - GIVEN comentario que solo parafrasea el identificador WHEN se audita THEN no
   satisface el requisito hasta explicar su papel sistémico.
-- GIVEN `go doc`, revisión estática y diff manual WHEN se ejecutan THEN no quedan
-  símbolos introducidos por la feature sin su contexto de sistema.
+- GIVEN familias de comentarios boilerplate o variantes obtenidas interpolando
+  identificadores WHEN se auditan sobre el diff completo THEN no satisfacen el
+  requisito aunque cada símbolo tenga texto asociado.
+- GIVEN `go doc`, revisión estática y muestreo manual del diff completo WHEN se
+  ejecutan THEN no quedan símbolos dentro del alcance anterior sin contexto de
+  sistema y no se exige ruido documental a locales triviales.
 
 ## Errores y casos límite globales
 
@@ -452,12 +468,27 @@ el manifest versionado del adapter, sin defaults de dominio. La feature 36 podr�
 versionar su procedencia y la 37 ampliar el modelo de tenant sin reinterpretar
 los contratos de esta entrega.
 
-## Aprobación humana
+## Aprobación humana original
 
 ```yaml
 approved_by: user
 approved_at: 2026-10-27T08:20:19+01:00
 ```
 
-La implementación no puede comenzar hasta aprobación humana explícita y cambio
-del estado a `in_progress` por el leader.
+## Enmienda R16 propuesta el 2026-10-29
+
+Esta enmienda restringe la obligación documental al alcance solicitado
+originalmente —entidades y funciones—, conserva símbolos de paquete no obvios y
+exige comentarios puntuales para autoridad, fencing, durabilidad u ownership
+ocultos. Elimina la obligación mecánica sobre cada local, parámetro y receiver,
+que produjo miles de comentarios genéricos contrarios a `CONV-009`.
+
+```yaml
+amendment: r16-comment-scope
+amendment_status: approved
+amendment_approved_by: user
+amendment_approved_at: 2026-10-29T15:47:22+01:00
+```
+
+La enmienda fue aprobada explícitamente por el usuario. La implementación puede
+continuar bajo este alcance documental sin reinterpretar el resto de R16.

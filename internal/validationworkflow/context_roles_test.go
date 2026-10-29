@@ -10,7 +10,7 @@ import (
 	"github.com/asierhr/featureProof/internal/contextassembly"
 )
 
-// workflowRoleConsumer retains the detached snapshot delivered by the productive role adapter.
+// workflowRoleConsumer records the isolated context projection delivered to one product role without executable authority.
 type workflowRoleConsumer struct {
 	snapshot contextassembly.Snapshot
 	calls    int

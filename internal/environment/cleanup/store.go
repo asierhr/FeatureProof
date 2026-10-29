@@ -3,9 +3,12 @@ package cleanup
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // Page is a bounded canonical scan result.
@@ -202,6 +205,11 @@ func (s *LocalStore) update(ctx context.Context, mutate storeMutation) (any, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(ctx, filepath.Dir(s.path))
+	if err != nil {
+		return nil, &Error{Category: CategoryConflict, Operation: "offline_import_freeze", Cause: err}
+	}
+	defer releaseImportWrite()
 	if s.fault != nil {
 		if err := s.fault("before_write"); err != nil {
 			return nil, &Error{Category: CategoryIntegrity, Operation: "store_fault", Cause: err}
@@ -452,7 +460,12 @@ type storeReserveResult struct {
 
 // sameCleanupIntent compares immutable authority while allowing redelivery after scheduler state advances.
 func sameCleanupIntent(current, candidate Item) bool {
-	initialState := candidate.State == StateDiscovered || candidate.Source != "orphan" && candidate.State == StateIntentCommitted
+	return EquivalentIntent(current, candidate)
+}
+
+// EquivalentIntent compares immutable cleanup authority while permitting idempotent redelivery after scheduler progress.
+func EquivalentIntent(current, candidate Item) bool {
+	initialState := candidate.State == StateDiscovered || candidate.State == StatePending && current.State == StatePending || candidate.Source != "orphan" && candidate.State == StateIntentCommitted
 	initial := initialState && candidate.VersionNumber == 1 && candidate.Attempts == 0 && candidate.LeaseOwner == "" && candidate.LeaseUntil.IsZero() && candidate.NextAttemptAt.IsZero() && candidate.CumulativeWait == 0 && candidate.LastCategory == ""
 	return initial && current.CleanupID == candidate.CleanupID && current.Source == candidate.Source && current.OwnerDigest == candidate.OwnerDigest && current.ProjectID == candidate.ProjectID && current.RunID == candidate.RunID && current.Binding.Digest == candidate.Binding.Digest && current.CreatedAt.Equal(candidate.CreatedAt) && current.ExpiresAt.Equal(candidate.ExpiresAt) && current.TTL == candidate.TTL && current.Demand == candidate.Demand
 }
@@ -592,27 +605,20 @@ func appendStoreEvent(snapshot *localSnapshot, item Item, event Event) error {
 	if event.ID == "" {
 		return nil
 	}
-	if event.Kind == "" {
-		event.Kind = "cleanup_state_changed"
-	}
 	events := snapshot.Events[item.CleanupID]
-	event.CleanupID, event.ProjectID, event.OwnerDigest, event.State, event.Attempt, event.FencingVersion = item.CleanupID, item.ProjectID, item.OwnerDigest, item.State, item.Attempts, item.FencingVersion
-	if event.Owner == "" {
-		event.Owner = item.LeaseOwner
+	bound, err := BindEvent(item, event)
+	if err != nil {
+		return err
 	}
-	event.At = event.At.UTC()
-	event.Category = item.LastCategory
-	event.Digest = ""
-	event.Digest = digestOf(event)
 	for _, existing := range events {
-		if existing.ID == event.ID {
-			if existing.Digest != event.Digest {
+		if existing.ID == bound.ID {
+			if existing.Digest != bound.Digest {
 				return &Error{Category: CategoryConflict, Operation: "store_event_redelivery"}
 			}
 			return nil
 		}
 	}
-	snapshot.Events[item.CleanupID] = append(events, event)
+	snapshot.Events[item.CleanupID] = append(events, bound)
 	return nil
 }
 

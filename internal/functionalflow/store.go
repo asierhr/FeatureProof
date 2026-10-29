@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"runtime"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // safeStoreID constrains run and step coordinates to flat traversal-free durable names.
@@ -238,9 +240,6 @@ func (s *LocalStore) ConfirmTerminal(ctx context.Context, record StepRecord) err
 		return err
 	}
 	key := storeStepKey(record.Revision, record.StepID)
-	if claim, exists := state.Claims[key]; exists && !validClaim(claim, record.ClaimToken, s.clock.Now()) {
-		return flowError(CategoryAuthority, "store.claim", nil)
-	}
 	safe := record
 	safe.ClaimToken = ""
 	if prior, exists := state.Terminals[key]; exists {
@@ -248,6 +247,12 @@ func (s *LocalStore) ConfirmTerminal(ctx context.Context, record StepRecord) err
 			return flowError(CategoryIntegrity, "store.terminal", nil)
 		}
 		return nil
+	}
+	if record.ClaimToken == "" {
+		return flowError(CategoryAuthority, "store.claim", nil)
+	}
+	if claim, exists := state.Claims[key]; !exists || !validClaim(claim, record.ClaimToken, s.clock.Now()) {
+		return flowError(CategoryAuthority, "store.claim", nil)
 	}
 	state.Terminals[key] = safe
 	delete(state.Claims, key)
@@ -365,6 +370,11 @@ func (s *LocalStore) load(runID string) (durableState, error) {
 
 // save increments the CAS version, authenticates state, and atomically replaces its durable file.
 func (s *LocalStore) save(runID string, state durableState) error {
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(context.Background(), s.root)
+	if err != nil {
+		return flowError(CategoryAuthority, "store.offline_import_freeze", err)
+	}
+	defer releaseImportWrite()
 	state.Version++
 	key, err := s.authorityKey()
 	if err != nil {

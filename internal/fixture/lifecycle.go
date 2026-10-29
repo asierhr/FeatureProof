@@ -244,7 +244,7 @@ func (l *Lifecycle) confirmPreIOCreateRejection(ctx context.Context, bound Bound
 }
 
 // Cleanup uses a finite owned scope and a durable lease before every reverse-order effect.
-func (l *Lifecycle) Cleanup(bound BoundSet) (CleanupReport, error) {
+func (l *Lifecycle) Cleanup(parent context.Context, bound BoundSet) (CleanupReport, error) {
 	if err := ValidateBoundSet(bound); err != nil {
 		return CleanupReport{Status: CleanupFailed}, err
 	}
@@ -253,7 +253,7 @@ func (l *Lifecycle) Cleanup(bound BoundSet) (CleanupReport, error) {
 		return CleanupReport{Status: CleanupFailed}, &Error{Category: CategoryInvalid, Phase: "cleanup_scope", Cause: err}
 	}
 	defer scope.Cancel()
-	ctx := scope.Context
+	ctx := cleanupValueContext{Context: scope.Context, values: parent}
 	state, err := l.store.Load(ctx, bound.RunID)
 	if err != nil {
 		return CleanupReport{Status: CleanupFailed}, errFor(ctx, CategoryInternal, "cleanup_load", "", err)
@@ -389,6 +389,22 @@ func (l *Lifecycle) Cleanup(bound BoundSet) (CleanupReport, error) {
 		return reportFromState(bound, state), err
 	}
 	return reportFromState(bound, state), nil
+}
+
+// cleanupValueContext uses the owned cleanup lifecycle for cancellation while
+// falling back to the caller's immutable composition values.
+type cleanupValueContext struct {
+	context.Context
+	values context.Context
+}
+
+// Value resolves scope-local values first and then the parent operation's
+// immutable authority without inheriting its cancellation signal.
+func (ctx cleanupValueContext) Value(key any) any {
+	if value := ctx.Context.Value(key); value != nil {
+		return value
+	}
+	return ctx.values.Value(key)
 }
 
 // revalidateRequest selects the request-aware guard while preserving the sealed legacy port for test doubles.

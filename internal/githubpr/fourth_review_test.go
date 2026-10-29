@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// deadlineSubmitValidation blocks submit until cancellation and records whether the run budget already exists.
+// deadlineSubmitValidation holds a submission at its inherited deadline so a second owner can prove lease-safe recovery.
 type deadlineSubmitValidation struct {
 	mu       sync.Mutex
 	submits  int

@@ -74,8 +74,7 @@ type TrustClass string
 
 const (
 	// TrustInstructions is reserved for composition-owned protocol instructions.
-	TrustInstructions TrustClass = "trusted_instructions"
-	// TrustConfiguration keeps approved configuration separate from instructions.
+	TrustInstructions  TrustClass = "trusted_instructions"
 	TrustConfiguration TrustClass = "approved_configuration"
 	// TrustUntrusted contains every external or domain source payload.
 	TrustUntrusted TrustClass = "untrusted_data"
@@ -95,7 +94,6 @@ const (
 	AuthorityObserved Authority = "observed"
 )
 
-// Completeness records whether a source projection can satisfy a mandatory profile entry.
 type Completeness string
 
 const (
@@ -326,7 +324,6 @@ type Conflict struct {
 	ItemIDs    []string `json:"item_ids"`
 }
 
-// Section keeps trust boundaries explicit through serialization.
 type Section struct {
 	Trust TrustClass `json:"trust"`
 	Items []Item     `json:"items"`

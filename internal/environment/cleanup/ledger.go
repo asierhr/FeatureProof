@@ -3,9 +3,12 @@ package cleanup
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // CapacityRequest contains trusted demand resolved before provider acquisition.
@@ -211,6 +214,13 @@ type ledgerMutation func(*capacityLedgerSnapshot) (any, bool, error)
 func (l *CapacityLedger) update(ctx context.Context, mutate ledgerMutation) (any, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if l.path != "" {
+		releaseImportWrite, err := controlplane.AcquireLocalImportWrite(ctx, filepath.Dir(l.path))
+		if err != nil {
+			return nil, &Error{Category: CategoryIntegrity, Operation: "capacity_frozen", Cause: err}
+		}
+		defer releaseImportWrite()
 	}
 	if l.path == "" {
 		l.mu.Lock()

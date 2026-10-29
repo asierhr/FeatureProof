@@ -29,7 +29,7 @@ func TestExecuteBoundRejectsStaleGrantBeforeAuditAndTools(t *testing.T) {
 	policy, tool, journal := &integrationPolicy{}, &integrationTool{}, harness.NewMemoryJournal()
 	executor := newIntegrationExecutor(t, run, policy, tool, journal)
 	store := NewMemoryStore()
-	workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
+	workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestExecutionCompositionGatesRealPlanExecutor(t *testing.T) {
 	policy, tool, journal := &integrationPolicy{}, &integrationTool{}, harness.NewMemoryJournal()
 	executor := newIntegrationExecutor(t, run, policy, tool, journal)
 	store := NewMemoryStore()
-	workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
+	workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +201,7 @@ func TestExecutionCompositionGatesRealPlanExecutor(t *testing.T) {
 	disabledRun := approvalRun("run-disabled", harness.StatusPlanning)
 	disabledPolicy, disabledTool, disabledJournal := &integrationPolicy{}, &integrationTool{}, harness.NewMemoryJournal()
 	disabledExecutor := newIntegrationExecutor(t, disabledRun, disabledPolicy, disabledTool, disabledJournal)
-	disabledWorkflow, err := NewWorkflow(NewMemoryStore(), safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), disabledRun)
+	disabledWorkflow, err := NewWorkflow(context.Background(), NewMemoryStore(), safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), disabledRun)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestExecutionCompositionRejectsInvalidFixedConfiguration(t *testing.T) {
 	run := approvalRun("run", harness.StatusPlanning)
 	policy, tool, journal := &integrationPolicy{}, &integrationTool{}, harness.NewMemoryJournal()
 	executor := newIntegrationExecutor(t, run, policy, tool, journal)
-	workflow, err := NewWorkflow(NewMemoryStore(), safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), run)
+	workflow, err := NewWorkflow(context.Background(), NewMemoryStore(), safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestExecutionCallbacksRunOutsideLifecycleLock(t *testing.T) {
 	tool, journal := &integrationTool{}, harness.NewMemoryJournal()
 	executor := newIntegrationExecutor(t, run, policy, tool, journal)
 	store := NewMemoryStore()
-	workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
+	workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
 	if err != nil {
 		t.Fatal(err)
 	}

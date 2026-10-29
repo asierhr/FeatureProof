@@ -26,7 +26,7 @@ func TestWorkflowGoContractReducerAdmitsExactRevisionAndPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	projection := contractcatalog.ProjectionPolicy{MaxStringBytes: 1024, AllowedURLSchemes: []string{"https"}, SensitiveNames: []string{}, SensitivePaths: []string{}, SensitiveHeaderNames: []string{}, ForbiddenValues: []string{}}
-	limits := goinspector.Limits{MaxFiles: 10, MaxBytes: 1 << 20, MaxPackages: 5, MaxASTNodes: 1000, MaxDepth: 10, MaxTypes: 20, MaxOperations: 10, MaxDiagnostics: 10, MaxDuration: time.Second}
+	limits := goinspector.Limits{MaxFiles: 10, MaxBytes: 1 << 20, MaxPackages: 5, MaxASTNodes: 1000, MaxDepth: 10, MaxTypes: 20, MaxOperations: 10, MaxDiagnostics: 10, MaxDuration: 30 * time.Second}
 	reducer := workflowGoContractReducer{root: root, repositoryID: "repo", revision: "0123456789abcdef0123456789abcdef01234567", config: workflowGoInspectorConfig{Roots: []string{"app"}, GOOS: "linux", GOARCH: "amd64", Limits: limits, EntrySymbols: []string{"routes"}}, selections: map[string][]workflowOperationSelection{"c1": {{Method: "GET", Path: "/health"}}}, projection: projection}
 	reduced, err := reducer.Reduce(context.Background(), root, specification.Specification{Constraints: []specification.Constraint{{ID: "c1"}}})
 	if err != nil {

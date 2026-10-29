@@ -61,5 +61,5 @@ func (a WorkflowAdapter) Cleanup(ctx context.Context, handle string) (CleanupRep
 	if err != nil || bound.RunID != handle {
 		return CleanupReport{Status: CleanupFailed}, &Error{Category: CategoryDenied, Phase: "workflow_binding", Cause: err}
 	}
-	return a.Lifecycle.Cleanup(bound)
+	return a.Lifecycle.Cleanup(ctx, bound)
 }

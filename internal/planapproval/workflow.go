@@ -22,11 +22,11 @@ type ApprovalWorkflow struct {
 }
 
 // NewWorkflow validates the fail-closed collaborators and budgets required by every approval operation.
-func NewWorkflow(store ApprovalStore, sanitizer Sanitizer, clock Clock, limits Limits, run *harness.Run) (*ApprovalWorkflow, error) {
+func NewWorkflow(ctx context.Context, store ApprovalStore, sanitizer Sanitizer, clock Clock, limits Limits, run *harness.Run) (*ApprovalWorkflow, error) {
 	if store == nil || sanitizer == nil || clock == nil || !validLimits(limits) || run == nil {
 		return nil, typedError(CategoryInvalidInput, "compose", "dependencies", nil)
 	}
-	lifecycle, err := store.BindRun(run)
+	lifecycle, err := store.BindRun(ctx, run)
 	if err != nil {
 		return nil, err
 	}
@@ -546,7 +546,6 @@ func provenanceInput(snapshot ContractSnapshot) agentplanning.ProvenanceInput {
 	return agentplanning.ProvenanceInput{Constraints: append([]agentplanning.Constraint(nil), snapshot.Constraints...), Contract: snapshot.Contract, Capabilities: capabilities, Identities: testidentity.CloneDescriptors(snapshot.Identities), ContextDigest: snapshot.ContextDigest, ContextEnvelope: append(json.RawMessage(nil), snapshot.ContextEnvelope...), ContextInstructions: snapshot.ContextInstructions, ContextSeal: snapshot.ContextSeal}
 }
 
-// transitionRun keeps the mutable harness aggregate aligned with the event-derived approval projection.
 func transitionRun(run *harness.Run, state harness.Status) error {
 	if run == nil {
 		return typedError(CategoryInvalidInput, "transition", "run", nil)

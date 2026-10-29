@@ -610,6 +610,19 @@ func (g GitHubGateway) Submit(ctx context.Context, selection githubpr.Selection,
 	return githubState(view, snapshot), nil
 }
 
+// ResolveIdempotency returns a prior GitHub workflow receipt without entering Start or any external boundary.
+func (g GitHubGateway) ResolveIdempotency(ctx context.Context, key string) (githubpr.RunState, bool, error) {
+	if g.Service == nil || !safeID.MatchString(g.Principal) || !safeID.MatchString(key) {
+		return githubpr.RunState{}, false, &githubpr.Error{Code: githubpr.CodeUnauthorized, Operation: "workflow_idempotency"}
+	}
+	view, found, err := g.Service.ResolveReservation(ctx, g.Principal, key)
+	if err != nil || !found {
+		return githubpr.RunState{}, found, githubError(err)
+	}
+	state, err := g.githubState(ctx, view)
+	return state, err == nil, err
+}
+
 // ResolveExisting verifies the durable workflow still belongs to the requested exact revision lineage.
 func (g GitHubGateway) ResolveExisting(ctx context.Context, lookup githubpr.ExistingRunLookup) (githubpr.RunState, error) {
 	view, err := g.Service.Status(ctx, lookup.RunHandle)

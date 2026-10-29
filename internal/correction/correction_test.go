@@ -12,19 +12,30 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 )
 
+// testNow fixes correction journal timestamps so lineage digests remain reproducible.
 var testNow = time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+
+// digestA is the first canonical SHA-256 authority fixture.
 var digestA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+// digestB is the distinct SHA-256 fixture used to prove drift detection.
 var digestB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+// oldOID identifies the parent Git revision in correction comparisons.
 var oldOID = "1111111111111111111111111111111111111111"
+
+// newOID identifies the corrected child Git revision.
 var newOID = "2222222222222222222222222222222222222222"
 
 // TestCorrectionModelsRejectAmbiguousIdentityAndUnsafeLimits proves unsafe identities and unbounded chains never enter state.
@@ -1638,7 +1649,6 @@ func TestBoundaryValidationBranches(t *testing.T) {
 	}
 }
 
-// TestCoordinatorCloseCancelsActiveWorker proves transport shutdown propagates and joins in-flight work.
 func TestCoordinatorCloseCancelsActiveWorker(t *testing.T) {
 	fixture := newFlowFixture(t, false)
 	fixture.executor.block, fixture.executor.started = true, make(chan struct{})
@@ -2338,7 +2348,41 @@ func testReservation(t *testing.T, parent, handle, key string) Reservation {
 	return Reservation{Record: Record{Link: link, RequestHash: keyDigest(parent, "selection"), KeyHash: keyDigest(key), Phase: PhaseReserved, Plan: CorrectionPlan{Version: Version}, Owner: "owner", PolicyID: policy.ID, PolicyScenarios: []ScenarioIdentity{}}, Limits: testLimits()}
 }
 
-// setReservationLimits keeps a low-level admission fixture bound to the exact sealed policy and limits digests.
+// TestValidateStoreTransitionRejectsIdentityAndLinkDrift proves SQL adapters
+// cannot advance a correction with a foreign or unauthenticated lineage link.
+func TestValidateStoreTransitionRejectsIdentityAndLinkDrift(t *testing.T) {
+	current := testReservation(t, "parent-transition", "transition.handle", "transition-key").Record
+	next := current
+	next.Phase = PhasePreflight
+	next.Link.UpdatedAt = next.Link.UpdatedAt.Add(time.Nanosecond)
+	var err error
+	next.Link, err = next.Link.Seal()
+	if err != nil || ValidateStoreTransition(current, PhaseReserved, next) != nil {
+		t.Fatalf("valid transition rejected: %v", err)
+	}
+	foreign := next
+	foreign.Link.Handle = "foreign.handle"
+	if ValidateStoreTransition(current, PhaseReserved, foreign) == nil {
+		t.Fatal("foreign correction identity accepted")
+	}
+	tampered := next
+	tampered.Link.Digest = strings.Repeat("f", 64)
+	if ValidateStoreTransition(current, PhaseReserved, tampered) == nil {
+		t.Fatal("tampered correction link accepted")
+	}
+	store := testStore(t)
+	importer, err := controlplane.OpenLocalImportStore(store.root, "correction-freeze")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = importer.Freeze(context.Background(), "correction-import", "correction-run", "project", strings.Repeat("a", 64), 1, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Reserve(context.Background(), testReservation(t, "frozen-parent", "frozen.handle", "frozen-key")); !IsCategory(err, Conflict) {
+		t.Fatalf("frozen correction store write err=%v", err)
+	}
+}
+
 func setReservationLimits(t *testing.T, reservation *Reservation, limits ChainLimits) {
 	t.Helper()
 	policy, err := (RegressionSnapshot{Version: Version, ID: reservation.Record.PolicyID, Scenarios: cloneIdentities(reservation.Record.PolicyScenarios), ApprovalRequired: reservation.Record.PolicyApprovalRequired, Limits: limits}).Seal()

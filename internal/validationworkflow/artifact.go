@@ -199,6 +199,27 @@ func verifyArtifact(artifact PlanArtifact, handle string) error {
 	return nil
 }
 
+// ValidatePlanArtifactForStore exposes the consumer-owned artifact integrity
+// contract to persistence adapters without leaking their infrastructure.
+func ValidatePlanArtifactForStore(artifact PlanArtifact, handle string) error {
+	return verifyArtifact(artifact, handle)
+}
+
+// SealPlanArtifactForStore computes the canonical self-excluding digest for a
+// typed artifact fixture or import before any persistence adapter sees it.
+func SealPlanArtifactForStore(artifact PlanArtifact) (PlanArtifact, error) {
+	artifact.ArtifactSHA256 = ""
+	digest, err := artifactDigest(artifact)
+	if err != nil {
+		return PlanArtifact{}, err
+	}
+	artifact.ArtifactSHA256 = digest
+	if err = verifyArtifact(artifact, artifact.WorkflowID); err != nil {
+		return PlanArtifact{}, err
+	}
+	return artifact, nil
+}
+
 // validSHA256 accepts only one lowercase canonical SHA-256 representation.
 func validSHA256(value string) bool {
 	decoded, err := hex.DecodeString(value)

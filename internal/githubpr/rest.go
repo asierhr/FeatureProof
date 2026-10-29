@@ -584,8 +584,8 @@ func classifyHTTP(response *http.Response, now time.Time) error {
 	return typed
 }
 
-// Compile-time checks ensure the REST adapter exposes only the package-owned contract.
+// RESTAdapter must satisfy the pull-request gateway used by webhook coordination.
 var _ PullRequestGateway = (*RESTAdapter)(nil)
 
-// Compile-time context check keeps read-only acquisition behind the consumer-owned neutral port.
+// RESTAdapter must also provide the read-only GitHub context consumed during planning.
 var _ githubcontext.Gateway = (*RESTAdapter)(nil)

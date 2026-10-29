@@ -735,3 +735,13 @@ Bitácora append-only de features completadas.
 - Tasks T1–T16 y R1–R15 trazados en `progress/environment-cleanup-controller/{implementation,review}.md`; review independiente aprobada en la sexta revisión.
 - Pasan global normal/race, cleanup race ×20, verticales race ×20, builds Windows/Linux/Darwin y runtime Linux autenticado.
 - Coverage exacta del diff productivo: `1812/2130 = 85,07042253521127 %`; global `37344/43378 = 86,08972290100973 %`.
+## 2026-10-29 — persistent-control-plane
+
+- Estado final: `done`.
+- Resultado: control plane PostgreSQL distribuible con adapters consumer-owned para workflow, approvals, functional flow, environments/capacity/cleanup, corrections, packages, inbox, queue, authority y outbox; el modo local permanece explícito y no existe fallback ni dual-write.
+- Causalidad y autoridad: inbox/job/authority/outbox se confirman antes del ACK; workers usan leases/fencing, coordenadas backend atómicas, capability JIT y claim/heartbeat/reconcile/confirm, con restart y shutdown sin perder ownership.
+- Import y operación: freeze global, exporters tipados sin secretos, materialización/verificación y cutover CAS; query/retention autenticados y referencias vivas causales. La vertical productiva continúa tras eliminar `.featureproof` y recomponer otro proceso únicamente desde PostgreSQL.
+- Spec original aprobada el `2026-10-27T08:20:19+01:00`; enmienda `r16-comment-scope` aprobada el `2026-10-29T15:47:22+01:00`. Tasks T1–T18 y R1–R16 trazados en `progress/persistent-control-plane/{implementation,review}.md`.
+- Review independiente aprobada en la décima revisión. Pasan global serial/race, vet, compile-only, formato, seis cross-builds y gate PostgreSQL 16.15 normal/race/runtime Linux/coverage.
+- Cobertura diferencial exacta y reproducible: `5420/6370 = 85,08634222919937205651491365777080062794 %`; cleanup sin distros, roots ni perfiles propios.
+

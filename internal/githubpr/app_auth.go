@@ -123,5 +123,5 @@ func (s *GitHubAppTokenSource) signJWT() (string, error) {
 	return unsigned + "." + base64.RawURLEncoding.EncodeToString(signature), nil
 }
 
-// Compile-time assertion keeps secret token exchange behind the consumer-owned interface.
+// GitHubAppTokenSource must remain the credential boundary consumed by REST composition.
 var _ CredentialSource = (*GitHubAppTokenSource)(nil)

@@ -23,9 +23,265 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 )
+
+// webhookIngressProbe records whether a verified webhook reached durable
+// admission, allowing tests to distinguish authentication from commit errors.
+type webhookIngressProbe struct {
+	calls int
+	err   error
+}
+
+// controlPlaneReaderProbe returns one restart-safe allowlisted command projection.
+type controlPlaneReaderProbe struct{ admission controlplane.IngressAdmission }
+
+// LoadIngress reloads the configured command by its exact run identity.
+func (probe controlPlaneReaderProbe) LoadIngress(_ context.Context, runID string) (controlplane.IngressAdmission, error) {
+	if runID != probe.admission.Job.RunID {
+		return controlplane.IngressAdmission{}, controlplane.ErrNotFound
+	}
+	return probe.admission, nil
+}
+
+// controlPlaneAdmitterProbe captures the command executed by a restarted durable worker.
+type controlPlaneAdmitterProbe struct {
+	commands []WebhookCommand
+	err      error
+}
+
+// controlPlaneDomainProbe records the productive PostgreSQL checkpoint lifecycle.
+type controlPlaneDomainProbe struct {
+	prepared, completed     int
+	prepareErr, completeErr error
+}
+
+// PrepareDispatch records intent-before-effect entry or returns its injected failure.
+func (probe *controlPlaneDomainProbe) PrepareDispatch(context.Context, controlplane.Job) error {
+	probe.prepared++
+	return probe.prepareErr
+}
+
+// CompleteDispatch records successful effect convergence or returns its injected failure.
+func (probe *controlPlaneDomainProbe) CompleteDispatch(context.Context, controlplane.Job) error {
+	probe.completed++
+	return probe.completeErr
+}
+
+// authorityStoreProbe exposes one persisted phase grant and records live-envelope persistence.
+type authorityStoreProbe struct {
+	grant                   controlplane.AuthorityGrant
+	err, saveErr, verifyErr error
+	saves, verifies         int
+}
+
+// LoadAuthorityGrant returns only the configured durable grant.
+func (probe *authorityStoreProbe) LoadAuthorityGrant(context.Context, string, controlplane.Phase) (controlplane.AuthorityGrant, error) {
+	return probe.grant, probe.err
+}
+
+// SaveAuthority verifies and records the exact leased worker envelope.
+func (probe *authorityStoreProbe) SaveAuthority(_ context.Context, envelope controlplane.AuthorityEnvelope, job controlplane.Job, worker string, now time.Time) error {
+	probe.saves++
+	if probe.saveErr != nil {
+		return probe.saveErr
+	}
+	return controlplane.VerifyAuthority(envelope, job, worker, now)
+}
+
+// VerifyLiveAuthority records the mandatory JIT revalidation boundary.
+func (probe *authorityStoreProbe) VerifyLiveAuthority(context.Context, controlplane.AuthorityEnvelope, string, time.Time) error {
+	probe.verifies++
+	return probe.verifyErr
+}
+
+// secretResolverProbe records private JIT access without exposing values to persistence.
+type secretResolverProbe struct{ calls int }
+
+// Resolve returns one ephemeral fixture only after live authority verification.
+func (probe *secretResolverProbe) Resolve(context.Context, []string) (map[string]string, error) {
+	probe.calls++
+	return map[string]string{"secret-1": "ephemeral"}, nil
+}
+
+// jobHandlerProbe counts capabilities delivered after the worker's live JIT
+// authority check; it never receives persisted secret material.
+type jobHandlerProbe struct{ calls int }
+
+// HandleAuthorized records one authorized product dispatch and proves the resolved capability crossed the boundary.
+func (probe *jobHandlerProbe) HandleAuthorized(_ context.Context, _ controlplane.Job, _ map[string]string) error {
+	probe.calls++
+	return nil
+}
+
+// effectOutboxProbe models one fenced intent and records every productive dispatcher transition.
+type effectOutboxProbe struct {
+	intent                                                 controlplane.EffectIntent
+	claim                                                  controlplane.EffectClaim
+	claims, loads, heartbeats, retries, confirms, recovers int
+	err, recoverErr, claimErr, loadErr, firstHeartbeatErr  error
+	heartbeatErr, confirmErr                               error
+}
+
+// ClaimOutbox returns the single configured durable effect lease.
+func (probe *effectOutboxProbe) ClaimOutbox(context.Context, string, time.Time, time.Duration, int) ([]controlplane.EffectClaim, error) {
+	probe.claims++
+	if probe.err != nil {
+		return nil, probe.err
+	}
+	return []controlplane.EffectClaim{probe.claim}, nil
+}
+
+// ClaimEffect returns only the operation selected by the causal job and rejects cross-operation claims.
+func (probe *effectOutboxProbe) ClaimEffect(_ context.Context, operationID, _ string, _ time.Time, _ time.Duration) (controlplane.EffectClaim, error) {
+	probe.claims++
+	if probe.claimErr != nil {
+		return controlplane.EffectClaim{}, probe.claimErr
+	}
+	if probe.err != nil {
+		return controlplane.EffectClaim{}, probe.err
+	}
+	if operationID != probe.claim.OperationID {
+		return controlplane.EffectClaim{}, controlplane.ErrConflict
+	}
+	return probe.claim, nil
+}
+
+// LoadEffect revalidates the configured operation identity at the fake durable boundary.
+func (probe *effectOutboxProbe) LoadEffect(_ context.Context, claim controlplane.EffectClaim) (controlplane.EffectIntent, error) {
+	probe.loads++
+	if probe.loadErr != nil {
+		return controlplane.EffectIntent{}, probe.loadErr
+	}
+	if claim.OperationID != probe.claim.OperationID {
+		return controlplane.EffectIntent{}, controlplane.ErrConflict
+	}
+	return probe.intent, probe.err
+}
+
+// HeartbeatOutbox records lease extension before external I/O.
+func (probe *effectOutboxProbe) HeartbeatOutbox(context.Context, controlplane.EffectClaim, time.Time) error {
+	probe.heartbeats++
+	if probe.heartbeats == 1 && probe.firstHeartbeatErr != nil {
+		return probe.firstHeartbeatErr
+	}
+	if probe.heartbeats > 1 && probe.heartbeatErr != nil {
+		return probe.heartbeatErr
+	}
+	return probe.err
+}
+
+// controlledEffectWaiter exposes the exact periodic heartbeat boundary without wall-clock sleeps.
+type controlledEffectWaiter struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+// failingEffectWaiter injects a heartbeat scheduling failure without cancellation.
+type failingEffectWaiter struct{}
+
+// Wait rejects the periodic heartbeat boundary immediately.
+func (failingEffectWaiter) Wait(context.Context, time.Duration) error {
+	return controlplane.ErrUnavailable
+}
+
+// Wait blocks until the test releases one heartbeat or the owned effect context is cancelled.
+func (waiter controlledEffectWaiter) Wait(ctx context.Context, _ time.Duration) error {
+	select {
+	case waiter.started <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-waiter.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// blockingControlPlaneEffect proves heartbeat loss cancels and joins the in-flight effect.
+type blockingControlPlaneEffect struct{ exited chan struct{} }
+
+// Reconcile waits exclusively on the caller-owned effect scope.
+func (effect blockingControlPlaneEffect) Reconcile(ctx context.Context, _ ControlPlaneEffectRequest) (string, bool, error) {
+	<-ctx.Done()
+	close(effect.exited)
+	return "", false, ctx.Err()
+}
+
+// Execute must never run after reconciliation loses its live outbox fence.
+func (blockingControlPlaneEffect) Execute(context.Context, ControlPlaneEffectRequest) (string, error) {
+	return "", errors.New("unexpected execute")
+}
+
+// RetryOutbox records release after an uncertain or failed effect.
+func (probe *effectOutboxProbe) RetryOutbox(context.Context, controlplane.EffectClaim, time.Time, string) error {
+	probe.retries++
+	return nil
+}
+
+// ConfirmOutbox records the causal terminal transition after one receipt.
+func (probe *effectOutboxProbe) ConfirmOutbox(context.Context, controlplane.EffectClaim, string) error {
+	probe.confirms++
+	if probe.confirmErr != nil {
+		return probe.confirmErr
+	}
+	return probe.err
+}
+
+// RecoverOutbox records restart recovery before a new claim.
+func (probe *effectOutboxProbe) RecoverOutbox(context.Context, time.Time, int) (int, error) {
+	probe.recovers++
+	if probe.recoverErr != nil {
+		return 0, probe.recoverErr
+	}
+	return 0, probe.err
+}
+
+// controlPlaneEffectProbe records reconciliation/execution and verifies JIT secrets reach the actual effect.
+type controlPlaneEffectProbe struct {
+	requests                  []ControlPlaneEffectRequest
+	reconcileReceipt, receipt string
+	reconciled                bool
+	reconcileErr, executeErr  error
+}
+
+// Reconcile checks for a prior provider receipt before any fresh execution.
+func (probe *controlPlaneEffectProbe) Reconcile(_ context.Context, request ControlPlaneEffectRequest) (string, bool, error) {
+	request.Secrets = cloneResolvedSecrets(request.Secrets)
+	probe.requests = append(probe.requests, request)
+	return probe.reconcileReceipt, probe.reconciled, probe.reconcileErr
+}
+
+// Execute consumes the ephemeral capability and returns one stable receipt.
+func (probe *controlPlaneEffectProbe) Execute(_ context.Context, request ControlPlaneEffectRequest) (string, error) {
+	request.Secrets = cloneResolvedSecrets(request.Secrets)
+	probe.requests = append(probe.requests, request)
+	return probe.receipt, probe.executeErr
+}
+
+// effectProbesForJob creates a matching pending intent, live claim and successful external receipt.
+func effectProbesForJob(job controlplane.Job, now time.Time) (*effectOutboxProbe, *controlPlaneEffectProbe) {
+	operationID := job.JobID + "-dispatch"
+	outbox := &effectOutboxProbe{intent: controlplane.EffectIntent{OperationID: operationID, IdempotencyKey: job.JobID, ProjectID: job.ProjectID, RunID: job.RunID, Phase: job.Phase, BindingDigest: job.BindingDigest, InputDigest: job.InputDigest, ReconcileMethod: "reload_ingress"}, claim: controlplane.EffectClaim{OperationID: operationID, ProjectID: job.ProjectID, Owner: "worker-outbox", LeaseUntil: now.Add(time.Minute), Fence: 1, Attempts: 1}}
+	effect := &controlPlaneEffectProbe{receipt: strings.Repeat("c", 64)}
+	return outbox, effect
+}
+
+// Admit records the reconstructed command without external provider I/O.
+func (probe *controlPlaneAdmitterProbe) Admit(_ context.Context, command WebhookCommand) (string, error) {
+	probe.commands = append(probe.commands, command)
+	return "association-1", probe.err
+}
+
+// Admit records one post-authentication command and returns only after the configured commit outcome.
+func (probe *webhookIngressProbe) Admit(context.Context, controlplane.IngressAdmission) (bool, error) {
+	probe.calls++
+	return true, probe.err
+}
 
 // testOID is the canonical full Git object ID used by hermetic fixtures.
 const testOID = "0123456789012345678901234567890123456789"
@@ -154,6 +410,250 @@ func TestWebhookAuthenticationReplayAndCollision(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusUnauthorized {
 		t.Fatal("invalid signature decoded")
+	}
+}
+
+// TestWebhookControlPlanePersistsAfterScopeAndBeforeACK proves invalid auth never reaches inbox and a failed commit cannot return accepted.
+func TestWebhookControlPlanePersistsAfterScopeAndBeforeACK(t *testing.T) {
+	secret := []byte("0123456789abcdef")
+	probe := &webhookIngressProbe{err: errors.New("commit unavailable")}
+	handler := &WebhookHandler{Secret: secret, MaxBody: 4096, Store: testStore(t), Owner: "webhook", Clock: &fakeClock{now: time.Unix(1, 0)}, LeaseTTL: 2 * time.Minute, Admit: func(context.Context, WebhookCommand) (string, error) {
+		t.Fatal("use case ran before inbox commit")
+		return "", nil
+	}, ControlPlane: probe, Admission: func(_ context.Context, command WebhookCommand) (controlplane.IngressAdmission, error) {
+		return controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{ExternalID: command.DeliveryID}}, nil
+	}}
+	body := []byte(`{"action":"created","installation":{"id":1},"repository":{"id":2},"issue":{"number":3,"pull_request":{}},"comment":{"body":"/featureproof validate","user":{"id":4}}}`)
+	invalid := signedRequest(t, secret, "invalid", "issue_comment", body)
+	invalid.Header.Set("X-Hub-Signature-256", "sha256=00")
+	invalidRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(invalidRecorder, invalid)
+	if invalidRecorder.Code != http.StatusUnauthorized || probe.calls != 0 {
+		t.Fatal("unauthenticated webhook reached durable inbox")
+	}
+	failedRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(failedRecorder, signedRequest(t, secret, "delivery-failed", "issue_comment", body))
+	if failedRecorder.Code != http.StatusServiceUnavailable || probe.calls != 1 {
+		t.Fatal("failed inbox commit was acknowledged")
+	}
+	probe.err = nil
+	handler.Admit = func(context.Context, WebhookCommand) (string, error) { return "association-1", nil }
+	successRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(successRecorder, signedRequest(t, secret, "delivery-ok", "issue_comment", body))
+	if successRecorder.Code != http.StatusAccepted || probe.calls != 2 {
+		t.Fatal("committed inbox was not acknowledged")
+	}
+}
+
+// TestWebhookControlPlaneRejectsPartialCompositionAndAdmissionFailure proves
+// the durable ingress path never falls back to the legacy delivery journal.
+func TestWebhookControlPlaneRejectsPartialCompositionAndAdmissionFailure(t *testing.T) {
+	secret := []byte("0123456789abcdef")
+	body := []byte(`{"action":"created","installation":{"id":1},"repository":{"id":2},"issue":{"number":3,"pull_request":{}},"comment":{"body":"/featureproof validate","user":{"id":4}}}`)
+	ingress := &webhookIngressProbe{}
+	handler := &WebhookHandler{Secret: secret, MaxBody: 4096, Store: testStore(t), Admit: func(context.Context, WebhookCommand) (string, error) { return "legacy", nil }, Owner: "webhook", Clock: &fakeClock{now: time.Unix(1, 0)}, LeaseTTL: time.Minute, ControlPlane: ingress}
+	partialResponse := httptest.NewRecorder()
+	handler.ServeHTTP(partialResponse, signedRequest(t, secret, "partial-control-plane", "issue_comment", body))
+	if partialResponse.Code != http.StatusServiceUnavailable || ingress.calls != 0 {
+		t.Fatalf("partial control-plane status=%d calls=%d", partialResponse.Code, ingress.calls)
+	}
+	handler.Admission = func(context.Context, WebhookCommand) (controlplane.IngressAdmission, error) {
+		return controlplane.IngressAdmission{}, &Error{Code: CodeInvalid, Operation: "admission"}
+	}
+	rejectedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(rejectedResponse, signedRequest(t, secret, "rejected-control-plane", "issue_comment", body))
+	if rejectedResponse.Code != http.StatusBadRequest || ingress.calls != 0 {
+		t.Fatalf("admission failure status=%d calls=%d", rejectedResponse.Code, ingress.calls)
+	}
+	ignoredResponse := httptest.NewRecorder()
+	handler.ServeHTTP(ignoredResponse, signedRequest(t, secret, "ignored-control-plane", "push", []byte(`{}`)))
+	if ignoredResponse.Code != http.StatusOK || ingress.calls != 0 || !strings.Contains(ignoredResponse.Body.String(), `"State":"ignored"`) {
+		t.Fatalf("ignored response=%d body=%s calls=%d", ignoredResponse.Code, ignoredResponse.Body.String(), ingress.calls)
+	}
+}
+
+// TestWebhookControlPlaneScopeIsClosed verifies static installation, repository, actor and selection authority precedes inbox persistence.
+func TestWebhookControlPlaneScopeIsClosed(t *testing.T) {
+	config := AuthorizationConfig{Installations: map[int64]map[int64]bool{1: {2: true}}, Actors: map[int64]bool{4: true}, Selections: map[string]Selection{"default": {Alias: "default"}}}
+	command := WebhookCommand{InstallationID: 1, RepositoryID: 2, ActorID: 4, SelectionAlias: "default"}
+	if !webhookCommandInScope(config, command) {
+		t.Fatal("exact scope rejected")
+	}
+	command.ActorID = 5
+	if webhookCommandInScope(config, command) {
+		t.Fatal("foreign actor admitted")
+	}
+}
+
+// TestControlPlaneWorkerReloadsAllowlistedCommandAfterRestart proves durable jobs do not depend on raw webhook bytes or process memory.
+func TestControlPlaneWorkerReloadsAllowlistedCommandAfterRestart(t *testing.T) {
+	now := time.Now().UTC()
+	job := controlplane.Job{JobID: "job-1", ProjectID: "project-1", RunID: "run-1", Phase: controlplane.PhaseExecute}
+	fields := map[string]string{"delivery_id": "delivery-1", "event": "issue_comment", "installation_id": "1", "repository_id": "2", "pull_request_number": "3", "actor_id": "4", "selection_alias": "default", "payload_digest": strings.Repeat("a", 64)}
+	reader := controlPlaneReaderProbe{admission: controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{CommandFields: fields}, Job: job}}
+	outbox, effect := effectProbesForJob(job, now)
+	handler := controlPlaneJobHandler{reader: reader, outbox: outbox, effect: effect, clock: &fakeClock{now: now}, owner: "worker-outbox"}
+	if err := handler.HandleAuthorized(context.Background(), job, map[string]string{"secret-1": "ephemeral"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(effect.requests) != 2 || effect.requests[1].Command.DeliveryID != "delivery-1" || effect.requests[1].Command.RepositoryID != 2 || effect.requests[1].Secrets["secret-1"] != "ephemeral" {
+		t.Fatal("durable command was not reconstructed exactly")
+	}
+}
+
+// TestControlPlaneWorkerUsesCausalOutboxAndJITAuthority verifies the real handler orders durable intent, secret resolution, product work and convergence.
+func TestControlPlaneWorkerUsesCausalOutboxAndJITAuthority(t *testing.T) {
+	now := time.Now().UTC()
+	if err := (authorizedControlPlaneJobHandler{}).Handle(context.Background(), controlplane.Job{}); err == nil {
+		t.Fatal("missing authority dependencies accepted")
+	}
+	binding := strings.Repeat("a", 64)
+	input := strings.Repeat("b", 64)
+	job, err := controlplane.SealJob(controlplane.Job{JobID: "job-1", ProjectID: "project-1", RunID: "run-1", BackendEpoch: 1, BindingDigest: binding, Phase: controlplane.PhaseExecute, State: controlplane.JobLeased, InputDigest: input, CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour), Owner: "worker-1", LeaseUntil: now.Add(time.Minute), Fence: 1, Attempt: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{ProjectID: job.ProjectID, RunID: job.RunID, BackendEpoch: job.BackendEpoch, BindingDigest: job.BindingDigest, Phase: job.Phase, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "target", TargetBindingDigest: input, SecretReferenceIDs: []string{"secret-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := &authorityStoreProbe{grant: grant}
+	secrets := &secretResolverProbe{}
+	next := &jobHandlerProbe{}
+	authorized := authorizedControlPlaneJobHandler{authority: authority, secrets: secrets, clock: &fakeClock{now: now}, next: next}
+	if err = authorized.Handle(context.Background(), job); err != nil || authority.saves != 1 || authority.verifies != 1 || secrets.calls != 1 || next.calls != 1 {
+		t.Fatal("authorized dispatch", err)
+	}
+	authority.err = controlplane.ErrConflict
+	if err = authorized.Handle(context.Background(), job); err == nil || secrets.calls != 1 || next.calls != 1 {
+		t.Fatal("stale authority reached private boundary")
+	}
+	authority.err, authority.saveErr = nil, controlplane.ErrConflict
+	if err = authorized.Handle(context.Background(), job); err == nil || secrets.calls != 1 || next.calls != 1 {
+		t.Fatal("failed envelope persistence reached private boundary")
+	}
+	authority.saveErr, authority.verifyErr = nil, controlplane.ErrConflict
+	if err = authorized.Handle(context.Background(), job); err == nil || secrets.calls != 1 || next.calls != 1 {
+		t.Fatal("failed live verification reached secret resolver")
+	}
+	authority.verifyErr = nil
+	evaluateJob := job
+	evaluateJob.Phase, evaluateJob.Digest = controlplane.PhaseEvaluate, ""
+	evaluateJob, err = controlplane.SealJob(evaluateJob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority.grant, err = controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{ProjectID: evaluateJob.ProjectID, RunID: evaluateJob.RunID, BackendEpoch: evaluateJob.BackendEpoch, BindingDigest: evaluateJob.BindingDigest, Phase: evaluateJob.Phase})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutSecrets := authorizedControlPlaneJobHandler{authority: authority, clock: &fakeClock{now: now}, next: next}
+	if err = withoutSecrets.Handle(context.Background(), evaluateJob); err != nil || next.calls != 2 {
+		t.Fatal("secretless phase", err)
+	}
+
+	fields := map[string]string{"delivery_id": "delivery-1", "event": "issue_comment", "installation_id": "1", "repository_id": "2", "pull_request_number": "3", "actor_id": "4", "selection_alias": "default", "payload_digest": input}
+	reader := controlPlaneReaderProbe{admission: controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{CommandFields: fields}, Job: job}}
+	outbox, effect := effectProbesForJob(job, now)
+	handler := controlPlaneJobHandler{reader: reader, outbox: outbox, effect: effect, clock: &fakeClock{now: now}, owner: "worker-outbox"}
+	if err = handler.HandleAuthorized(context.Background(), job, map[string]string{"secret-1": "ephemeral"}); err != nil || outbox.claims != 1 || outbox.heartbeats != 1 || outbox.confirms != 1 || len(effect.requests) != 2 {
+		t.Fatal("outbox dispatch", err)
+	}
+	effect.executeErr = controlplane.ErrUnavailable
+	if err = handler.HandleAuthorized(context.Background(), job, nil); err == nil || outbox.retries != 1 {
+		t.Fatal("product failure reached convergence")
+	}
+}
+
+// TestControlPlaneJobHandlerRejectsEveryDurableBoundary proves no later effect
+// runs after ingress, recovery, claim, intent, heartbeat or confirm authority fails.
+func TestControlPlaneJobHandlerRejectsEveryDurableBoundary(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	job := controlplane.Job{JobID: "fault-job", ProjectID: "project-1", RunID: "fault-run", Phase: controlplane.PhaseExecute, Deadline: now.Add(time.Hour)}
+	fields := map[string]string{"delivery_id": "delivery-1", "event": "issue_comment", "installation_id": "1", "repository_id": "2", "pull_request_number": "3", "actor_id": "4", "selection_alias": "default", "payload_digest": strings.Repeat("a", 64)}
+	cases := []struct {
+		name      string
+		configure func(*effectOutboxProbe, *controlPlaneReaderProbe)
+	}{
+		{name: "ingress load", configure: func(_ *effectOutboxProbe, reader *controlPlaneReaderProbe) { reader.admission.Job.RunID = "other-run" }},
+		{name: "malformed ingress", configure: func(_ *effectOutboxProbe, reader *controlPlaneReaderProbe) {
+			reader.admission.Envelope.CommandFields = map[string]string{}
+		}},
+		{name: "recovery", configure: func(outbox *effectOutboxProbe, _ *controlPlaneReaderProbe) {
+			outbox.recoverErr = controlplane.ErrUnavailable
+		}},
+		{name: "claim", configure: func(outbox *effectOutboxProbe, _ *controlPlaneReaderProbe) {
+			outbox.claimErr = controlplane.ErrConflict
+		}},
+		{name: "intent load", configure: func(outbox *effectOutboxProbe, _ *controlPlaneReaderProbe) { outbox.loadErr = controlplane.ErrConflict }},
+		{name: "intent identity", configure: func(outbox *effectOutboxProbe, _ *controlPlaneReaderProbe) {
+			outbox.intent.IdempotencyKey = "other-job"
+		}},
+		{name: "initial heartbeat", configure: func(outbox *effectOutboxProbe, _ *controlPlaneReaderProbe) {
+			outbox.firstHeartbeatErr = controlplane.ErrConflict
+		}},
+		{name: "confirm", configure: func(outbox *effectOutboxProbe, _ *controlPlaneReaderProbe) {
+			outbox.confirmErr = controlplane.ErrConflict
+		}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			outbox, effect := effectProbesForJob(job, now)
+			reader := &controlPlaneReaderProbe{admission: controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{CommandFields: fields}, Job: job}}
+			testCase.configure(outbox, reader)
+			handler := controlPlaneJobHandler{reader: reader, outbox: outbox, effect: effect, clock: &fakeClock{now: now}, owner: "worker-outbox"}
+			if err := handler.HandleAuthorized(context.Background(), job, nil); err == nil {
+				t.Fatal("durable boundary failure was accepted")
+			}
+			if testCase.name != "confirm" && len(effect.requests) != 0 {
+				t.Fatalf("fault %s reached effect: %#v", testCase.name, effect.requests)
+			}
+		})
+	}
+}
+
+// TestControlPlaneWorkerCancelsAndJoinsEffectOnHeartbeatLoss proves a stale dispatcher cannot continue provider I/O after losing its live lease.
+func TestControlPlaneWorkerCancelsAndJoinsEffectOnHeartbeatLoss(t *testing.T) {
+	now := time.Now().UTC()
+	job := controlplane.Job{JobID: "heartbeat-job", ProjectID: "project-1", RunID: "run-1", Phase: controlplane.PhaseExecute, Deadline: now.Add(time.Hour)}
+	fields := map[string]string{"delivery_id": "delivery-1", "event": "issue_comment", "installation_id": "1", "repository_id": "2", "pull_request_number": "3", "actor_id": "4", "selection_alias": "default", "payload_digest": strings.Repeat("a", 64)}
+	reader := controlPlaneReaderProbe{admission: controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{CommandFields: fields}, Job: job}}
+	outbox, _ := effectProbesForJob(job, now)
+	outbox.heartbeatErr = controlplane.ErrConflict
+	waiter := controlledEffectWaiter{started: make(chan struct{}), release: make(chan struct{})}
+	effect := blockingControlPlaneEffect{exited: make(chan struct{})}
+	handler := controlPlaneJobHandler{reader: reader, outbox: outbox, effect: effect, clock: &fakeClock{now: now}, waiter: waiter, owner: "worker-outbox"}
+	result := make(chan error, 1)
+	go func() { result <- handler.HandleAuthorized(context.Background(), job, nil) }()
+	<-waiter.started
+	close(waiter.release)
+	if err := <-result; !errors.Is(err, controlplane.ErrConflict) {
+		t.Fatal("heartbeat loss did not fence effect", err)
+	}
+	select {
+	case <-effect.exited:
+	default:
+		t.Fatal("effect handler was not joined")
+	}
+}
+
+// TestEffectLeaseMaintenanceReportsWaitFailureAndBoundsDeadline proves the
+// heartbeat loop surfaces scheduler failure and never exceeds job authority.
+func TestEffectLeaseMaintenanceReportsWaitFailureAndBoundsDeadline(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	result := make(chan error, 1)
+	cancelled := false
+	handler := controlPlaneJobHandler{waiter: failingEffectWaiter{}}
+	handler.maintainEffectLease(context.Background(), func() { cancelled = true }, controlplane.EffectClaim{}, now.Add(time.Hour), result)
+	if err := <-result; !errors.Is(err, controlplane.ErrUnavailable) || cancelled {
+		t.Fatalf("wait failure=%v cancelled=%t", err, cancelled)
+	}
+	deadline := now.Add(time.Second)
+	if got := boundedEffectLease(now, deadline); !got.Equal(deadline) {
+		t.Fatalf("bounded lease=%v want=%v", got, deadline)
+	}
+	if got := boundedEffectLease(now, time.Time{}); !got.Equal(now.Add(90 * time.Second)) {
+		t.Fatalf("default lease=%v", got)
 	}
 }
 
@@ -1289,6 +1789,81 @@ func TestSystemicCommentsCoverChangedSymbols(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// controlPlaneReaderFixture returns one payload-minimal durable command to the worker boundary.
+type controlPlaneReaderFixture struct {
+	admission controlplane.IngressAdmission
+	err       error
+}
+
+// LoadIngress supplies the exact fixture admission or its injected storage failure.
+func (fixture controlPlaneReaderFixture) LoadIngress(context.Context, string) (controlplane.IngressAdmission, error) {
+	return fixture.admission, fixture.err
+}
+
+// controlPlaneCoordinatorFixture records ordinary validation dispatches after durable reload.
+type controlPlaneCoordinatorFixture struct{ calls int }
+
+// Admit records one reconstructed command without retaining raw webhook bytes.
+func (fixture *controlPlaneCoordinatorFixture) Admit(context.Context, WebhookCommand) (string, error) {
+	fixture.calls++
+	return "run", nil
+}
+
+// TestControlPlaneCommandReconstructionAndDispatch covers closed scope, parsing, review and retry matrices.
+func TestControlPlaneCommandReconstructionAndDispatch(t *testing.T) {
+	authorization := AuthorizationConfig{Installations: map[int64]map[int64]bool{1: {2: true}}, Actors: map[int64]bool{3: true}, Selections: map[string]Selection{"safe": {Alias: "safe"}}}
+	command := WebhookCommand{InstallationID: 1, RepositoryID: 2, ActorID: 3, SelectionAlias: "safe"}
+	if !webhookCommandInScope(authorization, command) {
+		t.Fatal("authorized command rejected")
+	}
+	command.ActorID = 4
+	if webhookCommandInScope(authorization, command) {
+		t.Fatal("unauthorized actor accepted")
+	}
+	fields := map[string]string{"delivery_id": "delivery", "event": "issue_comment", "installation_id": "1", "repository_id": "2", "pull_request_number": "4", "actor_id": "3", "selection_alias": "safe", "payload_digest": strings.Repeat("a", 64), "review_revision": "5", "memory_expected_sequence": "6", "memory_expected_version": "7"}
+	reconstructed, err := webhookCommandFromFields(fields)
+	if err != nil || reconstructed.ReviewRevision != 5 || reconstructed.MemoryExpectedSequence != 6 || reconstructed.MemoryExpectedVersion != 7 {
+		t.Fatal("reconstruct", err)
+	}
+	for _, field := range []string{"installation_id", "repository_id", "pull_request_number", "actor_id"} {
+		invalid := map[string]string{}
+		for name, value := range fields {
+			invalid[name] = value
+		}
+		invalid[field] = "not-a-number"
+		if _, err = webhookCommandFromFields(invalid); err == nil {
+			t.Fatalf("invalid %s accepted", field)
+		}
+	}
+	now := time.Now().UTC()
+	job := controlplane.Job{JobID: "job", ProjectID: "project", RunID: "run", Phase: controlplane.PhaseExecute}
+	outbox, effect := effectProbesForJob(job, now)
+	handler := controlPlaneJobHandler{reader: controlPlaneReaderFixture{admission: controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{CommandFields: fields}}}, outbox: outbox, effect: effect, clock: &fakeClock{now: now}, owner: "worker-outbox"}
+	if err = handler.HandleAuthorized(context.Background(), job, nil); err != nil || len(effect.requests) != 2 {
+		t.Fatal("ordinary dispatch", err)
+	}
+	reviewFields := map[string]string{}
+	for name, value := range fields {
+		reviewFields[name] = value
+	}
+	reviewFields["review_operation"] = "approve"
+	handler.reader = controlPlaneReaderFixture{admission: controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{CommandFields: reviewFields}}}
+	if err = handler.HandleAuthorized(context.Background(), job, nil); err != nil || effect.requests[len(effect.requests)-1].Command.ReviewOperation != "approve" {
+		t.Fatal("review dispatch", err)
+	}
+	handler.reader = controlPlaneReaderFixture{err: errors.New("storage")}
+	if err = handler.HandleAuthorized(context.Background(), job, nil); err == nil {
+		t.Fatal("reader failure hidden")
+	}
+	classifier := controlPlaneErrorClassifier{}
+	if classifier.Classify(&Error{Code: CodeTransient}).MaxAttempts != 4 || classifier.Classify(&Error{Code: CodeRateLimited}).MaxAttempts != 4 || classifier.Classify(&Error{Code: CodeUnauthorized}).MaxAttempts != 1 {
+		t.Fatal("retry classification")
+	}
+	if err = (&Runtime{}).Start(context.Background()); err != nil {
+		t.Fatal("workerless runtime start", err)
 	}
 }
 

@@ -437,7 +437,7 @@ type Result struct {
 	ArtifactDigest string             `json:"artifact_digest"`
 }
 
-// MarshalJSON keeps ephemeral execution inputs and opaque keys outside serializable state.
+// MarshalJSON emits only durable coordinates, preventing resolved inputs and ephemeral execution authority from entering logs or stores.
 func (r ExecutionRequest) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		RunID, StepID string

@@ -22,7 +22,7 @@ import (
 // liveTestClock provides real cancelable timers only for concurrency and deadline tests.
 type liveTestClock struct{}
 
-// recordingObserver records whether the coordinator emitted one allowlisted lifecycle fact.
+// recordingObserver captures lifecycle telemetry so coordinator tests can prove events cross only the configured observer boundary.
 type recordingObserver struct {
 	called  bool
 	metrics int
@@ -407,7 +407,7 @@ func (p *stagedProvider) Release(ctx context.Context, _ ReleaseRequest) error {
 // attestExecutor forces the refreshing attestor boundary from inside the runner contract.
 type attestExecutor struct{}
 
-// Execute requests the current proof and propagates its operational failure.
+// Execute refreshes attestation through the authorized execution supplied by the runner and returns no extra authority.
 func (attestExecutor) Execute(ctx context.Context, execution AuthorizedExecution) (ExecutionResult, error) {
 	_, err := execution.Attestor.Attest(ctx, execution.Snapshot.EnvironmentID)
 	if err != nil {

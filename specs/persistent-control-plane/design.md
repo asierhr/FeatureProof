@@ -91,11 +91,24 @@ No se propone ninguna excepción.
 
 ## Convención obligatoria de comentarios
 
-Toda entidad, constante, variable, función, método y helper de test nuevo o
-modificado incluirá un comentario breve sobre su responsabilidad sistémica,
-frontera o invariante. Abarca símbolos privados, sentinels, variables de
-paquete, migration descriptors, fakes, factories, fixtures y helpers de assert.
-Repetir el nombre no satisface la convención.
+Toda entidad o tipo, función, método y helper de test nuevo o modificado incluirá
+un comentario breve sobre su responsabilidad sistémica, frontera o invariante.
+También lo incluirán constantes y variables de paquete cuyo papel compartido no
+sea evidente por el tipo, nombre y API contenedora. Abarca símbolos privados,
+sentinels, migration descriptors, fakes, factories, fixtures y helpers de
+assertion dentro de ese alcance.
+
+Variables locales, parámetros y receivers no se comentan mecánicamente. Cuando
+alguno materializa autoridad, fencing, durabilidad u ownership que no resulta
+evidente en el tipo y la operación, la implementación debe expresarlo mediante
+un tipo u operación más explícitos o documentar puntualmente esa frontera.
+
+La auditoría deriva el inventario del diff completo, comprueba los símbolos
+alcanzados y combina análisis estático con muestreo manual. Rechaza
+paráfrasis, familias repetidas y variantes de una plantilla interpolada; no
+cuenta líneas de comentario como sustituto de utilidad sistémica. Esta
+convención concreta la petición original de comentar entidades y funciones y
+evita el ruido contrario a `docs/conventions.md` §12.
 
 ## Áreas y paquetes previstos
 

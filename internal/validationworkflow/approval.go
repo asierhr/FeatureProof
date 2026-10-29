@@ -135,7 +135,7 @@ func (b *PlanApprovalBridge) workflow(ctx context.Context, planID string, snapsh
 		}
 	}
 	if run != nil {
-		workflow, workflowErr := planapproval.NewWorkflow(b.Store, b.Sanitizer, b.Clock, b.Limits, run)
+		workflow, workflowErr := planapproval.NewWorkflow(ctx, b.Store, b.Sanitizer, b.Clock, b.Limits, run)
 		if workflowErr != nil {
 			return nil, approvalError(workflowErr, "approval_compose")
 		}
@@ -159,7 +159,7 @@ func (b *PlanApprovalBridge) workflow(ctx context.Context, planID string, snapsh
 			return nil, &Error{Code: CodeConflict, Operation: "approval_lifecycle"}
 		}
 	}
-	workflow, err := planapproval.NewWorkflow(b.Store, b.Sanitizer, b.Clock, b.Limits, run)
+	workflow, err := planapproval.NewWorkflow(ctx, b.Store, b.Sanitizer, b.Clock, b.Limits, run)
 	if err != nil {
 		return nil, approvalError(err, "approval_compose")
 	}

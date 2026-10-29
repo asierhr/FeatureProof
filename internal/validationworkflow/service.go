@@ -143,7 +143,7 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	}
 	now := s.deps.Clock.Now().UTC()
 	record := Record{Version: 1, Handle: handle, Principal: command.Principal, IdempotencyKey: command.IdempotencyKey, RequestDigest: digest, RepositoryID: command.RepositoryID, Revision: command.Revision, Command: command, Phase: PhaseAdmitted, UpdatedAt: now}
-	record, created, err := s.deps.Store.Reserve(ctx, record, s.deps.Owner, now, s.config.LeaseTTL)
+	record, created, ctx, err := s.reserveOperation(ctx, record, now)
 	if err != nil {
 		return WorkflowView{}, err
 	}
@@ -425,6 +425,19 @@ func (s *Service) Status(ctx context.Context, handle string) (WorkflowView, erro
 	return viewOf(record), nil
 }
 
+// ResolveReservation returns an existing idempotent workflow projection without invoking admission, generation, or external I/O.
+func (s *Service) ResolveReservation(ctx context.Context, principal, key string) (WorkflowView, bool, error) {
+	lookup, ok := s.deps.Store.(WorkflowReservationLookup)
+	if !ok {
+		return WorkflowView{}, false, &Error{Code: CodeUnavailable, Operation: "idempotency_lookup"}
+	}
+	record, found, err := lookup.FindReservation(ctx, principal, key)
+	if err != nil || !found {
+		return WorkflowView{}, found, err
+	}
+	return viewOf(record), true, nil
+}
+
 // ApprovalView returns the exact safe revision currently waiting for a decision.
 func (s *Service) ApprovalView(ctx context.Context, handle string) (ApprovalView, error) {
 	record, err := s.deps.Store.Load(ctx, handle)
@@ -451,7 +464,7 @@ func (s *Service) Decide(ctx context.Context, command DecisionCommand) (Workflow
 	if !safeID.MatchString(command.Principal) || !safeID.MatchString(command.Handle) || !safeID.MatchString(command.DecisionID) || command.Revision == 0 || command.Action != DecisionApprove && command.Action != DecisionReject {
 		return WorkflowView{}, &Error{Code: CodeInvalid, Operation: "decision"}
 	}
-	record, err := s.deps.Store.Load(ctx, command.Handle)
+	record, ctx, err := s.loadOperation(ctx, command.Handle)
 	if err != nil {
 		return WorkflowView{}, mapNotFound(err, "decision")
 	}
@@ -524,7 +537,7 @@ func (s *Service) Decide(ctx context.Context, command DecisionCommand) (Workflow
 
 // Cancel persists cancellation, prevents new work and finalizes the workflow idempotently.
 func (s *Service) Cancel(ctx context.Context, principal, handle string) (WorkflowView, error) {
-	record, err := s.deps.Store.Load(ctx, handle)
+	record, ctx, err := s.loadOperation(ctx, handle)
 	if err != nil {
 		return WorkflowView{}, mapNotFound(err, "cancel")
 	}
@@ -592,6 +605,26 @@ func (s *Service) claimOperation(ctx context.Context, record Record) (Record, er
 	return claimed, nil
 }
 
+// reserveOperation atomically admits a PostgreSQL workflow with its immutable
+// epoch coordinate while local stores retain their ordinary context.
+func (s *Service) reserveOperation(ctx context.Context, record Record, now time.Time) (Record, bool, context.Context, error) {
+	if bounded, ok := s.deps.Store.(BoundWorkflowStore); ok {
+		return bounded.ReserveBound(ctx, record, s.deps.Owner, now, s.config.LeaseTTL)
+	}
+	reserved, created, err := s.deps.Store.Reserve(ctx, record, s.deps.Owner, now, s.config.LeaseTTL)
+	return reserved, created, ctx, err
+}
+
+// loadOperation reads one workflow and its PostgreSQL coordinate from the same
+// snapshot so no cutover can be adopted after work has been prepared.
+func (s *Service) loadOperation(ctx context.Context, handle string) (Record, context.Context, error) {
+	if bounded, ok := s.deps.Store.(BoundWorkflowStore); ok {
+		return bounded.LoadBound(ctx, handle)
+	}
+	record, err := s.deps.Store.Load(ctx, handle)
+	return record, ctx, err
+}
+
 // Result returns a closed terminal result and never invents functional status from control events.
 func (s *Service) Result(ctx context.Context, handle string) (WorkflowResult, error) {
 	record, err := s.deps.Store.Load(ctx, handle)
@@ -611,14 +644,18 @@ func (s *Service) Recover(ctx context.Context) error {
 		return err
 	}
 	for _, candidate := range records {
-		record, claimed, claimErr := s.deps.Store.Claim(ctx, candidate.Handle, s.deps.Owner, s.deps.Clock.Now(), s.config.LeaseTTL)
+		_, operationCtx, loadErr := s.loadOperation(ctx, candidate.Handle)
+		if loadErr != nil {
+			return loadErr
+		}
+		record, claimed, claimErr := s.deps.Store.Claim(operationCtx, candidate.Handle, s.deps.Owner, s.deps.Clock.Now(), s.config.LeaseTTL)
 		if claimErr != nil {
 			return claimErr
 		}
 		if !claimed {
 			continue
 		}
-		workCtx, worker, workErr := s.beginWork(ctx, record.Handle)
+		workCtx, worker, workErr := s.beginWork(operationCtx, record.Handle)
 		if workErr != nil {
 			return workErr
 		}

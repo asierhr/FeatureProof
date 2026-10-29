@@ -261,12 +261,12 @@ func TestCleanupBudgetReservationsSurviveRetryAndRestart(t *testing.T) {
 	if _, err := lifecycle.Prepare(context.Background(), bound); err != nil {
 		t.Fatal(err)
 	}
-	report, err := lifecycle.Cleanup(bound)
+	report, err := lifecycle.Cleanup(context.Background(), bound)
 	if err != nil || report.Status != CleanupFailed || len(executor.requests) != 2 || report.Incidents[0].Category != CategoryBudget {
 		t.Fatalf("call cap crossed: report=%#v calls=%d err=%v", report, len(executor.requests), err)
 	}
 	redelivery := lifecycleWithOwner(t, store, executor, "other-owner", fixedClock{now: time.Unix(200, 0)}, fixedScopes{calls: 1, retries: 1})
-	if _, err := redelivery.Cleanup(bound); err != nil || len(executor.requests) != 2 {
+	if _, err := redelivery.Cleanup(context.Background(), bound); err != nil || len(executor.requests) != 2 {
 		t.Fatalf("restart recovered budget: calls=%d err=%v", len(executor.requests), err)
 	}
 
@@ -285,7 +285,7 @@ func TestCleanupBudgetReservationsSurviveRetryAndRestart(t *testing.T) {
 	secondStore.states[secondBound.RunID] = state
 	secondExecutor.results = append(secondExecutor.results, HTTPResult{Status: 204})
 	restarted := lifecycleWithOwner(t, secondStore, secondExecutor, "restart-owner", fixedClock{now: time.Unix(300, 0)}, fixedScopes{calls: 2, retries: 1})
-	if recovered, recoverErr := restarted.Cleanup(secondBound); recoverErr != nil || recovered.Status != CleanupSucceeded || latestCleanupAttempt(secondStore.states[secondBound.RunID], "account") != 2 {
+	if recovered, recoverErr := restarted.Cleanup(context.Background(), secondBound); recoverErr != nil || recovered.Status != CleanupSucceeded || latestCleanupAttempt(secondStore.states[secondBound.RunID], "account") != 2 {
 		t.Fatalf("durable retry not resumed: report=%#v err=%v", recovered, recoverErr)
 	}
 }
@@ -451,7 +451,7 @@ func TestPostIOPersistenceCrashRecoversAsCleanupOnly(t *testing.T) {
 		t.Fatalf("prepare replayed effect: calls=%d err=%v", executor.callCount(), err)
 	}
 	executor.result = HTTPResult{Status: 204}
-	if report, err := second.Cleanup(bound); err != nil || report.Status != CleanupSucceeded || executor.callCount() != 2 {
+	if report, err := second.Cleanup(context.Background(), bound); err != nil || report.Status != CleanupSucceeded || executor.callCount() != 2 {
 		t.Fatalf("cleanup=%#v calls=%d err=%v", report, executor.callCount(), err)
 	}
 }
@@ -471,15 +471,15 @@ func TestCleanupClaimSerializesOwnersAndExpiredLeaseHandsOff(t *testing.T) {
 	ownerSame := lifecycleWithOwner(t, store, blocked, "owner-a", fixedClock{now: time.Unix(10, 0)}, fixedScopes{calls: 1})
 	ownerExpired := lifecycleWithOwner(t, store, blocked, "owner-expired", fixedClock{now: time.Now().Add(24 * time.Hour)}, fixedScopes{calls: 1})
 	done := make(chan error, 1)
-	go func() { _, err := ownerA.Cleanup(bound); done <- err }()
+	go func() { _, err := ownerA.Cleanup(context.Background(), bound); done <- err }()
 	<-blocked.entered
-	if _, err := ownerSame.Cleanup(bound); !errors.Is(err, &Error{Category: CategoryUnavailable}) || blocked.callCount() != 1 {
+	if _, err := ownerSame.Cleanup(context.Background(), bound); !errors.Is(err, &Error{Category: CategoryUnavailable}) || blocked.callCount() != 1 {
 		t.Fatalf("same owner crossed effect: calls=%d err=%v", blocked.callCount(), err)
 	}
-	if _, err := ownerB.Cleanup(bound); !errors.Is(err, &Error{Category: CategoryUnavailable}) || blocked.callCount() != 1 {
+	if _, err := ownerB.Cleanup(context.Background(), bound); !errors.Is(err, &Error{Category: CategoryUnavailable}) || blocked.callCount() != 1 {
 		t.Fatalf("second owner crossed effect: calls=%d err=%v", blocked.callCount(), err)
 	}
-	if _, err := ownerExpired.Cleanup(bound); !errors.Is(err, &Error{Category: CategoryUnavailable}) || blocked.callCount() != 1 {
+	if _, err := ownerExpired.Cleanup(context.Background(), bound); !errors.Is(err, &Error{Category: CategoryUnavailable}) || blocked.callCount() != 1 {
 		t.Fatalf("expired in-flight claim crossed effect: calls=%d err=%v", blocked.callCount(), err)
 	}
 	close(blocked.release)
@@ -500,7 +500,7 @@ func TestCleanupClaimSerializesOwnersAndExpiredLeaseHandsOff(t *testing.T) {
 	store.states[bound.RunID] = state
 	handoffExecutor := &scriptedExecutor{results: []HTTPResult{{Status: 204}}}
 	handoff := lifecycleWithOwner(t, store, handoffExecutor, "owner-c", fixedClock{now: time.Unix(51, 0)}, fixedScopes{calls: 1})
-	if report, err := handoff.Cleanup(bound); err != nil || report.Status != CleanupSucceeded || len(handoffExecutor.requests) != 1 {
+	if report, err := handoff.Cleanup(context.Background(), bound); err != nil || report.Status != CleanupSucceeded || len(handoffExecutor.requests) != 1 {
 		t.Fatalf("handoff=%#v calls=%d err=%v", report, len(handoffExecutor.requests), err)
 	}
 }
@@ -522,12 +522,12 @@ func TestCleanupExhaustionTerminalsAreDurableAndRedeliveryIsNoOp(t *testing.T) {
 				t.Fatal(err)
 			}
 			guards.err = test.guardErr
-			report, err := lifecycle.Cleanup(bound)
+			report, err := lifecycle.Cleanup(context.Background(), bound)
 			if err != nil || store.states[bound.RunID].CleanupTerminal["account"] != test.category || !store.states[bound.RunID].ReportConfirmed {
 				t.Fatalf("report=%#v state=%#v err=%v", report, store.states[bound.RunID], err)
 			}
 			before := len(executor.requests)
-			if _, err := lifecycle.Cleanup(bound); err != nil || len(executor.requests) != before {
+			if _, err := lifecycle.Cleanup(context.Background(), bound); err != nil || len(executor.requests) != before {
 				t.Fatalf("redelivery calls=%d/%d err=%v", before, len(executor.requests), err)
 			}
 		})
@@ -544,11 +544,11 @@ func TestCleanupReportPersistenceFailureRedeliversWithoutRepeatingDelete(t *test
 	if _, err := lifecycle.Prepare(context.Background(), bound); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lifecycle.Cleanup(bound); !errors.Is(err, &Error{Category: CategoryInternal}) || base.states[bound.RunID].CleanupTerminal["account"] != CategorySuccess || base.states[bound.RunID].ReportConfirmed {
+	if _, err := lifecycle.Cleanup(context.Background(), bound); !errors.Is(err, &Error{Category: CategoryInternal}) || base.states[bound.RunID].CleanupTerminal["account"] != CategorySuccess || base.states[bound.RunID].ReportConfirmed {
 		t.Fatalf("state=%#v err=%v", base.states[bound.RunID], err)
 	}
 	before := len(executor.requests)
-	if report, err := lifecycle.Cleanup(bound); err != nil || report.Status != CleanupSucceeded || len(executor.requests) != before || !base.states[bound.RunID].ReportConfirmed {
+	if report, err := lifecycle.Cleanup(context.Background(), bound); err != nil || report.Status != CleanupSucceeded || len(executor.requests) != before || !base.states[bound.RunID].ReportConfirmed {
 		t.Fatalf("report=%#v requests=%d/%d state=%#v err=%v", report, before, len(executor.requests), base.states[bound.RunID], err)
 	}
 }
@@ -590,7 +590,7 @@ func TestProvenPreIOCreateDenialClosesIntentWithoutCleanupEffect(t *testing.T) {
 	if state.Intents["account"] || state.Eligible["account"] || len(executor.requests) != 0 || len(state.Attempts) != 1 || !state.Attempts[0].Terminal {
 		t.Fatalf("state=%#v calls=%d", state, len(executor.requests))
 	}
-	if report, err := lifecycle.Cleanup(bound); err != nil || report.Status != CleanupNotRequired || len(executor.requests) != 0 {
+	if report, err := lifecycle.Cleanup(context.Background(), bound); err != nil || report.Status != CleanupNotRequired || len(executor.requests) != 0 {
 		t.Fatalf("report=%#v calls=%d err=%v", report, len(executor.requests), err)
 	}
 }

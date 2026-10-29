@@ -40,7 +40,7 @@ type FunctionalFlowExecutionPort interface {
 	Finalize(context.Context, string, Outcome, fixture.FixtureSummary) (PackageProjection, error)
 }
 
-// FunctionalFlowPrimary keeps a verified primary private until the environment publication checkpoint succeeds.
+// FunctionalFlowPrimary retains the private staged result until workflow state durably authorizes public promotion.
 type FunctionalFlowPrimary struct {
 	Outcome  Outcome
 	runID    string
@@ -286,7 +286,7 @@ func functionalflowIntegrityError(path string) error {
 	return &functionalflow.Error{Category: functionalflow.CategoryIntegrity, Path: path}
 }
 
-// recoverableFunctionalRuntimeError keeps durable post-tool checkpoints resumable while rejecting contract corruption.
+// recoverableFunctionalRuntimeError distinguishes durable pending execution from terminal flow rejection so recovery retains ownership.
 func recoverableFunctionalRuntimeError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true

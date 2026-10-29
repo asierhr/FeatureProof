@@ -89,7 +89,6 @@ func (m planningModel) Generate(context.Context, agentplanning.StructuredRequest
 // assertionValidator accepts fixture assertions while the real planning validator handles graph structure.
 type assertionValidator struct{}
 
-// ValidateDefinition keeps approval tests focused on the already-prepared plan boundary.
 func (assertionValidator) ValidateDefinition(planning.AssertionDeclaration, string) error { return nil }
 
 // allowPolicy authorizes local generation intent without granting runtime execution.
@@ -210,7 +209,7 @@ func testLimits() Limits {
 func newTestWorkflow(t *testing.T) (*ApprovalWorkflow, *MemoryStore) {
 	t.Helper()
 	store := NewMemoryStore()
-	workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{time.Unix(1, 2)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
+	workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{time.Unix(1, 2)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +479,7 @@ func TestSharedAggregateConcurrentDecisionsRemainJournalAligned(t *testing.T) {
 			plan, snapshot := approvalFixture(t)
 			store := NewMemoryStore()
 			run := approvalRun("run-1", harness.StatusPlanning)
-			workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
+			workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -519,11 +518,11 @@ func TestSharedAggregateConcurrentDecisionsRemainJournalAligned(t *testing.T) {
 func TestLifecycleOwnerRejectsAggregateSubstitution(t *testing.T) {
 	store := NewMemoryStore()
 	first := approvalRun("run-1", harness.StatusPlanning)
-	if _, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), first); err != nil {
+	if _, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), first); err != nil {
 		t.Fatal(err)
 	}
 	second := approvalRun("run-1", harness.StatusPlanning)
-	if _, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), second); err == nil {
+	if _, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), second); err == nil {
 		t.Fatal("aggregate identity substitution accepted")
 	}
 }
@@ -534,7 +533,7 @@ func TestSharedAggregateFailureAndReplayStayJournalAligned(t *testing.T) {
 	base := NewMemoryStore()
 	store := &failingStore{MemoryStore: base}
 	run := approvalRun("run-1", harness.StatusPlanning)
-	workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
+	workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(2, 0)}, testLimits(), run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,7 +596,7 @@ func TestLocalStoreRecoversStrictEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
+	workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -610,7 +609,7 @@ func TestLocalStoreRecoversStrictEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recoveredWorkflow, err := NewWorkflow(recovered, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
+	recoveredWorkflow, err := NewWorkflow(context.Background(), recovered, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,7 +632,7 @@ func TestLocalStoreRecoversStrictEvents(t *testing.T) {
 	}
 	localBackends.Delete(filepath.Clean(absolute))
 	third, _ := NewLocalStore(root)
-	thirdWorkflow, _ := NewWorkflow(third, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
+	thirdWorkflow, _ := NewWorkflow(context.Background(), third, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
 	if _, err := thirdWorkflow.View(context.Background(), "run-1"); err == nil {
 		t.Fatal("tampered recovered view accepted")
 	}
@@ -643,7 +642,7 @@ func TestLocalStoreRecoversStrictEvents(t *testing.T) {
 func TestSanitizerFailurePublishesNoRequest(t *testing.T) {
 	plan, snapshot := approvalFixture(t)
 	store := NewMemoryStore()
-	workflow, err := NewWorkflow(store, safeSanitizer{fail: true}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
+	workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{fail: true}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
 	if err != nil {
 		t.Fatal(err)
 	}

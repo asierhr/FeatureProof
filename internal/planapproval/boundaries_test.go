@@ -261,7 +261,7 @@ func (s *failingStore) CompareAndAppend(ctx context.Context, runID string, seque
 func TestApprovalAppendFailureReturnsNoGrant(t *testing.T) {
 	plan, snapshot := approvalFixture(t)
 	store := &failingStore{MemoryStore: NewMemoryStore()}
-	workflow, err := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
+	workflow, err := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +462,7 @@ func TestLocalStoreCASBranches(t *testing.T) {
 
 // TestInvalidCompositionAndViewStateFailBeforeWork covers constructor and read-side fail-closed branches.
 func TestInvalidCompositionAndViewStateFailBeforeWork(t *testing.T) {
-	if _, err := NewWorkflow(nil, nil, nil, Limits{}, nil); err == nil {
+	if _, err := NewWorkflow(context.Background(), nil, nil, nil, Limits{}, nil); err == nil {
 		t.Fatal("invalid workflow composed")
 	}
 	if _, err := NewExecutionGate(nil, nil, Limits{}); err == nil {
@@ -611,7 +611,7 @@ func TestSanitizerCancellationIsPreserved(t *testing.T) {
 func TestStageAndViewBoundaryErrorsLeaveNoExecutableState(t *testing.T) {
 	plan, snapshot := approvalFixture(t)
 	workflow, store := newTestWorkflow(t)
-	invalidWorkflow, _ := NewWorkflow(NewMemoryStore(), safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("invalid-run", harness.StatusExecuting))
+	invalidWorkflow, _ := NewWorkflow(context.Background(), NewMemoryStore(), safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("invalid-run", harness.StatusExecuting))
 	if _, err := invalidWorkflow.Stage(context.Background(), StageCommand{Plan: plan, Context: snapshot}); err == nil {
 		t.Fatal("non-planning stage accepted")
 	}
@@ -728,7 +728,7 @@ func TestIndependentRunsProgressConcurrently(t *testing.T) {
 	workflows := make([]*ApprovalWorkflow, 2)
 	for i := range workflows {
 		runID := fmt.Sprintf("run-%d", i)
-		workflows[i], _ = NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun(runID, harness.StatusPlanning))
+		workflows[i], _ = NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun(runID, harness.StatusPlanning))
 	}
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -765,10 +765,10 @@ func TestWorkflowDependencyFailuresNeverProduceAuthorization(t *testing.T) {
 			store.eventsErr = mode == "events"
 			store.corruptRead = mode == "corrupt"
 			store.saveErr = mode == "save"
-			workflow, _ := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
+			workflow, _ := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
 			if mode == "append" {
 				failing := &failingStore{MemoryStore: store.MemoryStore, fail: true}
-				workflow, _ = NewWorkflow(failing, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), workflow.lifecycle.run)
+				workflow, _ = NewWorkflow(context.Background(), failing, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), workflow.lifecycle.run)
 			}
 			if _, err := workflow.Stage(context.Background(), StageCommand{Plan: plan, Context: snapshot}); err == nil {
 				t.Fatal("stage dependency failure ignored")
@@ -776,7 +776,7 @@ func TestWorkflowDependencyFailuresNeverProduceAuthorization(t *testing.T) {
 		})
 	}
 	store := &scriptedStore{MemoryStore: NewMemoryStore()}
-	workflow, _ := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
+	workflow, _ := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
 	_, _ = workflow.Stage(context.Background(), StageCommand{Plan: plan, Context: snapshot})
 	store.requestErr = true
 	if _, err := workflow.View(context.Background(), "run-1"); err == nil {
@@ -813,7 +813,7 @@ func TestWorkflowHashFailuresStopBeforeDecisionPersistence(t *testing.T) {
 	plan, snapshot := approvalFixture(t)
 	limits := testLimits()
 	limits.MaxChecks = 1
-	workflow, _ := NewWorkflow(NewMemoryStore(), safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, limits, approvalRun("run-1", harness.StatusPlanning))
+	workflow, _ := NewWorkflow(context.Background(), NewMemoryStore(), safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, limits, approvalRun("run-1", harness.StatusPlanning))
 	if _, err := workflow.Stage(context.Background(), StageCommand{Plan: plan, Context: snapshot}); err == nil {
 		t.Fatal("stage plan hash failure ignored")
 	}
@@ -830,7 +830,7 @@ func TestWorkflowHashFailuresStopBeforeDecisionPersistence(t *testing.T) {
 	}
 	tiny := testLimits()
 	tiny.MaxBytes = 1
-	tinyWorkflow, _ := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, tiny, workflow.lifecycle.run)
+	tinyWorkflow, _ := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, tiny, workflow.lifecycle.run)
 	command.Action = ActionRejectReplan
 	if _, err := tinyWorkflow.Decide(context.Background(), command); err == nil {
 		t.Fatal("decision hash limit ignored")
@@ -841,7 +841,7 @@ func TestWorkflowHashFailuresStopBeforeDecisionPersistence(t *testing.T) {
 func TestGateOperationalBranchesDenyBeforeFurtherRuntimeWork(t *testing.T) {
 	plan, snapshot := approvalFixture(t)
 	store := &scriptedStore{MemoryStore: NewMemoryStore()}
-	workflow, _ := NewWorkflow(store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
+	workflow, _ := NewWorkflow(context.Background(), store, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), approvalRun("run-1", harness.StatusPlanning))
 	_, _ = workflow.Stage(context.Background(), StageCommand{Plan: plan, Context: snapshot})
 	decision, err := workflow.Decide(context.Background(), DecisionCommand{PlanID: "plan-1", DecisionID: "d", ExpectedRevision: 1, Actor: Actor{Subject: "u", Source: "s"}, Action: ActionApprove, CurrentPlan: plan, CurrentContext: snapshot})
 	if err != nil {
@@ -948,8 +948,8 @@ func TestLocalStoreHandlesSharePerRunCAS(t *testing.T) {
 	right, _ := NewLocalStore(root)
 	plan, snapshot := approvalFixture(t)
 	run := approvalRun("run-1", harness.StatusPlanning)
-	leftWorkflow, _ := NewWorkflow(left, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), run)
-	rightWorkflow, _ := NewWorkflow(right, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), run)
+	leftWorkflow, _ := NewWorkflow(context.Background(), left, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), run)
+	rightWorkflow, _ := NewWorkflow(context.Background(), right, safeSanitizer{}, fixedClock{value: time.Unix(1, 0)}, testLimits(), run)
 	if _, err := leftWorkflow.Stage(context.Background(), StageCommand{Plan: plan, Context: snapshot}); err != nil {
 		t.Fatal(err)
 	}

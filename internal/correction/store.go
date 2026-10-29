@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // Record is the private durable state for a single correction handle.
@@ -122,6 +124,17 @@ type Store interface {
 	Recover(context.Context, string, time.Time) error
 	ClaimPendingComparisons(context.Context, string, time.Time) ([]Record, error)
 	ReleaseOwner(string)
+}
+
+// ValidateStoreTransition exposes correction identity and phase invariants to infrastructure adapters.
+func ValidateStoreTransition(current Record, expected Phase, next Record) error {
+	if current.Phase != expected || next.Link.Handle != current.Link.Handle || next.Link.PrincipalID != current.Link.PrincipalID || next.Link.ParentRunID != current.Link.ParentRunID || !validTransition(expected, next.Phase) {
+		return &Error{Category: Conflict, Field: "phase"}
+	}
+	if next.Link.Verify() != nil {
+		return &Error{Category: IntegrityFailure, Field: "correction_link"}
+	}
+	return nil
 }
 
 // chainState is the journal-derived tail and cumulative budget ledger for one root.
@@ -574,6 +587,11 @@ func (s *LocalStore) ClaimPendingComparisons(ctx context.Context, owner string, 
 
 // withChainState serializes only one chain through a crash-released process lock.
 func (s *LocalStore) withChainState(ctx context.Context, root string, operation func(*projectedState) (*Event, error)) error {
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(ctx, s.root)
+	if err != nil {
+		return &Error{Category: Conflict, Field: "offline_import_freeze"}
+	}
+	defer releaseImportWrite()
 	dir := s.chainDir(root)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return &Error{Category: Infrastructure, Field: "journal"}

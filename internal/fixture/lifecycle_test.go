@@ -293,7 +293,7 @@ func TestCleanupRunsInReverseAfterEveryPrimaryOutcome(t *testing.T) {
 	if _, err := lifecycle.Prepare(context.Background(), bound); err != nil {
 		t.Fatal(err)
 	}
-	report, err := lifecycle.Cleanup(bound)
+	report, err := lifecycle.Cleanup(context.Background(), bound)
 	if err != nil || len(executor.requests) != 4 || executor.requests[2].FixtureID != "profile" || executor.requests[3].FixtureID != "account" || report.Status != CleanupPartial {
 		t.Fatalf("report=%#v requests=%#v err=%v", report, executor.requests, err)
 	}
@@ -312,7 +312,7 @@ func TestCleanupDeadlineAndBudgetsTerminateAllWork(t *testing.T) {
 	if _, err := lifecycle.Prepare(context.Background(), bound); err != nil {
 		t.Fatal(err)
 	}
-	report, _ := lifecycle.Cleanup(bound)
+	report, _ := lifecycle.Cleanup(context.Background(), bound)
 	if len(executor.requests) != 2 || report.Status != CleanupFailed || len(report.Incidents) != 2 {
 		t.Fatalf("report=%#v calls=%d", report, len(executor.requests))
 	}

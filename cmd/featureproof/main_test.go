@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -26,6 +27,9 @@ import (
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
+	"github.com/asierhr/featureProof/internal/controlplane"
+	"github.com/asierhr/featureProof/internal/controlplane/contracttest"
+	"github.com/asierhr/featureProof/internal/correction"
 	"github.com/asierhr/featureProof/internal/environment"
 	environmentcleanup "github.com/asierhr/featureProof/internal/environment/cleanup"
 	kubernetesenvironment "github.com/asierhr/featureProof/internal/environment/kubernetes"
@@ -44,12 +48,325 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-// staticWorkflowSpecification keeps the admission test focused on productive contract composition while returning an isolated trusted spec.
+// workflowCleanupLifecycleMemoryStore supplies the cleanup discovery extension
+// while keeping composition tests independent of filesystem persistence.
+type workflowCleanupLifecycleMemoryStore struct{ *environment.MemoryStore }
+
+// ScanCleanupLifecycle returns the empty stable page used by composition-only tests.
+func (workflowCleanupLifecycleMemoryStore) ScanCleanupLifecycle(context.Context, string, int) ([]environment.Record, string, error) {
+	return nil, "", nil
+}
+
+// TestGitHubWorkflowValidationSelectsOnlyComposedTargets covers the executable
+// bridge without invoking a provider or widening configured target authority.
+func TestGitHubWorkflowValidationSelectsOnlyComposedTargets(t *testing.T) {
+	service := &validationworkflow.Service{}
+	config := workflowConfig{TargetAlias: "selected", AuthProfile: "auth", Provider: "provider", Model: "model"}
+	if _, err := githubWorkflowValidation(nil, config); err == nil {
+		t.Fatal("nil workflow accepted")
+	}
+	cli := &validationworkflow.CLI{Service: service, Principal: "principal", AuthProfiles: map[string]string{"auth": "profile"}, DirectTargets: map[string]validationworkflow.DirectTarget{}, PreviewTargets: map[string]validationworkflow.PreviewTarget{}}
+	if _, err := githubWorkflowValidation(cli, config); err == nil {
+		t.Fatal("missing target accepted")
+	}
+	cli.DirectTargets[config.TargetAlias] = validationworkflow.DirectTarget{Alias: config.TargetAlias, Digest: strings.Repeat("d", 64)}
+	if gateway, err := githubWorkflowValidation(cli, config); err != nil || gateway == nil {
+		t.Fatal("direct target rejected", err)
+	}
+	delete(cli.DirectTargets, config.TargetAlias)
+	cli.PreviewTargets[config.TargetAlias] = validationworkflow.PreviewTarget{Alias: config.TargetAlias, Digest: strings.Repeat("e", 64)}
+	if gateway, err := githubWorkflowValidation(cli, config); err != nil || gateway == nil {
+		t.Fatal("preview target rejected", err)
+	}
+	config.ContractReviewID = "invalid"
+	if _, err := githubWorkflowValidation(cli, config); err == nil {
+		t.Fatal("invalid approved contract accepted")
+	}
+}
+
+// TestControlPlaneOperationalBoundariesFailClosed exercises operator identity,
+// content-free observation and command routing before any database is opened.
+func TestControlPlaneOperationalBoundariesFailClosed(t *testing.T) {
+	ctx := context.Background()
+	authorizer := operatorUIDAuthorizer{actual: "operator-1", allowed: "operator-1"}
+	for _, operation := range []string{"offline_import", "query_jobs", "retention"} {
+		if err := authorizer.Authorize(ctx, operation, "project-1"); err != nil {
+			t.Fatalf("authorized %s rejected: %v", operation, err)
+		}
+	}
+	for _, invalid := range []operatorUIDAuthorizer{{}, {actual: "operator-1", allowed: "operator-2"}} {
+		if err := invalid.Authorize(ctx, "offline_import", "project-1"); !errors.Is(err, controlplane.ErrUnauthorized) {
+			t.Fatalf("invalid operator accepted: %v", err)
+		}
+	}
+	if err := authorizer.Authorize(ctx, "unknown", "project-1"); !errors.Is(err, controlplane.ErrUnauthorized) {
+		t.Fatalf("unknown operation accepted: %v", err)
+	}
+	if err := authorizer.Authorize(ctx, "query_jobs", ""); !errors.Is(err, controlplane.ErrUnauthorized) {
+		t.Fatalf("empty project accepted: %v", err)
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := authorizer.Authorize(cancelled, "query_jobs", "project-1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled authorization=%v", err)
+	}
+	if err := (controlPlaneObserver{}).Observe(ctx, controlplane.Observation{}); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	observer := controlPlaneObserver{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+	if err := observer.Observe(ctx, controlplane.Observation{Operation: "query", Category: controlplane.CategoryConflict, Attempt: 2, Count: 3, Duration: 4 * time.Millisecond}); err != nil || !strings.Contains(logs.String(), `"operation":"query"`) || strings.Contains(logs.String(), "CANARY") {
+		t.Fatalf("observer output=%q err=%v", logs.String(), err)
+	}
+	for _, command := range [][]string{{"control-plane", "jobs"}, {"control-plane", "retention"}, {"control-plane", "import"}} {
+		if code := runWithContext(ctx, command, strings.NewReader(""), io.Discard, io.Discard); code != 3 && code != 2 {
+			t.Fatalf("unconfigured command %v returned %d", command, code)
+		}
+	}
+}
+
+// TestPostgresWorkflowCompositionRequiresCompletePersistence proves the
+// productive entrypoint rejects absence before it can open local state.
+func TestPostgresWorkflowCompositionRequiresCompletePersistence(t *testing.T) {
+	if cli, err := composeWorkflowCLIWithPersistence(context.Background(), io.Discard, io.Discard, nil); err == nil || cli != nil {
+		t.Fatalf("nil postgres persistence composed: cli=%#v err=%v", cli, err)
+	}
+}
+
+// TestRegisterLocalImportExportersHandlesAbsentOptionalStores proves the
+// productive aggregator registers every verifier without inventing streams.
+func TestRegisterLocalImportExportersHandlesAbsentOptionalStores(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := controlplane.OpenLocalImportStore(root, "command-import")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = registerLocalImportExporters(store, root); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := store.FreezeLocalStores(ctx, "command-import-id", "command-run", "command-project", strings.Repeat("a", 64), 1, time.Now().UTC())
+	if err != nil || len(manifest.Counts) != 0 || len(manifest.StreamDigests) != 0 {
+		t.Fatalf("absent optional stores produced counts=%#v digests=%#v err=%v", manifest.Counts, manifest.StreamDigests, err)
+	}
+	featureRoot := filepath.Join(t.TempDir(), ".featureproof")
+	if err = os.MkdirAll(featureRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nested, err := controlplane.OpenLocalImportStore(featureRoot, "command-nested")
+	if err != nil || registerLocalImportExporters(nested, featureRoot) != nil {
+		t.Fatalf("nested feature root registration err=%v", err)
+	}
+}
+
+// TestRegisterLocalImportExportersFreezesEveryTypedStore proves the command
+// materializes all consumer-owned DTOs and claims each complete durable chain.
+func TestRegisterLocalImportExportersFreezesEveryTypedStore(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	tests := []struct {
+		stream string
+		setup  func(*testing.T, string)
+	}{
+		{"correction", func(t *testing.T, root string) {
+			path := filepath.Join(root, ".featureproof", "corrections")
+			if err := contracttest.RunCorrectionStore(ctx, func() (correction.Store, error) { return correction.NewLocalStore(path) }, "command-root", "command-correction", "command-project", now); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"github", func(t *testing.T, root string) {
+			store, err := githubpr.OpenLocalStore(filepath.Join(root, ".featureproof", "github-pr"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt := githubpr.DeliveryReceipt{Version: githubpr.SchemaVersion, DeliveryID: "command-delivery", Event: "issue_comment", PayloadSHA256: workflowDigest("payload"), State: "received"}
+			if _, created, reserveErr := store.ReserveDelivery(ctx, receipt, "command-owner", now, time.Minute); reserveErr != nil || !created {
+				t.Fatalf("github reserve created=%v err=%v", created, reserveErr)
+			}
+		}},
+		{"packages", func(t *testing.T, root string) {
+			if err := os.MkdirAll(filepath.Join(root, ".featureproof", "workflows", "functional-flow", "packages"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.stream, func(t *testing.T) {
+			root := t.TempDir()
+			test.setup(t, root)
+			source, err := controlplane.OpenLocalImportStore(root, "command-"+test.stream)
+			if err != nil || registerLocalImportExporters(source, root) != nil {
+				t.Fatalf("register exporters: %v", err)
+			}
+			manifest, err := source.FreezeLocalStores(ctx, "command-"+test.stream+"-id", "command-"+test.stream+"-run", "command-project", strings.Repeat("b", 64), 1, now)
+			if err != nil || manifest.Counts[test.stream] != 1 || manifest.StreamDigests[test.stream] == "" {
+				t.Fatalf("typed stream %q counts=%#v err=%v", test.stream, manifest.Counts, err)
+			}
+		})
+	}
+}
+
 type staticWorkflowSpecification struct{ value specification.Specification }
 
 // Load returns the test-owned specification without performing external work.
 func (s staticWorkflowSpecification) Load(context.Context, string) (specification.Specification, error) {
 	return s.value, nil
+}
+
+// TestControlPlaneSecretResolverFailsClosed verifies the executable-only JIT
+// boundary copies allowlisted values and rejects missing or cancelled access.
+func TestControlPlaneSecretResolverFailsClosed(t *testing.T) {
+	resolver := controlPlaneSecretResolver{values: map[string]string{"secret-1": "value-1"}}
+	values, err := resolver.Resolve(context.Background(), []string{"secret-1"})
+	if err != nil || values["secret-1"] != "value-1" {
+		t.Fatal("allowed secret", err)
+	}
+	if _, err = resolver.Resolve(context.Background(), []string{"missing"}); !errors.Is(err, controlplane.ErrUnauthorized) {
+		t.Fatal("missing secret accepted")
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err = resolver.Resolve(cancelled, []string{"secret-1"}); !errors.Is(err, context.Canceled) {
+		t.Fatal("cancelled resolution accepted")
+	}
+}
+
+// reconciliationValidationStub exposes a prior workflow receipt without permitting a new submission.
+type reconciliationValidationStub struct {
+	key   string
+	run   githubpr.RunState
+	found bool
+	err   error
+}
+
+// ResolveIdempotency records the stable logical key and returns the programmed prior receipt.
+func (stub *reconciliationValidationStub) ResolveIdempotency(_ context.Context, key string) (githubpr.RunState, bool, error) {
+	stub.key = key
+	return stub.run, stub.found, stub.err
+}
+
+// Submit fails if reconciliation accidentally enters the effect path.
+func (*reconciliationValidationStub) Submit(context.Context, githubpr.Selection, githubpr.PullRequestSnapshot, string) (githubpr.RunState, error) {
+	return githubpr.RunState{}, errors.New("unexpected submit")
+}
+
+// ResolveExisting is outside the outbox reconciliation path.
+func (*reconciliationValidationStub) ResolveExisting(context.Context, githubpr.ExistingRunLookup) (githubpr.RunState, error) {
+	return githubpr.RunState{}, errors.New("unexpected existing lookup")
+}
+
+// Status is outside the outbox reconciliation path.
+func (*reconciliationValidationStub) Status(context.Context, string) (githubpr.RunState, error) {
+	return githubpr.RunState{}, errors.New("unexpected status")
+}
+
+// Cancel is outside the outbox reconciliation path.
+func (*reconciliationValidationStub) Cancel(context.Context, string, string) error {
+	return errors.New("unexpected cancel")
+}
+
+// TestGitHubRuntimeEffectReconcilesBeforeExecution proves response loss resolves an existing workflow without provider I/O.
+func TestGitHubRuntimeEffectReconcilesBeforeExecution(t *testing.T) {
+	validation := &reconciliationValidationStub{found: true, run: githubpr.RunState{RunHandle: "workflow-existing"}}
+	effect := &githubRuntimeEffect{validation: validation}
+	request := githubpr.ControlPlaneEffectRequest{Intent: controlplane.EffectIntent{OperationID: "operation-1", IdempotencyKey: "job-1"}, Claim: controlplane.EffectClaim{OperationID: "operation-1", Fence: 1}}
+	receipt, found, err := effect.Reconcile(context.Background(), request)
+	if err != nil || !found || len(receipt) != 64 || validation.key != "github:job-1" {
+		t.Fatal("existing workflow was not reconciled", found, err)
+	}
+	validation.found = false
+	if receipt, found, err = effect.Reconcile(context.Background(), request); err != nil || found || receipt != "" {
+		t.Fatal("missing workflow incorrectly reconciled", found, err)
+	}
+	if _, _, err = (&githubRuntimeEffect{}).Reconcile(context.Background(), request); !errors.Is(err, controlplane.ErrUnavailable) {
+		t.Fatal("missing reconciliation port did not fail closed", err)
+	}
+}
+
+// githubEffectValidationStub records the single authorized submission reached
+// after GitHub metadata refresh and returns one stable workflow receipt.
+type githubEffectValidationStub struct {
+	key   string
+	calls atomic.Int32
+}
+
+// Submit records the idempotency key after the productive GitHub boundary.
+func (stub *githubEffectValidationStub) Submit(_ context.Context, _ githubpr.Selection, _ githubpr.PullRequestSnapshot, key string) (githubpr.RunState, error) {
+	stub.key = key
+	stub.calls.Add(1)
+	return githubpr.RunState{RunHandle: "workflow-effect"}, nil
+}
+
+// ResolveExisting is not part of fresh effect execution.
+func (*githubEffectValidationStub) ResolveExisting(context.Context, githubpr.ExistingRunLookup) (githubpr.RunState, error) {
+	return githubpr.RunState{}, errors.New("unexpected resolve")
+}
+
+// Status is not part of fresh effect execution.
+func (*githubEffectValidationStub) Status(context.Context, string) (githubpr.RunState, error) {
+	return githubpr.RunState{}, errors.New("unexpected status")
+}
+
+// Cancel is not part of fresh effect execution.
+func (*githubEffectValidationStub) Cancel(context.Context, string, string) error {
+	return errors.New("unexpected cancel")
+}
+
+// githubEffectTransport serves only the token, pull metadata and changed-file
+// requests needed by one productive control-plane effect.
+type githubEffectTransport struct{ calls atomic.Int32 }
+
+// RoundTrip returns exact-scope provider documents without making network I/O.
+func (transport *githubEffectTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	transport.calls.Add(1)
+	body := ""
+	status := http.StatusOK
+	switch request.URL.Path {
+	case "/app/installations/1/access_tokens":
+		status = http.StatusCreated
+		body = `{"token":"short-lived","expires_at":"2100-01-01T00:00:00Z","permissions":{"checks":"write","issues":"write","metadata":"read","pull_requests":"read"},"repositories":[{"id":2}]}`
+	case "/repositories/2/pulls/3":
+		body = `{"number":3,"state":"open","user":{"id":4},"head":{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","repo":{"id":2}},"base":{"repo":{"id":2,"full_name":"owner/repository"}}}`
+	case "/repos/owner/repository/pulls/3/files":
+		body = `[{"filename":"internal/service.go"}]`
+	default:
+		return nil, fmt.Errorf("unexpected GitHub request %s", request.URL.Path)
+	}
+	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+}
+
+// TestGitHubRuntimeEffectExecutesThroughEphemeralGitHubCapability proves the
+// private key is consumed only at execution and the durable operation produces
+// one deterministic receipt after refreshed authorization.
+func TestGitHubRuntimeEffectExecutesThroughEphemeralGitHubCapability(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateKey := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}))
+	validation := &githubEffectValidationStub{}
+	transport := &githubEffectTransport{}
+	effect := &githubRuntimeEffect{
+		appID:         10,
+		authorization: githubpr.AuthorizationConfig{Installations: map[int64]map[int64]bool{1: {2: true}}, Actors: map[int64]bool{4: true}, Selections: map[string]githubpr.Selection{"default": {Alias: "default"}}, Forks: map[int64]map[int64]bool{}},
+		validation:    validation,
+		http:          &http.Client{Transport: transport},
+		clock:         githubpr.WallClock{},
+	}
+	request := githubpr.ControlPlaneEffectRequest{Command: githubpr.WebhookCommand{InstallationID: 1, RepositoryID: 2, PullRequestNumber: 3, ActorID: 4, SelectionAlias: "default"}, Intent: controlplane.EffectIntent{OperationID: "operation-effect", IdempotencyKey: "job-effect"}, Claim: controlplane.EffectClaim{OperationID: "operation-effect", Fence: 1}, Secrets: map[string]string{"github-app-private-key": privateKey}}
+	receipt, err := effect.Execute(context.Background(), request)
+	if err != nil || len(receipt) != 64 || validation.calls.Load() != 1 || validation.key != "github:job-effect" || transport.calls.Load() != 6 {
+		t.Fatalf("receipt=%q validation=%d key=%q transport=%d err=%v", receipt, validation.calls.Load(), validation.key, transport.calls.Load(), err)
+	}
+	request.Claim.OperationID = "other"
+	if _, err = effect.Execute(context.Background(), request); !errors.Is(err, controlplane.ErrUnauthorized) {
+		t.Fatalf("mismatched claim produced %v", err)
+	}
+	request.Claim.OperationID = request.Intent.OperationID
+	request.Secrets["github-app-private-key"] = "invalid"
+	if _, err = effect.Execute(context.Background(), request); err == nil {
+		t.Fatal("malformed private key accepted")
+	}
 }
 
 // rejectingWorkflowTransport records any unexpected productive network attempt and always fails it.
@@ -276,6 +593,16 @@ func TestWorkflowEnvironmentCompositionFailsClosedAtAuthorityBoundaries(t *testi
 	if _, err = composeWorkflowEnvironment(fileRoot, config, target, nil, nil); err == nil {
 		t.Fatal("unwritable lifecycle store accepted")
 	}
+	postgresRoot := t.TempDir()
+	if _, _, err = composeWorkflowEnvironmentWithRuntime(postgresRoot, config, target, nil, nil, &workflowPersistence{}); err == nil || !strings.Contains(err.Error(), "postgres environment persistence incomplete") {
+		t.Fatalf("incomplete postgres environment persistence produced %v", err)
+	}
+	if port, runtime, composeErr := composeWorkflowEnvironmentWithRuntime(postgresRoot, config, target, nil, nil, &workflowPersistence{environments: workflowCleanupLifecycleMemoryStore{MemoryStore: environment.NewMemoryStore()}}); composeErr != nil || port == nil || runtime != nil {
+		t.Fatalf("postgres existing environment composition failed: port=%T runtime=%#v err=%v", port, runtime, composeErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(postgresRoot, ".featureproof")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("postgres environment composition opened local state: %v", statErr)
+	}
 	lifecycle := &workflowExistingLifecycle{target: validationworkflow.TargetContext{Attestation: validationworkflow.AttestationContext{RepositoryID: "repo", CommitOID: strings.Repeat("a", 40)}}}
 	if _, err = lifecycle.directBinding(selection, "other", strings.Repeat("a", 40)); err == nil {
 		t.Fatal("cross-revision direct binding accepted")
@@ -306,6 +633,9 @@ func TestWorkflowEnvironmentCompositionRegistersOnlyExplicitManagedProvider(t *t
 		t.Fatal("missing managed provider accepted")
 	}
 	providers := map[string]environment.EnvironmentProvider{"kubernetes@v1": managedEnvironmentProviderStub{}}
+	if _, _, composeErr := composeWorkflowEnvironmentWithRuntime(t.TempDir(), config, target, nil, providers, &workflowPersistence{environments: workflowCleanupLifecycleMemoryStore{MemoryStore: environment.NewMemoryStore()}}); composeErr == nil || !strings.Contains(composeErr.Error(), "postgres capacity persistence incomplete") {
+		t.Fatalf("incomplete postgres capacity persistence produced %v", composeErr)
+	}
 	if port, composeErr := composeWorkflowEnvironment(t.TempDir(), config, target, nil, providers); composeErr != nil || port == nil {
 		t.Fatalf("explicit managed provider rejected: %v", composeErr)
 	}
@@ -516,6 +846,14 @@ func TestWorkflowGitHubContextCompositionRequiresSealedReadOnlyAuthority(t *test
 	source, err := composeWorkflowGitHubContext(t.TempDir(), "2", &policy, workflowGitHubContextAuthority{}, githubpr.WallClock{})
 	if err != nil || source == nil {
 		t.Fatalf("valid composition rejected: %v", err)
+	}
+	postgresRoot := t.TempDir()
+	postgresSource, err := composeWorkflowGitHubContext(postgresRoot, "2", &policy, workflowGitHubContextAuthority{}, githubpr.WallClock{}, true)
+	if err != nil || postgresSource == nil {
+		t.Fatalf("postgres context composition rejected: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(postgresRoot, "github-context")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("postgres context composition opened local state: %v", statErr)
 	}
 }
 
@@ -1408,6 +1746,53 @@ func TestConfiguredPreviewComposesInsideGitHubEntrypoint(t *testing.T) {
 	defer cancel()
 	if err = runtime.Close(closeCtx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestGitHubControlPlaneSelectorKeepsLocalExplicitAndPostgresFailClosed verifies no fake or fallback is installed by backend selection.
+func TestGitHubControlPlaneSelectorKeepsLocalExplicitAndPostgresFailClosed(t *testing.T) {
+	t.Setenv("FEATUREPROOF_CONTROL_PLANE_BACKEND", "local")
+	ingress, admission, err := composeGitHubControlPlane(context.Background(), githubpr.WallClock{}, time.Minute)
+	if err != nil || ingress != nil || admission != nil {
+		t.Fatal("local mode replaced existing stores")
+	}
+	t.Setenv("FEATUREPROOF_CONTROL_PLANE_BACKEND", "unknown")
+	if _, _, err = composeGitHubControlPlane(context.Background(), githubpr.WallClock{}, time.Minute); err == nil {
+		t.Fatal("unknown backend accepted")
+	}
+	t.Setenv("FEATUREPROOF_CONTROL_PLANE_BACKEND", "postgres")
+	t.Setenv("FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN", "")
+	if _, _, err = composeGitHubControlPlane(context.Background(), githubpr.WallClock{}, time.Minute); err == nil {
+		t.Fatal("postgres outage fell back to local")
+	}
+}
+
+// TestPostgresGitHubCompositionRejectsFilesystemIntegrationsBeforeOpeningStores
+// proves distributed mode cannot partially compose optional local durability.
+func TestPostgresGitHubCompositionRejectsFilesystemIntegrationsBeforeOpeningStores(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"FEATUREPROOF_GITHUB_INSTALLATION_ID": "1", "FEATUREPROOF_GITHUB_REPOSITORY_ID": "42", "FEATUREPROOF_GITHUB_ACTOR_ID": "7",
+		"FEATUREPROOF_GITHUB_APP_ID": "8", "FEATUREPROOF_GITHUB_BOT_ID": "9", "FEATUREPROOF_GITHUB_WEBHOOK_SECRET": "0123456789abcdef",
+		"FEATUREPROOF_GITHUB_PRIVATE_KEY_PEM": string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encoded})), "FEATUREPROOF_EVIDENCE_ORIGIN": "https://evidence.example.test",
+		"FEATUREPROOF_CONTROL_PLANE_BACKEND": "postgres", "FEATUREPROOF_PREVIEW_CONFIG": filepath.Join(root, "must-not-open.json"),
+	} {
+		t.Setenv(name, value)
+	}
+	if _, _, err = composeGitHubRuntime(context.Background()); err == nil {
+		t.Fatal("mixed postgres/filesystem composition accepted")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, ".featureproof")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("filesystem store opened before rejection: %v", statErr)
 	}
 }
 

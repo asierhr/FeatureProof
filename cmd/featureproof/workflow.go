@@ -24,6 +24,7 @@ import (
 	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/contractreview"
+	"github.com/asierhr/featureProof/internal/correction"
 	"github.com/asierhr/featureProof/internal/environment"
 	environmentcleanup "github.com/asierhr/featureProof/internal/environment/cleanup"
 	kubernetesenvironment "github.com/asierhr/featureProof/internal/environment/kubernetes"
@@ -136,6 +137,14 @@ type workflowEnvironmentCredentialResolver struct {
 	reference, environment string
 }
 
+// workflowGitHubContextObserver accepts only the already content-free terminal
+// record when PostgreSQL composition must not create a filesystem journal.
+type workflowGitHubContextObserver struct{}
+
+// Observe completes the PostgreSQL-mode observation boundary without retaining
+// request content, credentials, or a second durable source of truth.
+func (workflowGitHubContextObserver) Observe(context.Context, githubcontext.Record) error { return nil }
+
 // workflowCredentialResolverFactory is the composition-owned port that creates one late resolver for each trusted reference mapping.
 type workflowCredentialResolverFactory func(reference, environment string) testidentity.CredentialResolver
 
@@ -146,6 +155,32 @@ type workflowCompositionOptions struct {
 	environmentProviders      map[string]environment.EnvironmentProvider
 	kubernetes                *workflowKubernetesComposition
 	recoverPending            bool
+	persistence               *workflowPersistence
+}
+
+// workflowPersistence is the backend-homogeneous set of consumer-owned ports used by the productive workflow.
+type workflowPersistence struct {
+	workflows     validationworkflow.WorkflowStore
+	artifacts     validationworkflow.PlanArtifactStore
+	executables   validationworkflow.ExecutablePlanStore
+	approvals     planapproval.ApprovalStore
+	environments  environment.CleanupLifecycleStore
+	capacity      environment.CapacityAdmission
+	cleanupLedger workflowCapacityLedger
+	cleanup       environmentcleanup.Store
+	functional    functionalflow.IntentStore
+	journal       functionalflow.EventJournal
+	packages      validationworkflow.PackageStore
+	corrections   correction.Store
+	fixtures      interface {
+		fixture.Store
+		fixture.EvidenceSink
+		fixture.Observer
+	}
+	context           contextassembly.Store
+	functionalRuntime interface {
+		FunctionalRuntimeStores(map[string]string, functionalflow.Limits, functionalflow.EventJournal) (validationworkflow.FunctionalFlowArtifactStore, functionalflow.EvidenceStore, validationworkflow.FunctionalFlowPublisher, validationworkflow.FunctionalFlowCatalog, validationworkflow.FunctionalIdentityAttemptSink, error)
+	}
 }
 
 // workflowKubernetesComposition carries explicit cluster transport, sealed catalog, secrets, and safety bounds outside workflow input.
@@ -647,6 +682,14 @@ func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr i
 	return composeWorkflowCLIWithOptions(ctx, stdout, stderr, workflowCompositionOptions{githubAuthority: githubAuthority, credentialResolverFactory: newWorkflowEnvironmentCredentialResolver, recoverPending: true})
 }
 
+// composeWorkflowCLIWithPersistence builds the productive workflow exclusively from the selected PostgreSQL consumer ports.
+func composeWorkflowCLIWithPersistence(ctx context.Context, stdout, stderr io.Writer, persistence *workflowPersistence) (*validationworkflow.CLI, error) {
+	if persistence == nil {
+		return nil, errors.New("postgres workflow persistence unavailable")
+	}
+	return composeWorkflowCLIWithOptions(ctx, stdout, stderr, workflowCompositionOptions{credentialResolverFactory: newWorkflowEnvironmentCredentialResolver, recoverPending: true, persistence: persistence})
+}
+
 // composeWorkflowCLIWithOptions constructs the shared productive service graph from trusted ports and optionally runs startup recovery.
 func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer, options workflowCompositionOptions) (*validationworkflow.CLI, error) {
 	config, err := loadWorkflowConfig()
@@ -772,7 +815,7 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if targetContext.Fingerprint == "" {
 		targetContext.Fingerprint = workflowDigest("environment", targetContext.EnvironmentID, targetContext.URL, targetContext.Attestation.Reference)
 	}
-	environmentPort, environmentRuntime, err := composeWorkflowEnvironmentWithRuntime(root, config, targetContext, workflowPreview, options.environmentProviders)
+	environmentPort, environmentRuntime, err := composeWorkflowEnvironmentWithRuntime(root, config, targetContext, workflowPreview, options.environmentProviders, options.persistence)
 	if err != nil {
 		return nil, err
 	}
@@ -868,21 +911,33 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 		admission = validationworkflow.GitHubRefreshingAdmission{Next: trustedAdmission, Authority: options.githubAuthority}
 	}
 	storeRoot := filepath.Join(root, ".featureproof", "workflows")
-	store, err := validationworkflow.OpenLocalStore(storeRoot)
-	if err != nil {
-		return nil, err
-	}
-	artifacts, err := validationworkflow.OpenLocalArtifactStore(filepath.Join(storeRoot, "plans"))
-	if err != nil {
-		return nil, err
-	}
-	executables, err := validationworkflow.OpenLocalExecutableStore(filepath.Join(storeRoot, "private"))
-	if err != nil {
-		return nil, err
-	}
-	approvalStore, err := planapproval.NewLocalStore(filepath.Join(storeRoot, "approval"))
-	if err != nil {
-		return nil, err
+	var store validationworkflow.WorkflowStore
+	var artifacts validationworkflow.PlanArtifactStore
+	var executables validationworkflow.ExecutablePlanStore
+	var approvalStore planapproval.ApprovalStore
+	if options.persistence != nil {
+		store, artifacts, executables, approvalStore = options.persistence.workflows, options.persistence.artifacts, options.persistence.executables, options.persistence.approvals
+		if store == nil || artifacts == nil || executables == nil || approvalStore == nil {
+			return nil, errors.New("postgres workflow persistence incomplete")
+		}
+	} else {
+		localStore, openErr := validationworkflow.OpenLocalStore(storeRoot)
+		if openErr != nil {
+			return nil, openErr
+		}
+		localArtifacts, openErr := validationworkflow.OpenLocalArtifactStore(filepath.Join(storeRoot, "plans"))
+		if openErr != nil {
+			return nil, openErr
+		}
+		localExecutables, openErr := validationworkflow.OpenLocalExecutableStore(filepath.Join(storeRoot, "private"))
+		if openErr != nil {
+			return nil, openErr
+		}
+		localApprovals, openErr := planapproval.NewLocalStore(filepath.Join(storeRoot, "approval"))
+		if openErr != nil {
+			return nil, openErr
+		}
+		store, artifacts, executables, approvalStore = localStore, localArtifacts, localExecutables, localApprovals
 	}
 	approval := &validationworkflow.PlanApprovalBridge{Store: approvalStore, Sanitizer: workflowApprovalSanitizer{inner: evidence.NewSanitizer(redaction)}, Clock: githubpr.WallClock{}, Limits: planapproval.Limits{MaxBytes: 1 << 20, MaxDepth: 64, MaxEvents: 10000, MaxConstraints: 128, MaxChecks: 384, MaxSteps: 24576, MaxAssertions: 24576, MaxEvidence: 24576}}
 	deps := runtimeDeps
@@ -908,16 +963,29 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	var auditSigner localvalidation.FixtureAuditSigner
 	var auditTrust localvalidation.FixtureAuditTrust
 	if len(spec.Fixtures) > 0 {
-		fixturePort, fixtureState, err = composeWorkflowFixtures(ctx, root, owner, spec, manifest, runtimeDeps, fixtureReduced, config, redaction)
+		var fixturePersistence interface {
+			fixture.Store
+			fixture.EvidenceSink
+			fixture.Observer
+		}
+		if options.persistence != nil {
+			fixturePersistence = options.persistence.fixtures
+			if fixturePersistence == nil {
+				return nil, errors.New("postgres fixture persistence unavailable")
+			}
+		}
+		fixturePort, fixtureState, err = composeWorkflowFixtures(ctx, root, owner, spec, manifest, runtimeDeps, fixtureReduced, config, redaction, fixturePersistence)
 		if err != nil {
 			return nil, err
 		}
-		auditSigner, auditTrust, err = localvalidation.OpenFixtureAuditAuthority(filepath.Join(storeRoot, "private", "fixture-audit.ed25519"), filepath.Join(storeRoot, "trust", "fixture-audit.pin"))
-		if err != nil {
-			return nil, err
+		if options.persistence == nil {
+			auditSigner, auditTrust, err = localvalidation.OpenFixtureAuditAuthority(filepath.Join(storeRoot, "private", "fixture-audit.ed25519"), filepath.Join(storeRoot, "trust", "fixture-audit.pin"))
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
-	functionalPort, flowCatalog, err := composeWorkflowFunctionalFlow(root, storeRoot, owner, spec, manifest, config, runtimeDeps, redaction, targetDigest, runtimeDigest, fixtureState)
+	functionalPort, flowCatalog, err := composeWorkflowFunctionalFlow(root, storeRoot, owner, spec, manifest, config, runtimeDeps, redaction, targetDigest, runtimeDigest, fixtureState, options.persistence)
 	if err != nil {
 		return nil, err
 	}
@@ -934,6 +1002,9 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	var contextWitness projectmemory.MonotonicWitness
 	var contextWitnessStream string
 	if projectMemoryConfigured() {
+		if options.persistence != nil {
+			return nil, errors.New("postgres project memory persistence unavailable")
+		}
 		memoryComposition, memoryErr := composeProjectMemory()
 		if memoryErr != nil {
 			return nil, memoryErr
@@ -959,27 +1030,37 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 		}
 		contextWitnessStream = os.Getenv("FEATUREPROOF_CONTEXT_WITNESS_STREAM")
 	}
-	if contextWitness == nil {
+	if contextWitness == nil && options.persistence == nil {
 		return nil, errors.New("durable context witness required")
 	}
-	if _, witnessErr := contextWitness.Read(ctx, contextWitnessStream); errors.Is(witnessErr, projectmemory.ErrWitnessMissing) {
-		if _, witnessErr = contextWitness.Bootstrap(ctx, contextWitnessStream); witnessErr != nil {
+	if contextWitness != nil {
+		_, witnessErr := contextWitness.Read(ctx, contextWitnessStream)
+		if errors.Is(witnessErr, projectmemory.ErrWitnessMissing) {
+			if _, witnessErr = contextWitness.Bootstrap(ctx, contextWitnessStream); witnessErr != nil {
+				if ctx.Err() != nil {
+					return nil, workflowContextFailure(ctx)
+				}
+				return nil, errors.New("context witness bootstrap unavailable")
+			}
+		} else if witnessErr != nil {
 			if ctx.Err() != nil {
 				return nil, workflowContextFailure(ctx)
 			}
-			return nil, errors.New("context witness bootstrap unavailable")
+			return nil, errors.New("context witness unavailable")
 		}
-	} else if witnessErr != nil {
-		if ctx.Err() != nil {
-			return nil, workflowContextFailure(ctx)
+	}
+	if options.persistence != nil {
+		contextStore = options.persistence.context
+		if contextStore == nil {
+			return nil, errors.New("postgres context persistence incomplete")
 		}
-		return nil, errors.New("context witness unavailable")
+	} else {
+		contextStore, err = contextassembly.NewLocalStore(ctx, filepath.Join(storeRoot, "context"), contextWitnessStream, contextWitness)
+		if err != nil {
+			return nil, err
+		}
 	}
-	contextStore, err = contextassembly.NewLocalStore(ctx, filepath.Join(storeRoot, "context"), contextWitnessStream, contextWitness)
-	if err != nil {
-		return nil, err
-	}
-	githubContextSource, err := composeWorkflowGitHubContext(storeRoot, config.RepositoryID, config.GitHubContext, options.githubAuthority, wallClock)
+	githubContextSource, err := composeWorkflowGitHubContext(storeRoot, config.RepositoryID, config.GitHubContext, options.githubAuthority, wallClock, options.persistence != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1008,7 +1089,7 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 }
 
 // composeWorkflowGitHubContext confines trusted policy, read-only gateway and durable store to product composition.
-func composeWorkflowGitHubContext(storeRoot, repository string, policy *githubcontext.Policy, authority validationworkflow.GitHubPullRequestAuthority, clock githubcontext.Clock) (validationworkflow.GitHubContextSource, error) {
+func composeWorkflowGitHubContext(storeRoot, repository string, policy *githubcontext.Policy, authority validationworkflow.GitHubPullRequestAuthority, clock githubcontext.Clock, postgres ...bool) (validationworkflow.GitHubContextSource, error) {
 	if policy == nil {
 		return nil, nil
 	}
@@ -1021,13 +1102,20 @@ func composeWorkflowGitHubContext(storeRoot, repository string, policy *githubco
 	if err != nil || policy.Digest != sealed.Digest {
 		return nil, errors.New("github context policy unavailable")
 	}
-	store, err := githubcontext.OpenLocalStore(filepath.Join(storeRoot, "github-context"))
-	if err != nil {
-		return nil, err
-	}
-	observer, err := githubcontext.OpenLocalRecordObserver(filepath.Join(storeRoot, "github-context-records"))
-	if err != nil {
-		return nil, err
+	var store githubcontext.Store
+	var observer githubcontext.Observer
+	if len(postgres) > 0 && postgres[0] {
+		store = githubcontext.NewMemoryStore()
+		observer = workflowGitHubContextObserver{}
+	} else {
+		store, err = githubcontext.OpenLocalStore(filepath.Join(storeRoot, "github-context"))
+		if err != nil {
+			return nil, err
+		}
+		observer, err = githubcontext.OpenLocalRecordObserver(filepath.Join(storeRoot, "github-context-records"))
+		if err != nil {
+			return nil, err
+		}
 	}
 	acquirer, err := githubcontext.NewAcquirer(githubcontext.Dependencies{Gateway: githubGateway, Secrets: githubcontext.NewCanaryGate(nil), Clock: clock, Store: store, Observer: observer})
 	if err != nil {
@@ -1059,7 +1147,6 @@ func projectMemoryConfigured() bool {
 	return false
 }
 
-// compile-time ownership check keeps the shared service behind the planning and workflow consumer ports.
 var _ agentplanning.ProjectMemoryReader = (*projectmemory.Service)(nil)
 
 // cloneWorkflowAliases detaches trusted remote selections before exposing them to adapter composition.
@@ -1072,7 +1159,11 @@ func cloneWorkflowAliases(source map[string]string) map[string]string {
 }
 
 // composeWorkflowFunctionalFlow derives exact local runtime authority from the same specification, contract selections, target, policy, and HTTP boundaries as the shared workflow.
-func composeWorkflowFunctionalFlow(root, storeRoot, owner string, spec specification.Specification, manifest planmanifest.Manifest, config workflowConfig, deps localvalidation.RuntimeDependencies, redaction *evidence.Policy, targetDigest, runtimeDigest string, fixtureState fixture.Store) (validationworkflow.FunctionalFlowExecutionPort, *validationworkflow.LocalProvidedFlowCatalog, error) {
+func composeWorkflowFunctionalFlow(root, storeRoot, owner string, spec specification.Specification, manifest planmanifest.Manifest, config workflowConfig, deps localvalidation.RuntimeDependencies, redaction *evidence.Policy, targetDigest, runtimeDigest string, fixtureState fixture.Store, persistences ...*workflowPersistence) (validationworkflow.FunctionalFlowExecutionPort, validationworkflow.FunctionalFlowCatalog, error) {
+	var persistence *workflowPersistence
+	if len(persistences) > 0 {
+		persistence = persistences[0]
+	}
 	contractRaw, err := json.Marshal(config.ContractSelections)
 	if err != nil {
 		return nil, nil, err
@@ -1133,7 +1224,23 @@ func composeWorkflowFunctionalFlow(root, storeRoot, owner string, spec specifica
 	executionConfig := functionalflow.ExecutionConfig{Owner: owner, MaxCalls: limits.MaxToolCalls, MaxRetries: limits.MaxRetries, MaxWork: limits.MaxWork, StepTimeout: limits.StepTimeout, RunTimeout: limits.RunTimeout, ConfirmationTimeout: confirmation, RetryDelay: 100 * time.Millisecond}
 	leaseTTL := time.Duration(executionConfig.MaxRetries+1)*executionConfig.StepTimeout + time.Duration(executionConfig.MaxRetries)*executionConfig.RetryDelay + executionConfig.ConfirmationTimeout + time.Minute
 	targetTool := &workflowTargetHTTPTool{spec: spec, manifest: manifest, deps: deps, tools: map[string]harness.Tool{}, digests: map[string]string{}}
-	runtime, catalog, err := validationworkflow.ComposeLocalFunctionalFlowRuntime(validationworkflow.LocalFunctionalFlowRuntimeConfig{Root: filepath.Join(storeRoot, "functional-flow"), PublicIdentity: publicIdentity, AttemptJournalRoot: filepath.Join(root, ".featureproof", "runs"), AllowedManifestRoots: []string{root}, Aliases: config.FunctionalFlowAliases, Limits: limits, Validation: functionalflow.ValidationAuthority{Constraints: constraints, FixtureCaptures: captures}, Binding: functionalflow.BindingAuthority{Operations: operations, Identities: descriptors, Bindings: bindings}, Generated: functionalflow.GeneratedAuthority{ContextDigest: workflowDigest("functional-context", runtimeDigest, targetDigest), TargetID: spec.Target.ID, ContractDigest: contractDigest, Effects: map[string]bool{"http.request": true}, OperationEffects: operationEffects}, Execution: executionConfig, LeaseTTL: leaseTTL, Tool: targetTool, PolicyFactory: deps.PolicyFactory, Sanitizer: evidence.NewSanitizer(redaction), Evaluator: deps.Evaluator, Identities: identityCatalog, Clock: deps.Clock, IDs: deps.IDs, Waiter: deps.Waiter, Fixtures: fixtureResolver})
+	functionalConfig := validationworkflow.LocalFunctionalFlowRuntimeConfig{Root: filepath.Join(storeRoot, "functional-flow"), PublicIdentity: publicIdentity, AttemptJournalRoot: filepath.Join(root, ".featureproof", "runs"), AllowedManifestRoots: []string{root}, Aliases: config.FunctionalFlowAliases, Limits: limits, Validation: functionalflow.ValidationAuthority{Constraints: constraints, FixtureCaptures: captures}, Binding: functionalflow.BindingAuthority{Operations: operations, Identities: descriptors, Bindings: bindings}, Generated: functionalflow.GeneratedAuthority{ContextDigest: workflowDigest("functional-context", runtimeDigest, targetDigest), TargetID: spec.Target.ID, ContractDigest: contractDigest, Effects: map[string]bool{"http.request": true}, OperationEffects: operationEffects}, Execution: executionConfig, LeaseTTL: leaseTTL, Tool: targetTool, PolicyFactory: deps.PolicyFactory, Sanitizer: evidence.NewSanitizer(redaction), Evaluator: deps.Evaluator, Identities: identityCatalog, Clock: deps.Clock, IDs: deps.IDs, Waiter: deps.Waiter, Fixtures: fixtureResolver}
+	if persistence != nil {
+		functionalConfig.State, functionalConfig.Journal = persistence.functional, persistence.journal
+		if persistence.functionalRuntime == nil {
+			return nil, nil, errors.New("functional runtime persistence unavailable")
+		}
+		functionalConfig.Artifacts, functionalConfig.Evidence, functionalConfig.Publisher, functionalConfig.Catalog, functionalConfig.AttemptSink, err = persistence.functionalRuntime.FunctionalRuntimeStores(config.FunctionalFlowAliases, limits, persistence.journal)
+		if err != nil {
+			return nil, nil, err
+		}
+		manifestSource, ok := functionalConfig.Evidence.(validationworkflow.FunctionalFlowEvidenceManifestSource)
+		if !ok {
+			return nil, nil, errors.New("functional evidence manifest persistence unavailable")
+		}
+		functionalConfig.EvidenceManifest = manifestSource
+	}
+	runtime, catalog, err := validationworkflow.ComposeLocalFunctionalFlowRuntime(functionalConfig)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1146,7 +1253,11 @@ func composeWorkflowFunctionalFlow(root, storeRoot, owner string, spec specifica
 }
 
 // composeWorkflowFixtures builds one consumer-owned lifecycle shared by every productive workflow surface.
-func composeWorkflowFixtures(shutdown context.Context, root, owner string, spec specification.Specification, manifest planmanifest.Manifest, deps localvalidation.RuntimeDependencies, reduced contractcatalog.ReducedContext, config workflowConfig, policy *evidence.Policy) (validationworkflow.FixtureLifecyclePort, fixture.Store, error) {
+func composeWorkflowFixtures(shutdown context.Context, root, owner string, spec specification.Specification, manifest planmanifest.Manifest, deps localvalidation.RuntimeDependencies, reduced contractcatalog.ReducedContext, config workflowConfig, policy *evidence.Policy, persistences ...interface {
+	fixture.Store
+	fixture.EvidenceSink
+	fixture.Observer
+}) (validationworkflow.FixtureLifecyclePort, fixture.Store, error) {
 	if shutdown == nil {
 		return nil, nil, errors.New("fixture shutdown scope unavailable")
 	}
@@ -1186,22 +1297,50 @@ func composeWorkflowFixtures(shutdown context.Context, root, owner string, spec 
 		return safe.Value(), nil
 	})
 	fixtureRoot := filepath.Join(root, ".featureproof", "workflows", "fixtures")
-	stateStore, err := fixture.NewFileStore(filepath.Join(fixtureRoot, "state"))
-	if err != nil {
-		return nil, nil, err
+	var stateStore fixture.Store
+	var evidenceSink fixture.EvidenceSink
+	var observer fixture.Observer
+	if len(persistences) > 0 && persistences[0] != nil {
+		stateStore, evidenceSink, observer = persistences[0], workflowSanitizedFixtureEvidence{next: persistences[0], sanitizer: sanitizer}, persistences[0]
+	} else {
+		stateStore, err = fixture.NewFileStore(filepath.Join(fixtureRoot, "state"))
+		if err != nil {
+			return nil, nil, err
+		}
+		evidenceSink = fixture.FileEvidenceSink{Root: filepath.Join(fixtureRoot, "evidence"), Sanitizer: sanitizer}
+		observer = &fixture.FileObserver{Path: filepath.Join(fixtureRoot, "journal.jsonl")}
 	}
-	evidenceSink := fixture.FileEvidenceSink{Root: filepath.Join(fixtureRoot, "evidence"), Sanitizer: sanitizer}
 	executor, err := fixture.NewHTTPAdapter(fixture.HTTPAdapterConfig{Tool: httpTool, Evidence: evidenceSink, IdempotencyHeader: workflowFixtureIdempotencyHeader(manifest)})
 	if err != nil {
 		return nil, nil, err
 	}
 	guard := &fixture.ProductRevalidator{PolicyFactory: deps.PolicyFactory, Limits: harness.Limits{MaxSteps: 0, MaxToolCalls: runtimeLimits.MaxToolCalls, MaxRetries: runtimeLimits.MaxRetries}}
-	lifecycle, err := fixture.NewLifecycle(stateStore, executor, guard, sanitizer, &fixture.FileObserver{Path: filepath.Join(fixtureRoot, "journal.jsonl")}, fixture.ContextWaiter{}, fixture.DigestKeys{Namespace: config.RepositoryID + ":" + config.EnvironmentID}, fixture.FiniteScopes{Parent: shutdown, Timeout: time.Duration(runtimeLimits.CleanupTimeoutMS) * time.Millisecond, MaxCalls: runtimeLimits.CleanupMaxCalls, MaxRetries: runtimeLimits.CleanupRetries}, fixture.Config{MaxCaptureBytes: runtimeLimits.MaxCaptureBytes, MaxToolCalls: runtimeLimits.MaxToolCalls, MaxRetries: runtimeLimits.MaxRetries, CreateRetries: runtimeLimits.CreateRetries, RetryBackoff: time.Duration(runtimeLimits.RetryBackoffMS) * time.Millisecond, Owner: owner, LeaseTTL: time.Duration(runtimeLimits.LeaseTTLMS) * time.Millisecond, Clock: fixture.WallClock{}})
+	lifecycle, err := fixture.NewLifecycle(stateStore, executor, guard, sanitizer, observer, fixture.ContextWaiter{}, fixture.DigestKeys{Namespace: config.RepositoryID + ":" + config.EnvironmentID}, fixture.FiniteScopes{Parent: shutdown, Timeout: time.Duration(runtimeLimits.CleanupTimeoutMS) * time.Millisecond, MaxCalls: runtimeLimits.CleanupMaxCalls, MaxRetries: runtimeLimits.CleanupRetries}, fixture.Config{MaxCaptureBytes: runtimeLimits.MaxCaptureBytes, MaxToolCalls: runtimeLimits.MaxToolCalls, MaxRetries: runtimeLimits.MaxRetries, CreateRetries: runtimeLimits.CreateRetries, RetryBackoff: time.Duration(runtimeLimits.RetryBackoffMS) * time.Millisecond, Owner: owner, LeaseTTL: time.Duration(runtimeLimits.LeaseTTLMS) * time.Millisecond, Clock: fixture.WallClock{}})
 	if err != nil {
 		return nil, nil, err
 	}
 	authority := fixture.ReducedAuthority{Set: set, TargetID: spec.Target.ID, RepositoryID: config.RepositoryID, Revision: config.CommitOID, Contract: reduced, Identities: identities, Idempotency: fixture.ContractIdempotencyPolicy{}}
 	return fixture.WorkflowAdapter{Lifecycle: lifecycle, Authority: authority}, stateStore, nil
+}
+
+// workflowSanitizedFixtureEvidence applies composition-owned redaction before
+// PostgreSQL receives bounded fixture response fields.
+type workflowSanitizedFixtureEvidence struct {
+	next      fixture.EvidenceSink
+	sanitizer fixture.Sanitizer
+}
+
+// Confirm sanitizes one fixture response and delegates its durable confirmation.
+func (sink workflowSanitizedFixtureEvidence) Confirm(ctx context.Context, runID, binding string, value map[string]any) (map[string]any, string, error) {
+	safe, err := sink.sanitizer.Sanitize(ctx, value)
+	if err != nil {
+		return nil, "", err
+	}
+	projected, ok := safe.(map[string]any)
+	if !ok {
+		return nil, "", errors.New("fixture evidence projection unavailable")
+	}
+	return sink.next.Confirm(ctx, runID, binding, projected)
 }
 
 // workflowFixtureIdempotencyHeader selects the system-owned key header only when trusted HTTP policy explicitly permits it.
@@ -1629,12 +1768,16 @@ type workflowFinalizer struct{}
 
 // composeWorkflowEnvironment builds the sealed catalog, durable lifecycle and sole workflow environment port.
 func composeWorkflowEnvironment(root string, config workflowConfig, target validationworkflow.TargetContext, preview *workflowPreviewPort, managedProviders map[string]environment.EnvironmentProvider) (validationworkflow.EnvironmentPort, error) {
-	port, _, err := composeWorkflowEnvironmentWithRuntime(root, config, target, preview, managedProviders)
+	port, _, err := composeWorkflowEnvironmentWithRuntime(root, config, target, preview, managedProviders, nil)
 	return port, err
 }
 
 // composeWorkflowEnvironmentWithRuntime opens one shared durable capacity authority for lifecycle and cleanup composition.
-func composeWorkflowEnvironmentWithRuntime(root string, config workflowConfig, target validationworkflow.TargetContext, preview *workflowPreviewPort, managedProviders map[string]environment.EnvironmentProvider) (validationworkflow.EnvironmentPort, *workflowEnvironmentRuntime, error) {
+func composeWorkflowEnvironmentWithRuntime(root string, config workflowConfig, target validationworkflow.TargetContext, preview *workflowPreviewPort, managedProviders map[string]environment.EnvironmentProvider, persistences ...*workflowPersistence) (validationworkflow.EnvironmentPort, *workflowEnvironmentRuntime, error) {
+	var persistence *workflowPersistence
+	if len(persistences) > 0 {
+		persistence = persistences[0]
+	}
 	selection, err := config.EnvironmentCatalog.Resolve(config.TargetAlias)
 	if err != nil {
 		return nil, nil, err
@@ -1662,9 +1805,18 @@ func composeWorkflowEnvironmentWithRuntime(root string, config workflowConfig, t
 	if err != nil {
 		return nil, nil, err
 	}
-	store, err := environment.OpenLocalStore(filepath.Join(root, ".featureproof", "environment"))
-	if err != nil {
-		return nil, nil, err
+	var store environment.CleanupLifecycleStore
+	if persistence != nil {
+		store = persistence.environments
+		if store == nil {
+			return nil, nil, errors.New("postgres environment persistence incomplete")
+		}
+	} else {
+		localStore, openErr := environment.OpenLocalStore(filepath.Join(root, ".featureproof", "environment"))
+		if openErr != nil {
+			return nil, nil, openErr
+		}
+		store = localStore
 	}
 	clock := environment.WallClock{}
 	var demand environment.DemandResolver
@@ -1691,14 +1843,26 @@ func composeWorkflowEnvironmentWithRuntime(root string, config workflowConfig, t
 		if existingRuntime != nil {
 			return existingRuntime.port, existingRuntime, nil
 		}
-		ledger, ledgerErr := environmentcleanup.OpenCapacityLedger(filepath.Join(root, ".featureproof", "cleanup", "capacity.json"))
-		if ledgerErr != nil {
-			return nil, nil, ledgerErr
-		}
 		demand = environment.StaticDemandResolver{Demands: map[string]environment.ResourceDemand{selection.Digest: demandValue}, TTLs: map[string]time.Duration{selection.Digest: ttl}, PolicyDigests: map[string]string{selection.Digest: policy.Digest}}
-		durableCapacity := &workflowDurableCapacity{ledger: ledger, policies: map[string]environmentcleanup.CapacityPolicy{policy.Digest: policy}}
-		capacity = durableCapacity
-		runtime = &workflowEnvironmentRuntime{root: root, project: selection.ProjectID, config: *config.EnvironmentCleanup, ledger: ledger, capacity: durableCapacity}
+		if persistence != nil {
+			ledger := persistence.cleanupLedger
+			if ledger == nil || persistence.capacity == nil {
+				return nil, nil, errors.New("postgres capacity persistence incomplete")
+			}
+			capacity = persistence.capacity
+			if persistence.cleanup == nil {
+				return nil, nil, errors.New("postgres cleanup persistence incomplete")
+			}
+			runtime = &workflowEnvironmentRuntime{root: root, project: selection.ProjectID, config: *config.EnvironmentCleanup, ledger: ledger, cleanup: persistence.cleanup}
+		} else {
+			ledger, ledgerErr := environmentcleanup.OpenCapacityLedger(filepath.Join(root, ".featureproof", "cleanup", "capacity.json"))
+			if ledgerErr != nil {
+				return nil, nil, ledgerErr
+			}
+			durableCapacity := &workflowDurableCapacity{ledger: ledger, policies: map[string]environmentcleanup.CapacityPolicy{policy.Digest: policy}}
+			capacity = durableCapacity
+			runtime = &workflowEnvironmentRuntime{root: root, project: selection.ProjectID, config: *config.EnvironmentCleanup, ledger: ledger, capacity: durableCapacity}
+		}
 	}
 	lifecycle, err := environment.NewLifecycleService(environment.Dependencies{Catalog: config.EnvironmentCatalog, Providers: registry, Store: store, Network: environment.AllowlistedNetworkAuthorizer{}, Clock: clock, Waiter: clock, Observer: &environment.MemoryObserver{}, Owner: "workflow-composition", Demand: demand, Capacity: capacity, Limits: environment.Limits{AcquireTimeout: 30 * time.Second, ObserveTimeout: 10 * time.Second, ReleaseTimeout: 10 * time.Second, NetworkTimeout: 10 * time.Second, ObserverTimeout: 5 * time.Second, LeaseTTL: 10 * time.Minute, MaxAttempts: 3, MaxReadiness: 10, MaxElapsed: 2 * time.Minute, MaxCumulativeWait: 30 * time.Second, InitialBackoff: time.Second}})
 	if err != nil {

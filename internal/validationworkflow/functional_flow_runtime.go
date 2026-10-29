@@ -42,46 +42,99 @@ type LocalFunctionalFlowRuntimeConfig struct {
 	IDs                  harness.IDGenerator
 	Waiter               functionalflow.Waiter
 	Fixtures             functionalflow.FixtureCaptureStore
+	State                functionalflow.IntentStore
+	Journal              functionalflow.EventJournal
+	Artifacts            FunctionalFlowArtifactStore
+	Evidence             functionalflow.EvidenceStore
+	EvidenceManifest     FunctionalFlowEvidenceManifestSource
+	Publisher            FunctionalFlowPublisher
+	Catalog              FunctionalFlowCatalog
+	AttemptSink          FunctionalIdentityAttemptSink
+}
+
+// FunctionalFlowCatalog combines immutable document loading with CLI alias resolution without prescribing a filesystem backend.
+type FunctionalFlowCatalog interface {
+	ProvidedFlowCatalog
+	LocalFlowManifestResolver
+}
+
+// FunctionalIdentityAttempt is the bounded credential-free fact emitted for one authenticated tool attempt.
+type FunctionalIdentityAttempt struct {
+	RunID, IdentityID, OperationBindingSHA256, OutcomeCategory string
+	Attempt                                                    int
+}
+
+// FunctionalIdentityAttemptSink persists authenticated-attempt audit facts without exposing request, response, or credential material.
+type FunctionalIdentityAttemptSink interface {
+	AppendIdentityAttempt(context.Context, FunctionalIdentityAttempt) error
 }
 
 // ComposeLocalFunctionalFlowRuntime builds one shared canonical composer, durable executor, artifact store, evidence store, and post-cleanup publisher.
-func ComposeLocalFunctionalFlowRuntime(config LocalFunctionalFlowRuntimeConfig) (FunctionalFlowExecutionAdapter, *LocalProvidedFlowCatalog, error) {
+func ComposeLocalFunctionalFlowRuntime(config LocalFunctionalFlowRuntimeConfig) (FunctionalFlowExecutionAdapter, FunctionalFlowCatalog, error) {
 	if config.Root == "" || config.Tool == nil || config.PolicyFactory == nil || config.Evaluator == nil || config.Clock == nil || config.IDs == nil || config.Waiter == nil || config.LeaseTTL <= 0 {
 		return FunctionalFlowExecutionAdapter{}, nil, &Error{Code: CodeInvalid, Operation: "functional_flow_runtime"}
 	}
-	catalog, err := OpenLocalProvidedFlowCatalog(filepath.Join(config.Root, "provided"), config.AllowedManifestRoots, config.Aliases, config.Limits)
-	if err != nil {
-		return FunctionalFlowExecutionAdapter{}, nil, err
+	catalog := config.Catalog
+	var err error
+	if catalog == nil {
+		catalog, err = OpenLocalProvidedFlowCatalog(filepath.Join(config.Root, "provided"), config.AllowedManifestRoots, config.Aliases, config.Limits)
+		if err != nil {
+			return FunctionalFlowExecutionAdapter{}, nil, err
+		}
 	}
-	artifacts, err := OpenLocalFunctionalFlowArtifactStore(filepath.Join(config.Root, "artifacts"))
-	if err != nil {
-		return FunctionalFlowExecutionAdapter{}, nil, err
+	artifacts := config.Artifacts
+	if artifacts == nil {
+		artifacts, err = OpenLocalFunctionalFlowArtifactStore(filepath.Join(config.Root, "artifacts"))
+		if err != nil {
+			return FunctionalFlowExecutionAdapter{}, nil, err
+		}
 	}
-	confirmed, err := OpenLocalFunctionalFlowEvidenceStore(filepath.Join(config.Root, "evidence"))
-	if err != nil {
-		return FunctionalFlowExecutionAdapter{}, nil, err
+	confirmed := config.Evidence
+	manifest := config.EvidenceManifest
+	if confirmed == nil || manifest == nil {
+		if confirmed != nil || manifest != nil {
+			return FunctionalFlowExecutionAdapter{}, nil, &Error{Code: CodeInvalid, Operation: "functional_flow_evidence_persistence"}
+		}
+		localEvidence, openErr := OpenLocalFunctionalFlowEvidenceStore(filepath.Join(config.Root, "evidence"))
+		if openErr != nil {
+			return FunctionalFlowExecutionAdapter{}, nil, openErr
+		}
+		confirmed, manifest = localEvidence, localEvidence
 	}
-	state, err := functionalflow.NewLocalStore(filepath.Join(config.Root, "state"), config.Clock, config.LeaseTTL)
-	if err != nil {
-		return FunctionalFlowExecutionAdapter{}, nil, err
+	state, journal := config.State, config.Journal
+	if (state == nil) != (journal == nil) {
+		return FunctionalFlowExecutionAdapter{}, nil, &Error{Code: CodeInvalid, Operation: "functional_flow_persistence"}
 	}
-	publisher, err := OpenLocalFunctionalFlowPublisher(filepath.Join(config.Root, "packages"), artifacts, confirmed, state)
-	if err != nil {
-		return FunctionalFlowExecutionAdapter{}, nil, err
+	if state == nil || journal == nil {
+		localState, stateErr := functionalflow.NewLocalStore(filepath.Join(config.Root, "state"), config.Clock, config.LeaseTTL)
+		if stateErr != nil {
+			return FunctionalFlowExecutionAdapter{}, nil, stateErr
+		}
+		state, journal = localState, localState
+	}
+	publisher := config.Publisher
+	if publisher == nil {
+		publisher, err = OpenLocalFunctionalFlowPublisher(filepath.Join(config.Root, "packages"), artifacts, manifest, journal)
+		if err != nil {
+			return FunctionalFlowExecutionAdapter{}, nil, err
+		}
 	}
 	generated := config.Generated
 	generated.PublicIdentity = config.PublicIdentity
-	journalRoot := config.AttemptJournalRoot
-	if journalRoot == "" {
-		journalRoot = filepath.Join(config.Root, "attempts")
+	journalRoot := ""
+	if config.AttemptSink == nil {
+		journalRoot = config.AttemptJournalRoot
+		if journalRoot == "" {
+			journalRoot = filepath.Join(config.Root, "attempts")
+		}
+		journalRoot, err = filepath.Abs(journalRoot)
+		if err != nil || os.MkdirAll(journalRoot, 0o700) != nil {
+			return FunctionalFlowExecutionAdapter{}, nil, &Error{Code: CodeUnavailable, Operation: "functional_flow_journal"}
+		}
 	}
-	absoluteJournalRoot, err := filepath.Abs(journalRoot)
-	if err != nil || os.MkdirAll(absoluteJournalRoot, 0o700) != nil {
-		return FunctionalFlowExecutionAdapter{}, nil, &Error{Code: CodeUnavailable, Operation: "functional_flow_journal"}
-	}
-	executor := &functionalflow.Executor{Authority: config.Binding, Clock: config.Clock, Policy: &functionalFlowProductPolicy{factory: config.PolicyFactory, limits: config.Execution}, Revalidator: functionalFlowIdentityRevalidator{catalog: config.Identities, publicIdentity: config.PublicIdentity}, Tool: functionalFlowToolAdapter{tool: config.Tool, sanitizer: config.Sanitizer, ids: config.IDs, publicIdentity: config.PublicIdentity, journalRoot: absoluteJournalRoot, journalMu: &sync.Mutex{}}, Evidence: confirmed, Fixtures: config.Fixtures, Assertions: functionalFlowAssertionAdapter{evaluator: config.Evaluator}, State: state, Journal: state, Keys: functionalFlowKeyFactory{}, Waiter: config.Waiter, Config: config.Execution}
+	executor := &functionalflow.Executor{Authority: config.Binding, Clock: config.Clock, Policy: &functionalFlowProductPolicy{factory: config.PolicyFactory, limits: config.Execution}, Revalidator: functionalFlowIdentityRevalidator{catalog: config.Identities, publicIdentity: config.PublicIdentity}, Tool: functionalFlowToolAdapter{tool: config.Tool, sanitizer: config.Sanitizer, ids: config.IDs, publicIdentity: config.PublicIdentity, journalRoot: journalRoot, journalMu: &sync.Mutex{}, attemptSink: config.AttemptSink}, Evidence: confirmed, Fixtures: config.Fixtures, Assertions: functionalFlowAssertionAdapter{evaluator: config.Evaluator}, State: state, Journal: journal, Keys: functionalFlowKeyFactory{}, Waiter: config.Waiter, Config: config.Execution}
 	composer := CanonicalFunctionalFlowComposer{Limits: config.Limits, Validation: config.Validation, Binding: config.Binding, Generated: generated, Provided: catalog}
-	return FunctionalFlowExecutionAdapter{Composer: composer, Executor: executor, Artifacts: artifacts, Publisher: publisher, Journal: state}, catalog, nil
+	return FunctionalFlowExecutionAdapter{Composer: composer, Executor: executor, Artifacts: artifacts, Publisher: publisher, Journal: journal}, catalog, nil
 }
 
 // LocalFunctionalFlowEvidenceStore owns sanitized evidence payloads privately and exports only authenticated manifest records.
@@ -205,6 +258,7 @@ type functionalFlowToolAdapter struct {
 	publicIdentity string
 	journalRoot    string
 	journalMu      *sync.Mutex
+	attemptSink    FunctionalIdentityAttemptSink
 }
 
 // functionalIdentityAttemptEvent is the payload-free compatibility fact retained for authenticated attempts.
@@ -225,7 +279,7 @@ func (a functionalFlowToolAdapter) Execute(ctx context.Context, request function
 	binding := &request.Operation.Identity
 	result, err := a.tool.Execute(ctx, harness.ToolCall{ID: request.StepID, Tool: request.Operation.Reference.Capability, RunID: request.RunID, Attempt: request.Attempt, Input: input, IdempotencyKey: request.IdempotencyKey, IdentityBinding: binding})
 	if !binding.Anonymous {
-		if journalErr := a.appendIdentityAttempt(request, functionalIdentityOutcome(ctx, result, err)); journalErr != nil {
+		if journalErr := a.appendIdentityAttempt(ctx, request, functionalIdentityOutcome(ctx, result, err)); journalErr != nil {
 			return functionalflow.ExecutionResponse{CrossedNetwork: true}, journalErr
 		}
 	}
@@ -259,7 +313,10 @@ func (a functionalFlowToolAdapter) Execute(ctx context.Context, request function
 }
 
 // appendIdentityAttempt synchronously appends one bounded terminal fact without request, response, or credential material.
-func (a functionalFlowToolAdapter) appendIdentityAttempt(request functionalflow.ExecutionRequest, category string) error {
+func (a functionalFlowToolAdapter) appendIdentityAttempt(ctx context.Context, request functionalflow.ExecutionRequest, category string) error {
+	if a.attemptSink != nil {
+		return a.attemptSink.AppendIdentityAttempt(ctx, FunctionalIdentityAttempt{RunID: request.RunID, IdentityID: request.Operation.Identity.IdentityID, OperationBindingSHA256: request.Operation.Identity.Digest, Attempt: request.Attempt, OutcomeCategory: category})
+	}
 	if a.journalRoot == "" || a.journalMu == nil || !safeID.MatchString(request.RunID) || request.Attempt <= 0 || request.Operation.Identity.IdentityID == "" || request.Operation.Identity.Digest == "" {
 		return &Error{Code: CodeInternal, Operation: "functional_flow_journal"}
 	}

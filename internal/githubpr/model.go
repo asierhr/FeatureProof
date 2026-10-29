@@ -370,6 +370,11 @@ type ValidationGateway interface {
 	Cancel(context.Context, string, string) error
 }
 
+// ValidationIdempotencyReconciler resolves a prior submission receipt without creating or executing another run.
+type ValidationIdempotencyReconciler interface {
+	ResolveIdempotency(context.Context, string) (RunState, bool, error)
+}
+
 // PackageReader verifies evidence packages before terminal projection.
 type PackageReader interface {
 	Read(context.Context, string) (localvalidation.PackageIndex, error)

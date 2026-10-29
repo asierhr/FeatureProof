@@ -68,7 +68,7 @@ func TestWorkflowApprovalStagesFreshRevision(t *testing.T) {
 	contract := planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: "target", BaseURL: "https://example.invalid"}, Constraints: request.Constraints, Contract: request.Contract, Capabilities: []planapproval.CapabilitySnapshot{{Name: "http.request", Class: "http"}}, Runtime: planapproval.RuntimeSnapshot{PolicyVersion: "v1", Limits: map[string]int{"tools": 2}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: "v1", PromptVersion: "p1", Provider: "fake", Model: "fake"}}
 	limits := planapproval.Limits{MaxBytes: 1 << 20, MaxDepth: 64, MaxEvents: 100, MaxConstraints: 10, MaxChecks: 10, MaxSteps: 20, MaxAssertions: 20, MaxEvidence: 20}
 	store := planapproval.NewMemoryStore()
-	workflow, err := planapproval.NewWorkflow(store, approvalSanitizer{}, approvalClock{}, limits, run)
+	workflow, err := planapproval.NewWorkflow(context.Background(), store, approvalSanitizer{}, approvalClock{}, limits, run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestCoordinatorRecoversResolvedWorkflowApprovalWithoutSecondHumanDecision(t
 	input.Contract = planapproval.ContractSnapshot{Target: planapproval.TargetSnapshot{ID: "target", BaseURL: "https://example.invalid"}, Constraints: input.Generation.Constraints, Contract: input.Generation.Contract, Capabilities: []planapproval.CapabilitySnapshot{{Name: "http.request", Class: "http"}}, Runtime: planapproval.RuntimeSnapshot{PolicyVersion: "v1", Limits: map[string]int{"tools": 2}}, GenerationContract: planapproval.GenerationContractSnapshot{ProtocolVersion: "v1", PromptVersion: "p1", Provider: "fake", Model: "fake"}}
 	limits := planapproval.Limits{MaxBytes: 1 << 20, MaxDepth: 64, MaxEvents: 100, MaxConstraints: 10, MaxChecks: 10, MaxSteps: 20, MaxAssertions: 20, MaxEvidence: 20}
 	store := planapproval.NewMemoryStore()
-	workflow, err := planapproval.NewWorkflow(store, approvalSanitizer{}, approvalClock{}, limits, run)
+	workflow, err := planapproval.NewWorkflow(context.Background(), store, approvalSanitizer{}, approvalClock{}, limits, run)
 	if err != nil {
 		t.Fatal(err)
 	}

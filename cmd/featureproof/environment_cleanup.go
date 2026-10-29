@@ -103,15 +103,22 @@ func workflowCapacityConfirmation(cleanupID, environmentDigest, resourceDigest, 
 type workflowEnvironmentRuntime struct {
 	root, project string
 	config        workflowCleanupRuntimeConfig
-	ledger        *environmentcleanup.CapacityLedger
-	// capacity retains the shared adapter so composition tests can exercise its post-commit crash boundary.
-	capacity    *workflowDurableCapacity
-	bridge      *environment.CleanupBridge
-	controller  *environmentcleanup.Controller
-	inventories map[string]environmentcleanup.ManagedInventory
-	port        validationworkflow.EnvironmentPort
-	mu          sync.Mutex
-	running     bool
+	ledger        workflowCapacityLedger
+	capacity      *workflowDurableCapacity
+	cleanup       environmentcleanup.Store
+	bridge        *environment.CleanupBridge
+	controller    *environmentcleanup.Controller
+	inventories   map[string]environmentcleanup.ManagedInventory
+	port          validationworkflow.EnvironmentPort
+	mu            sync.Mutex
+	running       bool
+}
+
+// workflowCapacityLedger combines controller and receipt-discovery operations without fixing the backend implementation.
+type workflowCapacityLedger interface {
+	environmentcleanup.CapacityLedgerPort
+	ScanReceipts(context.Context, string, int) ([]environmentcleanup.CapacityReceipt, string, error)
+	ReleaseUnbound(context.Context, environmentcleanup.CapacityReceipt, string) (environmentcleanup.CapacityReceipt, bool, error)
 }
 
 // workflowEnvironmentRuntimes guarantees one in-process durable authority per absolute root and project.
@@ -148,7 +155,7 @@ type workflowOrphanAuthority struct {
 
 // workflowCapacitySource exposes the joint lifecycle/receipt index under an independent durable discovery cursor.
 type workflowCapacitySource struct {
-	ledger    *environmentcleanup.CapacityLedger
+	ledger    workflowCapacityLedger
 	lifecycle *environment.CleanupBridge
 }
 
@@ -212,9 +219,13 @@ func (r *workflowEnvironmentRuntime) attachWorkflow(store validationworkflow.Wor
 		return err
 	}
 	intents := validationworkflow.CleanupIntentSource{Store: store, Authority: r.bridge, Clock: clock}
-	cleanupStore, err := environmentcleanup.OpenLocalStore(filepath.Join(r.root, ".featureproof", "cleanup", "items.json"))
-	if err != nil {
-		return err
+	cleanupStore := r.cleanup
+	if cleanupStore == nil {
+		var err error
+		cleanupStore, err = environmentcleanup.OpenLocalStore(filepath.Join(r.root, ".featureproof", "cleanup", "items.json"))
+		if err != nil {
+			return err
+		}
 	}
 	r.controller, err = environmentcleanup.NewController(r.config.controllerConfig(), environmentcleanup.Dependencies{Store: cleanupStore, Intents: intents, Sources: map[string]environmentcleanup.DiscoverySource{"lifecycle": lifecycleSource, "capacity": workflowCapacitySource{ledger: r.ledger, lifecycle: r.bridge}}, Lifecycle: lifecycle, Inventories: r.inventories, Orphans: workflowOrphanAuthority{lifecycle: r.bridge, runs: intents}, Ledger: r.ledger, Clock: clock, Waiter: clock})
 	return err

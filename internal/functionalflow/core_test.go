@@ -284,7 +284,7 @@ func (m *memoryEvidence) Load(_ context.Context, id string) (Evidence, error) {
 	return copy, nil
 }
 
-// memoryCaptures keeps raw fixture values behind the private resolver port.
+// memoryCaptures exposes fixture outputs only to the run that owns them, allowing resolver tests to exercise capture isolation.
 type memoryCaptures struct {
 	runID  string
 	values map[string]any

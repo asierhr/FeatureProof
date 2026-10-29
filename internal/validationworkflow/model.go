@@ -11,6 +11,7 @@ import (
 	"github.com/asierhr/featureProof/internal/agentplanning"
 	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/contractcatalog"
+	"github.com/asierhr/featureProof/internal/controlplane"
 	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/functionalflow"
 	"github.com/asierhr/featureProof/internal/localvalidation"
@@ -330,19 +331,20 @@ type Record struct {
 	CleanupPending                                   bool
 	FunctionalFlowAdmitted                           bool
 	FunctionalFlowExecutionPending                   bool
-	FunctionalFlowPrimaryDurable                     bool
-	FunctionalFlowApprovalMode                       string
-	FunctionalFlowApprovalReference                  string
-	FunctionalFlowApproval                           *planapproval.FunctionalFlowSnapshot
-	DesiredOutcome                                   *Outcome
-	ApprovalDecisionID                               string
-	ApprovalDecisionAction                           DecisionAction
-	ApprovalDecisionRevision                         uint64
-	EnvironmentDigest                                string
-	OperationalCategory                              string
-	ApprovalDeadline                                 time.Time
-	FixtureSummary                                   *fixture.FixtureSummary
-	ContextBindingDigest                             string
+	// FunctionalFlowPrimaryDurable fences finalization until the staged functional result has been published exactly once.
+	FunctionalFlowPrimaryDurable    bool
+	FunctionalFlowApprovalMode      string
+	FunctionalFlowApprovalReference string
+	FunctionalFlowApproval          *planapproval.FunctionalFlowSnapshot
+	DesiredOutcome                  *Outcome
+	ApprovalDecisionID              string
+	ApprovalDecisionAction          DecisionAction
+	ApprovalDecisionRevision        uint64
+	EnvironmentDigest               string
+	OperationalCategory             string
+	ApprovalDeadline                time.Time
+	FixtureSummary                  *fixture.FixtureSummary
+	ContextBindingDigest            string
 }
 
 // ContextAssemblySelection is the detached planner envelope and immutable snapshot identity owned by composition.
@@ -469,20 +471,54 @@ type WorkflowStore interface {
 	ReleaseOwner(context.Context, string, string, uint64, time.Time) (Record, error)
 }
 
+// WorkflowReservationLookup resolves an idempotency identity for response-loss reconciliation without creating work.
+type WorkflowReservationLookup interface {
+	FindReservation(context.Context, string, string) (Record, bool, error)
+}
+
+// BoundWorkflowStore atomically returns the workflow projection together with
+// the immutable backend authority that every later mutation must present.
+type BoundWorkflowStore interface {
+	ReserveBound(context.Context, Record, string, time.Time, time.Duration) (Record, bool, context.Context, error)
+	LoadBound(context.Context, string) (Record, context.Context, error)
+}
+
+// CausalWorkflowStore extends the workflow boundary with the atomic scheduling
+// intents required to make a durable phase transition restart-safe.
+type CausalWorkflowStore interface {
+	WorkflowStore
+	SaveOwnedCausal(context.Context, Record, string, uint64, time.Time, time.Duration, Event, *controlplane.Job, *controlplane.EffectIntent) (Record, error)
+}
+
 // PlanArtifactStore atomically commits and integrity-checks canonical generated plans.
 type PlanArtifactStore interface {
 	Commit(context.Context, PlanArtifact) error
 	Load(context.Context, string) (PlanArtifact, error)
 }
 
-// ExecutablePlanStore keeps unredacted model values behind a private composition boundary for restart recovery.
+// PackageDocument is one immutable canonical evidence package independent of filesystem paths.
+type PackageDocument struct {
+	ProjectID, RunID, PackageID, MediaType, SchemaVersion  string
+	ArtifactDigest, BindingDigest, BackendIdentity, Digest string
+	BackendEpoch                                           uint64
+	Document                                               []byte
+	CreatedAt                                              time.Time
+}
+
+// PackageStore owns canonical byte-exact package persistence and lineage metadata.
+type PackageStore interface {
+	CommitPackage(context.Context, PackageDocument) (PackageDocument, error)
+	LoadPackage(context.Context, string, string) (PackageDocument, error)
+}
+
+// ExecutablePlanStore owns private prepared material that must never be reconstructed from the public artifact alone.
 type ExecutablePlanStore interface {
 	Commit(context.Context, string, ExecutableMaterial) error
 	Load(context.Context, string) (ExecutableMaterial, error)
 	Delete(context.Context, string) error
 }
 
-// ExecutableMaterial keeps private plan values and the secret commitment key bound to one public artifact context.
+// ExecutableMaterial binds private prepared inputs and commitment authority to one immutable public workflow artifact.
 type ExecutableMaterial struct {
 	Version, WorkflowID, ArtifactSHA256, ContextDigest, RevisionDigest, TargetDigest string
 	Snapshot                                                                         agentplanning.PreparedSnapshot

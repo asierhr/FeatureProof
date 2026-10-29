@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // WebhookCommand is the strictly translated, payload-minimal admission request.
@@ -48,11 +50,15 @@ type WebhookHandler struct {
 	Owner    string
 	Clock    Clock
 	LeaseTTL time.Duration
+	// ControlPlane persists an authenticated and scoped command before any accepted response.
+	ControlPlane controlplane.IngressStore
+	// Admission derives only composition-owned backend/run/job authority after webhook translation.
+	Admission func(context.Context, WebhookCommand) (controlplane.IngressAdmission, error)
 }
 
 // ServeHTTP enforces body/header/signature bounds and durable replay semantics.
 func (h *WebhookHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	if h == nil || len(h.Secret) < 16 || h.MaxBody <= 0 || h.Store == nil || h.Admit == nil || h.Owner == "" || h.Clock == nil || h.LeaseTTL <= 0 {
+	if h == nil || len(h.Secret) < 16 || h.MaxBody <= 0 || h.Owner == "" || h.Clock == nil || h.LeaseTTL <= 0 || h.ControlPlane == nil && (h.Store == nil || h.Admit == nil) {
 		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -68,6 +74,33 @@ func (h *WebhookHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	receipt := DeliveryReceipt{Version: SchemaVersion, DeliveryID: deliveryID, Event: event, PayloadSHA256: digest(body), State: "received", VersionCAS: 1}
+	command, ignored, err := decodeCommand(deliveryID, event, receipt.PayloadSHA256, body)
+	if err != nil {
+		writeWebhookError(writer, err)
+		return
+	}
+	if !ignored && (h.ControlPlane == nil) != (h.Admission == nil) {
+		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !ignored && h.ControlPlane != nil {
+		admission, admissionErr := h.Admission(request.Context(), command)
+		if admissionErr != nil {
+			writeWebhookError(writer, admissionErr)
+			return
+		}
+		if _, admissionErr = h.ControlPlane.Admit(request.Context(), admission); admissionErr != nil {
+			http.Error(writer, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		writer.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(writer).Encode(WebhookResult{State: "accepted"})
+		return
+	}
+	if ignored && h.ControlPlane != nil {
+		writeWebhookJSON(writer, WebhookResult{State: "ignored"})
+		return
+	}
 	reserved, fresh, err := h.Store.ReserveDelivery(request.Context(), receipt, h.Owner, h.Clock.Now(), h.LeaseTTL)
 	if err != nil {
 		writeWebhookError(writer, err)
@@ -75,12 +108,6 @@ func (h *WebhookHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 	}
 	if !fresh {
 		writeWebhookJSON(writer, WebhookResult{State: reserved.State, AssociationID: reserved.AssociationID})
-		return
-	}
-	command, ignored, err := decodeCommand(deliveryID, event, receipt.PayloadSHA256, body)
-	if err != nil {
-		_, _ = h.Store.CompleteDelivery(request.Context(), deliveryID, reserved.VersionCAS, "rejected", "")
-		writeWebhookError(writer, err)
 		return
 	}
 	if ignored {

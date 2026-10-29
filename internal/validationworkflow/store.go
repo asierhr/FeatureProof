@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // ErrNotFound identifies an unknown workflow handle without leaking filesystem paths.
@@ -28,6 +30,30 @@ type LocalStore struct {
 type workflowCheckpoint struct {
 	Record Record  `json:"record"`
 	Events []Event `json:"events"`
+}
+
+// DecodeWorkflowImportCheckpoint strictly replays one frozen local checkpoint
+// before PostgreSQL may materialize its projection and append-only journal.
+func DecodeWorkflowImportCheckpoint(document []byte) (Record, []Event, error) {
+	var checkpoint workflowCheckpoint
+	if json.Unmarshal(document, &checkpoint) != nil || !validRecordForImport(checkpoint.Record) {
+		return Record{}, nil, &Error{Code: CodeConflict, Operation: "import_checkpoint"}
+	}
+	for index, event := range checkpoint.Events {
+		if event.Handle != checkpoint.Record.Handle || event.Sequence != uint64(index+1) || event.ID == "" {
+			return Record{}, nil, &Error{Code: CodeConflict, Operation: "import_journal"}
+		}
+	}
+	if uint64(len(checkpoint.Events)) != checkpoint.Record.Sequence {
+		return Record{}, nil, &Error{Code: CodeConflict, Operation: "import_sequence"}
+	}
+	return checkpoint.Record, append([]Event(nil), checkpoint.Events...), nil
+}
+
+// validRecordForImport validates a persisted workflow projection without
+// requiring it to remain in the initial admitted phase.
+func validRecordForImport(record Record) bool {
+	return record.Version == 1 && safeID.MatchString(record.Handle) && safeID.MatchString(record.Principal) && safeID.MatchString(record.IdempotencyKey) && len(record.RequestDigest) == 64 && record.VersionCAS > 0 && record.Sequence > 0 && !record.UpdatedAt.IsZero()
 }
 
 // OpenLocalStore creates and validates the trusted workflow storage root.
@@ -356,6 +382,14 @@ func (s *LocalStore) findReservation(principal, key string) (Record, bool, error
 	return Record{}, false, nil
 }
 
+// FindReservation exposes the existing immutable idempotency receipt without reserving or advancing a workflow.
+func (s *LocalStore) FindReservation(ctx context.Context, principal, key string) (Record, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Record{}, false, err
+	}
+	return s.findReservation(principal, key)
+}
+
 // loadUnlocked decodes one record while the cross-process lock is held.
 func (s *LocalStore) loadUnlocked(handle string) (Record, error) {
 	checkpoint, err := s.loadCheckpoint(handle)
@@ -412,6 +446,11 @@ func (s *LocalStore) loadEvents(handle string) ([]Event, error) {
 
 // saveCheckpoint publishes projection and journal through one durable atomic rename.
 func (s *LocalStore) saveCheckpoint(checkpoint workflowCheckpoint) error {
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(context.Background(), s.root)
+	if err != nil {
+		return &Error{Code: CodeConflict, Operation: "offline_import_freeze"}
+	}
+	defer releaseImportWrite()
 	return s.saveJSON(checkpoint.Record.Handle+".state.json", checkpoint)
 }
 

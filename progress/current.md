@@ -4121,6 +4121,12 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Registrada la aprobación en `requirements.md` con timestamp `2026-10-27T08:20:19+01:00`.
 - `persistent-control-plane` pasa de `spec_ready` a `in_progress`; se delegan T1–T17 al implementer especializado.
 
+## Feature 35 — review 1 rechazada (2026-10-27)
+
+- La primera review rechaza la entrega con REV-1–REV-10: el paquete aislado pasa gates herméticos, pero no implementa verticalmente los puertos consumer-owned ni la composición productiva.
+- Deben corregirse adapters reales y transacciones causales; fencing por backend epoch; queue/cancel/shutdown; authority mínima; migraciones dirty/compatibility; import/cutover/retention/query; retries/observabilidad; y un gate PostgreSQL 16 reproducible con la matriz completa.
+- La feature permanece `in_progress`; se reabren las tareas afectadas y se exigirá nueva review independiente tras remediación y gates reales.
+
 ## Feature 34 — implementación en curso (2026-10-26)
 
 - Iniciada T1–T3: modelo canónico, binding destructivo sellado, store durable con CAS/leases y ledger de capacidad por proyecto.
@@ -4330,3 +4336,333 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Matrices adicionales rechazan A→B→A intra-run/reopen, rewind/epoch skip/CAS stale y prueban crash before-write/after-publish del completion sin pérdida ni loop.
 - Pasan formato/diff/vet/compile/global, focales/races ×20, race global UCRT64, coverage global `37344/43378 = 86,08972290100973 %` y diff productivo exacto `1812/2130 = 85,07042253521127 %`.
 - Pasan cross-builds 12/12 y runtime real Alpine 3.22.2 4/4; temporales/distro eliminados, sin procesos, secretos, red de tests, cambios de `feature_list.json`, commit o push. T1–T16 quedan `[x]` para review 6.
+## Feature 35 — implementación preparada para review (2026-10-27)
+
+- Se implementó el control plane neutral, PostgreSQL 16.15 con migraciones embebidas, epochs/head CAS, adapters nombrados, queue lease/fence, scheduler, authority mínima, inbox/outbox, cancel/recovery, import offline, paginación y retention.
+- El gate PostgreSQL real se ejecutó en una distro WSL1 Alpine 3.22.2 efímera y aislada; cada prueba creó/eliminó solo su schema propio. Normal, concurrencia, restart/reload, race ×10 y runtime Linux pasan.
+- Pasan formato/diff, vet, compile-only, `go test ./...`, focales ×20, race global y focal ×20, seis cross-builds y dos binarios Linux reales.
+- Cobertura exacta del diff productivo: `839/985 = 85,17766497461929 %`. T1–T17 quedan `[x]`; `feature_list.json` permanece intacto y no hubo commit ni push.
+## Feature 35 — review 1 rechazada; bloque A iniciado (2026-10-27)
+
+- Se reabren T3, T5–T8, T13 y T17 para REV-1 y la base de REV-3.
+- Se elimina `AggregateRecord`/`namedAdapter` como sustituto y se implementan directamente los puertos consumer-owned con tipos de dominio, tablas específicas, assertions de interfaz y transacciones causales.
+- `feature_list.json` permanece intacto; este bloque no adelanta la composición, epochs/queue/authority/import de los bloques posteriores.
+## Feature 35 — review 1 bloque A cerrado (2026-10-27)
+
+- REV-1 corregida: se eliminaron `AggregateRecord`, `namedAdapter` y las tablas genéricas. Los adapters PostgreSQL satisfacen directamente los puertos consumer-owned de workflow/artifacts/packages, approval snapshots/CAS, functional intents/journal, environment/capacity, cleanup/cursors/ledger y correction lineage/budget; cada contrato tiene assertion de compilación.
+- Base de REV-3: workflow y lifecycle disponen de fronteras projection+event+job/outbox en una única transacción; functional intent se confirma bajo claim antes de I/O. Fault injection real cubre rollback tras projection/event/job/outbox y unknown commit resoluble por reload.
+- PostgreSQL 16 real pasa adapters tipados, contract suite compartida local/Postgres, cinco boundaries de fallo, concurrencia e idempotencia. Pasan vet focal, repetición normal ×10, race focal ×10 y gate PostgreSQL race ×5.
+- El cierre final del bloque añade verificación consumer-owned de la confirmación de release de capacity, persistencia idempotente de esa prueba y un smoke real del adapter privado de approvals. Suite global, PostgreSQL normal y race focal/PostgreSQL ×3 pasan sobre el diff final.
+- T3, T5–T8 y T13 vuelven a `[x]`. T17 queda abierta para la matriz completa de bloques posteriores; `feature_list.json` permanece intacto y no hubo commit/push.
+
+## Feature 35 — review 1 bloque B cerrado (2026-10-27)
+
+- Se reabrieron y revalidaron T4 y T9–T12/T14 para REV-2/REV-4/REV-5/REV-6; vuelven a `[x]`. T17 continúa `[ ]` hasta cerrar todos los bloques de la review.
+- La composición real de `github serve` selecciona local explícito conservando los stores existentes, o PostgreSQL sin fallback: abre el pool, migra, comprueba readiness y conecta inbox/queue. Firma HMAC, traducción y scope instalación/repositorio/actor/selección ocurren antes del inbox causal; el 202 solo aparece tras commit.
+- `Admit` confirma en una transacción inbox + epoch/head + evento de admisión + job/evento. El worker recarga únicamente campos allowlisted, sin body raw, y el ejecutable posee `Start`/`Stop`/`Join`; restart no depende de memoria de proceso.
+- Queue y outbox cercan mutaciones por head/epoch/digest/identidad PostgreSQL, owner/fence/cancel revision y lease viva. El orden es `(available_at,created_at,job_id)`, heartbeat queda limitado por policy/deadline, cancel invalida la lease y crea convergencia cleanup cuando había ownership.
+- Authority se deriva de grants persistidos catalog/policy/binding bajo una matriz cerrada por fase. El resolver secreto JIT vuelve a validar project/phase/head/epoch/owner/fence/lease/expiry y nunca se invoca ante rechazo o cutover.
+- Pruebas reales PostgreSQL cubren rollback por cada statement y unknown commit de ingress, cutover-vs-worker/secret resolver, cancel-vs-complete, lease expirada, orden y cleanup. Pasan suite global, vet, focal ×10, race focal ×3, PostgreSQL normal ×3 y PostgreSQL race ×3.
+- `feature_list.json` permanece intacto; no hubo commit/push. La distro PostgreSQL 16 aislada y su tar temporal fueron detenidos, desregistrados y eliminados tras los gates.
+
+## Feature 35 — review 1 bloque C iniciado (2026-10-27)
+
+- Se reabren T2/T3/T15/T16 para corregir REV-7/REV-8/REV-9. T17 permanece abierta y la feature no está preparada aún para review final.
+- El bloque incorpora ledger dirty/compatibilidad real de migraciones, import offline contra stores locales congelables, cutover CAS transaccional, queries keyset con cursor autenticado, retention por terminal/reference graph y observabilidad content-free no autoritativa.
+- `feature_list.json` permanece intacto; no habrá commit/push ni acceso a PostgreSQL de producción.
+
+## Feature 35 — review 1 bloque C cerrado (2026-10-27)
+
+- T2 vuelve a `[x]`: el ledger singleton registra `dirty/target/current`, major de servidor y ventana min/max; cada descriptor `expand/backfill/contract` tiene su propia transacción tras un intent durable. Readiness rechaza dirty, abort, checksum, hueco, futuro, major alterado, permisos insuficientes y binario fuera de N/N+1.
+- T3 vuelve a `[x]`: las operaciones de import y retention usan retry acotado de transacción completa para `40001/40P01`; errores de dominio no se remapean, constraints se clasifican por SQLSTATE/contexto y el observer recibe solo operación/categoría/intento/count/duración. El sink puede fallar sin cambiar verdad durable.
+- T15 vuelve a `[x]`: `LocalImportStore` mantiene receipt atómico de freeze/archive, bytes ordenados, counts y digests de streams/relations/events. El `LocalStore` real de ingress consulta ese receipt antes de commit. PostgreSQL mantiene staging sin authority, copia idempotente, verifica, abandona pre-cutover y publica epoch+head+archive/cutover events+receipt en una transacción CAS. Commit desconocido se resuelve por receipt y dos candidatos verificados solo publican un head.
+- T16 vuelve a `[x]`: cursores HMAC-SHA256 composition-owned incluyen versión/project/filter/snapshot/keyset/expiry y se verifican antes de query. `ListJobs` usa `(created_at,job_id)` estable; retention usa `terminal_at`, páginas bloqueadas, reference graph/effects/packages/authority y summary tombstones idempotentes; sin policy continúa sin borrar.
+- Gates frescos: suite global y compile-only, vet, focales normales, cursor/import/migrator/observer race ×20, freeze real race ×20, PostgreSQL 16.15 normal completo y PostgreSQL race completo. La instancia WSL1 Alpine 3.22.2, schemas, rootfs y temporales pertenecían al gate y fueron detenidos/desregistrados/eliminados.
+- T17 permanece `[ ]` para REV-10 y la matriz final/coverage diferencial reproducible. `feature_list.json` permanece intacto; no hubo commit/push.
+
+## Feature 35 — T17/REV-10 cerrado (2026-10-27)
+
+- Se versionó un gate fail-closed que acepta solo DSN administrativo autorizado o bootstrap WSL explícito. El bootstrap autentica Alpine 3.22.2 por SHA-256, instala PostgreSQL 16.15-r0, crea database/distro/cluster/puerto/token UUID propios, verifica ownership antes de borrar y ejecuta teardown en `finally`; no infiere ni contacta producción.
+- La matriz tagged cubre adapters consumer-owned, migraciones corruptas/concurrentes, causalidad/unknown commit, queue/lease/fence/cancel/cutover, authority/JIT, inbox/outbox, restart/shutdown, import/cutover y pagination/retention. El mismo gate ejecuta binarios Linux reales hermético y PostgreSQL antes de eliminar todo recurso propio.
+- El race global detectó y corrigió una carrera entre la copia de job del handler y las renovaciones heartbeat; el handler recibe ahora una copia inmutable. Tras el fix pasan global normal serial, global race serial, focal control-plane race ×20, PostgreSQL normal ×3, PostgreSQL race, seis cross-builds y runtime Linux.
+- Coverage diferencial exacta: `2786/3267 = 85,27701254973982246709519436792164064891 %`, calculada por inventario versionado y perfiles unitarios+tagged combinados sin redondeo. T1–T17 quedan `[x]`; `feature_list.json` permanece intacto y no hubo commit/push.
+## Feature 35 — review 2 rechazada (2026-10-27)
+
+- La revisión independiente cerró la reproducibilidad del gate PostgreSQL 16 y confirmó una cobertura diferencial de 2786/3267 (85,277 %).
+- Permanecen abiertos REV-1–REV-9: fidelidad de contratos consumer-owned, composición productiva íntegramente PostgreSQL, fronteras causales reales, fencing global, shutdown acotado, authority JIT en workers, compatibilidad binaria N/N+1, import/retention reales y retry/observabilidad productivos.
+- La feature permanece `in_progress`; se inicia una tercera iteración de implementación antes de solicitar una nueva revisión independiente.
+
+## Feature 35 — review 3 rechazada (2026-10-27)
+
+- Los gates mecánicos y PostgreSQL 16 continúan pasando; cobertura diferencial verificada por reviewer: 3058/3596 (85,0389 %).
+- La revisión detectó que el recorrido productivo aún delega en stores locales y ejecuta el efecto fuera del outbox, por lo que los componentes PostgreSQL aislados no forman todavía el control plane real.
+- También permanecen abiertos el fencing de stores de dominio, autoridad JIT efectiva, ownership de handlers durante shutdown, binarios N/N+1 reales, import tipado/materializado y controllers operacionales con retries/observabilidad.
+- La feature continúa `in_progress`; se inicia una cuarta iteración y no se hará commit ni push antes de aprobación independiente.
+
+## Feature 35 — remediación de review 2 iniciada (2026-10-27)
+
+- Se reabren T2–T17: aunque REV-10 conserva su cierre, cualquier cambio productivo invalida la evidencia final del gate y exige repetirla. T1 permanece cerrada porque el modelo base no fue cuestionado.
+- El primer bloque corrige la fidelidad de los contratos consumer-owned, su composición PostgreSQL real y la causalidad usada por producto; los bloques siguientes completan fencing/worker/lifecycle y, por último, migración/import/retention/observabilidad.
+- La corrección se limita a feature 35: `feature_list.json` permanece intacto y no se realizará commit ni push.
+
+## Feature 35 — review 2 remediada y preparada para review 3 (2026-10-27)
+
+- REV-1–REV-3: contracts consumer-owned recuperan CAS, claims, digests y scope; `DomainStores` compone todos los adapters PostgreSQL y el recorrido productivo confirma workflow+event+effect intent antes del efecto, con reopen del mismo run desde otro store PostgreSQL.
+- REV-4–REV-6: grants quedan ligados a epoch/digest, mutaciones productivas revalidan head/adapter/lease/fence/cancel revision, cutover archiva explícitamente y el worker usa envelope persistido más resolución secreta JIT. `Stop`/`JoinContext` queda acotado aun con handler no cooperativo.
+- REV-7–REV-9: tests N/N+1 usan manifests realmente distintos; freeze cubre todos los stores locales y exporta sus bytes reales; references alimentan retention; capacity/import/retention reintentan transacciones completas y `cmd` inyecta observabilidad content-free.
+- Pasan vet, compile-only, global normal/race, focal control-plane race ×20, focal GitHub distribuido race ×20, gate PostgreSQL 16.15 normal ×3/race/runtime Linux/coverage, `go mod verify` y seis cross-builds. Coverage diferencial exacta: `3057/3596 = 85,01112347052280311457174638487208008899 %`.
+- El gate eliminó distro, cluster, database y temporales propios; WSL quedó vacío. T1–T17 están `[x]`; `feature_list.json` permanece intacto y no hubo commit ni push.
+
+## Feature 35 — review 3 rechazada; remediación vertical iniciada (2026-10-27)
+
+- Se reabren T2–T17. La revisión confirma que los componentes PostgreSQL aislados no sustituyen aún los stores filesystem en el recorrido productivo y que el outbox no gobierna el efecto real.
+- La remediación reemplazará la composición local por puertos inyectados, hará que todo efecto salga exclusivamente de un claim outbox, propagará fencing a las mutaciones de dominio y corregirá ownership de handlers/JIT.
+- También exige binarios N/N+1 reales, import tipado y atómico, controllers operacionales, suites contractuales compartidas y auditoría AST feature-wide. `feature_list.json` permanece intacto; no habrá commit ni push.
+## 2026-10-27 — Feature 35 review 3 remediation: causal ingress and functional PostgreSQL runtime
+
+- Removed the synthetic `DomainStores.PrepareDispatch` workflow checkpoint. PostgreSQL ingress now commits the first immutable effect intent and outbox row in the same transaction as inbox, epoch/head, event, job, and authority grant; fault injection includes `ingress.after_effect`.
+- Added targeted `EffectOutbox.ClaimEffect` so a product worker cannot lease and strand unrelated effects while selecting its causal operation. Product execution still performs recover, exact claim, live load, heartbeat, reconcile, execute/retry, and confirm.
+- Added migration `0014_functional_runtime.sql` and PostgreSQL ports for functional artifacts, sanitized evidence, staged primaries, identity-attempt audit facts, provided-flow catalog, and canonical functional packages. Distributed composition injects these ports and no longer opens local functional artifact/evidence/state/package/catalog/attempt stores.
+- Workflow admission now creates its PostgreSQL backend epoch/head atomically. Workflow load/save/cancel/recovery lease operations and plan/executable/functional stores validate this adapter's active backend identity before mutation or use.
+- Verification during this block: `go test -p=1 ./...` passed.
+
+## 2026-10-27 — Feature 35 review 3 remediation: fencing, causal terminal and atomic freeze
+
+- PostgreSQL workflow composition no longer opens filesystem context or GitHub-context stores. Unsupported fixture/project-memory durability fails closed before opening local state instead of silently mixing backends.
+- Product approvals, environment/capacity, cleanup and functional mutations now lock and verify the active PostgreSQL backend head inside their transaction. Cleanup renewal/save also requires a live lease. Correction reserve/update uses bounded full-transaction retry plus active-root verification.
+- Added `ConfirmEffectAndJob`: the worker now confirms outbox receipt and the exact live queue terminal in one transaction. The scheduler's subsequent completion is an idempotent observation of that commit, closing the prior response-loss gap.
+- `FreezeLocalStores` now acquires the source-wide exclusion before reading, exports only a closed typed path allowlist and persists the frozen manifest without an intervening writable interval. Unknown files, including credential-shaped residual files, fail closed.
+- Added a real AST audit, `TestPersistentControlPlaneSystemicCommentsCoverDeclaredSymbols`, over all feature-owned production declarations. It replaces the previously cited unrelated test.
+- Fresh evidence: hermetic `go test -p=1 ./...` passes. The PostgreSQL 16 isolated gate passed after domain fencing; after adding the causal effect/job terminal, its first rerun exposed a stale test fixture that reused an already-leased job and is being corrected before the final matrix. T2–T17 remain open and the feature is not ready for review.
+
+## 2026-10-27 — Feature 35 review 3 remediation: operational scope and current gaps
+
+- The authenticated query and retention controllers are now product commands. Retention is project-scoped in its persistence port and SQL, authenticates before access, and no explicit policy still means no delete. Unit probes prove rejected authority never reaches storage.
+- Offline import reconciliation and source archival now use caller-independent but bounded contexts; a cancelled caller cannot leave an unknown commit unresolved forever.
+- Environment reserve and causal projection+event+job/outbox transitions now use full serializable transaction retry with the content-free observer, while retaining the post-commit unknown-outcome boundary.
+- The latest hermetic `go test -p=1 ./...` passes after these changes. T2–T17 remain open: actual typed materialization into consumer tables, complete shared local/PostgreSQL contract suites, and one end-to-end filesystem-removal restart gate are not yet demonstrated. The feature is not ready for review.
+
+## 2026-10-27 — Feature 35 review 3 remediation: full-transaction retries and homogeneous composition
+
+- Functional claim/renew, intent confirmation, terminal confirmation/reconciliation and journal append now retry the complete serializable transaction and emit only allowlisted observations. Cleanup reserve/claim/renew/save and cursor CAS use the same boundary; stale lease/fence/version checks remain inside the retried transaction.
+- PostgreSQL GitHub composition rejects optional preview, project-memory or contract-review integrations before opening any filesystem store when no PostgreSQL adapter exists for them. A product-composition test proves rejection leaves no `.featureproof` root.
+- The isolated PostgreSQL 16 gate passed after the retry conversion, including command composition, tagged adapter/integration matrix, approval shared contract and Linux runtime. No test database, distro or temporary cluster remained.
+- T2–T17 remain open for the three previously recorded architectural gaps; this entry does not claim final review readiness.
+
+## 2026-10-27 — Feature 35 review 3 remediation: writer/freeze exclusion
+
+- Replaced the check-only local import guard with `AcquireLocalImportWrite`: it acquires the same source-root cross-process lock as freeze, rereads state after lock acquisition and releases only its own random ownership token after durable publication.
+- Workflow, plan/executable artifacts, functional artifacts/evidence/catalog/packages, GitHub, environment, cleanup/capacity, correction, functional-flow and approval local writers now hold that exclusion across the actual mutation. Freeze cannot interleave between check and rename/fsync.
+- `TestLocalWriterHoldsFreezeExclusionThroughPublication` deterministically holds a writer, proves freeze cannot enter, publishes bytes, releases, and proves the subsequent frozen manifest contains them. All directly affected package suites pass.
+- Typed PostgreSQL materialization and the final vertical/shared-contract evidence remain open; no task status changed.
+
+## 2026-10-27 — Feature 35 review 3 remediation: shared consumer contracts
+
+- Added backend-neutral suites that execute unchanged against local and PostgreSQL implementations for functional claims/intents/events, environment lifecycle/events, cleanup leases/events/cursors, correction lineage/events, capacity reservation/confirmation/release, and workflow plan/executable material. The existing approval suite already exercises the same local/PostgreSQL contract.
+- The suites reopen independent PostgreSQL pools where durability is part of the port, and the PostgreSQL side reserves the real active backend head before every fenced domain operation. Capacity validation now uses one exported consumer-owned grammar in both adapters, avoiding a PostgreSQL-only acceptance path.
+- The PostgreSQL gate was made deterministic across packages with `-p=1`; a parallel run had exceeded the explicit five-second migration-lock budget even though no semantic test failed. The serial gate preserves concurrent migrator tests inside the owning suite.
+- Correction, environment and cleanup shared suites have passed on PostgreSQL 16.15. The current full gate rerun includes the newly added capacity and workflow-material suites. Typed import materialization and the single filesystem-removal vertical remain open; T2–T17 stay unchecked.
+
+## 2026-10-27 — Feature 35 review 3 remediation: shared-contract gate result
+
+- PostgreSQL 16.15 isolated gate passes with the new functional, environment, cleanup, correction, capacity and plan/executable shared suites. Workflow material fixtures now use the same canonical self-excluding artifact seal and private-envelope grammar as both product adapters.
+- Fresh hermetic evidence passes: `go test -p=1 -count=1 ./...`, `go vet ./...`, and `go test -race -count=20` over the shared contracts plus worker join using UCRT64 CGO. The gate created and removed only its UUID-owned WSL distro/cluster/database/root.
+- This closes the shared-suite portion of REV-3/REV-9, not the feature. Typed import materialization and the one vertical filesystem-removal continuation remain unsatisfied, so T2–T17 remain `[ ]` and no final coverage number is claimed.
+
+## 2026-10-27 — Feature 35 fourth iteration: typed import materialization started
+
+- Frozen local relations now retain a bounded reversible relative-path identity instead of an opaque path hash; unknown paths still fail the closed allowlist and no file contents or secret values enter relation metadata.
+- The import controller copies streams in explicit dependency order. PostgreSQL now decodes and validates real workflow checkpoints, replays their complete event journals, validates canonical plan artifacts and private executable envelopes, and materializes them into `workflow_runs`, `workflow_events`, `workflow_artifacts` and `workflow_executables` while the local epoch remains authoritative.
+- `VerifyImport` compares staged bytes against the materialized projection and every event before advancing to verified. `TestPostgresOfflineImportMaterializesWorkflowConsumers` exercises real local stores, authenticated controller, cutover and a fresh PostgreSQL pool; the isolated PostgreSQL 16.15 gate passes.
+- This is partial closure only. Approval, functional, environment/capacity, cleanup/cursors/ledger, correction, packages and GitHub/inbox materializers plus the complete vertical restart remain open; T2–T17 stay unchecked.
+## Feature 35 — import tipado, autoridad diferida (2026-10-27)
+
+- El snapshot de `functionalflow` verifica su MAC con la clave privada únicamente en el origen congelado, elimina claims efímeros y emite un DTO canónico sin clave ni MAC; estado alterado o clave incorrecta falla cerrado.
+- El import de approvals reconstruye y proyecta el journal confirmado; una request pendiente cuyo material ejecutable no existe en el formato local bloquea el cutover en vez de inventar autoridad.
+- `SaveImportPage` vuelve a ser staging puro. `VerifyImport` prueba materialización y relaciones dentro de un savepoint revertido; la materialización definitiva se mueve a la misma transacción CAS que publica epoch/head y receipt, evitando autoridad PostgreSQL antes del cutover.
+- Se añadió materialización tipada inicial de functional intents/terminals/events, approvals y environment records/events, además de workflow/artifact/executable ya existentes. Tests focales de controlplane, environment y adapters pasan.
+- T2–T17 continúan abiertas: cleanup/capacity usan receipts/anchors consumer-owned, correction usa journals derivados y packages/GitHub requieren exporters propios; no se aceptará parseo raw que omita su verificación.
+- Mientras esos exporters no existan, `VerifyImport` rechaza explícitamente los streams capacity/cleanup/correction/packages/GitHub; ningún caso sin materializador puede caer por defecto y publicar un backend parcial.
+
+## Feature 35 — agregación tipada y journals materializados (2026-10-27)
+
+- `LocalImportStore` acepta exporters consumer-owned bajo la exclusión global y excluye sus paths reclamados del walk raw; paths fuera del root, streams abiertos y DTOs inválidos fallan cerrado.
+- El comando productivo registra exporters de cleanup/capacity, correction, GitHub y packages. Correction reconstruye journals con su projector; GitHub conserva solo eventos allowlisted; packages se verifican y se ligan a la nueva epoch PostgreSQL dentro de la misma transacción de cutover.
+- Se añadió materialización y verificación PostgreSQL para correction y GitHub, además de una migración expand para el audit journal de GitHub. Una prueba PostgreSQL elimina por completo el filesystem tras cutover y reabre correction/GitHub desde un pool nuevo.
+- Pasan suite global serial, vet, diff check salvo advertencias CRLF preexistentes y gate aislado PostgreSQL 16.15. T2–T17 continúan abiertas hasta completar la vertical productiva íntegra y repetir race/coverage final.
+
+## Feature 35 — vertical productiva PostgreSQL y contexto durable (2026-10-28)
+
+- Se añadió una vertical productiva real: el primer proceso compone el workflow PostgreSQL, genera el plan y se detiene en aprobación; tras cerrar su pool y eliminar `.featureproof`, un segundo proceso/pool recupera la aprobación y completa identidad JIT, environment, functional-flow y package exclusivamente desde PostgreSQL.
+- La vertical descubrió que context assembly seguía usando `MemoryStore` en modo distribuido. Se añadió `PostgresContextStore`, la migración `0016_context_store.sql`, fencing por backend activo y composición directa de snapshots/bindings; la recuperación deja de fallar con `stale_context`.
+- El gate PostgreSQL 16.15 pasa normal ×3 y race para la nueva vertical, además del runtime Linux y la matriz de adapters. Suite global serial, vet, compile-only, formato y diff-check pasan.
+- La auditoría diferencial vigente falla honestamente: `4261/5882 = 72,44134648078885 %`. Los exporters/materializadores añadidos en la cuarta iteración ampliaron el inventario sin tests suficientes; T2–T17 permanecen `[ ]` y no se solicita review.
+
+## Feature 35 — cierre de la vertical productiva y gates finales (2026-10-28)
+
+- La vertical `TestPostgresProductWorkflowContinuesAfterFilesystemRemoval` ya cubre dos procesos/runtimes y pools distintos: admisión hasta approval, shutdown, eliminación del root local y continuación desde `ClaimOutbox` por capability JIT, environment/capacity, execution, cleanup, correction, package/publication, reconciliation y retention/references exclusivamente PostgreSQL.
+- El import productivo agrega exporters consumer-owned bajo freeze y materializa/verifica workflow/materiales, approval, functional, environment, cleanup/capacity, correction, packages y GitHub en el cutover. Se añadieron shared contracts, negativos, corrupción y fault injection sobre cada frontera; ningún test abre un `LocalStore` tras retirar el filesystem.
+- El gate definitivo pasa PostgreSQL 16.15 normal ×3, tagged race, runtime Linux hermético/tagged y cobertura diferencial exacta `5007/5885 = 85,08071367884451996601529311809685641461 %`. También pasan vet, compile-only, suite global serial, global race, focal race ×20, comentarios AST, `go mod verify`, formato/diff y seis cross-builds Windows/Linux/Darwin amd64/arm64.
+- Database, distro WSL, cluster, roots temporales y perfiles diagnósticos propios fueron eliminados. `feature_list.json` no cambió; T2–T17 se marcan `[x]` y se solicita review mediante `progress/persistent-control-plane/implementation.md`.
+## Feature 35 — review 4 rechazada (2026-10-28)
+
+- La revisión independiente confirma que composición PostgreSQL, outbox/JIT aislado, lifecycle, contratos compartidos, binarios N/N+1, gate PostgreSQL 16 y cobertura superior al 85 % ya pasan.
+- Permanecen cinco bloqueos: la vertical no atraviesa realmente el worker/outbox productivo completo; las mutaciones no presentan explícitamente epoch/digest; import no compara todos los streams contra sus tablas consumidoras; retention no recibe referencias de writers productivos; y la auditoría de comentarios no cubre todo el diff.
+- La cifra reproducida por el reviewer es 5008/5885 (85,097706 %). La feature continúa `in_progress`, T2–T17 se reabren y no habrá commit/push antes de una nueva aprobación independiente.
+
+
+## Feature 35 — Review 4 remediation in progress (2026-10-28)
+
+- Reopened T2–T17 after REV-1..REV-5. Removed process-memory `sessionBindings`; workflow composition now captures an immutable PostgreSQL backend coordinate at read/prepare and every fenced mutation compares it with the locked head. The PostgreSQL cutover test presents epoch N only after cutover and proves rejection before a freshly bound N+1 context progresses.
+- `VerifyImport` now requires an exact allowlisted manifest/staging set, rejects opaque relations, materializes packages with candidate authority, projects GitHub delivery receipts into the productive inbox, compares cleanup/capacity/package/GitHub projections, and revalidates all materialized rows inside the cutover transaction.
+- Added causal retention references in workflow, environment/capacity, cleanup, correction, fixture and package writers; workflow terminal closure retires the complete originating-job graph in the same transaction.
+- Replaced the direct-service pseudo vertical with `TestPostgresProductRuntimeContinuesOnlyThroughDurableWorker`: process N enters through signed GitHub webhook and productive scheduler/JIT/outbox, stops at durable approval, closes runtime/pools and loses `.featureproof`; process N+1 reopens PostgreSQL, receives approval through a second signed webhook and the same worker/outbox path, then executes fixture create, functional request, fixture cleanup and PostgreSQL package publication. The test asserts two confirmed effects, one package, closed retention and no recreated filesystem state.
+- Added PostgreSQL fixture state/evidence/event persistence and wired it into the backend-homogeneous workflow graph; no fixture file store, evidence file, observer journal or local fixture authority is opened in PostgreSQL composition.
+- The R16 AST audit now derives all changed and untracked Go files directly from the Git diff, including commands, production, tests and contract suites, and rejects undocumented functions, methods, helpers, entities, constants and package variables. Global `go test -p=1 -count=1 ./...` passes after these changes; full race/PG16/coverage gates remain pending.
+
+## Feature 35 — Review 4 remediation complete (2026-10-28)
+
+- The single product vertical now starts the signed GitHub runtime twice, crosses durable approval only through queue/JIT/outbox, blocks the real target effect to observe live causal references, performs fixture create/execution/cleanup, package/publication and closes every reference without recreating `.featureproof`.
+- Immutable backend coordinates replace process-memory session authority. Post-cutover mutations require the coordinate captured at prepare/read time; the stale first mutation under epoch N is rejected and a newly composed N+1 adapter progresses.
+- Offline verification requires an exact closed stream set and compares cleanup, capacity, packages and productive GitHub inbox receipts. Explicit negatives cover an undeclared stream, package `ON CONFLICT` divergence and incompatible GitHub redelivery.
+- Workflow, environment, both capacity ledgers, cleanup, correction, fixture and package writers maintain retention references causally. The full diff comment audit includes production, commands, tests and contract suites.
+- Final gates pass: global serial, vet, compile-only, global/focal race, six cross-builds and PostgreSQL 16.15 Repeat=3 + race + Linux runtime. Differential coverage is exactly `5233/6154 = 85.03412414689632759181020474488137796555%`. T2–T17 are closed; no feature-list, commit or push action was performed.
+## Feature 35 — review 5 rechazada (2026-10-28)
+
+- La revisión independiente valida la vertical productiva real, outbox/JIT, writers de retention, lifecycle, contratos y gates PostgreSQL/race.
+- Quedan tres bloqueos focales: captura de coordenada separada del `Load`, relaciones desconocidas aceptadas dentro de streams import permitidos y auditoría AST sin variables locales.
+- La cobertura reproducida fue 5234/6154 (85,0503737 %), un statement distinta del informe; se exige estabilizar la medición. La feature sigue `in_progress` sin commit/push.
+
+## Feature 35 — remediación review 5 completa (2026-10-28)
+
+- La autoridad consumer-owned se captura atómicamente con `ReserveBound` o
+  `LoadBound`; ninguna mutación PostgreSQL, incluida epoch 1, admite un contexto
+  sin identidad/epoch/digest. Los casos productivos Decide, Cancel y Recover
+  rechazan la primera escritura si hubo cutover y progresan tras releer N+1.
+- El import aplica un allowlist exacto por stream/relación/formato y falla antes
+  de verificar o cortar ante cualquier relación opaca. La auditoría R16 recorre
+  todo el AST añadido del diff, incluidas variables locales, range, parámetros,
+  receivers y helpers de test.
+- El gate mide cobertura en una base PostgreSQL limpia separada. Dos mediciones
+  consecutivas fueron idénticas: `5297/6223 =
+  85.11971717820986662381488028282179013338%`. Global normal/race, focal race,
+  vet, compile, cross-builds y PostgreSQL 16 Repeat=3/race/runtime pasan. T4,
+  T15 y T17 vuelven a `[x]`; no hubo cambios de feature_list, commit ni push.
+
+## Feature 35 — review 6 rechazada (2026-10-28)
+
+- Se reabren T6, T15 y T17 por el flake del journal funcional durable, la
+  gramática incompleta de rutas de import y la aceptación de 3539 comentarios
+  boilerplate por la auditoría R16.
+- La remediación preservará fencing estricto: mismo claim token vivo y CAS
+  causal para intent, progress, renew y terminal; allowlist exacto por root y
+  componentes; comentarios individuales con responsabilidad o invariante real.
+## Feature 35 — review 6 rechazada (2026-10-28)
+
+- El reviewer valida autoridad atómica, vertical productiva, retention y cobertura determinista 5297/6223 (85,1197 %).
+- Restan tres bloqueos: flake reproducible del executor funcional con claims, gramática de rutas import aún demasiado permisiva y 3539 comentarios locales con plantilla genérica sin contexto sistémico.
+- La feature continúa `in_progress`; se corrigen estos puntos y se repetirán las suites normales/focales antes de otra revisión. No commit/push.
+
+## Feature 35 — remediación de review 6 completa (2026-10-29)
+
+- T6 vuelve a `[x]`: el executor propaga el claim vivo más reciente por todos
+  los CAS causales y conserva token/revisión/lease entre progress, renovación y
+  terminal. La reconstrucción fsync-backed pasa ×100 y el conjunto focal pasa
+  race ×20.
+- T15 vuelve a `[x]`: la gramática de import exige root, componentes, IDs y
+  schema exactos por stream/relation; la matriz negativa incluye cruces entre
+  streams, roots parecidos, traversal y componentes extra.
+- R16 rechaza las familias de comentarios boilerplate observadas en review 6 y
+  el diff usa responsabilidades e invariantes concretas. T17 vuelve a `[x]`
+  tras global normal/race, PostgreSQL 16.15 Repeat=3/race/runtime/coverage,
+  seis cross-builds y cleanup smoke.
+- Coverage diferencial exacta: `5404/6356 =
+  85.02202643171806167400881057268722466960%`. El gate normaliza salida WSL
+  NUL-padded y reintenta el cleanup UUID-owned; la auditoría final encuentra
+  cero distros, roots y profiles temporales. `feature_list.json` permanece
+  intacto; no hubo commit ni push.
+## Feature 35 — review 7 rechazada (2026-10-29)
+
+- Se validan definitivamente claim funcional, gramática cerrada de import, autoridad atómica, vertical productiva y retention.
+- Quedan dos bloqueos: timeout/flaky completion de la vertical durante coverage `-count=3` y nuevas familias masivas de comentarios generados que siguen sin aportar responsabilidad sistémica concreta.
+- T17 se reabre; la feature continúa `in_progress` y sin commit/push.
+
+## Feature 35 — remediación review 7 (2026-10-29)
+
+- La vertical PostgreSQL ya no observa fases mediante sleeps/polling: espera
+  notificaciones ligadas a proyecciones durables, owner liberado y receipts de
+  outbox terminales, todo bajo deadlines explícitos. El diagnóstico reprodujo
+  dos carreras reales: cierre antes de `ReleaseOwner` y cierre antes de confirmar
+  el dispatch inicial. Ambas quedaron cercadas por barreras durables.
+- La rama de error de `CutoverImport` dejó de cubrirse accidentalmente por una
+  carrera entre imports. Un caso determinista verifica que un import validado
+  sin binding head no puede adquirir autoridad.
+- Se eliminaron las familias de comentarios denunciadas. El auditor normaliza
+  identificadores, nombres de función, literales y CamelCase sobre todo el diff;
+  su fixture interpolada demuestra que una plantilla no evade el detector.
+- Se revisó manualmente al menos una declaración añadida en cada uno de los 181
+  archivos Go del diff (113 producción y 68 tests), comprobando consumidor,
+  ownership/fence/durabilidad o invariante concreto. Los focos incluyeron
+  scheduler/outbox, import/cutover/retention, functional flow, GitHub PR,
+  preview environments y validation workflow.
+- Dos gates completos consecutivos (`Repeat=3`, race, runtime Linux y coverage)
+  terminaron con el mismo resultado exacto: `5405/6356 =
+  85.03775959723096286972938955317809943361%`. También pasan global normal,
+  global race serial, vet, compile-only, `go mod verify`, gofmt y los seis
+  cross-builds. T17 vuelve a `[x]`; `feature_list.json` permanece intacto y no
+  hubo commit ni push.
+## Feature 35 — review 8 rechazada (2026-10-29)
+
+- El timeout de coverage queda cerrado y el gate PostgreSQL termina; persiste una rama de cobertura variable (5405/6356 frente a 5406/6356) y quedó un perfil `block` residual.
+- R16 sigue produciendo familias de comentarios falsamente sistémicos. La exigencia de comentar cada variable local contradice la convención original solicitada para entidades y funciones y ha degradado legibilidad.
+- Se separa la corrección técnica de coverage de una propuesta de enmienda mínima de R16, que requerirá aprobación humana SDD antes de retirar el ruido documental.
+
+## Feature 35 — enmienda R16 aprobada (2026-10-29)
+
+- El usuario aprobó explícitamente `r16-comment-scope` a las `2026-10-29T15:47:22+01:00`.
+- La convención vuelve al alcance original: entidades/tipos, funciones, métodos, helpers y símbolos de paquete no evidentes; los locales triviales no reciben comentarios mecánicos.
+- Se reanuda T18 para retirar el ruido documental, conservar comentarios puntuales de autoridad/fencing/durabilidad/ownership y repetir los gates antes de review.
+
+## Feature 35 — enmienda R16 implementada y review 8 remediada (2026-10-29)
+
+- T18 queda cerrada: se retiraron comentarios mecánicos de locales, parámetros,
+  receivers triviales y familias boilerplate; la auditoría del diff completo
+  conserva el alcance aprobado y rechaza paráfrasis/familias interpoladas.
+- La cobertura deja de depender de la carrera de cancelación en
+  `verifyActiveJobTx`: una transacción ya abierta cubre de forma determinista la
+  rama de error. Dos gates completos consecutivos compararon dos perfiles en dos
+  bases aisladas y dieron exactamente `5406/6356 =
+  85.05349276274386406544996853366897419761%`.
+- Pasan global serial/race, focal race ×20, vet, compile-only, los seis
+  cross-builds, PostgreSQL 16 Repeat=3/race/Linux/coverage, gofmt, mod verify y
+  diff audit. Cleanup final: cero distros WSL, roots del gate y perfiles
+  `.cover`/`block`. Feature 35 vuelve a `ready_for_review`; sin tocar
+  `feature_list.json`, commit ni push.
+## Feature 35 — review 9 rechazada (2026-10-29)
+
+- La enmienda R16 y la limpieza documental quedan aprobadas técnicamente.
+- Restan dos gates objetivos: dos subtests de release de environment agotan una espera temporal solo bajo coverage `-count=3`, y `gofmt -l .` lista 53 archivos con CRLF.
+- T17/T18 se reabren para sustituir la espera por una condición observable y normalizar únicamente los Go afectados antes de repetir el gate completo.
+
+## Feature 35 — remediación review 9 (2026-10-29)
+
+- El cleanup desacoplado usa el lease validado como límite de la secuencia
+  durable completa y conserva límites propios para reconcile y release. La
+  matriz contractual de environment pasa en el coverage exacto `-count=3`
+  (88.0%) y en repetición ampliada `-count=10`, sin ampliar timeouts ni reducir
+  inventario.
+- Se aplicó `gofmt` solo a los 53 archivos Go ya afectados por la feature;
+  `gofmt -l .` queda vacío.
+- Pasan global serial/race, vet, compile-only, `go mod verify`, seis
+  cross-builds y el gate PostgreSQL 16 con `Repeat=3`, race, runtime Linux y
+  dos perfiles idénticos. Cobertura exacta: `5420/6370 =
+  85.08634222919937205651491365777080062794%`.
+- T17/T18 vuelven a `[x]`; el cleanup no deja distros WSL, roots ni perfiles
+  temporales. `feature_list.json` permanece intacto; no hubo commit ni push.
+## Feature 35 — cierre aprobado (2026-10-29)
+
+- La review independiente 10 aprobó R1–R16 y T1–T18, incluida la enmienda R16.
+- Gates finales: global serial/race, vet, compile-only, gofmt, seis cross-builds y PostgreSQL 16.15 normal/race/runtime/coverage.
+- Cobertura diferencial: `5420/6370 = 85,08634222919937205651491365777080062794 %`; cleanup sin residuos.
+- El leader cambia feature 35 a `done` y registra el cierre append-only en `progress/history.md`.
+

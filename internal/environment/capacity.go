@@ -108,7 +108,7 @@ func (a *MemoryCapacityAdmission) Confirm(ctx context.Context, receipt CapacityR
 	if err := ctx.Err(); err != nil {
 		return CapacityReceipt{}, err
 	}
-	if !digestPattern.MatchString(environment) || !digestPattern.MatchString(resource) {
+	if !ValidCapacityProviderIdentity(environment, resource) {
 		return CapacityReceipt{}, &Error{Category: CategoryIntegrity, Operation: "capacity_confirm"}
 	}
 	a.mu.Lock()
@@ -130,7 +130,7 @@ func (a *MemoryCapacityAdmission) Release(ctx context.Context, receipt CapacityR
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !safeID.MatchString(cleanupID) || !digestPattern.MatchString(confirmation) {
+	if !ValidCapacityReleaseInput(cleanupID, confirmation) {
 		return &Error{Category: CategoryIntegrity, Operation: "capacity_release"}
 	}
 	a.mu.Lock()
@@ -151,6 +151,23 @@ func (a *MemoryCapacityAdmission) Release(ctx context.Context, receipt CapacityR
 // capacityReleaseConfirmation binds one absence proof to cleanup identity, provider identity, and receipt authority.
 func capacityReleaseConfirmation(cleanupID, environment, resource, receiptID string) string {
 	return stableKey("capacity-release", cleanupID, environment, resource, receiptID)
+}
+
+// CapacityReleaseConfirmation lets persistence adapters verify the same consumer-owned absence proof as the in-memory admission implementation.
+func CapacityReleaseConfirmation(cleanupID, environment, resource, receiptID string) string {
+	return capacityReleaseConfirmation(cleanupID, environment, resource, receiptID)
+}
+
+// ValidCapacityProviderIdentity applies the consumer-owned digest grammar at
+// every in-memory or persistent admission boundary.
+func ValidCapacityProviderIdentity(environment, resource string) bool {
+	return digestPattern.MatchString(environment) && digestPattern.MatchString(resource)
+}
+
+// ValidCapacityReleaseInput applies the consumer-owned cleanup and proof
+// grammar before a backend can mutate quota state.
+func ValidCapacityReleaseInput(cleanupID, confirmation string) bool {
+	return safeID.MatchString(cleanupID) && digestPattern.MatchString(confirmation)
 }
 
 // addResourceDemand performs overflow-safe vector addition.

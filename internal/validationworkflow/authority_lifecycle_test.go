@@ -114,6 +114,7 @@ func authorityLifecycleFixture(t *testing.T) (*Service, *authorityTrackingFlow, 
 	service.deps.FunctionalFlow = flow
 	service.deps.FlowAuthority = flow
 	service.deps.FixturePackages = fakePackages{}
+	service.config.FinalizeTimeout = 10 * time.Second
 	return service, flow, store, clock
 }
 

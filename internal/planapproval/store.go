@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/asierhr/featureProof/internal/agentplanning"
+	"github.com/asierhr/featureProof/internal/controlplane"
 	"github.com/asierhr/featureProof/internal/harness"
 )
 
@@ -28,7 +29,7 @@ type approvalRequest struct {
 
 // ApprovalStore owns per-run ordering, idempotency and private request snapshots.
 type ApprovalStore interface {
-	BindRun(*harness.Run) (*runLifecycle, error)
+	BindRun(context.Context, *harness.Run) (*runLifecycle, error)
 	Events(context.Context, string) ([]ApprovalEvent, error)
 	Request(context.Context, string, uint64) (approvalRequest, error)
 	SaveRequest(context.Context, approvalRequest) error
@@ -108,7 +109,7 @@ func NewMemoryStore() *MemoryStore {
 }
 
 // BindRun registers the sole aggregate identity allowed to observe and mutate one journal partition.
-func (s *MemoryStore) BindRun(run *harness.Run) (*runLifecycle, error) {
+func (s *MemoryStore) BindRun(_ context.Context, run *harness.Run) (*runLifecycle, error) {
 	if run == nil || !safeRunID.MatchString(run.ID) {
 		return nil, typedError(CategoryInvalidInput, "bind_run", "run", nil)
 	}
@@ -211,6 +212,7 @@ func (s *MemoryStore) CompareAndAppend(ctx context.Context, runID string, expect
 	return cloneEvent(event), false, nil
 }
 
+// safeRunID bounds durable approval stream identities before filesystem or SQL use.
 var safeRunID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 // LocalStore persists append-only event streams with fsync while delegating atomic in-process CAS to partitions.
@@ -404,8 +406,8 @@ func (s *LocalStore) loadJournal(ctx context.Context, path string) ([]ApprovalEv
 }
 
 // BindRun shares the same lifecycle owner across every local-store handle for one root and run ID.
-func (s *LocalStore) BindRun(run *harness.Run) (*runLifecycle, error) {
-	return s.backend.memory.BindRun(run)
+func (s *LocalStore) BindRun(ctx context.Context, run *harness.Run) (*runLifecycle, error) {
+	return s.backend.memory.BindRun(ctx, run)
 }
 
 // RestoreRun returns the exact shared aggregate identity, rebuilding its projected status after process restart.
@@ -444,7 +446,7 @@ func (s *LocalStore) RestoreRun(ctx context.Context, runID string) (*harness.Run
 			return nil, err
 		}
 	}
-	if _, err = s.backend.memory.BindRun(run); err != nil {
+	if _, err = s.backend.memory.BindRun(ctx, run); err != nil {
 		return nil, err
 	}
 	return run, nil
@@ -499,8 +501,12 @@ func (s *LocalStore) Request(ctx context.Context, runID string, revision uint64)
 	return cloneRequest(request), nil
 }
 
-// SaveRequest atomically persists sanitized recovery material and keeps raw executable snapshots process-private.
 func (s *LocalStore) SaveRequest(ctx context.Context, request approvalRequest) error {
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(ctx, s.root)
+	if err != nil {
+		return typedError(CategoryRevisionConflict, "save_request", "offline_import_freeze", err)
+	}
+	defer releaseImportWrite()
 	if err := s.ensureLoaded(ctx, request.runID); err != nil {
 		return err
 	}
@@ -547,6 +553,11 @@ func (s *LocalStore) requestPath(runID string, revision uint64) string {
 
 // CompareAndAppend persists the event under the run partition lock before exposing it as confirmed.
 func (s *LocalStore) CompareAndAppend(ctx context.Context, runID string, expectedSequence uint64, decisionID string, event ApprovalEvent) (ApprovalEvent, bool, error) {
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(ctx, s.root)
+	if err != nil {
+		return ApprovalEvent{}, false, typedError(CategoryRevisionConflict, "append", "offline_import_freeze", err)
+	}
+	defer releaseImportWrite()
 	if err := s.ensureLoaded(ctx, runID); err != nil {
 		return ApprovalEvent{}, false, err
 	}

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"github.com/asierhr/featureProof/internal/controlplane"
 )
 
 // LocalExecutableStore owns private unredacted plans needed to resume an already-confirmed generation.
@@ -25,6 +27,11 @@ func (s *LocalExecutableStore) Commit(ctx context.Context, handle string, materi
 	if ctx.Err() != nil || !validExecutableMaterial(handle, material) {
 		return &Error{Code: CodeInvalid, Operation: "executable_commit"}
 	}
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(ctx, s.root)
+	if err != nil {
+		return &Error{Code: CodeUnavailable, Operation: "executable_frozen"}
+	}
+	defer releaseImportWrite()
 	raw, err := json.Marshal(material)
 	if err != nil {
 		return &Error{Code: CodeInternal, Operation: "executable_commit"}
@@ -82,7 +89,12 @@ func (s *LocalExecutableStore) Delete(ctx context.Context, handle string) error 
 	if ctx.Err() != nil || !safeID.MatchString(handle) {
 		return &Error{Code: CodeInvalid, Operation: "executable_delete"}
 	}
-	err := os.Remove(filepath.Join(s.root, handle+".private.json"))
+	releaseImportWrite, err := controlplane.AcquireLocalImportWrite(ctx, s.root)
+	if err != nil {
+		return &Error{Code: CodeUnavailable, Operation: "executable_frozen"}
+	}
+	defer releaseImportWrite()
+	err = os.Remove(filepath.Join(s.root, handle+".private.json"))
 	if err != nil && !os.IsNotExist(err) {
 		return &Error{Code: CodeUnavailable, Operation: "executable_delete"}
 	}
@@ -92,4 +104,10 @@ func (s *LocalExecutableStore) Delete(ctx context.Context, handle string) error 
 // validExecutableMaterial validates the closed private envelope without exposing its values.
 func validExecutableMaterial(handle string, material ExecutableMaterial) bool {
 	return material.Version == ArtifactVersion && material.WorkflowID == handle && len(material.ArtifactSHA256) == 64 && len(material.ContextDigest) == 64 && len(material.RevisionDigest) == 64 && len(material.TargetDigest) == 64 && material.Snapshot.ID != "" && len(material.Snapshot.Checks) > 0 && len(material.CommitmentKey) == 32
+}
+
+// ValidExecutableMaterialForStore exposes the private-envelope grammar to
+// persistence adapters while keeping commitment bytes behind the port.
+func ValidExecutableMaterialForStore(handle string, material ExecutableMaterial) bool {
+	return validExecutableMaterial(handle, material)
 }

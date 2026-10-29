@@ -56,6 +56,171 @@ type renewalFailureIntents struct {
 	failAt, calls int
 }
 
+// selectiveJournal fails one named causal checkpoint while accepting every
+// earlier append, allowing each executor boundary to be tested independently.
+type selectiveJournal struct{ failType string }
+
+// AppendEvent rejects only the configured event type.
+func (journal selectiveJournal) AppendEvent(_ context.Context, event Event) (Event, error) {
+	if event.Type == journal.failType {
+		return Event{}, errors.New("journal unavailable")
+	}
+	return event, nil
+}
+
+// Events returns no prior terminals for fresh fault-injection executions.
+func (selectiveJournal) Events(context.Context, string) ([]Event, error) { return nil, nil }
+
+// rejectingBinding injects authority loss immediately before tool execution.
+type rejectingBinding struct{}
+
+// Revalidate rejects the bound operation without opening external I/O.
+func (rejectingBinding) Revalidate(context.Context, string, BoundStep) error {
+	return errors.New("binding revoked")
+}
+
+// rejectingAssertions injects deterministic evaluator failure after evidence persistence.
+type rejectingAssertions struct{}
+
+// Evaluate rejects confirmed evidence to exercise the integrity boundary.
+func (rejectingAssertions) Evaluate(context.Context, []planning.AssertionDeclaration, Evidence) ([]planning.AssertionResult, error) {
+	return nil, errors.New("assertion evaluator unavailable")
+}
+
+// rejectingEvidence injects either a persistence error or an invalid returned record.
+type rejectingEvidence struct{ invalid bool }
+
+// Confirm returns the selected evidence failure mode.
+func (sink rejectingEvidence) Confirm(_ context.Context, evidence Evidence) (Evidence, error) {
+	if sink.invalid {
+		evidence.Digest = "invalid"
+		return evidence, nil
+	}
+	return Evidence{}, errors.New("evidence unavailable")
+}
+
+// Load is unreachable because both confirmation modes stop the executor first.
+func (rejectingEvidence) Load(context.Context, string) (Evidence, error) {
+	return Evidence{}, errors.New("unexpected evidence load")
+}
+
+// rejectingProgressStore fails the selected started or evidence intent transition.
+type rejectingProgressStore struct {
+	*memoryIntents
+	failEvidence bool
+}
+
+// rejectingTerminalStore injects a fenced terminal CAS failure after input resolution.
+type rejectingTerminalStore struct{ *memoryIntents }
+
+// ConfirmTerminal refuses the terminal while preserving the active claim.
+func (rejectingTerminalStore) ConfirmTerminal(context.Context, StepRecord) error {
+	return errors.New("terminal unavailable")
+}
+
+// ConfirmIntent rejects only the selected causal action progress checkpoint.
+func (store *rejectingProgressStore) ConfirmIntent(ctx context.Context, intent Intent) error {
+	if intent.EffectStarted && (intent.EvidenceID != "") == store.failEvidence {
+		return errors.New("intent progress unavailable")
+	}
+	return store.memoryIntents.ConfirmIntent(ctx, intent)
+}
+
+// rejectingWaiter injects cancellation between retry attempts.
+type rejectingWaiter struct{}
+
+// Wait refuses the retry delay without sleeping.
+func (rejectingWaiter) Wait(context.Context, time.Duration) error {
+	return context.Canceled
+}
+
+// tracedLeaseStore wraps the real durable store and rejects any executor call
+// that presents an older lease snapshot after a successful renewal.
+type tracedLeaseStore struct {
+	IntentStore
+	clock  *advancingFlowClock
+	mu     sync.Mutex
+	claims map[string]Claim
+	trace  []string
+}
+
+// Claim records the exact token and expiry returned by the production store.
+func (s *tracedLeaseStore) Claim(ctx context.Context, runID string, revision uint64, stepID, owner string) (Claim, bool, error) {
+	claim, acquired, err := s.IntentStore.Claim(ctx, runID, revision, stepID, owner)
+	if err == nil && acquired {
+		s.mu.Lock()
+		s.claims[stateKey(runID, revision, stepID)] = claim
+		s.trace = append(s.trace, "claim:"+stepID+":"+claim.Token)
+		s.mu.Unlock()
+	}
+	return claim, acquired, err
+}
+
+// RenewClaim enforces propagation of the latest expiry while preserving the
+// immutable token across a deterministic clock advance.
+func (s *tracedLeaseStore) RenewClaim(ctx context.Context, runID string, revision uint64, stepID string, claim Claim) (Claim, error) {
+	key := stateKey(runID, revision, stepID)
+	s.mu.Lock()
+	current := s.claims[key]
+	s.mu.Unlock()
+	if claim != current {
+		return Claim{}, errors.New("stale lease snapshot")
+	}
+	s.clock.Advance(time.Second)
+	renewed, err := s.IntentStore.RenewClaim(ctx, runID, revision, stepID, claim)
+	if err != nil {
+		return Claim{}, err
+	}
+	if renewed.Token != claim.Token || renewed.Owner != claim.Owner || !renewed.ExpiresAt.After(claim.ExpiresAt) {
+		return Claim{}, errors.New("renewal changed authority or failed to extend expiry")
+	}
+	s.mu.Lock()
+	s.claims[key] = renewed
+	s.trace = append(s.trace, "renew:"+stepID+":"+renewed.Token)
+	s.mu.Unlock()
+	return renewed, nil
+}
+
+// ConfirmIntent proves each prepared or progressed action uses the currently
+// live claim token before delegating the durable CAS.
+func (s *tracedLeaseStore) ConfirmIntent(ctx context.Context, intent Intent) error {
+	key := stateKey(intent.RunID, intent.Revision, intent.StepID)
+	s.mu.Lock()
+	current := s.claims[key]
+	phase := "prepared"
+	if intent.EvidenceID != "" {
+		phase = "evidence"
+	} else if intent.EffectStarted {
+		phase = "started"
+	}
+	s.trace = append(s.trace, "intent:"+intent.StepID+":"+phase+":"+intent.ClaimToken)
+	s.mu.Unlock()
+	if intent.ClaimToken != current.Token {
+		return errors.New("intent used stale claim token")
+	}
+	return s.IntentStore.ConfirmIntent(ctx, intent)
+}
+
+// ConfirmTerminal requires the newest live claim snapshot's token and records
+// the terminal boundary before releasing the wrapper's ownership view.
+func (s *tracedLeaseStore) ConfirmTerminal(ctx context.Context, record StepRecord) error {
+	key := stateKey(record.RunID, record.Revision, record.StepID)
+	s.mu.Lock()
+	current := s.claims[key]
+	s.trace = append(s.trace, "terminal:"+record.StepID+":"+record.ClaimToken)
+	s.mu.Unlock()
+	if record.ClaimToken != current.Token {
+		return errors.New("terminal used stale claim token")
+	}
+	if err := s.IntentStore.ConfirmTerminal(ctx, record); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	delete(s.claims, key)
+	s.mu.Unlock()
+	return nil
+}
+
 // RenewClaim fails only the selected call and delegates every other renewal.
 func (s *renewalFailureIntents) RenewClaim(ctx context.Context, runID string, revision uint64, stepID string, claim Claim) (Claim, error) {
 	s.calls++
@@ -97,7 +262,7 @@ func (m *memoryIntents) Claim(_ context.Context, runID string, revision uint64, 
 	return Claim{Owner: owner, Token: "claim:" + key, ExpiresAt: time.Unix(10_000, 0)}, true, nil
 }
 
-// RenewClaim retains the same in-memory token while extending its deterministic test lease.
+// RenewClaim extends only the currently owned in-memory lease and preserves its fencing token for executor tests.
 func (m *memoryIntents) RenewClaim(_ context.Context, runID string, revision uint64, stepID string, claim Claim) (Claim, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -519,13 +684,19 @@ func TestDurableJournalReconstructsRealExecution(t *testing.T) {
 	appendEvent(Event{Type: "fixtures_terminal", Status: string(fixture.PreparationPrepared)})
 	evidence := &memoryEvidence{values: map[string]Evidence{}}
 	tool := &scriptedTool{outputs: map[string]any{"before": map[string]any{"ok": true, "value": "old"}, "act": map[string]any{"ok": true}, "after": map[string]any{"ok": true, "value": "new"}}, transient: map[string]int{}}
-	executor := &Executor{Authority: authority, Clock: clock, Policy: allowPolicy{}, Revalidator: allowBinding{}, Tool: tool, Evidence: evidence, Assertions: deterministicAssertions{}, State: state, Journal: state, Keys: stableKeys{}, Waiter: immediateWaiter{}, Config: ExecutionConfig{Owner: "owner", MaxCalls: 10, MaxRetries: 0, MaxWork: 100, StepTimeout: time.Second, RunTimeout: 10 * time.Second, ConfirmationTimeout: time.Second}}
+	config := ExecutionConfig{Owner: "owner", MaxCalls: 10, MaxRetries: 0, MaxWork: 100, StepTimeout: 5 * time.Second, RunTimeout: 60 * time.Second, ConfirmationTimeout: 10 * time.Second}
+	executor := &Executor{Authority: authority, Clock: clock, Policy: allowPolicy{}, Revalidator: allowBinding{}, Tool: tool, Evidence: evidence, Assertions: deterministicAssertions{}, State: state, Journal: state, Keys: stableKeys{}, Waiter: immediateWaiter{}, Config: config}
 	if _, complete, recoverErr := executor.RecoverCompleted(context.Background(), "journal-run", validated, artifact); recoverErr != nil || complete {
 		t.Fatalf("partial journal complete=%t err=%v", complete, recoverErr)
 	}
 	result, err := executor.Execute(context.Background(), "journal-run", validated, artifact)
 	if err != nil || result.Outcome != OutcomePassed {
 		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	callsAfterFirst := tool.callCount("before") + tool.callCount("act") + tool.callCount("after")
+	replayed, replayErr := executor.Execute(context.Background(), "journal-run", validated, artifact)
+	if replayErr != nil || digestValue(replayed) != digestValue(result) || tool.callCount("before")+tool.callCount("act")+tool.callCount("after") != callsAfterFirst {
+		t.Fatalf("terminal replay=%#v calls=%d err=%v", replayed, callsAfterFirst, replayErr)
 	}
 	recovered, complete, recoverErr := executor.RecoverCompleted(context.Background(), "journal-run", validated, artifact)
 	if recoverErr != nil || !complete || digestValue(recovered) != digestValue(result) {
@@ -673,6 +844,58 @@ func TestDurableJournalReconstructsRealExecution(t *testing.T) {
 				t.Fatalf("divergent evidence complete=%t err=%v", complete, recoverErr)
 			}
 		})
+	}
+}
+
+// TestExecutorPropagatesLatestLiveClaimAcrossEveryCausalCAS proves that an
+// action's progress, renewals and terminal all retain one token while callers
+// propagate each newly extended expiry instead of reusing the initial lease.
+func TestExecutorPropagatesLatestLiveClaimAcrossEveryCausalCAS(t *testing.T) {
+	clock := &advancingFlowClock{now: time.Unix(100, 0)}
+	durable, err := NewLocalStore(t.TempDir(), clock, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &tracedLeaseStore{IntentStore: durable, clock: clock, claims: map[string]Claim{}}
+	tool := &scriptedTool{outputs: map[string]any{"before": map[string]any{"ok": true, "value": "old"}, "act": map[string]any{"ok": true}, "after": map[string]any{"ok": true, "value": "new"}}, transient: map[string]int{}}
+	executor, validated, artifact, _, _ := executorFixture(t, tool, allowPolicy{})
+	executor.Clock = clock
+	executor.State = state
+	executor.Config.Owner = "causal-owner"
+	executor.Config.RunTimeout = 30 * time.Second
+	executor.Config.StepTimeout = 10 * time.Second
+	executor.Config.ConfirmationTimeout = 10 * time.Second
+	result, err := executor.Execute(context.Background(), "causal-run", validated, artifact)
+	if err != nil || result.Outcome != OutcomePassed {
+		t.Fatalf("result=%#v err=%v trace=%v", result, err, state.trace)
+	}
+
+	state.mu.Lock()
+	trace := append([]string(nil), state.trace...)
+	state.mu.Unlock()
+	claimPrefix := "claim:act:"
+	claimIndex, evidenceIndex, renewalAfterEvidence, terminalIndex := -1, -1, -1, -1
+	claimToken := ""
+	for index, entry := range trace {
+		if strings.HasPrefix(entry, claimPrefix) {
+			claimIndex = index
+			claimToken = strings.TrimPrefix(entry, claimPrefix)
+		}
+		if strings.HasPrefix(entry, "intent:act:evidence:") {
+			evidenceIndex = index
+		}
+		if evidenceIndex >= 0 && index > evidenceIndex && strings.HasPrefix(entry, "renew:act:") && renewalAfterEvidence < 0 {
+			renewalAfterEvidence = index
+		}
+		if strings.HasPrefix(entry, "terminal:act:") {
+			terminalIndex = index
+		}
+		if strings.Contains(entry, ":act:") && claimToken != "" && !strings.HasSuffix(entry, claimToken) {
+			t.Fatalf("action boundary changed claim token: %q trace=%v", entry, trace)
+		}
+	}
+	if claimIndex < 0 || evidenceIndex <= claimIndex || renewalAfterEvidence <= evidenceIndex || terminalIndex <= renewalAfterEvidence {
+		t.Fatalf("causal action order missing: %v", trace)
 	}
 }
 
@@ -904,6 +1127,51 @@ func TestActionCrashMatrixRecoversWithoutUnsafeReplay(t *testing.T) {
 	}
 }
 
+// TestInputResolutionFailureConfirmsOneFencedTerminal proves a claimed step
+// cannot escape ownership merely because its private fixture is unavailable.
+func TestInputResolutionFailureConfirmsOneFencedTerminal(t *testing.T) {
+	flow, authority := actionFlow()
+	flow.Steps[0].Input["id"] = InputValue{Reference: &Reference{Fixture: &FixtureReference{FixtureID: "seed", Output: "id", ValueType: planning.ValueString}}}
+	validated, err := Validate(flow, testLimits(), testAuthority())
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := Bind(validated, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := &scriptedTool{outputs: map[string]any{}, transient: map[string]int{}}
+	state := &memoryIntents{claims: map[string]string{}, intents: map[string]Intent{}, terminals: map[string]StepRecord{}}
+	executor := &Executor{Authority: authority, Clock: fixedFlowClock{now: time.Unix(100, 0)}, Policy: allowPolicy{}, Revalidator: allowBinding{}, Tool: tool, Evidence: &memoryEvidence{values: map[string]Evidence{}}, Assertions: deterministicAssertions{}, State: state, Keys: stableKeys{}, Waiter: immediateWaiter{}, Config: ExecutionConfig{Owner: "owner", MaxCalls: 10, MaxRetries: 0, MaxWork: 100, StepTimeout: time.Second, RunTimeout: 3 * time.Second, ConfirmationTimeout: time.Second}}
+	result, executeErr := executor.Execute(context.Background(), "resolution-run", validated, artifact)
+	if executeErr != nil || len(result.Steps) != len(flow.Steps) || result.Steps[0].Category != CategoryResolution || tool.callCount("before") != 0 {
+		t.Fatalf("result=%#v calls=%d err=%v", result, tool.callCount("before"), executeErr)
+	}
+	terminal, found, err := state.Terminal(context.Background(), "resolution-run", 1, "before")
+	if err != nil || !found || terminal.Category != CategoryResolution {
+		t.Fatalf("terminal=%#v found=%t err=%v", terminal, found, err)
+	}
+	renewalState := &memoryIntents{claims: map[string]string{}, intents: map[string]Intent{}, terminals: map[string]StepRecord{}}
+	renewalExecutor := *executor
+	renewalExecutor.State = &renewalFailureIntents{memoryIntents: renewalState, failAt: 1}
+	if _, err = renewalExecutor.Execute(context.Background(), "resolution-renewal", validated, artifact); err == nil {
+		t.Fatal("resolution terminal ignored renewal failure")
+	}
+	terminalState := &memoryIntents{claims: map[string]string{}, intents: map[string]Intent{}, terminals: map[string]StepRecord{}}
+	terminalExecutor := *executor
+	terminalExecutor.State = rejectingTerminalStore{memoryIntents: terminalState}
+	if _, err = terminalExecutor.Execute(context.Background(), "resolution-terminal", validated, artifact); err == nil {
+		t.Fatal("resolution terminal CAS failure was ignored")
+	}
+	journalState := &memoryIntents{claims: map[string]string{}, intents: map[string]Intent{}, terminals: map[string]StepRecord{}}
+	journalExecutor := *executor
+	journalExecutor.State = journalState
+	journalExecutor.Journal = selectiveJournal{failType: "step_terminal"}
+	if _, err = journalExecutor.Execute(context.Background(), "resolution-journal", validated, artifact); err == nil {
+		t.Fatal("resolution terminal journal failure was ignored")
+	}
+}
+
 // TestLeaseMustCoverStepAndConfirmationBoundaries proves a short lease opens no tool boundary.
 func TestLeaseMustCoverStepAndConfirmationBoundaries(t *testing.T) {
 	tool := &scriptedTool{outputs: map[string]any{}, transient: map[string]int{}}
@@ -1092,7 +1360,7 @@ func TestPostToolRenewalFailureStopsBeforeEvidenceAndAllowsSafeObserveRecovery(t
 
 // TestEveryPostToolRenewalFailureFailsClosed covers evidence, journal, assertions, and terminal ownership checkpoints.
 func TestEveryPostToolRenewalFailureFailsClosed(t *testing.T) {
-	for failAt := 1; failAt <= 5; failAt++ {
+	for _, failAt := range []int{1, 2, 3, 4, 5, 8} {
 		t.Run(itoa(failAt), func(t *testing.T) {
 			tool := &scriptedTool{outputs: map[string]any{"before": map[string]any{"ok": true, "value": "old"}}, transient: map[string]int{}}
 			executor, validated, artifact, state, _ := executorFixture(t, tool, allowPolicy{})
@@ -1102,6 +1370,75 @@ func TestEveryPostToolRenewalFailureFailsClosed(t *testing.T) {
 			}
 			if tool.callCount("before") != 1 || tool.callCount("after") != 0 {
 				t.Fatalf("boundary=%d calls=%d/%d", failAt, tool.callCount("before"), tool.callCount("after"))
+			}
+		})
+	}
+}
+
+// TestExecutorFaultBoundariesFailClosed exercises every causal error boundary
+// introduced between attempt start, durable evidence and assertion journaling.
+func TestExecutorFaultBoundariesFailClosed(t *testing.T) {
+	cases := []struct {
+		name      string
+		configure func(*Executor, *memoryIntents, *scriptedTool)
+	}{
+		{name: "attempt journal", configure: func(executor *Executor, _ *memoryIntents, _ *scriptedTool) {
+			executor.Journal = selectiveJournal{failType: "attempt_started"}
+		}},
+		{name: "binding revalidation", configure: func(executor *Executor, _ *memoryIntents, _ *scriptedTool) { executor.Revalidator = rejectingBinding{} }},
+		{name: "call budget on retry", configure: func(executor *Executor, _ *memoryIntents, tool *scriptedTool) {
+			executor.Config.MaxCalls = 1
+			tool.transient["before"] = 1
+		}},
+		{name: "retry journal", configure: func(executor *Executor, _ *memoryIntents, tool *scriptedTool) {
+			executor.Journal = selectiveJournal{failType: "retry_scheduled"}
+			tool.transient["before"] = 1
+		}},
+		{name: "missing retry waiter", configure: func(executor *Executor, _ *memoryIntents, tool *scriptedTool) {
+			executor.Waiter = nil
+			tool.transient["before"] = 1
+		}},
+		{name: "cancelled retry waiter", configure: func(executor *Executor, _ *memoryIntents, tool *scriptedTool) {
+			executor.Waiter = rejectingWaiter{}
+			tool.transient["before"] = 1
+		}},
+		{name: "evidence persistence", configure: func(executor *Executor, _ *memoryIntents, _ *scriptedTool) { executor.Evidence = rejectingEvidence{} }},
+		{name: "invalid evidence receipt", configure: func(executor *Executor, _ *memoryIntents, _ *scriptedTool) {
+			executor.Evidence = rejectingEvidence{invalid: true}
+		}},
+		{name: "evidence journal", configure: func(executor *Executor, _ *memoryIntents, _ *scriptedTool) {
+			executor.Journal = selectiveJournal{failType: "evidence_confirmed"}
+		}},
+		{name: "assertion evaluator", configure: func(executor *Executor, _ *memoryIntents, _ *scriptedTool) {
+			executor.Assertions = rejectingAssertions{}
+		}},
+		{name: "assertion journal", configure: func(executor *Executor, _ *memoryIntents, _ *scriptedTool) {
+			executor.Journal = selectiveJournal{failType: "assertions_confirmed"}
+		}},
+		{name: "terminal journal", configure: func(executor *Executor, _ *memoryIntents, _ *scriptedTool) {
+			executor.Journal = selectiveJournal{failType: "step_terminal"}
+		}},
+		{name: "functional failure", configure: func(_ *Executor, _ *memoryIntents, tool *scriptedTool) {
+			tool.functionalFailures = map[string]bool{"before": true}
+		}},
+		{name: "started intent", configure: func(executor *Executor, state *memoryIntents, _ *scriptedTool) {
+			executor.State = &rejectingProgressStore{memoryIntents: state}
+		}},
+		{name: "evidence intent", configure: func(executor *Executor, state *memoryIntents, _ *scriptedTool) {
+			executor.State = &rejectingProgressStore{memoryIntents: state, failEvidence: true}
+		}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			tool := &scriptedTool{outputs: map[string]any{"before": map[string]any{"ok": true, "value": "old"}, "act": map[string]any{"ok": true}, "after": map[string]any{"ok": true, "value": "new"}}, transient: map[string]int{}}
+			executor, validated, artifact, state, _ := executorFixture(t, tool, allowPolicy{})
+			testCase.configure(executor, state, tool)
+			result, err := executor.Execute(context.Background(), "fault-run", validated, artifact)
+			if err == nil && result.Outcome == OutcomePassed {
+				t.Fatalf("fault %s produced a passing result", testCase.name)
+			}
+			if tool.callCount("after") != 0 {
+				t.Fatalf("fault %s crossed a later tool boundary", testCase.name)
 			}
 		})
 	}
