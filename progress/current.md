@@ -4673,3 +4673,9 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - La feature pasa de `pending` a `spec_ready`. No se ha modificado código ni tests.
 - La implementación queda pausada hasta aprobación humana explícita de la spec.
 
+## Feature 36 — spec aprobada (2026-11-16)
+
+- El usuario aprobó explícitamente la spec mediante “continúa con la implementación”.
+- Aprobación registrada a las `2026-11-16T10:24:25+01:00`.
+- La feature pasa de `spec_ready` a `in_progress`; se autoriza al implementer a ejecutar T1–T16 en orden.
+

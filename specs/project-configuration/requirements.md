@@ -455,8 +455,8 @@ manifests versionados; el dominio no inventa valores.
 ## Aprobación humana
 
 ```yaml
-approved_by: null
-approved_at: null
+approved_by: user
+approved_at: 2026-11-16T10:24:25+01:00
 ```
 
 La implementación no puede comenzar hasta aprobación humana explícita y cambio
