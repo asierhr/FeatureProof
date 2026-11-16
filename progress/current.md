@@ -4666,3 +4666,10 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Cobertura diferencial: `5420/6370 = 85,08634222919937205651491365777080062794 %`; cleanup sin residuos.
 - El leader cambia feature 35 a `done` y registra el cierre append-only en `progress/history.md`.
 
+## Feature 36 — spec lista (2026-11-16)
+
+- Rama creada: `feature-36-project-configuration`, basada en feature 35 porque la configuración versionada se integra con su control plane persistente.
+- El spec author creó `requirements.md`, `design.md` y `tasks.md` para R1–R18 y T1–T16.
+- La feature pasa de `pending` a `spec_ready`. No se ha modificado código ni tests.
+- La implementación queda pausada hasta aprobación humana explícita de la spec.
+
