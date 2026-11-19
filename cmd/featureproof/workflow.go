@@ -45,6 +45,8 @@ import (
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
 	"github.com/asierhr/featureProof/internal/previewenv"
+	"github.com/asierhr/featureProof/internal/projectconfig"
+	localprojectconfig "github.com/asierhr/featureProof/internal/projectconfig/local"
 	"github.com/asierhr/featureProof/internal/projectmemory"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 	"github.com/asierhr/featureProof/internal/specification"
@@ -59,15 +61,15 @@ import (
 // workflowProvisionalPlanningTarget is a non-routable validation placeholder replaced by acquired authority before model generation.
 const workflowProvisionalPlanningTarget = "https://composition.invalid/"
 
-// workflowConfig is the trusted local composition record; it contains references but no credential bytes.
+// workflowConfig is private composition inventory; productive composition replaces every legacy selector from the bound snapshot before use.
 type workflowConfig struct {
-	Provider                      string                                  `json:"provider"`
-	Model                         string                                  `json:"model"`
-	AuthProfile                   string                                  `json:"auth_profile"`
+	Provider                      string                                  `json:"provider,omitempty"`
+	Model                         string                                  `json:"model,omitempty"`
+	AuthProfile                   string                                  `json:"auth_profile,omitempty"`
 	ProfileStore                  string                                  `json:"profile_store"`
-	RuntimeProfile                string                                  `json:"runtime_profile"`
+	RuntimeProfile                string                                  `json:"runtime_profile,omitempty"`
 	SpecificationPath             string                                  `json:"specification_path"`
-	ContractPath                  string                                  `json:"contract_path"`
+	ContractPath                  string                                  `json:"contract_path,omitempty"`
 	ContractSource                string                                  `json:"contract_source,omitempty"`
 	ContractSources               []string                                `json:"contract_sources,omitempty"`
 	OpenAPIContractPath           string                                  `json:"openapi_contract_path,omitempty"`
@@ -79,12 +81,12 @@ type workflowConfig struct {
 	CommitOID                     string                                  `json:"commit_oid"`
 	EnvironmentID                 string                                  `json:"environment_id"`
 	AttestationRef                string                                  `json:"attestation_ref"`
-	TargetAlias                   string                                  `json:"target_alias"`
+	TargetAlias                   string                                  `json:"target_alias,omitempty"`
 	TargetURL                     string                                  `json:"target_url"`
 	TargetKind                    string                                  `json:"target_kind"`
-	PolicyID                      string                                  `json:"policy_id"`
+	PolicyID                      string                                  `json:"policy_id,omitempty"`
 	AttestationValidUntil         time.Time                               `json:"attestation_valid_until"`
-	AllowDisabledApproval         bool                                    `json:"allow_disabled_approval"`
+	AllowDisabledApproval         bool                                    `json:"allow_disabled_approval,omitempty"`
 	ContractSelections            map[string][]workflowOperationSelection `json:"contract_selections"`
 	ContractProjection            workflowProjectionConfig                `json:"contract_projection"`
 	ContractReviewID              string                                  `json:"contract_review_id,omitempty"`
@@ -99,6 +101,8 @@ type workflowConfig struct {
 	ManagedCapacity               *workflowManagedCapacityConfig          `json:"managed_capacity,omitempty"`
 	EnvironmentCleanup            *workflowCleanupRuntimeConfig           `json:"environment_cleanup,omitempty"`
 	Kubernetes                    *workflowKubernetesRuntimeConfig        `json:"kubernetes,omitempty"`
+	SpecificationAuthorizationRef string                                  `json:"-"`
+	ContractAuthorizationRef      string                                  `json:"-"`
 }
 
 // workflowManagedCapacityConfig carries sealed project policy and per-selection demand without request/model defaults.
@@ -156,6 +160,281 @@ type workflowCompositionOptions struct {
 	kubernetes                *workflowKubernetesComposition
 	recoverPending            bool
 	persistence               *workflowPersistence
+	boundEffective            *projectconfig.EffectiveConfiguration
+	disableResourceFactory    bool
+	boundResources            *validationworkflow.ProjectBoundResources
+	boundConfig               *workflowConfig
+}
+
+// workflowProjectResourceMaterializer rebuilds and caches one exact resource graph per sealed effective digest.
+type workflowProjectResourceMaterializer struct {
+	stdout, stderr io.Writer
+	options        workflowCompositionOptions
+	mu             sync.Mutex
+	cache          map[string]workflowMaterializedResources
+	artifacts      projectconfig.ResourceArtifactStore
+	artifactRoot   string
+}
+
+// workflowResourceBundle freezes mutable composition files together with their non-secret inventory.
+type workflowResourceBundle struct {
+	Config        workflowConfig `json:"config"`
+	Specification []byte         `json:"specification"`
+	Runtime       []byte         `json:"runtime"`
+	Contract      []byte         `json:"contract,omitempty"`
+}
+
+// workflowMaterializedResources keeps historical in-process runs pinned when a later head reuses selection IDs.
+type workflowMaterializedResources struct {
+	resources validationworkflow.ProjectBoundResources
+	command   validationworkflow.StartCommand
+}
+
+// SnapshotForAdmission seals all current non-secret backing bytes before a workflow binding can become durable.
+func (materializer *workflowProjectResourceMaterializer) SnapshotForAdmission(ctx context.Context, binding projectconfig.RunConfigurationBinding) error {
+	if projectconfig.ValidateRunBinding(binding) != nil {
+		return errors.New("invalid project configuration binding")
+	}
+	return materializer.snapshotEffective(ctx, binding.Effective)
+}
+
+// Materialize composes exclusively from the captured effective snapshot and never queries a later head for selections.
+func (materializer *workflowProjectResourceMaterializer) Materialize(ctx context.Context, binding projectconfig.RunConfigurationBinding, command validationworkflow.StartCommand) (validationworkflow.ProjectBoundResources, validationworkflow.StartCommand, error) {
+	if projectconfig.ValidateRunBinding(binding) != nil {
+		return validationworkflow.ProjectBoundResources{}, validationworkflow.StartCommand{}, errors.New("invalid project configuration binding")
+	}
+	config, err := materializer.loadBoundConfig(ctx, binding)
+	if err != nil {
+		return validationworkflow.ProjectBoundResources{}, validationworkflow.StartCommand{}, err
+	}
+	options := materializer.options
+	options.boundEffective = &binding.Effective
+	options.boundConfig = &config
+	options.disableResourceFactory = true
+	options.recoverPending = false
+	var resources validationworkflow.ProjectBoundResources
+	options.boundResources = &resources
+	cli, err := composeWorkflowCLIWithOptions(ctx, materializer.stdout, materializer.stderr, options)
+	if err != nil {
+		return validationworkflow.ProjectBoundResources{}, validationworkflow.StartCommand{}, err
+	}
+	selected, err := boundWorkflowCommand(command, binding.Effective, cli)
+	if err != nil {
+		return validationworkflow.ProjectBoundResources{}, validationworkflow.StartCommand{}, err
+	}
+	materializer.mu.Lock()
+	if cached, ok := materializer.cache[binding.EffectiveDigest]; ok {
+		materializer.mu.Unlock()
+		return cached.resources, mergeBoundWorkflowCommand(command, cached.command), nil
+	}
+	materializer.mu.Unlock()
+	materializer.mu.Lock()
+	if cached, ok := materializer.cache[binding.EffectiveDigest]; ok {
+		materializer.mu.Unlock()
+		return cached.resources, mergeBoundWorkflowCommand(command, cached.command), nil
+	}
+	materializer.cache[binding.EffectiveDigest] = workflowMaterializedResources{resources: resources, command: selected}
+	materializer.mu.Unlock()
+	return resources, selected, nil
+}
+
+// snapshotEffective copies current composition backing into immutable artifacts and is called only by startup/admission paths.
+func (materializer *workflowProjectResourceMaterializer) snapshotEffective(ctx context.Context, effective projectconfig.EffectiveConfiguration) error {
+	if materializer.artifacts == nil || !filepath.IsAbs(materializer.artifactRoot) {
+		return errors.New("project resource artifact store unavailable")
+	}
+	anchor := workflowContractDescriptor(effective)
+	if anchor == nil {
+		return errors.New("bound contract artifact unavailable")
+	}
+	current, err := loadWorkflowConfig()
+	if err != nil {
+		return err
+	}
+	bundle := workflowResourceBundle{Config: current}
+	bundle.Specification, err = os.ReadFile(current.SpecificationPath)
+	if err == nil {
+		bundle.Runtime, err = os.ReadFile(current.RuntimeManifestPath)
+	}
+	if err == nil && current.ContractPath != "" {
+		bundle.Contract, err = os.ReadFile(current.ContractPath)
+		if err != nil && current.ContractSource != "" && current.ContractSource != "openapi" {
+			err = nil
+			bundle.Contract = nil
+		}
+	}
+	if err != nil {
+		return errors.New("project resource backing unavailable")
+	}
+	payload, err := json.Marshal(bundle)
+	if err != nil {
+		return errors.New("project resource artifact unavailable")
+	}
+	if err = materializer.artifacts.Put(ctx, *anchor, payload); projectconfig.IsCategory(err, projectconfig.CategoryIntegrity) {
+		return errors.New("project resource inventory drift")
+	} else if err != nil {
+		return errors.New("project resource artifact unavailable")
+	}
+	for _, descriptor := range effective.Descriptors {
+		if descriptor.Kind == projectconfig.ResourceContract {
+			continue
+		}
+		identity, marshalErr := json.Marshal(descriptor)
+		if marshalErr != nil {
+			return errors.New("project resource artifact unavailable")
+		}
+		if err = materializer.artifacts.Put(ctx, descriptor, identity); projectconfig.IsCategory(err, projectconfig.CategoryIntegrity) {
+			return errors.New("project resource inventory drift")
+		} else if err != nil {
+			return errors.New("project resource artifact unavailable")
+		}
+	}
+	return nil
+}
+
+// workflowContractDescriptor returns the immutable anchor whose payload contains the complete composition bundle.
+func workflowContractDescriptor(effective projectconfig.EffectiveConfiguration) *projectconfig.ResourceDescriptor {
+	for index := range effective.Descriptors {
+		if effective.Descriptors[index].Kind == projectconfig.ResourceContract {
+			copy := effective.Descriptors[index]
+			return &copy
+		}
+	}
+	return nil
+}
+
+// loadBoundConfig performs strict historical lookup and never consults or republishes mutable backing.
+func (materializer *workflowProjectResourceMaterializer) loadBoundConfig(ctx context.Context, binding projectconfig.RunConfigurationBinding) (workflowConfig, error) {
+	if materializer.artifacts == nil || !filepath.IsAbs(materializer.artifactRoot) {
+		return workflowConfig{}, errors.New("project resource artifact store unavailable")
+	}
+	anchor := workflowContractDescriptor(binding.Effective)
+	if anchor == nil {
+		return workflowConfig{}, errors.New("bound contract artifact unavailable")
+	}
+	payload, err := materializer.artifacts.Get(ctx, *anchor)
+	if err != nil {
+		return workflowConfig{}, errors.New("project resource artifact unavailable")
+	}
+	var bundle workflowResourceBundle
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&bundle) != nil {
+		return workflowConfig{}, errors.New("project resource artifact corrupt")
+	}
+	for _, descriptor := range binding.Effective.Descriptors {
+		if descriptor.Kind == projectconfig.ResourceContract {
+			continue
+		}
+		identity, getErr := materializer.artifacts.Get(ctx, descriptor)
+		var stored projectconfig.ResourceDescriptor
+		if getErr != nil || json.Unmarshal(identity, &stored) != nil || stored.ProjectKey != descriptor.ProjectKey || stored.Kind != descriptor.Kind || stored.ID != descriptor.ID || stored.Version != descriptor.Version || stored.Digest != descriptor.Digest {
+			return workflowConfig{}, errors.New("project resource artifact corrupt")
+		}
+	}
+	rootDigest := sha256.Sum256([]byte(materializer.artifactRoot))
+	directory := filepath.Join(os.TempDir(), "featureproof-bound", hex.EncodeToString(rootDigest[:8]), binding.EffectiveDigest)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return workflowConfig{}, errors.New("project resource materialization unavailable")
+	}
+	bundle.Config.SpecificationAuthorizationRef = bundle.Config.SpecificationPath
+	bundle.Config.ContractAuthorizationRef = anchor.Selection
+	bundle.Config.SpecificationPath = filepath.Join(directory, "specification.yaml")
+	bundle.Config.RuntimeManifestPath = filepath.Join(directory, "runtime.json")
+	if err := os.WriteFile(bundle.Config.SpecificationPath, bundle.Specification, 0o600); err != nil || os.WriteFile(bundle.Config.RuntimeManifestPath, bundle.Runtime, 0o600) != nil {
+		return workflowConfig{}, errors.New("project resource materialization unavailable")
+	}
+	if len(bundle.Contract) > 0 {
+		bundle.Config.ContractPath = filepath.Join(directory, "contract.json")
+		if err := os.WriteFile(bundle.Config.ContractPath, bundle.Contract, 0o600); err != nil {
+			return workflowConfig{}, errors.New("project resource materialization unavailable")
+		}
+	}
+	return bundle.Config, nil
+}
+
+// workflowProjectConfiguration is the one service graph shared by workflow ingress and administrative adapters.
+type workflowProjectConfiguration struct {
+	Resolver  *projectconfig.AdmissionResolver
+	Gateway   projectconfig.Gateway
+	Authority projectconfig.ConfigurationAuthority
+	Key       projectconfig.ProjectKey
+}
+
+// composeWorkflowProjectConfiguration selects exactly one durable backend and fails before resource composition.
+func composeWorkflowProjectConfiguration(ctx context.Context, _ string, actor, repositoryID string, persistence *workflowPersistence, requireActive bool) (workflowProjectConfiguration, error) {
+	projectID := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID")
+	catalogPath := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_CATALOG")
+	policyPath := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_POLICY")
+	cursorKey := []byte(os.Getenv("FEATUREPROOF_PROJECT_CONFIG_CURSOR_KEY"))
+	key, err := projectconfig.NewProjectKey(projectID, repositoryID)
+	if err != nil || len(cursorKey) < 32 || !filepath.IsAbs(catalogPath) || !filepath.IsAbs(policyPath) {
+		return workflowProjectConfiguration{}, errors.New("project configuration bootstrap unavailable")
+	}
+	var catalogSnapshot projectconfig.ResourceCatalogSnapshot
+	if err = loadWorkflowProjectConfigurationJSON(catalogPath, &catalogSnapshot); err != nil || catalogSnapshot.ProjectKey != key {
+		return workflowProjectConfiguration{}, errors.New("project configuration catalog unavailable")
+	}
+	var policySnapshot projectconfig.OrganizationPolicySnapshot
+	if err = loadWorkflowProjectConfigurationJSON(policyPath, &policySnapshot); err != nil {
+		return workflowProjectConfiguration{}, errors.New("project configuration policy unavailable")
+	}
+	catalog, err := projectconfig.NewSnapshotCatalog([]projectconfig.ResourceCatalogSnapshot{catalogSnapshot})
+	if err != nil {
+		return workflowProjectConfiguration{}, err
+	}
+	policies, err := projectconfig.NewSnapshotPolicies([]projectconfig.PolicyForProject{{ProjectKey: key, Snapshot: policySnapshot}})
+	if err != nil {
+		return workflowProjectConfiguration{}, err
+	}
+	var store projectconfig.Store
+	if persistence != nil {
+		if persistence.projectConfig == nil {
+			return workflowProjectConfiguration{}, errors.New("postgres project configuration persistence unavailable")
+		}
+		store = persistence.projectConfig
+	} else {
+		storeRoot := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_ROOT")
+		if !filepath.IsAbs(storeRoot) {
+			return workflowProjectConfiguration{}, errors.New("local project configuration persistence unavailable")
+		}
+		store, err = localprojectconfig.New(storeRoot)
+		if err != nil {
+			return workflowProjectConfiguration{}, err
+		}
+	}
+	service, err := projectconfig.NewService(store, catalog, policies, nil, projectconfig.ServiceConfig{CursorKey: cursorKey, CursorTTL: time.Hour})
+	if err != nil {
+		return workflowProjectConfiguration{}, err
+	}
+	authority, err := projectconfig.IssueAuthority(actor, key, projectconfig.ActionValidate, projectconfig.ActionPublish, projectconfig.ActionRollback, projectconfig.ActionRead, projectconfig.ActionExport, projectconfig.ActionAdmit)
+	if err != nil {
+		return workflowProjectConfiguration{}, err
+	}
+	resolver, err := projectconfig.NewAdmissionResolver(service, []projectconfig.RepositoryAdmission{{RepositoryID: repositoryID, ProjectKey: key, Authority: authority}})
+	if err != nil {
+		return workflowProjectConfiguration{}, err
+	}
+	if requireActive {
+		if _, _, _, err = service.Active(ctx, authority, key); err != nil {
+			return workflowProjectConfiguration{}, errors.New("active project configuration unavailable")
+		}
+	}
+	return workflowProjectConfiguration{Resolver: resolver, Gateway: projectconfig.Gateway{Service: service}, Authority: authority, Key: key}, nil
+}
+
+// loadWorkflowProjectConfigurationJSON strictly decodes one bounded composition-owned snapshot.
+func loadWorkflowProjectConfigurationJSON(path string, destination any) error {
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 || len(raw) > projectconfig.MaxCanonicalBytes {
+		return errors.New("invalid project configuration snapshot")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(destination); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("invalid project configuration snapshot")
+	}
+	return nil
 }
 
 // workflowPersistence is the backend-homogeneous set of consumer-owned ports used by the productive workflow.
@@ -178,6 +457,8 @@ type workflowPersistence struct {
 		fixture.Observer
 	}
 	context           contextassembly.Store
+	projectConfig     projectconfig.Store
+	resourceArtifacts projectconfig.ResourceArtifactStore
 	functionalRuntime interface {
 		FunctionalRuntimeStores(map[string]string, functionalflow.Limits, functionalflow.EventJournal) (validationworkflow.FunctionalFlowArtifactStore, functionalflow.EvidenceStore, validationworkflow.FunctionalFlowPublisher, validationworkflow.FunctionalFlowCatalog, validationworkflow.FunctionalIdentityAttemptSink, error)
 	}
@@ -574,16 +855,20 @@ func loadWorkflowConfig() (workflowConfig, error) {
 	if decoder.Decode(&config) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return workflowConfig{}, errors.New("invalid workflow configuration")
 	}
-	if config.Provider != "openai" || config.Model == "" || config.AuthProfile == "" || config.ProfileStore == "" || config.RuntimeProfile == "" || config.SpecificationPath == "" || config.ContractPath == "" || config.RuntimeManifestPath == "" || !revisionbinding.ValidID(config.RepositoryID) || !revisionbinding.ValidOID(config.CommitOID) || !revisionbinding.ValidID(config.EnvironmentID) || !revisionbinding.ValidID(config.AttestationRef) || config.TargetAlias == "" || config.TargetURL == "" || config.PolicyID == "" || !config.AttestationValidUntil.After(time.Now()) || (config.TargetKind != "direct" && config.TargetKind != "preview") {
+	if config.ProfileStore == "" || config.SpecificationPath == "" || config.RuntimeManifestPath == "" || !revisionbinding.ValidID(config.RepositoryID) || !revisionbinding.ValidOID(config.CommitOID) || !revisionbinding.ValidID(config.EnvironmentID) || !revisionbinding.ValidID(config.AttestationRef) || config.TargetURL == "" || !config.AttestationValidUntil.After(time.Now()) || (config.TargetKind != "direct" && config.TargetKind != "preview") {
 		return workflowConfig{}, errors.New("invalid workflow configuration")
 	}
 	sealedEnvironmentCatalog, environmentCatalogErr := environment.SealCatalog(config.EnvironmentCatalog)
-	selection, selectionErr := sealedEnvironmentCatalog.Resolve(config.TargetAlias)
-	managedKubernetes := selection.Kind == environment.KindManaged && selection.ProviderID == kubernetesenvironment.ProviderID && selection.ProviderVersion == kubernetesenvironment.ProviderVersion
-	if environmentCatalogErr != nil || selectionErr != nil || (selection.Kind != environment.KindExistingURL && selection.Kind != environment.KindManaged) || selection.ProjectID != config.RepositoryID || selection.RepositoryID != config.RepositoryID || selection.NetworkPolicyID != config.PolicyID || (selection.Kind == environment.KindManaged && (config.TargetKind != "direct" || !managedKubernetes || config.Kubernetes == nil || config.Kubernetes.validate() != nil)) || (selection.Kind != environment.KindManaged && config.Kubernetes != nil) {
+	if environmentCatalogErr != nil {
 		return workflowConfig{}, errors.New("invalid environment catalog configuration")
 	}
 	config.EnvironmentCatalog = sealedEnvironmentCatalog
+	legacySelectionPresent := config.Provider != "" || config.Model != "" || config.AuthProfile != "" || config.RuntimeProfile != "" || config.ContractPath != "" || config.TargetAlias != "" || config.PolicyID != ""
+	if legacySelectionPresent {
+		if err := validateBoundWorkflowConfig(config); err != nil {
+			return workflowConfig{}, errors.New("invalid workflow configuration")
+		}
+	}
 	if config.ContractSource != "" && config.ContractSource != "openapi" && config.ContractSource != goinspector.SourceKind && config.ContractSource != springinspector.SourceKind && config.ContractSource != "combined" {
 		return workflowConfig{}, errors.New("invalid workflow configuration")
 	}
@@ -629,6 +914,19 @@ func loadWorkflowConfig() (workflowConfig, error) {
 		config.GitHubContext = &sealed
 	}
 	return config, nil
+}
+
+// validateBoundWorkflowConfig checks selectors only after the active effective snapshot has supplied them.
+func validateBoundWorkflowConfig(config workflowConfig) error {
+	if config.Provider != "openai" || config.Model == "" || config.AuthProfile == "" || config.RuntimeProfile == "" || config.ContractPath == "" || config.TargetAlias == "" || config.PolicyID == "" {
+		return errors.New("invalid bound workflow configuration")
+	}
+	selection, err := config.EnvironmentCatalog.Resolve(config.TargetAlias)
+	managedKubernetes := selection.Kind == environment.KindManaged && selection.ProviderID == kubernetesenvironment.ProviderID && selection.ProviderVersion == kubernetesenvironment.ProviderVersion
+	if err != nil || (selection.Kind != environment.KindExistingURL && selection.Kind != environment.KindManaged) || selection.ProjectID != config.RepositoryID || selection.RepositoryID != config.RepositoryID || selection.NetworkPolicyID != config.PolicyID || (selection.Kind == environment.KindManaged && (config.TargetKind != "direct" || !managedKubernetes || config.Kubernetes == nil || config.Kubernetes.validate() != nil)) || (selection.Kind != environment.KindManaged && config.Kubernetes != nil) {
+		return errors.New("invalid bound environment catalog configuration")
+	}
+	return nil
 }
 
 // approvedContractReference validates the trusted all-or-none durable review selector used by CLI, MCP and GitHub starts.
@@ -692,8 +990,90 @@ func composeWorkflowCLIWithPersistence(ctx context.Context, stdout, stderr io.Wr
 
 // composeWorkflowCLIWithOptions constructs the shared productive service graph from trusted ports and optionally runs startup recovery.
 func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer, options workflowCompositionOptions) (*validationworkflow.CLI, error) {
-	config, err := loadWorkflowConfig()
+	var config workflowConfig
+	var err error
+	if options.boundConfig != nil {
+		config = *options.boundConfig
+	} else {
+		config, err = loadWorkflowConfig()
+		if err != nil {
+			return nil, err
+		}
+	}
+	root, err := os.Getwd()
 	if err != nil {
+		return nil, err
+	}
+	resourceRoot := filepath.Join(root, ".featureproof", "project-resource-artifacts")
+	var compositionArtifactStore projectconfig.ResourceArtifactStore
+	if options.persistence != nil {
+		compositionArtifactStore = options.persistence.resourceArtifacts
+		if compositionArtifactStore == nil {
+			return nil, errors.New("postgres resource artifact persistence incomplete")
+		}
+	} else {
+		compositionArtifactStore, err = projectconfig.NewLocalResourceArtifactStore(filepath.Join(resourceRoot, "registry"))
+		if err != nil {
+			return nil, err
+		}
+	}
+	current, err := user.Current()
+	if err != nil || current.Uid == "" {
+		return nil, errors.New("local identity unavailable")
+	}
+	projectConfiguration, err := composeWorkflowProjectConfiguration(ctx, root, current.Uid, config.RepositoryID, options.persistence, options.boundEffective == nil)
+	if err != nil {
+		return nil, err
+	}
+	var effective projectconfig.EffectiveConfiguration
+	if options.boundEffective != nil {
+		effective = options.boundEffective.Clone()
+		if effective.ProjectKey != projectConfiguration.Key || projectconfig.ValidateEffectiveSnapshot(projectConfiguration.Key, effective) != nil {
+			return nil, errors.New("bound project configuration unavailable")
+		}
+	} else {
+		activeConfiguration, activeErr := projectConfiguration.Gateway.Execute(ctx, projectconfig.GatewayRequest{Operation: projectconfig.OperationShowActive, Authority: projectConfiguration.Authority, ProjectKey: projectConfiguration.Key})
+		if activeErr != nil || activeConfiguration.Effective == nil {
+			return nil, errors.New("active project configuration unavailable")
+		}
+		effective = activeConfiguration.Effective.Clone()
+	}
+	if err = applyBoundWorkflowSelections(&config, effective); err != nil {
+		return nil, err
+	}
+	if options.boundConfig == nil {
+		for _, descriptor := range effective.Descriptors {
+			if descriptor.Kind != projectconfig.ResourceContract {
+				continue
+			}
+			loader := &workflowProjectResourceMaterializer{artifacts: compositionArtifactStore, artifactRoot: filepath.Join(resourceRoot, "materialized")}
+			if historicalErr := loader.snapshotEffective(ctx, effective); historicalErr != nil {
+				return nil, historicalErr
+			}
+			historical, historicalErr := loader.loadBoundConfig(ctx, projectconfig.RunConfigurationBinding{EffectiveDigest: effective.Digest, Effective: effective})
+			if historicalErr != nil {
+				return nil, historicalErr
+			}
+			if config.RepositoryID != historical.RepositoryID || config.EnvironmentID != historical.EnvironmentID || config.AttestationRef != historical.AttestationRef || config.TargetAlias != historical.TargetAlias || config.TargetURL != historical.TargetURL || config.TargetKind != historical.TargetKind || config.PolicyID != historical.PolicyID || !workflowStringMapEqual(config.IdentityCredentialEnvironment, historical.IdentityCredentialEnvironment) {
+				return nil, errors.New("project resource inventory drift")
+			}
+			config = historical
+			if err = applyBoundWorkflowSelections(&config, effective); err != nil {
+				return nil, err
+			}
+			config.SpecificationPath, config.RuntimeManifestPath, config.ContractPath = historical.SpecificationPath, historical.RuntimeManifestPath, historical.ContractPath
+			config.SpecificationAuthorizationRef, config.ContractAuthorizationRef = historical.SpecificationAuthorizationRef, historical.ContractAuthorizationRef
+			break
+		}
+	}
+	if options.boundConfig != nil {
+		config.SpecificationAuthorizationRef = options.boundConfig.SpecificationAuthorizationRef
+		config.ContractAuthorizationRef = options.boundConfig.ContractAuthorizationRef
+		config.SpecificationPath = options.boundConfig.SpecificationPath
+		config.RuntimeManifestPath = options.boundConfig.RuntimeManifestPath
+		config.ContractPath = options.boundConfig.ContractPath
+	}
+	if err = validateBoundWorkflowConfig(config); err != nil {
 		return nil, err
 	}
 	selection, selectionErr := config.EnvironmentCatalog.Resolve(config.TargetAlias)
@@ -718,10 +1098,6 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	} else if options.kubernetes != nil {
 		return nil, errors.New("unexpected kubernetes environment composition")
 	}
-	root, err := os.Getwd()
-	if err != nil {
-		return nil, err
-	}
 	var workflowPreview *workflowPreviewPort
 	if config.TargetKind == "preview" {
 		configured, present, previewErr := composeConfiguredPreview(ctx, root)
@@ -730,12 +1106,11 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 		}
 		workflowPreview = &workflowPreviewPort{configured: configured, target: config.TargetURL, attestors: map[string]revisionbinding.EnvironmentAttestor{}}
 	}
-	current, err := user.Current()
-	if err != nil || current.Uid == "" {
-		return nil, errors.New("local identity unavailable")
-	}
 	spec, err := specyaml.Load(ctx, config.SpecificationPath)
 	if err != nil {
+		return nil, err
+	}
+	if err = validateBoundWorkflowResources(effective, spec, config); err != nil {
 		return nil, err
 	}
 	manifest, err := planmanifest.Load(ctx, config.RuntimeManifestPath, spec)
@@ -779,7 +1154,12 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if err != nil {
 		return nil, err
 	}
-	session, err := model.NewSession(model.Config{ProviderID: config.Provider, ModelID: config.Model, AuthProfileID: config.AuthProfile, CallTimeout: 2 * time.Minute, MaxRequestBytes: 1 << 20, MaxStreamBytes: 2 << 20, MaxOutputBytes: 1 << 20, Budget: model.BudgetLimits{MaxCalls: 1, MaxTokens: 64000, MaxDuration: 3 * time.Minute, MaxReplans: 0}}, adapter, evalClock{}, evalObserver{})
+	boundLimits := effective.Constraints.Limits
+	if boundLimits.ToolCalls > uint64(^uint(0)>>1) || boundLimits.ModelTokens > uint64(^uint64(0)>>1) || boundLimits.Replans > uint64(^uint(0)>>1) || boundLimits.DurationSeconds > uint64((1<<63-1)/int64(time.Second)) {
+		return nil, errors.New("project configuration limits unavailable")
+	}
+	boundDuration := time.Duration(boundLimits.DurationSeconds) * time.Second
+	session, err := model.NewSession(model.Config{ProviderID: config.Provider, ModelID: config.Model, AuthProfileID: config.AuthProfile, CallTimeout: boundDuration, MaxRequestBytes: 1 << 20, MaxStreamBytes: 2 << 20, MaxOutputBytes: 1 << 20, Budget: model.BudgetLimits{MaxCalls: int(boundLimits.ToolCalls), MaxTokens: int64(boundLimits.ModelTokens), MaxDuration: boundDuration, MaxReplans: int(boundLimits.Replans)}}, adapter, evalClock{}, evalObserver{})
 	if err != nil {
 		return nil, err
 	}
@@ -899,13 +1279,17 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 			}
 			fixtureReduced, err = approvedReducer.ReduceApproved(contractContext, validationworkflow.StartCommand{Principal: current.Uid, ApprovedContract: approvedRef}, spec)
 		} else {
-			fixtureReduced, err = contractReducer.Reduce(contractContext, config.ContractPath, spec)
+			contractRef := config.ContractPath
+			if config.ContractAuthorizationRef != "" {
+				contractRef = config.ContractAuthorizationRef
+			}
+			fixtureReduced, err = contractReducer.Reduce(contractContext, contractRef, spec)
 		}
 		if err != nil {
 			return nil, err
 		}
 	}
-	trustedAdmission := validationworkflow.TrustedAdmissionBuilder{Specifications: workflowSpecLoader{path: config.SpecificationPath}, Contracts: contractReducer, Bindings: workflowBindingVerifier{config: config, binding: bindingContext}, Catalog: workflowCatalog{profile: config.RuntimeProfile, runtime: runtimeContext, descriptors: []agentplanning.CapabilityDescriptor{capability}}, Config: validationworkflow.AdmissionConfig{Provider: config.Provider, Model: config.Model, CompositionRef: compositionRef, Limits: agentplanning.Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 128, MaxCapabilities: 16, MaxChecks: 384, MaxStepsPerCheck: 64, MaxAssertionsPerStep: 64, MaxMissingItems: 32, MaxValidationWork: 100000}}}
+	trustedAdmission := validationworkflow.TrustedAdmissionBuilder{Specifications: workflowSpecLoader{path: config.SpecificationPath, authorizedRef: config.SpecificationAuthorizationRef}, Contracts: contractReducer, Bindings: workflowBindingVerifier{config: config, binding: bindingContext}, Catalog: workflowCatalog{profile: config.RuntimeProfile, runtime: runtimeContext, descriptors: []agentplanning.CapabilityDescriptor{capability}}, Config: validationworkflow.AdmissionConfig{Provider: config.Provider, Model: config.Model, CompositionRef: compositionRef, Limits: agentplanning.Limits{MaxInputBytes: 1 << 20, MaxOutputBytes: 1 << 20, MaxConstraints: 128, MaxCapabilities: 16, MaxChecks: 384, MaxStepsPerCheck: 64, MaxAssertionsPerStep: 64, MaxMissingItems: 32, MaxValidationWork: 100000}}}
 	var admission validationworkflow.AdmissionBuilder = trustedAdmission
 	if options.githubAuthority != nil {
 		admission = validationworkflow.GitHubRefreshingAdmission{Next: trustedAdmission, Authority: options.githubAuthority}
@@ -1066,7 +1450,19 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	}
 	contextRegistry := validationworkflow.CurrentContextProducerRegistry{Workflows: store, Admission: admission, GitHub: githubContextSource}
 	contextPort := &validationworkflow.ContextAssemblyAdapter{Profiles: contextProfiles, Registry: contextRegistry, Secrets: contextassembly.NewCanaryGate(nil), Tokens: contextassembly.ByteTokenCounter{Selections: map[string]bool{config.Provider + "/" + config.Model: true}}, Store: contextStore, Observer: validationworkflow.ContextObserver{}, Clock: wallClock, GitHub: githubContextSource}
-	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, validationworkflow.Dependencies{Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: config.AllowDisabledApproval}, Finalizer: workflowFinalizer{}, Environment: environmentPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, FlowAuthority: flowAuthority, Memory: memoryPort, MemoryObserver: memoryObserver, Context: contextPort, TargetPlanning: workflowTargetPlanningBinder{spec: spec, manifest: manifest, deps: runtimeDeps}})
+	serviceDependencies := validationworkflow.Dependencies{ProjectConfig: projectConfiguration.Resolver, Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: effective.Constraints.Approval != "required"}, Finalizer: workflowFinalizer{}, Environment: environmentPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, FlowAuthority: flowAuthority, Memory: memoryPort, MemoryObserver: memoryObserver, Context: contextPort, TargetPlanning: workflowTargetPlanningBinder{spec: spec, manifest: manifest, deps: runtimeDeps}}
+	resources := validationworkflow.ProjectBoundResources{Admission: serviceDependencies.Admission, Generation: serviceDependencies.Generation, Preparation: serviceDependencies.Preparation, Approval: serviceDependencies.Approval, Execution: serviceDependencies.Execution, Packages: serviceDependencies.Packages, Authorization: serviceDependencies.Authorization, Environment: serviceDependencies.Environment, ContractReview: serviceDependencies.ContractReview, Fixtures: serviceDependencies.Fixtures, FixturePackages: serviceDependencies.FixturePackages, FunctionalFlow: serviceDependencies.FunctionalFlow, FlowAuthority: serviceDependencies.FlowAuthority, Context: serviceDependencies.Context, TargetPlanning: serviceDependencies.TargetPlanning}
+	if options.boundResources != nil {
+		*options.boundResources = resources
+	}
+	if options.disableResourceFactory {
+		serviceDependencies.ProjectResources = validationworkflow.StaticProjectResourceMaterializer{Resources: resources}
+	} else {
+		factoryOptions := options
+		factoryOptions.boundEffective, factoryOptions.boundResources = nil, nil
+		serviceDependencies.ProjectResources = &workflowProjectResourceMaterializer{stdout: stdout, stderr: stderr, options: factoryOptions, cache: map[string]workflowMaterializedResources{}, artifacts: compositionArtifactStore, artifactRoot: filepath.Join(resourceRoot, "materialized")}
+	}
+	service, err := validationworkflow.NewService(validationworkflow.Config{LeaseTTL: 10 * time.Minute, HeartbeatInterval: time.Minute, FinalizeTimeout: 10 * time.Second, ApprovalTTL: 24 * time.Hour}, serviceDependencies)
 	if err != nil {
 		return nil, err
 	}
@@ -1085,7 +1481,132 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	} else {
 		cli.PreviewTargets[config.TargetAlias] = validationworkflow.PreviewTarget{Alias: config.TargetAlias, Digest: targetDigest}
 	}
+	if materializer, ok := serviceDependencies.ProjectResources.(*workflowProjectResourceMaterializer); ok {
+		template, templateErr := boundWorkflowCommand(validationworkflow.StartCommand{}, effective, cli)
+		if templateErr != nil {
+			return nil, templateErr
+		}
+		materializer.cache[effective.Digest] = workflowMaterializedResources{resources: resources, command: template}
+	}
 	return cli, nil
+}
+
+// workflowStringMapEqual detects composition inventory drift without resolving or persisting referenced secrets.
+func workflowStringMapEqual(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+// applyBoundWorkflowSelections replaces every resource selector with the active non-secret descriptor before adapters are built.
+func applyBoundWorkflowSelections(config *workflowConfig, effective projectconfig.EffectiveConfiguration) error {
+	if config == nil || projectconfig.ValidateEffectiveSnapshot(effective.ProjectKey, effective) != nil {
+		return errors.New("invalid effective project configuration")
+	}
+	selections := map[projectconfig.ResourceKind][]string{}
+	for _, descriptor := range effective.Descriptors {
+		if descriptor.Selection != "" {
+			selections[descriptor.Kind] = append(selections[descriptor.Kind], descriptor.Selection)
+		}
+	}
+	requireOne := func(kind projectconfig.ResourceKind) (string, error) {
+		values := selections[kind]
+		if len(values) != 1 {
+			return "", errors.New("project resource selection unavailable")
+		}
+		return values[0], nil
+	}
+	var err error
+	if config.ContractPath, err = requireOne(projectconfig.ResourceContract); err != nil {
+		return err
+	}
+	if config.TargetAlias, err = requireOne(projectconfig.ResourceEnvironment); err != nil {
+		return err
+	}
+	if config.Provider, err = requireOne(projectconfig.ResourceProvider); err != nil {
+		return err
+	}
+	if config.RuntimeProfile, err = requireOne(projectconfig.ResourceRuntimeProfile); err != nil {
+		return err
+	}
+	if config.Model, err = requireOne(projectconfig.ResourceModelProfile); err != nil {
+		return err
+	}
+	if config.AuthProfile, err = requireOne(projectconfig.ResourceAuthProfile); err != nil {
+		return err
+	}
+	if values := selections[projectconfig.ResourcePolicy]; len(values) == 1 {
+		config.PolicyID = values[0]
+	} else if len(values) > 1 {
+		return errors.New("project policy selection unavailable")
+	}
+	return nil
+}
+
+// boundWorkflowCommand replaces every project-owned request coordinate with values materialized from its binding.
+func boundWorkflowCommand(command validationworkflow.StartCommand, effective projectconfig.EffectiveConfiguration, cli *validationworkflow.CLI) (validationworkflow.StartCommand, error) {
+	var selected workflowConfig
+	if cli == nil || applyBoundWorkflowSelections(&selected, effective) != nil {
+		return validationworkflow.StartCommand{}, errors.New("bound workflow command unavailable")
+	}
+	command.ContractRef, command.Provider, command.Model, command.RuntimeProfile = selected.ContractPath, selected.Provider, selected.Model, selected.RuntimeProfile
+	command.CompositionRef = cli.AuthProfiles[selected.AuthProfile]
+	if effective.Constraints.Approval == "required" {
+		command.Approval = validationworkflow.ApprovalRequired
+	}
+	command.Target = validationworkflow.TargetSelection{}
+	if target, ok := cli.DirectTargets[selected.TargetAlias]; ok {
+		command.Target.Direct = &target
+	} else if target, ok := cli.PreviewTargets[selected.TargetAlias]; ok {
+		command.Target.Preview = &target
+	} else {
+		return validationworkflow.StartCommand{}, errors.New("bound workflow target unavailable")
+	}
+	if command.CompositionRef == "" {
+		return validationworkflow.StartCommand{}, errors.New("bound workflow profile unavailable")
+	}
+	return command, nil
+}
+
+// mergeBoundWorkflowCommand reapplies cached project-owned coordinates while preserving per-admission input.
+func mergeBoundWorkflowCommand(command, selected validationworkflow.StartCommand) validationworkflow.StartCommand {
+	command.ContractRef, command.Provider, command.Model = selected.ContractRef, selected.Provider, selected.Model
+	command.RuntimeProfile, command.CompositionRef = selected.RuntimeProfile, selected.CompositionRef
+	if selected.Approval != "" {
+		command.Approval = selected.Approval
+	}
+	command.Target = selected.Target
+	return command
+}
+
+// validateBoundWorkflowResources requires every identity, fixture and policy consumer to exist in the sealed effective snapshot.
+func validateBoundWorkflowResources(effective projectconfig.EffectiveConfiguration, spec specification.Specification, config workflowConfig) error {
+	secretReferences := map[string]bool{}
+	for _, reference := range effective.References {
+		if reference.Kind == projectconfig.ResourceIdentity && reference.SecretRef != "" {
+			secretReferences[reference.ID+"\x00"+reference.SecretRef] = true
+		}
+	}
+	for _, identity := range spec.Identities {
+		if !effective.AllowsReference(projectconfig.ResourceIdentity, identity.ID) || !secretReferences[identity.ID+"\x00"+identity.CredentialRef] {
+			return errors.New("project identity selection unavailable")
+		}
+	}
+	for _, fixture := range spec.Fixtures {
+		if !effective.AllowsReference(projectconfig.ResourceFixture, fixture.ID) {
+			return errors.New("project fixture selection unavailable")
+		}
+	}
+	if !effective.AllowsReference(projectconfig.ResourcePolicy, config.PolicyID) {
+		return errors.New("project policy selection unavailable")
+	}
+	return nil
 }
 
 // composeWorkflowGitHubContext confines trusted policy, read-only gateway and durable store to product composition.
@@ -1369,15 +1890,19 @@ func workflowContractReducerFor(config workflowConfig, projection contractcatalo
 		}
 		return workflowCombinedContractReducer{openAPIPath: config.OpenAPIContractPath, root: config.RepositoryRoot, authorizedRef: config.ContractPath, repositoryID: config.RepositoryID, revision: config.CommitOID, config: goConfig, spring: config.SpringInspector, sources: append([]string(nil), config.ContractSources...), selections: config.ContractSelections, projection: projection}
 	}
-	return workflowContractReducer{path: config.ContractPath, selections: config.ContractSelections, projection: projection}
+	return workflowContractReducer{path: config.ContractPath, authorizedRef: config.ContractAuthorizationRef, selections: config.ContractSelections, projection: projection}
 }
 
 // workflowSpecLoader authorizes exactly one configured specification path.
-type workflowSpecLoader struct{ path string }
+type workflowSpecLoader struct{ path, authorizedRef string }
 
 // Load rejects transport-selected paths outside trusted composition.
 func (l workflowSpecLoader) Load(ctx context.Context, ref string) (specification.Specification, error) {
-	if ref != l.path {
+	authorized := l.path
+	if l.authorizedRef != "" {
+		authorized = l.authorizedRef
+	}
+	if ref != authorized {
 		return specification.Specification{}, errors.New("unauthorized specification")
 	}
 	return specyaml.Load(ctx, l.path)
@@ -1385,14 +1910,19 @@ func (l workflowSpecLoader) Load(ctx context.Context, ref string) (specification
 
 // workflowContractReducer authorizes one contract and retains every operation as untrusted planning data.
 type workflowContractReducer struct {
-	path       string
-	selections map[string][]workflowOperationSelection
-	projection contractcatalog.ProjectionPolicy
+	path          string
+	authorizedRef string
+	selections    map[string][]workflowOperationSelection
+	projection    contractcatalog.ProjectionPolicy
 }
 
 // Reduce builds a bounded per-constraint operation context from the configured contract.
 func (r workflowContractReducer) Reduce(ctx context.Context, ref string, spec specification.Specification) (contractcatalog.ReducedContext, error) {
-	if ref != r.path {
+	authorized := r.path
+	if r.authorizedRef != "" {
+		authorized = r.authorizedRef
+	}
+	if ref != authorized {
 		return contractcatalog.ReducedContext{}, errors.New("unauthorized contract")
 	}
 	root := filepath.Dir(r.path)

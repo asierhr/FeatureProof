@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "base": "11d65d57ed26c36c1c945223bfc1531165899a02",
+  "production": [
+    "cmd/featureproof/main.go",
+    "cmd/featureproof/workflow.go",
+    "internal/controlplane/postgres/domain_stores.go",
+	"internal/controlplane/postgres/external_agent.go",
+    "internal/controlplane/postgres/project_configuration.go",
+	"internal/controlplane/postgres/resource_artifacts.go",
+    "internal/controlplane/postgres/workflow_store.go",
+	"internal/externalagent/registry.go",
+	"internal/externalagent/service.go",
+	"internal/externalagent/supervisor.go",
+	"internal/projectconfig/artifacts.go",
+    "internal/projectconfig/admission.go",
+    "internal/projectconfig/authority.go",
+    "internal/projectconfig/contracttest/store.go",
+    "internal/projectconfig/gateway.go",
+    "internal/projectconfig/loader.go",
+    "internal/projectconfig/local/lock_unix.go",
+    "internal/projectconfig/local/lock_windows.go",
+    "internal/projectconfig/local/store.go",
+    "internal/projectconfig/local/sync_unix.go",
+    "internal/projectconfig/local/sync_windows.go",
+    "internal/projectconfig/model.go",
+    "internal/projectconfig/service.go",
+    "internal/projectconfig/sources.go",
+    "internal/projectconfig/store_contract.go",
+    "internal/projectconfig/validator.go",
+    "internal/validationworkflow/model.go",
+    "internal/validationworkflow/service.go",
+    "internal/validationworkflow/store.go"
+  ],
+  "tests": [
+    "cmd/featureproof/controlplane_integration_test.go",
+    "cmd/featureproof/main_test.go",
+    "cmd/featureproof/workflow_identity_test.go",
+	"cmd/featureproof/workflow_resource_restart_test.go",
+    "internal/controlplane/postgres/integration_test.go",
+	"internal/externalagent/project_configuration_test.go",
+	"internal/projectconfig/artifacts_test.go",
+    "internal/projectconfig/local/store_test.go",
+    "internal/projectconfig/local/test_write_test.go",
+    "internal/projectconfig/projectconfig_test.go",
+    "internal/projectconfig/service_integration_test.go",
+    "internal/validationworkflow/functional_flow_test.go",
+    "internal/validationworkflow/project_configuration_test.go",
+    "internal/validationworkflow/workflow_test.go"
+  ],
+  "zero_statement_sources": [
+    "internal/validationworkflow/model.go"
+  ],
+  "unit_packages": [
+    "./cmd/featureproof",
+    "./internal/controlplane/postgres",
+	"./internal/externalagent",
+    "./internal/projectconfig/...",
+    "./internal/validationworkflow"
+  ]
+}

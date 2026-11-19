@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/asierhr/featureProof/internal/controlplane"
+	pc "github.com/asierhr/featureProof/internal/projectconfig"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 	"github.com/jackc/pgx/v5"
 )
@@ -120,6 +121,9 @@ func (adapter *PostgresWorkflowStore) ReserveBound(ctx context.Context, proposed
 	proposed.Version, proposed.VersionCAS, proposed.Sequence = 1, 1, 1
 	proposed.Owner, proposed.LeaseUntil, proposed.UpdatedAt = owner, now.Add(ttl), now.UTC()
 	event := validationworkflow.Event{Version: 1, Sequence: 1, ID: proposed.Handle + ":1", Handle: proposed.Handle, Type: "workflow_admitted", OccurredAt: now.UTC()}
+	if err = adapter.reserveProjectConfigurationTx(ctx, tx, proposed, now); err != nil {
+		return validationworkflow.Record{}, false, ctx, workflowError(err, "reserve_project_configuration")
+	}
 	recordData, _ := canonical(proposed)
 	eventData, _ := canonical(event)
 	if _, err = tx.Exec(ctx, `INSERT INTO workflow_runs(handle,principal,idempotency_key,request_digest,version,phase,owner,lease_until,updated_at,record) VALUES($1,$2,$3,$4,1,$5,$6,$7,$8,$9)`, proposed.Handle, proposed.Principal, proposed.IdempotencyKey, proposed.RequestDigest, proposed.Phase, owner, proposed.LeaseUntil, proposed.UpdatedAt, recordData); err != nil {
@@ -139,6 +143,50 @@ func (adapter *PostgresWorkflowStore) ReserveBound(ctx context.Context, proposed
 		return validationworkflow.Record{}, false, ctx, workflowError(mapError(err), "reserve_commit")
 	}
 	return proposed, true, bound, nil
+}
+
+// AtomicConfigurationBinding marks ReserveBound as the owner of binding, run and first-event commit.
+func (adapter *PostgresWorkflowStore) AtomicConfigurationBinding() {}
+
+// reserveProjectConfigurationTx fences and inserts a prepared binding before workflow visibility.
+func (adapter *PostgresWorkflowStore) reserveProjectConfigurationTx(ctx context.Context, tx pgx.Tx, proposed validationworkflow.Record, now time.Time) error {
+	binding := proposed.ProjectConfigurationBinding
+	if binding == nil {
+		return nil
+	}
+	if pc.ValidateRunBinding(*binding) != nil || binding.RunID != proposed.Handle || binding.ProjectKey.RepositoryID != proposed.RepositoryID {
+		return &validationworkflow.Error{Code: validationworkflow.CodeInvalid, Operation: "project_configuration"}
+	}
+	if err := adapter.store.injectFault("workflow.project_configuration.before"); err != nil {
+		return err
+	}
+	var generation uint64
+	var activationDigest, effectiveDigest string
+	err := tx.QueryRow(ctx, `SELECT a.generation,a.digest,e.effective_digest FROM project_configuration_heads h JOIN project_configuration_activations a USING(project_id,repository_id,generation) JOIN project_configuration_effective_snapshots e USING(project_id,repository_id,generation) WHERE h.project_id=$1 AND h.repository_id=$2 FOR SHARE`, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID).Scan(&generation, &activationDigest, &effectiveDigest)
+	if err != nil {
+		return err
+	}
+	if generation != binding.ActivationGeneration || activationDigest != binding.ActivationDigest || effectiveDigest != binding.EffectiveDigest {
+		return &validationworkflow.Error{Code: validationworkflow.CodeConflict, Operation: "project_configuration_stale"}
+	}
+	raw, err := canonical(binding)
+	if err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO project_configuration_run_bindings(project_id,repository_id,run_id,binding,binding_digest,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID, binding.RunID, raw, binding.BindingDigest, now.UTC())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		var existing string
+		if err = tx.QueryRow(ctx, `SELECT binding_digest FROM project_configuration_run_bindings WHERE project_id=$1 AND repository_id=$2 AND run_id=$3`, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID, binding.RunID).Scan(&existing); err != nil {
+			return err
+		}
+		if existing != binding.BindingDigest {
+			return &validationworkflow.Error{Code: validationworkflow.CodeConflict, Operation: "project_configuration_idempotency"}
+		}
+	}
+	return adapter.store.injectFault("workflow.project_configuration.after")
 }
 
 // reserveBackendTx creates the workflow's immutable PostgreSQL epoch/head in the same admission transaction, so every downstream adapter can fence by handle.

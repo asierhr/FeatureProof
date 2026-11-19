@@ -26,6 +26,9 @@ type LocalStore struct {
 	cleanupScanHook func(string)
 }
 
+// AtomicConfigurationBinding marks Reserve as the local checkpoint owner for binding, run and first event.
+func (s *LocalStore) AtomicConfigurationBinding() {}
+
 // workflowCheckpoint atomically couples the durable projection with its complete event journal.
 type workflowCheckpoint struct {
 	Record Record  `json:"record"`

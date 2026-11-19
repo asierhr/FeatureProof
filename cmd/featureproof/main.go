@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -32,6 +33,7 @@ import (
 	"github.com/asierhr/featureProof/internal/model/openai"
 	"github.com/asierhr/featureProof/internal/model/openai/oauth"
 	"github.com/asierhr/featureProof/internal/previewenv"
+	"github.com/asierhr/featureProof/internal/projectconfig"
 	"github.com/asierhr/featureProof/internal/projectmemory"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 )
@@ -150,6 +152,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 // runWithContext dispatches every product entrypoint under one caller-owned lifecycle for deterministic server shutdown.
 func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) >= 2 && args[0] == "project-config" {
+		return runProjectConfigurationCommand(ctx, args[1:], stdin, stdout)
+	}
 	if len(args) == 2 && args[0] == "control-plane" && args[1] == "import" {
 		return runControlPlaneImport(ctx, stdout, stderr)
 	}
@@ -229,6 +234,74 @@ func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout,
 		return externalagent.RunCLI(ctx, args, stdout, service)
 	}
 	return localvalidation.RunCommand(localvalidation.TerminalSignalContext(ctx), args, stdin, stdout, stderr)
+}
+
+// runProjectConfigurationCommand routes the local administrative CLI through the same authoritative gateway used by admission.
+func runProjectConfigurationCommand(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) int {
+	if len(args) == 0 {
+		return 2
+	}
+	current, err := user.Current()
+	if err != nil {
+		return 3
+	}
+	repositoryID := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_REPOSITORY_ID")
+	composition, err := composeWorkflowProjectConfiguration(ctx, "", current.Uid, repositoryID, nil, false)
+	if err != nil {
+		return 3
+	}
+	request := projectconfig.GatewayRequest{Authority: composition.Authority, ProjectKey: composition.Key, Operation: projectconfig.Operation(args[0])}
+	if request.Operation == projectconfig.OperationValidate || request.Operation == projectconfig.OperationPublish {
+		request.Document, err = io.ReadAll(io.LimitReader(stdin, projectconfig.MaxCanonicalBytes+1))
+		if err != nil || len(request.Document) > projectconfig.MaxCanonicalBytes {
+			return 2
+		}
+	}
+	switch request.Operation {
+	case projectconfig.OperationPublish:
+		if len(args) != 3 {
+			return 2
+		}
+		request.OperationID = args[1]
+		request.ExpectedGeneration, err = strconv.ParseUint(args[2], 10, 64)
+	case projectconfig.OperationRollback:
+		if len(args) != 4 {
+			return 2
+		}
+		request.OperationID = args[1]
+		request.Version, err = strconv.ParseUint(args[2], 10, 64)
+		if err == nil {
+			request.ExpectedGeneration, err = strconv.ParseUint(args[3], 10, 64)
+		}
+	case projectconfig.OperationShowVersion, projectconfig.OperationExport:
+		if len(args) != 2 {
+			return 2
+		}
+		request.Version, err = strconv.ParseUint(args[1], 10, 64)
+	case projectconfig.OperationHistory:
+		if len(args) != 3 {
+			return 2
+		}
+		request.Cursor = args[1]
+		request.Limit, err = strconv.Atoi(args[2])
+	case projectconfig.OperationValidate, projectconfig.OperationShowActive:
+		if len(args) != 1 {
+			return 2
+		}
+	default:
+		return 2
+	}
+	if err != nil {
+		return 2
+	}
+	result, err := composition.Gateway.Execute(ctx, request)
+	if err != nil {
+		return 3
+	}
+	if json.NewEncoder(stdout).Encode(result) != nil {
+		return 3
+	}
+	return 0
 }
 
 // currentOperatorAuthorizer binds operational commands to the exact current
@@ -422,6 +495,11 @@ func registerLocalImportExporters(source *controlplane.LocalImportStore, root st
 
 // runGitHubServer composes secrets at the executable boundary and owns bounded HTTP shutdown.
 func runGitHubServer(ctx context.Context, stderr io.Writer) int {
+	return runGitHubServerWithReadiness(ctx, stderr, nil)
+}
+
+// runGitHubServerWithReadiness exposes listener ownership to integration tests without changing production shutdown semantics.
+func runGitHubServerWithReadiness(ctx context.Context, stderr io.Writer, ready chan<- struct{}) int {
 	runtime, address, err := composeGitHubRuntime(ctx)
 	if err != nil {
 		return 3
@@ -430,9 +508,17 @@ func runGitHubServer(ctx context.Context, stderr io.Writer) int {
 		_ = runtime.Close(context.WithoutCancel(ctx))
 		return 3
 	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		_ = runtime.Close(context.WithoutCancel(ctx))
+		return 3
+	}
 	server := &http.Server{Addr: address, Handler: runtime.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	done := make(chan error, 1)
-	go func() { done <- server.ListenAndServe() }()
+	go func() { done <- server.Serve(listener) }()
+	if ready != nil {
+		close(ready)
+	}
 	select {
 	case err = <-done:
 		if !errors.Is(err, http.ErrServerClosed) {
@@ -529,8 +615,11 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 			return nil, "", workflowErr
 		}
 		configuredWorkflow = &workflowConfig
-		selection = githubpr.Selection{Alias: workflowConfig.TargetAlias, Secretless: workflowConfig.TargetKind == "preview"}
 		if !postgresMode {
+			if workflowErr = bindProductWorkflowConfiguration(ctx, configuredWorkflow, nil); workflowErr != nil {
+				return nil, "", workflowErr
+			}
+			selection = githubpr.Selection{Alias: configuredWorkflow.TargetAlias, Secretless: configuredWorkflow.TargetKind == "preview"}
 			workflowCLI, composeErr := composeWorkflowCLIWithGitHubAuthority(ctx, io.Discard, io.Discard, authorityAdapter)
 			if composeErr != nil {
 				return nil, "", composeErr
@@ -629,7 +718,13 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 		}
 		controlPlaneDomains = postgresDomains
 		if configuredWorkflow != nil {
-			workflowCLI, composeErr := composeWorkflowCLIWithPersistence(ctx, io.Discard, io.Discard, &workflowPersistence{workflows: postgresDomains.Workflow, artifacts: postgresDomains.PlanArtifacts, executables: postgresDomains.ExecutablePlan, approvals: postgresDomains.Approval, environments: postgresDomains.Environment, capacity: postgresDomains.Capacity, cleanupLedger: postgresDomains.CleanupLedger, cleanup: postgresDomains.Cleanup, functional: postgresDomains.Functional, journal: postgresDomains.Functional, packages: postgresDomains.Packages, corrections: postgresDomains.Correction, fixtures: postgresDomains.Fixtures, context: postgresDomains.Context, functionalRuntime: postgresStore})
+			configurationPersistence := &workflowPersistence{projectConfig: postgresDomains.ProjectConfig}
+			if bindErr := bindProductWorkflowConfiguration(ctx, configuredWorkflow, configurationPersistence); bindErr != nil {
+				postgresStore.Close()
+				return nil, "", bindErr
+			}
+			selection = githubpr.Selection{Alias: configuredWorkflow.TargetAlias, Secretless: configuredWorkflow.TargetKind == "preview"}
+			workflowCLI, composeErr := composeWorkflowCLIWithPersistence(ctx, io.Discard, io.Discard, &workflowPersistence{workflows: postgresDomains.Workflow, artifacts: postgresDomains.PlanArtifacts, executables: postgresDomains.ExecutablePlan, approvals: postgresDomains.Approval, environments: postgresDomains.Environment, capacity: postgresDomains.Capacity, cleanupLedger: postgresDomains.CleanupLedger, cleanup: postgresDomains.Cleanup, functional: postgresDomains.Functional, journal: postgresDomains.Functional, packages: postgresDomains.Packages, corrections: postgresDomains.Correction, fixtures: postgresDomains.Fixtures, context: postgresDomains.Context, projectConfig: postgresDomains.ProjectConfig, resourceArtifacts: postgresDomains.ResourceArtifacts, functionalRuntime: postgresStore})
 			if composeErr != nil {
 				postgresStore.Close()
 				return nil, "", composeErr
@@ -658,6 +753,29 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 		address = "127.0.0.1:8081"
 	}
 	return runtime, address, nil
+}
+
+// bindProductWorkflowConfiguration materializes project-owned selectors from the authoritative backend before any ingress advertises them.
+func bindProductWorkflowConfiguration(ctx context.Context, config *workflowConfig, persistence *workflowPersistence) error {
+	if config == nil {
+		return errors.New("workflow configuration unavailable")
+	}
+	current, err := user.Current()
+	if err != nil || current.Uid == "" {
+		return errors.New("local identity unavailable")
+	}
+	composition, err := composeWorkflowProjectConfiguration(ctx, "", current.Uid, config.RepositoryID, persistence, true)
+	if err != nil {
+		return err
+	}
+	active, err := composition.Gateway.Execute(ctx, projectconfig.GatewayRequest{Operation: projectconfig.OperationShowActive, Authority: composition.Authority, ProjectKey: composition.Key})
+	if err != nil || active.Effective == nil {
+		return errors.New("active project configuration unavailable")
+	}
+	if err = applyBoundWorkflowSelections(config, *active.Effective); err != nil {
+		return err
+	}
+	return validateBoundWorkflowConfig(*config)
 }
 
 // githubWorkflowValidation exposes one composed workflow through the GitHub gateway without changing its persistence backend.
@@ -889,6 +1007,80 @@ func isExternalAgentCommand(args []string) bool {
 	return len(args) > 0 && (args[0] == "capabilities" || args[0] == "run" || args[0] == "correction" || args[0] == "mcp")
 }
 
+// externalProjectResourceMaterializer derives every external-agent admission consumer and limit from its sealed run binding.
+type externalProjectResourceMaterializer struct {
+	principalID string
+	selection   externalagent.Selection
+	executor    externalagent.ApprovedExecutor
+	artifacts   interface {
+		GetArtifact(context.Context, projectconfig.ResourceDescriptor) ([]byte, error)
+	}
+}
+
+// PrepareAdmission validates current backing and builds consumers without persisting before the causal registry transaction.
+func (materializer externalProjectResourceMaterializer) PrepareAdmission(_ context.Context, binding projectconfig.RunConfigurationBinding) (externalagent.ProjectResourceSnapshot, externalagent.ProjectBoundResources, error) {
+	if projectconfig.ValidateRunBinding(binding) != nil || materializer.principalID == "" || materializer.selection.Alias == "" || materializer.executor == nil || materializer.artifacts == nil {
+		return externalagent.ProjectResourceSnapshot{}, externalagent.ProjectBoundResources{}, errors.New("external project resources unavailable")
+	}
+	descriptor := externalEnvironmentDescriptor(binding)
+	if descriptor == nil || descriptor.Selection != materializer.selection.Alias {
+		return externalagent.ProjectResourceSnapshot{}, externalagent.ProjectBoundResources{}, errors.New("external project selection unavailable")
+	}
+	payload, err := json.Marshal(materializer.selection.Value)
+	if err != nil {
+		return externalagent.ProjectResourceSnapshot{}, externalagent.ProjectBoundResources{}, errors.New("external project artifact unavailable")
+	}
+	resources, err := materializer.resourcesFromPayload(binding, *descriptor, payload)
+	if err != nil {
+		return externalagent.ProjectResourceSnapshot{}, externalagent.ProjectBoundResources{}, err
+	}
+	return externalagent.ProjectResourceSnapshot{Descriptor: *descriptor, Payload: payload}, resources, nil
+}
+
+// externalEnvironmentDescriptor returns the single environment identity carried by the sealed binding.
+func externalEnvironmentDescriptor(binding projectconfig.RunConfigurationBinding) *projectconfig.ResourceDescriptor {
+	for index := range binding.Effective.Descriptors {
+		candidate := binding.Effective.Descriptors[index]
+		if candidate.Kind == projectconfig.ResourceEnvironment && candidate.Selection != "" {
+			copy := candidate
+			return &copy
+		}
+	}
+	return nil
+}
+
+// Materialize rejects descriptor drift and returns only artifacts authorized by the historical binding without republishing backing.
+func (materializer externalProjectResourceMaterializer) Materialize(ctx context.Context, binding projectconfig.RunConfigurationBinding) (externalagent.ProjectBoundResources, error) {
+	if projectconfig.ValidateRunBinding(binding) != nil || materializer.principalID == "" || materializer.executor == nil || materializer.artifacts == nil {
+		return externalagent.ProjectBoundResources{}, errors.New("external project resources unavailable")
+	}
+	descriptor := externalEnvironmentDescriptor(binding)
+	if descriptor == nil {
+		return externalagent.ProjectBoundResources{}, errors.New("external project selection unavailable")
+	}
+	payload, err := materializer.artifacts.GetArtifact(ctx, *descriptor)
+	if err != nil {
+		return externalagent.ProjectBoundResources{}, errors.New("external project artifact unavailable")
+	}
+	return materializer.resourcesFromPayload(binding, *descriptor, payload)
+}
+
+// resourcesFromPayload authenticates the selected alias and derives limits before consumers can be admitted or recovered.
+func (materializer externalProjectResourceMaterializer) resourcesFromPayload(binding projectconfig.RunConfigurationBinding, descriptor projectconfig.ResourceDescriptor, payload []byte) (externalagent.ProjectBoundResources, error) {
+	var request previewenv.ConsumerRequest
+	if json.Unmarshal(payload, &request) != nil || request.Selection.Alias != descriptor.Selection {
+		return externalagent.ProjectBoundResources{}, errors.New("external project artifact corrupt")
+	}
+	selection := externalagent.Selection{Alias: descriptor.Selection, Value: request}
+	catalog, err := externalagent.NewAliasCatalog(map[string]map[string]externalagent.Selection{materializer.principalID: {selection.Alias: selection}})
+	retention := time.Duration(binding.Effective.Constraints.RetentionDays) * 24 * time.Hour
+	timeout := time.Duration(binding.Effective.Constraints.Limits.DurationSeconds) * time.Second
+	if err != nil || retention <= 0 || timeout <= 0 {
+		return externalagent.ProjectBoundResources{}, errors.New("external project limits unavailable")
+	}
+	return externalagent.ProjectBoundResources{Catalog: catalog, Executor: materializer.executor, Retention: retention, RunTimeout: timeout}, nil
+}
+
 // composeExternalAgentService enables preview scopes only after complete trusted composition.
 func composeExternalAgentService() (*externalagent.Service, error) {
 	root, err := os.Getwd()
@@ -899,6 +1091,57 @@ func composeExternalAgentService() (*externalagent.Service, error) {
 	if err != nil || current.Uid == "" {
 		return nil, errors.New("local identity unavailable")
 	}
+	var registry externalagent.Registry
+	var configurationPersistence *workflowPersistence
+	var postgresOwner *controlplanepg.Store
+	keepPostgresOwner := false
+	defer func() {
+		if postgresOwner != nil && !keepPostgresOwner {
+			postgresOwner.Close()
+		}
+	}()
+	backend := os.Getenv("FEATUREPROOF_CONTROL_PLANE_BACKEND")
+	switch backend {
+	case "", string(controlplane.BackendLocal):
+		registry, err = externalagent.NewLocalRegistry(filepath.Join(root, ".featureproof", "external-agent"))
+	case string(controlplane.BackendPostgres):
+		identity := os.Getenv("FEATUREPROOF_CONTROL_PLANE_IDENTITY")
+		if identity == "" {
+			identity = "external-agent-postgres"
+		}
+		observer := controlPlaneObserver{logger: slog.New(slog.NewJSONHandler(os.Stderr, nil))}
+		postgresOwner, err = controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: os.Getenv("FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN"), BackendIdentity: identity, MaxConnections: 8, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, Observer: observer})
+		if err == nil {
+			err = postgresOwner.Migrate(context.Background())
+		}
+		if err == nil {
+			err = postgresOwner.Ready(context.Background())
+		}
+		if err == nil {
+			registry = postgresOwner.ExternalAgentRegistry()
+			configurationPersistence = &workflowPersistence{projectConfig: postgresOwner.ProjectConfiguration()}
+		}
+	default:
+		return nil, errors.New("control plane backend unavailable")
+	}
+	if err != nil || registry == nil {
+		return nil, errors.New("external registry unavailable")
+	}
+	artifactRegistry, ok := registry.(interface {
+		GetArtifact(context.Context, projectconfig.ResourceDescriptor) ([]byte, error)
+	})
+	if !ok {
+		return nil, errors.New("external artifact registry unavailable")
+	}
+	repositoryID := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_REPOSITORY_ID")
+	projectConfiguration, err := composeWorkflowProjectConfiguration(context.Background(), root, current.Uid, repositoryID, configurationPersistence, true)
+	if err != nil {
+		return nil, err
+	}
+	active, err := projectConfiguration.Gateway.Execute(context.Background(), projectconfig.GatewayRequest{Operation: projectconfig.OperationShowActive, Authority: projectConfiguration.Authority, ProjectKey: projectConfiguration.Key})
+	if err != nil || active.Effective == nil {
+		return nil, errors.New("active project configuration unavailable")
+	}
 	preview, configured, err := composeConfiguredPreview(context.Background(), root)
 	if err != nil {
 		return nil, err
@@ -907,6 +1150,9 @@ func composeExternalAgentService() (*externalagent.Service, error) {
 	selections := map[string]externalagent.Selection{}
 	executor := externalagent.ApprovedExecutor(externalagent.FailClosedExecutor{})
 	if configured {
+		if !active.Effective.AllowsReference(projectconfig.ResourceEnvironment, preview.Request.Selection.Alias) {
+			return nil, errors.New("external selection outside project configuration")
+		}
 		scopes = map[string]bool{externalagent.ScopeCreate: true, externalagent.ScopeRead: true, externalagent.ScopeCancel: true}
 		selections[preview.Request.Selection.Alias] = externalagent.Selection{Alias: preview.Request.Selection.Alias, Value: preview.Request}
 		executor = previewenv.ExternalExecutor{Coordinator: preview.Coordinator, Recovery: preview.Recovery}
@@ -916,10 +1162,6 @@ func composeExternalAgentService() (*externalagent.Service, error) {
 		return nil, err
 	}
 	catalog, err := externalagent.NewAliasCatalog(map[string]map[string]externalagent.Selection{current.Uid: selections})
-	if err != nil {
-		return nil, err
-	}
-	registry, err := externalagent.NewLocalRegistry(filepath.Join(root, ".featureproof", "external-agent"))
 	if err != nil {
 		return nil, err
 	}
@@ -935,9 +1177,21 @@ func composeExternalAgentService() (*externalagent.Service, error) {
 		preview.Recovery = recovery
 		executor = previewenv.ExternalExecutor{Coordinator: preview.Coordinator, Recovery: recovery}
 	}
-	service, serviceErr := externalagent.NewService(externalagent.ServiceDependencies{Identity: identity, Catalog: catalog, Registry: registry, Executor: executor, Packages: externalagent.VerifiedPackageReader{}, Clock: externalagent.WallClock{}, IDs: externalagent.RandomIDs{}, Owner: owner, Retention: 24 * time.Hour, RunTimeout: 30 * time.Minute})
+	retention := time.Duration(active.Effective.Constraints.RetentionDays) * 24 * time.Hour
+	runTimeout := time.Duration(active.Effective.Constraints.Limits.DurationSeconds) * time.Second
+	if retention <= 0 || runTimeout <= 0 {
+		return nil, errors.New("project configuration limits unavailable")
+	}
+	selection := externalagent.Selection{Alias: "unavailable"}
+	if configured {
+		selection = selections[preview.Request.Selection.Alias]
+	}
+	service, serviceErr := externalagent.NewService(externalagent.ServiceDependencies{Identity: identity, Catalog: catalog, Registry: registry, Executor: executor, Packages: externalagent.VerifiedPackageReader{}, Clock: externalagent.WallClock{}, IDs: externalagent.RandomIDs{}, Owner: owner, Retention: retention, RunTimeout: runTimeout, RepositoryID: repositoryID, ProjectConfig: projectConfiguration.Resolver, ProjectResources: externalProjectResourceMaterializer{principalID: current.Uid, selection: selection, executor: executor, artifacts: artifactRegistry}})
 	if serviceErr != nil && configured {
 		_ = preview.Recovery.Close(context.Background())
+	}
+	if serviceErr == nil && postgresOwner != nil {
+		keepPostgresOwner = true
 	}
 	return service, serviceErr
 }

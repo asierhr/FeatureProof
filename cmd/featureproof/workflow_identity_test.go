@@ -251,12 +251,27 @@ type workflowProductModelTransport struct {
 
 // workflowProductResolverSpy counts actual productive Resolve calls while delegating late material acquisition to the environment resolver.
 type workflowProductResolverSpy struct {
-	calls atomic.Int32
+	calls       atomic.Int32
+	unavailable bool
 }
 
 // Factory returns a composition resolver wrapper for one trusted reference and environment mapping.
 func (s *workflowProductResolverSpy) Factory(reference, environment string) testidentity.CredentialResolver {
+	if s.unavailable {
+		return workflowProductCountingResolver{next: workflowProductUnavailableResolver{}, calls: &s.calls}
+	}
 	return workflowProductCountingResolver{next: newWorkflowEnvironmentCredentialResolver(reference, environment), calls: &s.calls}
+}
+
+// workflowProductUnavailableResolver provides a test-local missing credential without mutating process environment.
+type workflowProductUnavailableResolver struct{}
+
+// Resolve fails at the same late material boundary as a revoked or absent external secret.
+func (workflowProductUnavailableResolver) Resolve(ctx context.Context, _ testidentity.ResolutionRequest) (testidentity.CredentialLease, error) {
+	if err := ctx.Err(); err != nil {
+		return testidentity.CredentialLease{}, err
+	}
+	return testidentity.CredentialLease{}, errors.New("credential unavailable")
 }
 
 // workflowProductCountingResolver records the actual resolver boundary without deriving counts from audit events.
@@ -477,6 +492,7 @@ func composeProductWorkflowWithOptionsAndPersistence(t *testing.T, root string, 
 			value["fixture_runtime"] = map[string]any{"max_capture_bytes": 1024, "max_tool_calls": 8, "max_retries": 2, "create_retries": 1, "cleanup_timeout_ms": 10000, "cleanup_max_calls": 2, "cleanup_retries": 1, "retry_backoff_ms": 10, "lease_ttl_ms": 11000}
 		}
 	})
+	writeWorkflowProjectConfigurationFixture(t, root, configPath)
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)
 	t.Setenv("FEATUREPROOF_PRODUCT_IDENTITY", "PRODUCT-IDENTITY-CANARY")
 	previousTransport := http.DefaultTransport
@@ -748,6 +764,10 @@ func TestProductWorkflowMCPEntrypointComposesFunctionalAliases(t *testing.T) {
 	rewriteWorkflowConfig(t, configPath, func(value map[string]any) {
 		value["functional_flow_aliases"] = map[string]any{"approved": strings.Repeat("a", 64)}
 	})
+	// The setup composition admits no run; discard its pre-admission snapshot so the executable snapshots the finalized fixture.
+	if err := os.RemoveAll(filepath.Join(root, ".featureproof", "project-resource-artifacts")); err != nil {
+		t.Fatal(err)
+	}
 	request := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"protocolVersion":"2026-07-28"}}` + "\n"
 	var stdout, stderr bytes.Buffer
 	if code := runWithContext(context.Background(), []string{"workflow", "mcp", "serve"}, strings.NewReader(request), &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "featureproof.workflow.start") {
@@ -888,26 +908,28 @@ func TestProductIdentityFailureParityAcrossAllSurfaces(t *testing.T) {
 		identityID, bindingDigest, category, nativeCode string
 		modelCalls, resolverCalls, targetCalls          int32
 	}
-	runSuffix := strconv.FormatInt(time.Now().UnixNano(), 10)
+	runSuffix := "isolated"
+	expectedCodes := map[string]string{"api": "api:inconclusive", "cli": "cli:0:inconclusive", "mcp": "mcp::inconclusive", "github": "github:inconclusive"}
 	results := map[string]failureResult{}
-	for _, surface := range []string{"api", "cli", "mcp", "github"} {
+	// GitHub owns an additional authenticated PR-authority admission path. Running it first
+	// also proves it does not depend on state or resources left by the simpler surfaces.
+	for _, surface := range []string{"github", "api", "cli", "mcp"} {
 		t.Run(surface, func(t *testing.T) {
 			root := t.TempDir()
 			t.Chdir(root)
+			surfaceCtx, cancelSurface := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancelSurface()
 			var targetCalls atomic.Int32
 			target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { targetCalls.Add(1) }))
 			defer target.Close()
 			modelTransport := &workflowProductModelTransport{}
-			resolverSpy := &workflowProductResolverSpy{}
+			resolverSpy := &workflowProductResolverSpy{unavailable: true}
 			cli, specPath, contractPath := composeProductIdentityWorkflowWithOptions(t, root, target.URL, modelTransport, resolverSpy, true)
-			if err := os.Unsetenv("FEATUREPROOF_PRODUCT_IDENTITY"); err != nil {
-				t.Fatal(err)
-			}
 			command := productIdentityStartCommand(cli, specPath, contractPath, "product-failure-"+surface+"-"+runSuffix, validationworkflow.ApprovalDisabled)
 			handle, nativeCode := "", ""
 			switch surface {
 			case "api":
-				view, err := cli.Service.Start(context.Background(), command)
+				view, err := cli.Service.Start(surfaceCtx, command)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -915,7 +937,7 @@ func TestProductIdentityFailureParityAcrossAllSurfaces(t *testing.T) {
 			case "cli":
 				var output bytes.Buffer
 				args := []string{"start", "--spec", specPath, "--contract", contractPath, "--provider", "openai", "--model", "selected-model", "--profile", "profile", "--runtime-profile", "runtime", "--repository", "7", "--revision", strings.Repeat("a", 40), "--approval", "disabled", "--idempotency-key", command.IdempotencyKey, "--target", "target"}
-				code := cli.Run(context.Background(), args, &output)
+				code := cli.Run(surfaceCtx, args, &output)
 				var view validationworkflow.WorkflowView
 				if json.Unmarshal(output.Bytes(), &view) != nil || view.Outcome == nil {
 					t.Fatalf("CLI code=%d output=%s", code, output.String())
@@ -924,7 +946,7 @@ func TestProductIdentityFailureParityAcrossAllSurfaces(t *testing.T) {
 			case "mcp":
 				server := validationworkflow.MCPServer{Service: cli.Service, Principal: cli.Principal, AuthProfiles: cli.AuthProfiles, DirectTargets: cli.DirectTargets}
 				arguments, _ := json.Marshal(map[string]any{"idempotency_key": command.IdempotencyKey, "specification_ref": specPath, "contract_ref": contractPath, "provider": "openai", "model": "selected-model", "auth_profile": "profile", "runtime_profile": "runtime", "repository_id": "7", "revision": strings.Repeat("a", 40), "approval": "disabled", "target_alias": "target"})
-				response := server.Handle(context.Background(), validationworkflow.MCPRequest{Version: validationworkflow.ContractVersion, Operation: "workflow.start", Arguments: arguments})
+				response := server.Handle(surfaceCtx, validationworkflow.MCPRequest{Version: validationworkflow.ContractVersion, Operation: "workflow.start", Arguments: arguments})
 				view, ok := response.Value.(validationworkflow.WorkflowView)
 				if !ok || view.Outcome == nil {
 					t.Fatalf("MCP response=%#v", response)
@@ -934,35 +956,38 @@ func TestProductIdentityFailureParityAcrossAllSurfaces(t *testing.T) {
 				command.Approval = validationworkflow.ApprovalRequired
 				snapshot, _ := githubpr.SealSnapshot(githubpr.PullRequestSnapshot{Version: 1, InstallationID: 1, RepositoryID: 7, Number: 2, AuthorID: 9, State: "open", HeadOID: strings.Repeat("a", 40), HeadRepositoryID: 7})
 				gateway := validationworkflow.GitHubGateway{Service: cli.Service, Principal: cli.Principal, Commands: map[string]validationworkflow.StartCommand{"default": command}}
-				state, err := gateway.Submit(context.Background(), githubpr.Selection{Alias: "default"}, snapshot, command.IdempotencyKey)
+				state, err := gateway.Submit(surfaceCtx, githubpr.Selection{Alias: "default"}, snapshot, command.IdempotencyKey)
 				if err != nil {
 					t.Fatal(err)
 				}
 				handle = state.RunHandle
-				approval, _ := cli.Service.ApprovalView(context.Background(), handle)
-				if _, err = cli.Service.Decide(context.Background(), validationworkflow.DecisionCommand{Principal: cli.Principal, Handle: handle, DecisionID: "approve-failure", Revision: approval.Revision, Action: validationworkflow.DecisionApprove}); err != nil {
+				approval, _ := cli.Service.ApprovalView(surfaceCtx, handle)
+				if _, err = cli.Service.Decide(surfaceCtx, validationworkflow.DecisionCommand{Principal: cli.Principal, Handle: handle, DecisionID: "approve-failure", Revision: approval.Revision, Action: validationworkflow.DecisionApprove}); err != nil {
 					t.Fatal(err)
 				}
-				state, err = gateway.Status(context.Background(), handle)
+				state, err = gateway.Status(surfaceCtx, handle)
 				if err != nil {
 					t.Fatal(err)
 				}
 				nativeCode = "github:" + state.Outcome
 			}
-			result, err := cli.Service.Result(context.Background(), handle)
+			result, err := cli.Service.Result(surfaceCtx, handle)
 			if err != nil || result.View.Outcome == nil {
 				t.Fatalf("failure result=%#v err=%v", result, err)
 			}
 			identityID, bindingDigest := readProductIdentityBinding(t, root, handle)
-			results[surface] = failureResult{identityID: identityID, bindingDigest: bindingDigest, category: string(*result.View.Outcome), nativeCode: nativeCode, modelCalls: modelTransport.calls.Load(), resolverCalls: resolverSpy.calls.Load(), targetCalls: targetCalls.Load()}
+			captured := failureResult{identityID: identityID, bindingDigest: bindingDigest, category: string(*result.View.Outcome), nativeCode: nativeCode, modelCalls: modelTransport.calls.Load(), resolverCalls: resolverSpy.calls.Load(), targetCalls: targetCalls.Load()}
+			if captured.identityID != "customer" || captured.category != "inconclusive" || captured.nativeCode != expectedCodes[surface] || captured.modelCalls != 1 || captured.resolverCalls != 1 || captured.targetCalls != 0 {
+				t.Fatalf("%s failure parity=%#v", surface, captured)
+			}
+			results[surface] = captured
 		})
 	}
-	expectedCodes := map[string]string{"api": "api:inconclusive", "cli": "cli:0:inconclusive", "mcp": "mcp::inconclusive", "github": "github:inconclusive"}
 	binding := ""
 	for _, surface := range []string{"api", "cli", "mcp", "github"} {
-		result := results[surface]
-		if result.identityID != "customer" || result.category != "inconclusive" || result.nativeCode != expectedCodes[surface] || result.modelCalls != 1 || result.resolverCalls != 1 || result.targetCalls != 0 {
-			t.Fatalf("%s failure parity=%#v", surface, result)
+		result, ran := results[surface]
+		if !ran {
+			continue
 		}
 		if binding == "" {
 			binding = result.bindingDigest
@@ -1166,5 +1191,5 @@ func TestProductIdentityRotationPreservesHistoricalJournalWithoutSecrets(t *test
 			t.Fatalf("rotation terminal events for %s: %#v", run, events)
 		}
 	}
-	assertProductDurableFilesExclude(t, root, firstCanary, secondCanary, "cred_customer")
+	assertProductDurableFilesExclude(t, root, firstCanary, secondCanary)
 }

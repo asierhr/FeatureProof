@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/asierhr/featureProof/internal/projectconfig"
 )
 
 // Stable registry errors are translated without inspecting text.
@@ -19,9 +21,10 @@ var (
 
 // registryDocument is the closed private persistence schema for all local runs.
 type registryDocument struct {
-	Version int                  `json:"version"`
-	Runs    map[string]RunRecord `json:"runs"`
-	Events  []RunEvent           `json:"events"`
+	Version   int                                       `json:"version"`
+	Runs      map[string]RunRecord                      `json:"runs"`
+	Events    []RunEvent                                `json:"events"`
+	Artifacts map[string]projectconfig.ResourceArtifact `json:"artifacts,omitempty"`
 }
 
 // LocalRegistry durably stores private run state in one protected local document.
@@ -48,7 +51,7 @@ func NewLocalRegistry(root string) (*LocalRegistry, error) {
 	}
 	defer release()
 	if _, err := os.Stat(registry.path); errors.Is(err, os.ErrNotExist) {
-		if err := registry.saveLocked(registryDocument{Version: 1, Runs: map[string]RunRecord{}, Events: []RunEvent{}}); err != nil {
+		if err := registry.saveLocked(registryDocument{Version: 1, Runs: map[string]RunRecord{}, Events: []RunEvent{}, Artifacts: map[string]projectconfig.ResourceArtifact{}}); err != nil {
 			return nil, err
 		}
 	} else if err != nil {
@@ -58,6 +61,156 @@ func NewLocalRegistry(root string) (*LocalRegistry, error) {
 		return nil, err
 	}
 	return registry, nil
+}
+
+// ReserveConfigured atomically persists one verified artifact with its binding-bearing run and reserved event.
+func (r *LocalRegistry) ReserveConfigured(ctx context.Context, candidate RunRecord, snapshot ProjectResourceSnapshot) (ReserveResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ReserveResult{}, err
+	}
+	if candidate.Configuration == nil || !bindingContainsDescriptor(*candidate.Configuration, snapshot.Descriptor) {
+		return ReserveResult{}, errors.New("invalid configured admission")
+	}
+	artifact, err := projectconfig.SealResourceArtifact(snapshot.Descriptor, snapshot.Payload)
+	if err != nil {
+		return ReserveResult{}, err
+	}
+	artifactKey, err := json.Marshal(artifact.Key)
+	if err != nil {
+		return ReserveResult{}, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	release, err := acquireRegistryLock(ctx, r.path+".lock")
+	if err != nil {
+		return ReserveResult{}, err
+	}
+	defer release()
+	document, err := r.loadLocked()
+	if err != nil {
+		return ReserveResult{}, err
+	}
+	for _, existing := range document.Runs {
+		if existing.PrincipalID == candidate.PrincipalID && existing.SubmitKeyHash == candidate.SubmitKeyHash {
+			if existing.RequestHash != candidate.RequestHash {
+				return ReserveResult{}, ErrConflict
+			}
+			return ReserveResult{Record: existing}, nil
+		}
+	}
+	if _, exists := document.Runs[candidate.Handle]; exists || !validInitialRecord(candidate) {
+		return ReserveResult{}, ErrConflict
+	}
+	key := string(artifactKey)
+	if current, exists := document.Artifacts[key]; exists {
+		verified, verifyErr := projectconfig.VerifyResourceArtifact(snapshot.Descriptor, current)
+		if verifyErr != nil || string(verified) != string(snapshot.Payload) {
+			return ReserveResult{}, ErrConflict
+		}
+	} else {
+		document.Artifacts[key] = artifact
+	}
+	ownerRelease, err := acquireRegistryLock(ctx, r.ownerPath(candidate.Handle))
+	if err != nil {
+		return ReserveResult{}, err
+	}
+	document.Runs[candidate.Handle] = candidate
+	appendRunEvent(&document, candidate, "reserved", "")
+	if err = r.saveLocked(document); err != nil {
+		ownerRelease()
+		return ReserveResult{}, err
+	}
+	r.leases[candidate.Handle] = ownerRelease
+	return ReserveResult{Record: candidate, New: true}, nil
+}
+
+// GetArtifact reloads one committed configured-admission artifact from the same durable document as its run.
+func (r *LocalRegistry) GetArtifact(ctx context.Context, descriptor projectconfig.ResourceDescriptor) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	sealed, err := projectconfig.SealResourceArtifact(descriptor, nil)
+	if err != nil {
+		return nil, err
+	}
+	keyBytes, err := json.Marshal(sealed.Key)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	release, err := acquireRegistryLock(ctx, r.path+".lock")
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	document, err := r.loadLocked()
+	if err != nil {
+		return nil, err
+	}
+	artifact, ok := document.Artifacts[string(keyBytes)]
+	if !ok {
+		return nil, &projectconfig.Error{Category: projectconfig.CategoryMissingReference, Operation: "external.artifact.get"}
+	}
+	return projectconfig.VerifyResourceArtifact(descriptor, artifact)
+}
+
+// bindingContainsDescriptor requires the committed artifact identity to be authorized by the exact run binding.
+func bindingContainsDescriptor(binding projectconfig.RunConfigurationBinding, descriptor projectconfig.ResourceDescriptor) bool {
+	for _, candidate := range binding.Effective.Descriptors {
+		if candidate.ProjectKey == descriptor.ProjectKey && candidate.Kind == descriptor.Kind && candidate.ID == descriptor.ID && candidate.Version == descriptor.Version && candidate.Digest == descriptor.Digest {
+			return true
+		}
+	}
+	return false
+}
+
+// ClaimSubmit owns the configured admission frontier and resolves replay before callers consult mutable project state.
+func (r *LocalRegistry) ClaimSubmit(ctx context.Context, principalID, keyHash, requestHash string) (*SubmissionClaim, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if principalID == "" || len(keyHash) != 64 || len(requestHash) != 64 {
+		return nil, ErrConflict
+	}
+	releaseAdmission, err := acquireRegistryLock(ctx, r.path+".admission.lock")
+	if err != nil {
+		return nil, err
+	}
+	failed := true
+	defer func() {
+		if failed {
+			releaseAdmission()
+		}
+	}()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	releaseDocument, err := acquireRegistryLock(ctx, r.path+".lock")
+	if err != nil {
+		return nil, err
+	}
+	document, err := r.loadLocked()
+	releaseDocument()
+	if err != nil {
+		return nil, err
+	}
+	claim := &SubmissionClaim{release: releaseAdmission}
+	for _, existing := range document.Runs {
+		if existing.PrincipalID == principalID && existing.SubmitKeyHash == keyHash {
+			if existing.RequestHash != requestHash {
+				return nil, ErrConflict
+			}
+			copy := existing
+			if existing.Configuration != nil {
+				binding := existing.Configuration.Clone()
+				copy.Configuration = &binding
+			}
+			claim.Existing = &copy
+			break
+		}
+	}
+	failed = false
+	return claim, nil
 }
 
 // Reserve atomically binds principal, operation, key hash, and request hash.
@@ -340,6 +493,9 @@ func (r *LocalRegistry) loadLocked() (registryDocument, error) {
 	if err := DecodeStrict(raw, &document); err != nil || document.Version != 1 || document.Runs == nil || document.Events == nil || validateJournal(document) != nil {
 		return registryDocument{}, errors.New("invalid external registry")
 	}
+	if document.Artifacts == nil {
+		document.Artifacts = map[string]projectconfig.ResourceArtifact{}
+	}
 	return document, nil
 }
 
@@ -415,7 +571,8 @@ func (r *LocalRegistry) saveLocked(document registryDocument) error {
 
 // validInitialRecord guards persistence invariants before the first write.
 func validInitialRecord(record RunRecord) bool {
-	return validHandle(record.Handle) && validHandle(record.InternalID) && record.PrincipalID != "" && record.SelectionAlias != "" && len(record.RequestHash) == 64 && len(record.SubmitKeyHash) == 64 && record.Phase == PhaseQueued && record.Status == "" && !record.UpdatedAt.IsZero()
+	validConfiguration := record.Configuration == nil || record.Configuration.RunID == record.InternalID && projectconfig.ValidateRunBinding(*record.Configuration) == nil
+	return validHandle(record.Handle) && validHandle(record.InternalID) && record.PrincipalID != "" && record.SelectionAlias != "" && len(record.RequestHash) == 64 && len(record.SubmitKeyHash) == 64 && record.Phase == PhaseQueued && record.Status == "" && !record.UpdatedAt.IsZero() && validConfiguration
 }
 
 // validTransition defines the monotonic public lifecycle.

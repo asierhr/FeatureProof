@@ -43,7 +43,10 @@ import (
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/model"
 	"github.com/asierhr/featureProof/internal/planmanifest"
+	"github.com/asierhr/featureProof/internal/projectconfig"
+	localprojectconfig "github.com/asierhr/featureProof/internal/projectconfig/local"
 	"github.com/asierhr/featureProof/internal/specification"
+	specyaml "github.com/asierhr/featureProof/internal/specification/yaml"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 	"k8s.io/client-go/rest"
 )
@@ -1012,6 +1015,7 @@ func TestComposeWorkflowCLISealsGoInspectorAuthority(t *testing.T) {
 		value["contract_path"] = root
 		value["go_inspector"] = map[string]any{"roots": []string{"app"}, "changed_paths": []string{"app/main.go"}, "goos": "linux", "goarch": "amd64", "build_tags": []string{}, "auth_matchers": []any{}, "limits": map[string]any{"max_files": 10, "max_bytes": 1048576, "max_packages": 5, "max_ast_nodes": 1000, "max_depth": 10, "max_types": 20, "max_operations": 10, "max_diagnostics": 10, "max_duration": int64(time.Second)}, "include_generated": false, "entry_symbols": []string{"routes"}}
 	})
+	writeWorkflowProjectConfigurationFixture(t, root, configPath)
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)
 	cli, err := composeWorkflowCLI(context.Background(), io.Discard, io.Discard)
 	if err != nil || cli == nil {
@@ -1042,6 +1046,7 @@ func TestComposeWorkflowCLIUsesMatchingPreviewConfiguration(t *testing.T) {
 	if err = os.WriteFile(configPath, rawConfig, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	writeWorkflowProjectConfigurationFixture(t, root, configPath)
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)
 	cli, err := composeWorkflowCLI(context.Background(), io.Discard, io.Discard)
 	if err != nil || len(cli.PreviewTargets) != 1 || len(cli.DirectTargets) != 0 {
@@ -1344,7 +1349,267 @@ func writeWorkflowCompositionFixture(t *testing.T, root string, document map[str
 			t.Fatal(err)
 		}
 	}
+	writeWorkflowProjectConfigurationFixture(t, root, configPath)
 	return configPath, specPath, contractPath
+}
+
+// writeWorkflowProjectConfigurationFixture publishes the exact active authority used by productive composition tests.
+func writeWorkflowProjectConfigurationFixture(t *testing.T, root, configPath string) {
+	t.Helper()
+	rawConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]any
+	if err = json.Unmarshal(rawConfig, &config); err != nil {
+		t.Fatal(err)
+	}
+	repositoryID := config["repository_id"].(string)
+	contractPath := config["contract_path"].(string)
+	provider := config["provider"].(string)
+	modelID := config["model"].(string)
+	runtimeProfile := config["runtime_profile"].(string)
+	authProfile := config["auth_profile"].(string)
+	targetAlias := config["target_alias"].(string)
+	providerKind := "existing-url"
+	if catalog, ok := config["environment_catalog"].(map[string]any); ok {
+		if items, ok := catalog["items"].([]any); ok && len(items) > 0 {
+			if selection, ok := items[0].(map[string]any); ok {
+				providerKind, _ = selection["provider_id"].(string)
+			}
+		}
+	}
+	projectID := "project"
+	if isolated := os.Getenv("FEATUREPROOF_TEST_PROJECT_ID"); isolated != "" {
+		projectID = isolated
+	}
+	key, err := projectconfig.NewProjectKey(projectID, repositoryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("a", 64)
+	limits := projectconfig.CatalogLimits{MaxDescriptors: 16, MaxOperationsPerDescriptor: 16, MaxCapabilitiesPerDescriptor: 16, MaxDependenciesPerDescriptor: 16, MaxDependencyEdges: 64, MaxGraphWork: 80}
+	descriptors := []projectconfig.ResourceDescriptor{
+		{Kind: projectconfig.ResourceContract, ID: "contract", Selection: contractPath, Version: 1, Digest: digest, ProjectKey: key},
+		{Kind: projectconfig.ResourceEnvironment, ID: "target", Selection: targetAlias, Version: 1, Digest: digest, ProjectKey: key, ProviderKind: providerKind},
+		{Kind: projectconfig.ResourceProvider, ID: "provider", Selection: provider, Version: 1, Digest: digest, ProjectKey: key},
+		{Kind: projectconfig.ResourceRuntimeProfile, ID: "runtime", Selection: runtimeProfile, Version: 1, Digest: digest, ProjectKey: key, ProviderKind: providerKind},
+		{Kind: projectconfig.ResourceModelProfile, ID: "model", Selection: modelID, Version: 1, Digest: digest, ProjectKey: key, ProviderKind: providerKind},
+		{Kind: projectconfig.ResourceAuthProfile, ID: "auth", Selection: authProfile, Version: 1, Digest: digest, ProjectKey: key, ProviderKind: providerKind},
+		{Kind: projectconfig.ResourcePolicy, ID: "policy", Selection: config["policy_id"].(string), Version: 1, Digest: digest, ProjectKey: key},
+	}
+	if specificationPath, ok := config["specification_path"].(string); ok {
+		if specificationDocument, loadErr := specyaml.Load(context.Background(), specificationPath); loadErr == nil {
+			for _, identity := range specificationDocument.Identities {
+				descriptors = append(descriptors, projectconfig.ResourceDescriptor{Kind: projectconfig.ResourceIdentity, ID: identity.ID, Selection: identity.ID, Version: 1, Digest: digest, ProjectKey: key})
+			}
+			for _, fixture := range specificationDocument.Fixtures {
+				descriptors = append(descriptors, projectconfig.ResourceDescriptor{Kind: projectconfig.ResourceFixture, ID: fixture.ID, Selection: fixture.ID, Version: 1, Digest: digest, ProjectKey: key})
+			}
+		}
+	}
+	references := make([]projectconfig.ResourceReference, len(descriptors))
+	for index, descriptor := range descriptors {
+		references[index] = projectconfig.ResourceReference{Kind: descriptor.Kind, ID: descriptor.ID, Version: descriptor.Version, Digest: descriptor.Digest}
+		if descriptor.Kind == projectconfig.ResourceAuthProfile {
+			references[index].SecretRef = "profile"
+		}
+		if descriptor.Kind == projectconfig.ResourceIdentity {
+			for _, identity := range mustLoadWorkflowSpecification(t, config["specification_path"].(string)).Identities {
+				if identity.ID == descriptor.ID {
+					references[index].SecretRef = identity.CredentialRef
+				}
+			}
+		}
+	}
+	approval := "required"
+	if allowed, _ := config["allow_disabled_approval"].(bool); allowed {
+		approval = "optional"
+	}
+	document := projectconfig.Document{Schema: projectconfig.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Limits: projectconfig.Limits{DurationSeconds: 300, ToolCalls: 4, ModelTokens: 64000, Replans: 1}, Approval: approval, RetentionDays: 7, Capabilities: []string{"read"}}}
+	canonical, err := projectconfig.Canonicalize(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogSnapshot := projectconfig.ResourceCatalogSnapshot{ProjectKey: key, Digest: digest, Descriptors: descriptors, Limits: limits}
+	policySnapshot := projectconfig.OrganizationPolicySnapshot{Version: 1, Digest: digest, MaximumLimits: projectconfig.Limits{DurationSeconds: 300, ToolCalls: 4, ModelTokens: 64000, Replans: 1}, ApprovalRequired: approval == "required", MinimumRetentionDays: 1, MaximumRetentionDays: 30, AllowedCapabilities: []string{"read"}}
+	catalog, err := projectconfig.NewSnapshotCatalog([]projectconfig.ResourceCatalogSnapshot{catalogSnapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policies, err := projectconfig.NewSnapshotPolicies([]projectconfig.PolicyForProject{{ProjectKey: key, Snapshot: policySnapshot}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeRoot := filepath.Join(root, "project-configuration")
+	store, err := localprojectconfig.New(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursorKey := "01234567890123456789012345678901"
+	service, err := projectconfig.NewService(store, catalog, policies, nil, projectconfig.ServiceConfig{CursorKey: []byte(cursorKey), CursorTTL: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := projectconfig.IssueAuthority("test", key, projectconfig.ActionPublish, projectconfig.ActionRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedGeneration := uint64(0)
+	if head, _, _, activeErr := service.Active(context.Background(), authority, key); activeErr == nil {
+		expectedGeneration = head.Activation.Generation
+	}
+	if _, err = service.PublishAndActivate(context.Background(), authority, key, fmt.Sprintf("fixture-publish-%d", expectedGeneration+1), expectedGeneration, canonical.Bytes); err != nil {
+		t.Fatal(err)
+	}
+	catalogPath := filepath.Join(root, "project-catalog.json")
+	policyPath := filepath.Join(root, "project-policy.json")
+	for path, value := range map[string]any{catalogPath: catalogSnapshot, policyPath: policySnapshot} {
+		raw, marshalErr := json.Marshal(value)
+		if marshalErr != nil || os.WriteFile(path, raw, 0o600) != nil {
+			t.Fatalf("write project configuration fixture: %v", marshalErr)
+		}
+	}
+	t.Setenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID", key.ProjectID)
+	t.Setenv("FEATUREPROOF_PROJECT_CONFIG_REPOSITORY_ID", key.RepositoryID)
+	t.Setenv("FEATUREPROOF_PROJECT_CONFIG_CATALOG", catalogPath)
+	t.Setenv("FEATUREPROOF_PROJECT_CONFIG_POLICY", policyPath)
+	t.Setenv("FEATUREPROOF_PROJECT_CONFIG_CURSOR_KEY", cursorKey)
+	t.Setenv("FEATUREPROOF_PROJECT_CONFIG_ROOT", storeRoot)
+}
+
+// mustLoadWorkflowSpecification reads one test-owned strict specification for resource descriptor construction.
+func mustLoadWorkflowSpecification(t *testing.T, path string) specification.Specification {
+	t.Helper()
+	document, err := specyaml.Load(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return document
+}
+
+// TestProjectConfigurationCLIUsesSharedGateway proves the administrative surface queries and validates through productive composition.
+func TestProjectConfigurationCLIUsesSharedGateway(t *testing.T) {
+	root := t.TempDir()
+	writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
+	var output bytes.Buffer
+	if code := runWithContext(context.Background(), []string{"project-config", "show"}, strings.NewReader(""), &output, io.Discard); code != 0 || !strings.Contains(output.String(), "Head") {
+		t.Fatalf("show code=%d output=%s", code, output.String())
+	}
+	localStore, err := localprojectconfig.New(os.Getenv("FEATUREPROOF_PROJECT_CONFIG_ROOT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _ := projectconfig.NewProjectKey(os.Getenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID"), os.Getenv("FEATUREPROOF_PROJECT_CONFIG_REPOSITORY_ID"))
+	head, err := localStore.Head(context.Background(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, _, err := localStore.Version(context.Background(), key, head.Activation.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if code := runWithContext(context.Background(), []string{"project-config", "validate"}, bytes.NewReader(version.Canonical), &output, io.Discard); code != 0 || !strings.Contains(output.String(), "Effective") {
+		t.Fatalf("validate code=%d output=%s", code, output.String())
+	}
+	commands := [][]string{{"publish", "cli-publish", "1"}, {"version", "2"}, {"export", "2"}, {"history", "", "10"}, {"rollback", "cli-rollback", "1", "2"}, {"show"}}
+	for _, command := range commands {
+		output.Reset()
+		input := strings.NewReader("")
+		if command[0] == "publish" {
+			input = strings.NewReader(string(version.Canonical))
+		}
+		if code := runProjectConfigurationCommand(context.Background(), command, input, &output); code != 0 {
+			t.Fatalf("command %v code=%d output=%s", command, code, output.String())
+		}
+	}
+	invalid := []struct {
+		args  []string
+		input string
+	}{{nil, ""}, {[]string{"unknown"}, ""}, {[]string{"publish"}, ""}, {[]string{"publish", "id", "bad"}, string(version.Canonical)}, {[]string{"rollback", "id", "bad", "1"}, ""}, {[]string{"rollback", "id", "1", "bad"}, ""}, {[]string{"version"}, ""}, {[]string{"version", "bad"}, ""}, {[]string{"history", "", "bad"}, ""}, {[]string{"validate", "extra"}, string(version.Canonical)}, {[]string{"validate"}, strings.Repeat("x", projectconfig.MaxCanonicalBytes+1)}}
+	for _, test := range invalid {
+		if code := runProjectConfigurationCommand(context.Background(), test.args, strings.NewReader(test.input), io.Discard); code != 2 {
+			t.Fatalf("invalid command %v code=%d", test.args, code)
+		}
+	}
+	if code := runProjectConfigurationCommand(context.Background(), []string{"show"}, strings.NewReader(""), mainTestRejectWriter{}); code != 3 {
+		t.Fatalf("output failure code=%d", code)
+	}
+}
+
+// mainTestRejectWriter injects a deterministic transport write failure.
+type mainTestRejectWriter struct{}
+
+// Write rejects the administrative result without retaining it.
+func (mainTestRejectWriter) Write([]byte) (int, error) { return 0, errors.New("output unavailable") }
+
+// TestApplyBoundWorkflowSelectionsRejectsMissingAndAmbiguousResources proves bootstrap values cannot fill configuration gaps.
+func TestApplyBoundWorkflowSelectionsRejectsMissingAndAmbiguousResources(t *testing.T) {
+	t.Parallel()
+	key, _ := projectconfig.NewProjectKey("project", "repo")
+	digest := strings.Repeat("a", 64)
+	required := []projectconfig.ResourceDescriptor{{Kind: projectconfig.ResourceContract, ID: "contract", Selection: "contract.json"}, {Kind: projectconfig.ResourceEnvironment, ID: "environment", Selection: "target"}, {Kind: projectconfig.ResourceProvider, ID: "provider", Selection: "openai"}, {Kind: projectconfig.ResourceRuntimeProfile, ID: "runtime", Selection: "runtime"}, {Kind: projectconfig.ResourceModelProfile, ID: "model", Selection: "model"}, {Kind: projectconfig.ResourceAuthProfile, ID: "auth", Selection: "profile"}}
+	build := func(descriptors []projectconfig.ResourceDescriptor) projectconfig.EffectiveConfiguration {
+		references := make([]projectconfig.ResourceReference, len(descriptors))
+		for index := range descriptors {
+			descriptors[index].Version, descriptors[index].Digest, descriptors[index].ProjectKey = 1, digest, key
+			references[index] = projectconfig.ResourceReference{Kind: descriptors[index].Kind, ID: descriptors[index].ID, Version: 1, Digest: digest}
+			if descriptors[index].Kind == projectconfig.ResourceIdentity {
+				references[index].SecretRef = "credential"
+			}
+		}
+		canonical, err := projectconfig.Canonicalize(projectconfig.Document{Schema: projectconfig.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Limits: projectconfig.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		effective, err := projectconfig.ValidateAndMerge(canonical, projectconfig.OrganizationPolicySnapshot{Version: 1, Digest: digest}, projectconfig.ResourceCatalogSnapshot{ProjectKey: key, Digest: digest, Descriptors: descriptors, Limits: projectconfig.CatalogLimits{MaxDescriptors: 16, MaxOperationsPerDescriptor: 4, MaxCapabilitiesPerDescriptor: 4, MaxDependenciesPerDescriptor: 4, MaxDependencyEdges: 16, MaxGraphWork: 32}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return effective
+	}
+	if err := applyBoundWorkflowSelections(nil, build(append([]projectconfig.ResourceDescriptor(nil), required...))); err == nil {
+		t.Fatal("nil bootstrap accepted")
+	}
+	for index := range required {
+		descriptors := append([]projectconfig.ResourceDescriptor(nil), required[:index]...)
+		descriptors = append(descriptors, required[index+1:]...)
+		if err := applyBoundWorkflowSelections(&workflowConfig{}, build(descriptors)); err == nil {
+			t.Fatalf("missing kind %s accepted", required[index].Kind)
+		}
+	}
+	withPolicy := append(append([]projectconfig.ResourceDescriptor(nil), required...), projectconfig.ResourceDescriptor{Kind: projectconfig.ResourcePolicy, ID: "policy", Selection: "network"})
+	config := workflowConfig{}
+	if err := applyBoundWorkflowSelections(&config, build(withPolicy)); err != nil || config.PolicyID != "network" || config.Model != "model" {
+		t.Fatalf("valid selections: %+v %v", config, err)
+	}
+	ambiguous := append(withPolicy, projectconfig.ResourceDescriptor{Kind: projectconfig.ResourcePolicy, ID: "policy2", Selection: "network2"})
+	if err := applyBoundWorkflowSelections(&workflowConfig{}, build(ambiguous)); err == nil {
+		t.Fatal("ambiguous policy accepted")
+	}
+	consumerDescriptors := append(append([]projectconfig.ResourceDescriptor(nil), withPolicy...), projectconfig.ResourceDescriptor{Kind: projectconfig.ResourceIdentity, ID: "customer", Selection: "customer"}, projectconfig.ResourceDescriptor{Kind: projectconfig.ResourceFixture, ID: "account", Selection: "account"})
+	consumerEffective := build(consumerDescriptors)
+	consumerSpec := specification.Specification{Identities: []specification.TestIdentity{{ID: "customer", CredentialRef: "credential"}}, Fixtures: []specification.Fixture{{ID: "account"}}}
+	if err := validateBoundWorkflowResources(consumerEffective, consumerSpec, workflowConfig{PolicyID: "network"}); err != nil {
+		t.Fatalf("valid consumers rejected: %v", err)
+	}
+	if err := validateBoundWorkflowResources(build(withPolicy), consumerSpec, workflowConfig{PolicyID: "network"}); err == nil {
+		t.Fatal("missing identity accepted")
+	}
+	wrongCredential := consumerSpec
+	wrongCredential.Identities = []specification.TestIdentity{{ID: "customer", CredentialRef: "revoked"}}
+	if err := validateBoundWorkflowResources(consumerEffective, wrongCredential, workflowConfig{PolicyID: "network"}); err == nil {
+		t.Fatal("revoked credential reference accepted")
+	}
+	missingFixture := consumerSpec
+	missingFixture.Fixtures = []specification.Fixture{{ID: "other"}}
+	if err := validateBoundWorkflowResources(consumerEffective, missingFixture, workflowConfig{PolicyID: "network"}); err == nil {
+		t.Fatal("missing fixture accepted")
+	}
+	if err := validateBoundWorkflowResources(consumerEffective, consumerSpec, workflowConfig{PolicyID: "other"}); err == nil {
+		t.Fatal("missing policy accepted")
+	}
 }
 
 // assertWorkflowStoresContainNoSensitiveState proves rejected admission created no plan, approval, executable or workflow record.
@@ -1625,10 +1890,12 @@ func TestProductionExternalAgentCompositionFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chdir(t.TempDir()); err != nil {
+	root := t.TempDir()
+	if err := os.Chdir(root); err != nil {
 		t.Fatal(err)
 	}
 	defer os.Chdir(original)
+	writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
 	service, err := composeExternalAgentService()
 	if err != nil {
 		t.Fatal(err)
@@ -1656,10 +1923,12 @@ func TestRunDispatchesExternalCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chdir(t.TempDir()); err != nil {
+	root := t.TempDir()
+	if err := os.Chdir(root); err != nil {
 		t.Fatal(err)
 	}
 	defer os.Chdir(original)
+	writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"capabilities", "--json"}, strings.NewReader(""), &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), `"contract_version":2`) {
 		t.Fatalf("code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
@@ -1688,6 +1957,12 @@ func TestConfiguredPreviewRunsThroughExternalCLIEntrypoint(t *testing.T) {
 	defer server.Close()
 	root := t.TempDir()
 	t.Chdir(root)
+	configPath, _, _ := writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
+	rewriteWorkflowConfig(t, configPath, func(value map[string]any) {
+		value["target_alias"] = "preview"
+		value["environment_catalog"].(map[string]any)["items"].([]any)[0].(map[string]any)["alias"] = "preview"
+	})
+	writeWorkflowProjectConfigurationFixture(t, root, configPath)
 	t.Setenv("FEATUREPROOF_PREVIEW_CONFIG", writeConfiguredPreviewFixture(t, root, server.URL+"/"))
 	var stdout, stderr bytes.Buffer
 	if code := run([]string{"run", "submit", "--selection", "preview", "--idempotency-key", "root-entrypoint-key", "--json"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
@@ -1708,6 +1983,12 @@ func TestConfiguredPreviewRunsThroughMCPEntrypoint(t *testing.T) {
 	defer server.Close()
 	root := t.TempDir()
 	t.Chdir(root)
+	configPath, _, _ := writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
+	rewriteWorkflowConfig(t, configPath, func(value map[string]any) {
+		value["target_alias"] = "preview"
+		value["environment_catalog"].(map[string]any)["items"].([]any)[0].(map[string]any)["alias"] = "preview"
+	})
+	writeWorkflowProjectConfigurationFixture(t, root, configPath)
 	t.Setenv("FEATUREPROOF_PREVIEW_CONFIG", writeConfiguredPreviewFixture(t, root, server.URL+"/"))
 	request := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"protocolVersion":"2026-07-28","name":"featureproof.submit","arguments":{"selection_alias":"preview","idempotency_key":"mcp-entrypoint-key"}}}` + "\n"
 	var stdout, stderr bytes.Buffer

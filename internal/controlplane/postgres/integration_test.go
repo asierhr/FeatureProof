@@ -24,17 +24,928 @@ import (
 	"github.com/asierhr/featureProof/internal/correction"
 	"github.com/asierhr/featureProof/internal/environment"
 	cleanup "github.com/asierhr/featureProof/internal/environment/cleanup"
+	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/functionalflow"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/planning"
+	pc "github.com/asierhr/featureProof/internal/projectconfig"
+	pccontract "github.com/asierhr/featureProof/internal/projectconfig/contracttest"
 	"github.com/asierhr/featureProof/internal/testidentity"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// integrationCatalogLimits supplies explicit finite budgets to real PostgreSQL fixtures.
+func integrationCatalogLimits() pc.CatalogLimits {
+	return pc.CatalogLimits{MaxDescriptors: 16, MaxOperationsPerDescriptor: 16, MaxCapabilitiesPerDescriptor: 16, MaxDependenciesPerDescriptor: 16, MaxDependencyEdges: 64, MaxGraphWork: 80}
+}
+
+// TestPostgresResourceArtifactsSurviveRestartAndRejectCorruption verifies exact historical payloads without filesystem fallback.
+func TestPostgresResourceArtifactsSurviveRestartAndRejectCorruption(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := pc.NewProjectKey("project", "repository")
+	descriptor := pc.ResourceDescriptor{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: strings.Repeat("a", 64), ProjectKey: key}
+	if _, err := owner.ResourceArtifacts().Get(ctx, descriptor); !pc.IsCategory(err, pc.CategoryMissingReference) {
+		t.Fatalf("missing artifact=%v", err)
+	}
+	invalid := descriptor
+	invalid.ProjectKey = pc.ProjectKey{}
+	if err := owner.ResourceArtifacts().Put(ctx, invalid, []byte("invalid")); !pc.IsCategory(err, pc.CategoryInvalid) {
+		t.Fatalf("invalid authority put=%v", err)
+	}
+	if _, err := owner.ResourceArtifacts().Get(ctx, invalid); !pc.IsCategory(err, pc.CategoryInvalid) {
+		t.Fatalf("invalid authority get=%v", err)
+	}
+	if err := owner.ResourceArtifacts().Put(ctx, descriptor, []byte("historical")); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.ResourceArtifacts().Put(ctx, descriptor, []byte("historical")); err != nil {
+		t.Fatalf("exact redelivery=%v", err)
+	}
+	if err := owner.ResourceArtifacts().Put(ctx, descriptor, []byte("divergent")); !pc.IsCategory(err, pc.CategoryIntegrity) {
+		t.Fatalf("divergent redelivery=%v", err)
+	}
+	reopened, err := Open(ctx, Config{DSN: owner.pool.Config().ConnString(), BackendIdentity: "artifact-restart", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	payload, err := reopened.ResourceArtifacts().Get(ctx, descriptor)
+	if err != nil || string(payload) != "historical" {
+		t.Fatalf("restart artifact=%q err=%v", payload, err)
+	}
+	if _, err = owner.pool.Exec(ctx, `UPDATE project_configuration_resource_artifacts SET payload=$1 WHERE project_id=$2 AND repository_id=$3 AND reference_kind=$4 AND reference_id=$5 AND reference_version=$6 AND descriptor_digest=$7`, []byte("corrupt"), descriptor.ProjectKey.ProjectID, descriptor.ProjectKey.RepositoryID, string(descriptor.Kind), descriptor.ID, descriptor.Version, descriptor.Digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = reopened.ResourceArtifacts().Get(ctx, descriptor); !pc.IsCategory(err, pc.CategoryIntegrity) {
+		t.Fatalf("corruption=%v", err)
+	}
+	if err = reopened.ResourceArtifacts().Put(ctx, descriptor, []byte("historical")); !pc.IsCategory(err, pc.CategoryIntegrity) {
+		t.Fatalf("corrupt redelivery=%v", err)
+	}
+}
+
+// TestPostgresResourceArtifactSharedContract applies the adapter-neutral project-scoped artifact suite.
+func TestPostgresResourceArtifactSharedContract(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := pccontract.RunResourceArtifacts(ctx, func() (pc.ResourceArtifactStore, error) {
+		return owner.ResourceArtifacts(), nil
+	}, fmt.Sprintf("postgres-%d", time.Now().UnixNano())); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPostgresExternalAdmissionIsCausalAtomicAndRestartable proves idempotency is decided before a new head and artifact, binding, run and first event share one transaction.
+func TestPostgresExternalAdmissionIsCausalAtomicAndRestartable(t *testing.T) {
+	ctx := context.Background()
+	store := integrationStore(t)
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	registry := store.ExternalAgentRegistry()
+	binding, descriptor := integrationExternalBinding(t, "external-repository", "external-internal-1", 1)
+	record := externalagent.RunRecord{Handle: "external-atomic-handle", InternalID: binding.RunID, PrincipalID: "external-principal", SelectionAlias: descriptor.Selection, RequestHash: integrationDigest("external-request"), SubmitKeyHash: integrationDigest("external-key"), Phase: externalagent.PhaseQueued, Owner: "external-owner", UpdatedAt: time.Unix(1000, 0).UTC(), Configuration: &binding, RetentionNS: int64(time.Hour), RunTimeoutNS: int64(time.Minute)}
+	snapshot := externalagent.ProjectResourceSnapshot{Descriptor: descriptor, Payload: []byte("external-artifact-v1")}
+	claim, err := registry.ClaimSubmit(ctx, record.PrincipalID, record.SubmitKeyHash, record.RequestHash)
+	if err != nil || claim.Existing != nil {
+		t.Fatalf("initial claim=%+v err=%v", claim, err)
+	}
+	result, err := registry.ReserveConfigured(ctx, record, snapshot)
+	claim.Release()
+	if err != nil || !result.New {
+		t.Fatalf("reserve=%+v err=%v", result, err)
+	}
+
+	// A new process and a changed current head must still converge on the committed binding without creating rows.
+	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "external-restart", MaxConnections: 8, StatementTimeout: 30 * time.Second, MaxLease: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	restartedRegistry := restarted.ExternalAgentRegistry()
+	replay, err := restartedRegistry.ClaimSubmit(ctx, record.PrincipalID, record.SubmitKeyHash, record.RequestHash)
+	if err != nil || replay.Existing == nil || replay.Existing.Handle != record.Handle || replay.Existing.Configuration == nil || replay.Existing.Configuration.BindingDigest != binding.BindingDigest {
+		t.Fatalf("restart replay=%+v err=%v", replay, err)
+	}
+	replay.Release()
+	payload, err := restartedRegistry.GetArtifact(ctx, descriptor)
+	if err != nil || string(payload) != string(snapshot.Payload) {
+		t.Fatalf("restart artifact=%q err=%v", payload, err)
+	}
+
+	// A fault after the artifact insert but before the run insert rolls back both parts.
+	faultBinding, faultDescriptor := integrationExternalBinding(t, "external-repository", "external-internal-2", 2)
+	faultRecord := record
+	faultRecord.InternalID = faultBinding.RunID
+	faultRecord.SubmitKeyHash = integrationDigest("external-fault-key")
+	faultRecord.RequestHash = integrationDigest("external-fault-request")
+	faultRecord.SelectionAlias = faultDescriptor.Selection
+	faultRecord.Configuration = &faultBinding
+	faultClaim, err := registry.ClaimSubmit(ctx, faultRecord.PrincipalID, faultRecord.SubmitKeyHash, faultRecord.RequestHash)
+	if err != nil || faultClaim.Existing != nil {
+		t.Fatalf("fault claim=%+v err=%v", faultClaim, err)
+	}
+	_, err = registry.ReserveConfigured(ctx, faultRecord, externalagent.ProjectResourceSnapshot{Descriptor: faultDescriptor, Payload: []byte("must-rollback")})
+	faultClaim.Release()
+	if !errors.Is(err, externalagent.ErrConflict) {
+		t.Fatalf("fault boundary=%v", err)
+	}
+	if _, err = registry.GetArtifact(ctx, faultDescriptor); !pc.IsCategory(err, pc.CategoryMissingReference) {
+		t.Fatalf("orphan artifact survived=%v", err)
+	}
+	var faultRuns int
+	if err = store.pool.QueryRow(ctx, `SELECT count(*) FROM external_agent_runs WHERE principal_id=$1 AND submit_key_hash=$2`, faultRecord.PrincipalID, faultRecord.SubmitKeyHash).Scan(&faultRuns); err != nil || faultRuns != 0 {
+		t.Fatalf("fault run rows=%d err=%v", faultRuns, err)
+	}
+
+	// Concurrent replays serialize on the same causal key and all observe the original run.
+	results := make(chan error, 12)
+	var wait sync.WaitGroup
+	for index := 0; index < 12; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			concurrent, claimErr := registry.ClaimSubmit(ctx, record.PrincipalID, record.SubmitKeyHash, record.RequestHash)
+			if claimErr == nil && (concurrent.Existing == nil || concurrent.Existing.Handle != record.Handle) {
+				claimErr = errors.New("concurrent replay diverged")
+			}
+			if concurrent != nil {
+				concurrent.Release()
+			}
+			results <- claimErr
+		}()
+	}
+	wait.Wait()
+	close(results)
+	for claimErr := range results {
+		if claimErr != nil {
+			t.Fatal(claimErr)
+		}
+	}
+	var runs, events, artifacts, projectBindings int
+	if err = store.pool.QueryRow(ctx, `SELECT count(*) FROM external_agent_runs`).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.pool.QueryRow(ctx, `SELECT count(*) FROM external_agent_events`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.pool.QueryRow(ctx, `SELECT count(*) FROM project_configuration_resource_artifacts`).Scan(&artifacts); err != nil || runs != 1 || events != 1 || artifacts != 1 {
+		t.Fatalf("runs=%d events=%d artifacts=%d err=%v", runs, events, artifacts, err)
+	}
+	if err = store.pool.QueryRow(ctx, `SELECT count(*) FROM project_configuration_run_bindings`).Scan(&projectBindings); err != nil || projectBindings != 0 {
+		t.Fatalf("orphan project bindings=%d err=%v", projectBindings, err)
+	}
+}
+
+// integrationExternalResolver changes its active candidate only after a genuinely new admission owns the causal claim.
+type integrationExternalResolver struct {
+	mu       sync.Mutex
+	bindings []pc.RunConfigurationBinding
+	calls    int
+}
+
+// PrepareForWorkflow returns the next head as an unpersisted candidate tied to the generated run ID.
+func (resolver *integrationExternalResolver) PrepareForWorkflow(_ context.Context, _ string, runID string) (pc.AdmissionCandidate, error) {
+	resolver.mu.Lock()
+	defer resolver.mu.Unlock()
+	if resolver.calls >= len(resolver.bindings) {
+		return pc.AdmissionCandidate{}, errors.New("unexpected head lookup")
+	}
+	binding := resolver.bindings[resolver.calls].Clone()
+	resolver.calls++
+	binding.RunID = runID
+	binding.BindingDigest = ""
+	sealed, err := pc.SealRunBinding(binding)
+	return pc.AdmissionCandidate{Binding: sealed}, err
+}
+
+// integrationExternalExecutor completes one test run without reading mutable project authority.
+type integrationExternalExecutor struct{}
+
+// Execute returns a deterministic terminal outcome for lifecycle coverage.
+func (integrationExternalExecutor) Execute(context.Context, externalagent.Selection, string) (externalagent.ExecutionResult, error) {
+	return externalagent.ExecutionResult{Status: externalagent.OutcomePassed}, nil
+}
+
+// integrationExternalMaterializer prepares current bytes and reloads historical bytes only through the PostgreSQL owner.
+type integrationExternalMaterializer struct{ registry *ExternalAgentRegistry }
+
+// PrepareAdmission creates a speculative in-memory payload and binding-owned consumers.
+func (materializer integrationExternalMaterializer) PrepareAdmission(_ context.Context, binding pc.RunConfigurationBinding) (externalagent.ProjectResourceSnapshot, externalagent.ProjectBoundResources, error) {
+	descriptor := integrationExternalDescriptor(binding)
+	resources, err := integrationExternalResources(binding)
+	return externalagent.ProjectResourceSnapshot{Descriptor: descriptor, Payload: []byte("payload-" + descriptor.Digest)}, resources, err
+}
+
+// Materialize authenticates the exact committed artifact before reconstructing historical consumers.
+func (materializer integrationExternalMaterializer) Materialize(ctx context.Context, binding pc.RunConfigurationBinding) (externalagent.ProjectBoundResources, error) {
+	descriptor := integrationExternalDescriptor(binding)
+	if _, err := materializer.registry.GetArtifact(ctx, descriptor); err != nil {
+		return externalagent.ProjectBoundResources{}, err
+	}
+	return integrationExternalResources(binding)
+}
+
+// integrationExternalResources derives alias and finite limits from one immutable binding.
+func integrationExternalResources(binding pc.RunConfigurationBinding) (externalagent.ProjectBoundResources, error) {
+	descriptor := integrationExternalDescriptor(binding)
+	catalog, err := externalagent.NewAliasCatalog(map[string]map[string]externalagent.Selection{"external-principal": {descriptor.Selection: {Alias: descriptor.Selection}}})
+	return externalagent.ProjectBoundResources{Catalog: catalog, Executor: integrationExternalExecutor{}, Retention: time.Hour, RunTimeout: time.Minute}, err
+}
+
+// integrationExternalDescriptor selects the environment independent of canonical descriptor ordering.
+func integrationExternalDescriptor(binding pc.RunConfigurationBinding) pc.ResourceDescriptor {
+	for _, descriptor := range binding.Effective.Descriptors {
+		if descriptor.Kind == pc.ResourceEnvironment {
+			return descriptor
+		}
+	}
+	return pc.ResourceDescriptor{}
+}
+
+// TestPostgresExternalServiceReplayNeverConsultsChangedHead exercises the productive service boundary with concurrent delivery and a second active head.
+func TestPostgresExternalServiceReplayNeverConsultsChangedHead(t *testing.T) {
+	ctx := context.Background()
+	store := integrationStore(t)
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	registry := store.ExternalAgentRegistry()
+	first, _ := integrationExternalBinding(t, "external-service-repository", "placeholder-one", 1)
+	second, _ := integrationExternalBinding(t, "external-service-repository", "placeholder-two", 2)
+	resolver := &integrationExternalResolver{bindings: []pc.RunConfigurationBinding{first, second}}
+	identity, err := externalagent.NewLocalIdentity(externalagent.Principal{ID: "external-principal", Scopes: map[string]bool{externalagent.ScopeCreate: true, externalagent.ScopeRead: true, externalagent.ScopeCancel: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialCatalog, err := externalagent.NewAliasCatalog(map[string]map[string]externalagent.Selection{"external-principal": {"environment-1": {Alias: "environment-1"}, "environment-2": {Alias: "environment-2"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := externalagent.NewService(externalagent.ServiceDependencies{Identity: identity, Catalog: initialCatalog, Registry: registry, Executor: integrationExternalExecutor{}, Packages: externalagent.VerifiedPackageReader{}, Clock: externalagent.WallClock{}, IDs: externalagent.RandomIDs{}, Owner: "external-service-owner", Retention: time.Hour, RunTimeout: time.Minute, RepositoryID: "external-service-repository", ProjectConfig: resolver, ProjectResources: integrationExternalMaterializer{registry: registry}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close(context.Background())
+	views := make(chan externalagent.RunView, 12)
+	errorsFound := make(chan error, 12)
+	var wait sync.WaitGroup
+	for index := 0; index < 12; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			view, submitErr := service.Submit(ctx, externalagent.SubmitInput{SelectionAlias: "environment-1", IdempotencyKey: "postgres-concurrent-key"})
+			views <- view
+			errorsFound <- submitErr
+		}()
+	}
+	wait.Wait()
+	close(views)
+	close(errorsFound)
+	canonical := ""
+	for submitErr := range errorsFound {
+		if submitErr != nil {
+			t.Fatal(submitErr)
+		}
+	}
+	for view := range views {
+		if canonical == "" {
+			canonical = view.RunHandle
+		} else if view.RunHandle != canonical {
+			t.Fatalf("concurrent handles %s != %s", view.RunHandle, canonical)
+		}
+	}
+	if err = service.Wait(ctx, canonical); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := service.Submit(ctx, externalagent.SubmitInput{SelectionAlias: "environment-1", IdempotencyKey: "postgres-concurrent-key"})
+	if err != nil || replay.RunHandle != canonical {
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	newHead, err := service.Submit(ctx, externalagent.SubmitInput{SelectionAlias: "environment-2", IdempotencyKey: "postgres-second-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = service.Wait(ctx, newHead.RunHandle); err != nil {
+		t.Fatal(err)
+	}
+	resolver.mu.Lock()
+	calls := resolver.calls
+	resolver.mu.Unlock()
+	firstRecord, firstErr := registry.Get(ctx, canonical)
+	secondRecord, secondErr := registry.Get(ctx, newHead.RunHandle)
+	if calls != 2 || firstErr != nil || secondErr != nil || firstRecord.Configuration == nil || secondRecord.Configuration == nil || firstRecord.Configuration.Version != 1 || secondRecord.Configuration.Version != 2 {
+		t.Fatalf("calls=%d first=%+v/%v second=%+v/%v", calls, firstRecord.Configuration, firstErr, secondRecord.Configuration, secondErr)
+	}
+}
+
+// TestPostgresExternalRegistryLifecycleAndNegativeContract covers the durable adapter's closed errors, retries, recovery and artifact conflicts.
+func TestPostgresExternalRegistryLifecycleAndNegativeContract(t *testing.T) {
+	ctx := context.Background()
+	store := integrationStore(t)
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	registry := store.ExternalAgentRegistry()
+	if claim, err := (*ExternalAgentRegistry)(nil).ClaimSubmit(ctx, "principal", integrationDigest("key"), integrationDigest("request")); claim != nil || !errors.Is(err, externalagent.ErrConflict) {
+		t.Fatalf("nil registry claim=%+v err=%v", claim, err)
+	}
+	if claim, err := registry.ClaimSubmit(ctx, "", "short", "short"); claim != nil || !errors.Is(err, externalagent.ErrConflict) {
+		t.Fatalf("invalid claim=%+v err=%v", claim, err)
+	}
+	base := externalagent.RunRecord{Handle: "external-lifecycle", InternalID: "external-lifecycle-internal", PrincipalID: "lifecycle-principal", SelectionAlias: "selection", RequestHash: integrationDigest("lifecycle-request"), SubmitKeyHash: integrationDigest("lifecycle-key"), Phase: externalagent.PhaseQueued, Owner: "old-owner", UpdatedAt: time.Unix(1200, 0).UTC(), RetentionNS: int64(time.Hour), RunTimeoutNS: int64(time.Minute)}
+	claim, err := registry.ClaimSubmit(ctx, base.PrincipalID, base.SubmitKeyHash, base.RequestHash)
+	if err != nil || claim.Existing != nil {
+		t.Fatalf("new claim=%+v err=%v", claim, err)
+	}
+	reserved, err := registry.Reserve(ctx, base)
+	claim.Release()
+	if err != nil || !reserved.New {
+		t.Fatalf("reserve=%+v err=%v", reserved, err)
+	}
+	replayed, err := registry.Reserve(ctx, base)
+	if err != nil || replayed.New || replayed.Record.Handle != base.Handle {
+		t.Fatalf("reserve replay=%+v err=%v", replayed, err)
+	}
+	divergent := base
+	divergent.RequestHash = integrationDigest("lifecycle-divergent")
+	if _, err = registry.Reserve(ctx, divergent); !errors.Is(err, externalagent.ErrConflict) {
+		t.Fatalf("divergent reserve=%v", err)
+	}
+	if claim, err = registry.ClaimSubmit(ctx, base.PrincipalID, base.SubmitKeyHash, divergent.RequestHash); claim != nil || !errors.Is(err, externalagent.ErrConflict) {
+		t.Fatalf("divergent replay claim=%+v err=%v", claim, err)
+	}
+	if loaded, getErr := registry.Get(ctx, base.Handle); getErr != nil || loaded.Handle != base.Handle {
+		t.Fatalf("get=%+v err=%v", loaded, getErr)
+	}
+	if _, err = registry.Get(ctx, "external-missing"); !errors.Is(err, externalagent.ErrNotFound) {
+		t.Fatalf("missing get=%v", err)
+	}
+	if _, err = registry.Events(ctx, "external-missing"); !errors.Is(err, externalagent.ErrNotFound) {
+		t.Fatalf("missing events=%v", err)
+	}
+	if _, err = registry.Transition(ctx, base.Handle, externalagent.PhaseRunning, externalagent.PhaseTerminal, externalagent.OutcomePassed, "", "", time.Unix(1201, 0).UTC()); !errors.Is(err, externalagent.ErrConflict) {
+		t.Fatalf("invalid transition=%v", err)
+	}
+	running, err := registry.Transition(ctx, base.Handle, externalagent.PhaseQueued, externalagent.PhaseRunning, "", "", "worker", time.Unix(1201, 0).UTC())
+	if err != nil || running.Phase != externalagent.PhaseRunning {
+		t.Fatalf("running=%+v err=%v", running, err)
+	}
+	if err = registry.MarkPublicationFailure(ctx, base.Handle, time.Unix(1202, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, created, err := registry.ReserveCancel(ctx, base.Handle, integrationDigest("cancel-key"), integrationDigest("cancel-request"))
+	if err != nil || !created || cancelled.CancelKeyHash == "" {
+		t.Fatalf("cancel=%+v created=%v err=%v", cancelled, created, err)
+	}
+	if _, created, err = registry.ReserveCancel(ctx, base.Handle, integrationDigest("cancel-key"), integrationDigest("cancel-request")); err != nil || created {
+		t.Fatalf("cancel replay created=%v err=%v", created, err)
+	}
+	if _, _, err = registry.ReserveCancel(ctx, base.Handle, integrationDigest("other-cancel"), integrationDigest("other-request")); !errors.Is(err, externalagent.ErrConflict) {
+		t.Fatalf("cancel conflict=%v", err)
+	}
+	if _, err = registry.Transition(ctx, base.Handle, externalagent.PhaseRunning, externalagent.PhaseFinalizing, "", "package", "worker", time.Unix(1203, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := registry.Transition(ctx, base.Handle, externalagent.PhaseFinalizing, externalagent.PhaseTerminal, externalagent.OutcomePassed, "package", "", time.Unix(1204, 0).UTC())
+	if err != nil || terminal.Status != externalagent.OutcomePassed {
+		t.Fatalf("terminal=%+v err=%v", terminal, err)
+	}
+	events, err := registry.Events(ctx, base.Handle)
+	if err != nil || len(events) < 5 {
+		t.Fatalf("events=%d err=%v", len(events), err)
+	}
+
+	recoverable := base
+	recoverable.Handle = "external-recoverable"
+	recoverable.InternalID = "external-recoverable-internal"
+	recoverable.SubmitKeyHash = integrationDigest("recover-key")
+	recoverable.RequestHash = integrationDigest("recover-request")
+	recoverable.CancelKeyHash, recoverable.CancelHash = "", ""
+	recoverable.UpdatedAt = time.Unix(1300, 0).UTC()
+	if result, reserveErr := registry.Reserve(ctx, recoverable); reserveErr != nil || !result.New {
+		t.Fatalf("recover reserve=%+v err=%v", result, reserveErr)
+	}
+	registry.ReleaseOwner(recoverable.Handle)
+	if err = registry.Recover(ctx, "new-owner", time.Unix(1301, 0).UTC()); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := registry.Get(ctx, recoverable.Handle)
+	if err != nil || recovered.Phase != externalagent.PhaseTerminal || recovered.Status != externalagent.OutcomeError || recovered.Cause != "interrupted" {
+		t.Fatalf("recovered=%+v err=%v", recovered, err)
+	}
+
+	binding, descriptor := integrationExternalBinding(t, "external-negative-repository", "external-configured-one", 1)
+	configured := base
+	configured.Handle = "external-configured-one"
+	configured.InternalID = binding.RunID
+	configured.SubmitKeyHash = integrationDigest("configured-key-one")
+	configured.RequestHash = integrationDigest("configured-request-one")
+	configured.SelectionAlias = descriptor.Selection
+	configured.Configuration = &binding
+	configured.Owner = "configured-owner"
+	configured.UpdatedAt = time.Unix(1400, 0).UTC()
+	snapshot := externalagent.ProjectResourceSnapshot{Descriptor: descriptor, Payload: []byte("configured-payload")}
+	if result, reserveErr := registry.ReserveConfigured(ctx, configured, snapshot); reserveErr != nil || !result.New {
+		t.Fatalf("configured reserve=%+v err=%v", result, reserveErr)
+	}
+	exact := configured
+	exact.Handle = "external-configured-two"
+	exact.InternalID = "external-configured-two-internal"
+	exact.SubmitKeyHash = integrationDigest("configured-key-two")
+	exact.RequestHash = integrationDigest("configured-request-two")
+	exactBinding := binding.Clone()
+	exactBinding.RunID = exact.InternalID
+	exactBinding.BindingDigest = ""
+	exactBinding, err = pc.SealRunBinding(exactBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exact.Configuration = &exactBinding
+	if result, reserveErr := registry.ReserveConfigured(ctx, exact, snapshot); reserveErr != nil || !result.New {
+		t.Fatalf("existing artifact reserve=%+v err=%v", result, reserveErr)
+	}
+	conflictingArtifact := exact
+	conflictingArtifact.Handle = "external-configured-three"
+	conflictingArtifact.InternalID = "external-configured-three-internal"
+	conflictingArtifact.SubmitKeyHash = integrationDigest("configured-key-three")
+	conflictingArtifact.RequestHash = integrationDigest("configured-request-three")
+	conflictBinding := binding.Clone()
+	conflictBinding.RunID = conflictingArtifact.InternalID
+	conflictBinding.BindingDigest = ""
+	conflictBinding, err = pc.SealRunBinding(conflictBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflictingArtifact.Configuration = &conflictBinding
+	if _, err = registry.ReserveConfigured(ctx, conflictingArtifact, externalagent.ProjectResourceSnapshot{Descriptor: descriptor, Payload: []byte("divergent-payload")}); !errors.Is(err, externalagent.ErrConflict) {
+		t.Fatalf("divergent artifact=%v", err)
+	}
+	outside := descriptor
+	outside.ID = "outside-binding"
+	if _, err = registry.ReserveConfigured(ctx, conflictingArtifact, externalagent.ProjectResourceSnapshot{Descriptor: outside, Payload: []byte("outside")}); !errors.Is(err, externalagent.ErrConflict) {
+		t.Fatalf("outside binding=%v", err)
+	}
+
+	corrupt := base
+	corrupt.Handle = "external-corrupt"
+	corrupt.InternalID = "external-corrupt-internal"
+	corrupt.SubmitKeyHash = integrationDigest("corrupt-key")
+	corrupt.RequestHash = integrationDigest("corrupt-request")
+	corrupt.UpdatedAt = time.Unix(1500, 0).UTC()
+	if _, err = registry.Reserve(ctx, corrupt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.pool.Exec(ctx, `UPDATE external_agent_runs SET document='not-json' WHERE handle=$1`, corrupt.Handle); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = registry.Get(ctx, corrupt.Handle); !errors.Is(err, externalagent.ErrConflict) {
+		t.Fatalf("corrupt document=%v", err)
+	}
+}
+
+// TestPostgresProjectConfigurationSharedContract executes the adapter-neutral atomic state suite.
+func TestPostgresProjectConfigurationSharedContract(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dsn := owner.pool.Config().ConnString()
+	opened := []*Store{}
+	factory := func() (pc.Store, error) {
+		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: time.Minute})
+		if err != nil {
+			return nil, err
+		}
+		opened = append(opened, store)
+		return store.ProjectConfiguration(), nil
+	}
+	t.Cleanup(func() {
+		for _, store := range opened {
+			store.Close()
+		}
+	})
+	if err := pccontract.Run(ctx, factory, fmt.Sprintf("postgres-%d", time.Now().UnixNano())); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestProjectConfigurationErrorMapping covers the adapter's closed SQLSTATE and context vocabulary.
+func TestProjectConfigurationErrorMapping(t *testing.T) {
+	t.Parallel()
+	if mapProjectError(nil, "test") != nil {
+		t.Fatal("nil error changed")
+	}
+	safe := pcErr(pc.CategoryConflict, "safe")
+	if mapProjectError(safe, "test") != safe {
+		t.Fatal("safe error changed")
+	}
+	tests := []struct {
+		err      error
+		category pc.Category
+	}{
+		{context.Canceled, pc.CategoryCancelled},
+		{context.DeadlineExceeded, pc.CategoryDeadline},
+		{&pgconn.PgError{Code: "23505"}, pc.CategoryConflict},
+		{&pgconn.PgError{Code: "23503"}, pc.CategoryIntegrity},
+		{&pgconn.PgError{Code: "23514"}, pc.CategoryIntegrity},
+		{&pgconn.PgError{Code: "40001"}, pc.CategoryUnavailable},
+		{&pgconn.PgError{Code: "40P01"}, pc.CategoryUnavailable},
+		{&pgconn.PgError{Code: "99999"}, pc.CategoryUnavailable},
+		{errors.New("provider canary"), pc.CategoryUnavailable},
+	}
+	for _, test := range tests {
+		if got := mapProjectError(test.err, "test"); !pc.IsCategory(got, test.category) || strings.Contains(got.Error(), "canary") {
+			t.Fatalf("%T: %v", test.err, got)
+		}
+	}
+	if !projectRetryable(&pgconn.PgError{Code: "40001"}) || !projectRetryable(&pgconn.PgError{Code: "40P01"}) || projectRetryable(&pgconn.PgError{Code: "23505"}) || projectRetryable(errors.New("plain")) {
+		t.Fatal("retry classification changed")
+	}
+	if postgresDigest([]byte("stable")) != postgresDigest([]byte("stable")) {
+		t.Fatal("digest is not deterministic")
+	}
+}
+
+// TestProjectConfigurationCancellationAfterBegin deterministically covers statement cancellation and rollback.
+func TestProjectConfigurationCancellationAfterBegin(t *testing.T) {
+	owner := integrationStore(t)
+	if err := owner.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := pc.NewProjectKey(fmt.Sprintf("cancel-project-%d", time.Now().UnixNano()), fmt.Sprintf("cancel-repo-%d", time.Now().UnixNano()))
+	command := integrationProjectPublishCommand(t, key, fmt.Sprintf("cancel-operation-%d", time.Now().UnixNano()))
+	ctx, cancel := context.WithCancel(context.Background())
+	owner.fault = func(boundary string) error {
+		if boundary == "project_config.publish.before_lock" {
+			cancel()
+		}
+		return nil
+	}
+	defer func() {
+		owner.fault = nil
+		cancel()
+	}()
+	if _, err := owner.ProjectConfiguration().Publish(ctx, command); !pc.IsCategory(err, pc.CategoryCancelled) {
+		t.Fatalf("cancelled publish: %v", err)
+	}
+	var projects int
+	if err := owner.pool.QueryRow(context.Background(), `SELECT count(*) FROM project_configuration_projects WHERE project_id=$1 AND repository_id=$2`, key.ProjectID, key.RepositoryID).Scan(&projects); err != nil || projects != 0 {
+		t.Fatalf("partial cancellation %d: %v", projects, err)
+	}
+}
+
+// TestPostgresProjectConfigurationCountersExhaustWithoutMutation covers the common bigint ceiling.
+func TestPostgresProjectConfigurationCountersExhaustWithoutMutation(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	prefix := fmt.Sprintf("counter-%d-", time.Now().UnixNano())
+	for _, field := range []string{"next_version", "next_generation", "next_sequence"} {
+		t.Run("publish_"+field, func(t *testing.T) {
+			key, _ := pc.NewProjectKey(prefix+field, prefix+"repo-"+field)
+			command := integrationProjectPublishCommand(t, key, prefix+"seed-"+field)
+			if _, err := owner.ProjectConfiguration().Publish(ctx, command); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := owner.pool.Exec(ctx, `UPDATE project_configuration_projects SET `+field+`=$3 WHERE project_id=$1 AND repository_id=$2`, key.ProjectID, key.RepositoryID, int64(pc.MaxDurableCounter)); err != nil {
+				t.Fatal(err)
+			}
+			command.OperationID = prefix + "overflow-" + field
+			command.CommandDigest = integrationDigest(command.OperationID)
+			command.ExpectedGeneration = 1
+			if field == "next_generation" {
+				command.ExpectedGeneration = pc.MaxDurableCounter
+			}
+			if _, err := owner.ProjectConfiguration().Publish(ctx, command); !pc.IsCategory(err, pc.CategoryExhausted) {
+				t.Fatalf("publish overflow: %v", err)
+			}
+		})
+	}
+	for _, field := range []string{"next_generation", "next_sequence"} {
+		t.Run("rollback_"+field, func(t *testing.T) {
+			key, _ := pc.NewProjectKey(prefix+"rollback-"+field, prefix+"rollback-repo-"+field)
+			published := integrationProjectPublishCommand(t, key, prefix+"rollback-seed-"+field)
+			if _, err := owner.ProjectConfiguration().Publish(ctx, published); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := owner.pool.Exec(ctx, `UPDATE project_configuration_projects SET `+field+`=$3 WHERE project_id=$1 AND repository_id=$2`, key.ProjectID, key.RepositoryID, int64(pc.MaxDurableCounter)); err != nil {
+				t.Fatal(err)
+			}
+			expected := uint64(1)
+			if field == "next_generation" {
+				expected = pc.MaxDurableCounter
+			}
+			rollback := pc.RollbackCommand{OperationID: prefix + "rollback-overflow-" + field, CommandDigest: integrationDigest("rollback-" + field), Actor: "actor", ProjectKey: key, Version: 1, ExpectedGeneration: expected, Effective: published.Effective, CreatedAt: time.Now().UTC()}
+			if _, err := owner.ProjectConfiguration().Rollback(ctx, rollback); !pc.IsCategory(err, pc.CategoryExhausted) {
+				t.Fatalf("rollback overflow: %v", err)
+			}
+		})
+	}
+}
+
+// TestPostgresProjectConfigurationWorkflowCausalCommit proves binding, run and first event share rollback boundaries.
+func TestPostgresProjectConfigurationWorkflowCausalCommit(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	prefix := fmt.Sprintf("%d-", time.Now().UnixNano())
+	for _, boundary := range []string{"workflow.project_configuration.before", "workflow.project_configuration.after"} {
+		t.Run(boundary, func(t *testing.T) {
+			suffix := prefix + strings.ReplaceAll(boundary, ".", "-")
+			key, _ := pc.NewProjectKey("causal-project-"+suffix, "causal-repo-"+suffix)
+			binding := integrationProjectBinding(t, ctx, owner, key, "run-"+suffix)
+			owner.fault = func(current string) error {
+				if current == boundary {
+					return errors.New("injected")
+				}
+				return nil
+			}
+			record := validationworkflow.Record{Version: 1, Handle: binding.RunID, Principal: "principal-" + suffix, IdempotencyKey: "key-" + suffix, RequestDigest: integrationDigest("request-" + suffix), RepositoryID: key.RepositoryID, Revision: strings.Repeat("a", 40), Phase: validationworkflow.PhaseAdmitted, ProjectConfigurationBinding: &binding}
+			if _, _, _, err := owner.WorkflowStore().ReserveBound(ctx, record, "owner", time.Now().UTC(), time.Minute); err == nil {
+				t.Fatal("fault accepted")
+			}
+			owner.fault = nil
+			var bindings, runs, events int
+			if err := owner.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM project_configuration_run_bindings WHERE run_id=$1),(SELECT count(*) FROM workflow_runs WHERE handle=$1),(SELECT count(*) FROM workflow_events WHERE handle=$1)`, binding.RunID).Scan(&bindings, &runs, &events); err != nil {
+				t.Fatal(err)
+			}
+			if bindings != 0 || runs != 0 || events != 0 {
+				t.Fatalf("partial causal state %d/%d/%d", bindings, runs, events)
+			}
+		})
+	}
+	key, _ := pc.NewProjectKey(prefix+"causal-project-success", prefix+"causal-repo-success")
+	binding := integrationProjectBinding(t, ctx, owner, key, prefix+"run-causal-success")
+	record := validationworkflow.Record{Version: 1, Handle: binding.RunID, Principal: prefix + "principal-success", IdempotencyKey: prefix + "key-success", RequestDigest: integrationDigest("request-success"), RepositoryID: key.RepositoryID, Revision: strings.Repeat("a", 40), Phase: validationworkflow.PhaseAdmitted, ProjectConfigurationBinding: &binding}
+	reserved, created, _, err := owner.WorkflowStore().ReserveBound(ctx, record, "owner", time.Now().UTC(), time.Minute)
+	if err != nil || !created || reserved.ProjectConfigurationBinding == nil {
+		t.Fatalf("causal reserve: %+v %v", reserved, err)
+	}
+}
+
+// integrationProjectBinding publishes one complete configuration and prepares its exact active binding.
+func integrationProjectBinding(t *testing.T, ctx context.Context, owner *Store, key pc.ProjectKey, runID string) pc.RunConfigurationBinding {
+	t.Helper()
+	digest := integrationDigest("project-fixture")
+	document := pc.Document{Schema: pc.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digest}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
+	canonical, err := pc.Canonicalize(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err := pc.ValidateAndMerge(canonical, pc.OrganizationPolicySnapshot{Version: 1, Digest: digest}, pc.ResourceCatalogSnapshot{Limits: integrationCatalogLimits(), ProjectKey: key, Digest: digest, Descriptors: []pc.ResourceDescriptor{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digest, ProjectKey: key}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := owner.ProjectConfiguration().Publish(ctx, pc.PublishCommand{OperationID: "publish-" + runID, CommandDigest: integrationDigest("command-" + runID), Actor: "actor", Document: canonical, Effective: effective, CreatedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := pc.SealRunBinding(pc.RunConfigurationBinding{RunID: runID, ProjectKey: key, Version: receipt.Version, VersionDigest: canonical.Digest, ActivationGeneration: receipt.Generation, ActivationDigest: receipt.HeadDigest, PolicyVersion: effective.PolicyVersion, PolicyDigest: effective.PolicyDigest, CatalogDigest: effective.CatalogDigest, EffectiveDigest: effective.Digest, Effective: effective})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return binding
+}
+
+// TestPostgresProjectConfigurationPublishFaultBoundaries proves rollback and unknown-commit receipt resolution.
+func TestPostgresProjectConfigurationPublishFaultBoundaries(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	prefix := fmt.Sprintf("%d-", time.Now().UnixNano())
+	boundaries := []string{"project_config.publish.before_lock", "project_config.publish.before_version", "project_config.publish.before_activation", "project_config.publish.before_effective", "project_config.publish.before_head", "project_config.publish.before_receipt_event", "project_config.publish.before_counters"}
+	for index, boundary := range boundaries {
+		t.Run(boundary, func(t *testing.T) {
+			key, _ := pc.NewProjectKey(fmt.Sprintf("%sfault-project-%d", prefix, index), fmt.Sprintf("%sfault-repo-%d", prefix, index))
+			command := integrationProjectPublishCommand(t, key, prefix+"fault-operation")
+			owner.fault = func(current string) error {
+				if current == boundary {
+					return errors.New("injected")
+				}
+				return nil
+			}
+			if _, err := owner.ProjectConfiguration().Publish(ctx, command); err == nil {
+				t.Fatal("fault accepted")
+			}
+			owner.fault = nil
+			var versions, heads, receipts int
+			if err := owner.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM project_configuration_versions WHERE project_id=$1 AND repository_id=$2),(SELECT count(*) FROM project_configuration_heads WHERE project_id=$1 AND repository_id=$2),(SELECT count(*) FROM project_configuration_receipts WHERE project_id=$1 AND repository_id=$2)`, key.ProjectID, key.RepositoryID).Scan(&versions, &heads, &receipts); err != nil {
+				t.Fatal(err)
+			}
+			if versions != 0 || heads != 0 || receipts != 0 {
+				t.Fatalf("partial publish %d/%d/%d", versions, heads, receipts)
+			}
+		})
+	}
+	key, _ := pc.NewProjectKey(prefix+"unknown-project", prefix+"unknown-repo")
+	command := integrationProjectPublishCommand(t, key, prefix+"unknown-operation")
+	fired := false
+	owner.fault = func(boundary string) error {
+		if boundary == "project_config.publish.after_commit" && !fired {
+			fired = true
+			return errors.New("unknown commit")
+		}
+		return nil
+	}
+	receipt, err := owner.ProjectConfiguration().Publish(ctx, command)
+	owner.fault = nil
+	if err != nil || receipt.Version != 1 || !fired {
+		t.Fatalf("unknown commit not resolved: %+v %v", receipt, err)
+	}
+}
+
+// TestPostgresProjectConfigurationRollbackFaultBoundaries proves every rollback statement is atomic.
+func TestPostgresProjectConfigurationRollbackFaultBoundaries(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	prefix := fmt.Sprintf("%d-", time.Now().UnixNano())
+	boundaries := []string{"project_config.rollback.before_lock", "project_config.rollback.before_activation", "project_config.rollback.before_effective", "project_config.rollback.before_head", "project_config.rollback.before_receipt_event"}
+	for index, boundary := range boundaries {
+		t.Run(boundary, func(t *testing.T) {
+			key, _ := pc.NewProjectKey(fmt.Sprintf("%srollback-project-%d", prefix, index), fmt.Sprintf("%srollback-repo-%d", prefix, index))
+			published := integrationProjectPublishCommand(t, key, prefix+fmt.Sprintf("rollback-seed-%d", index))
+			if _, err := owner.ProjectConfiguration().Publish(ctx, published); err != nil {
+				t.Fatal(err)
+			}
+			command := pc.RollbackCommand{OperationID: prefix + fmt.Sprintf("rollback-%d", index), CommandDigest: integrationDigest(boundary), Actor: "actor", ProjectKey: key, Version: 1, ExpectedGeneration: 1, Effective: published.Effective, CreatedAt: time.Now().UTC()}
+			owner.fault = func(current string) error {
+				if current == boundary {
+					return errors.New("injected")
+				}
+				return nil
+			}
+			if _, err := owner.ProjectConfiguration().Rollback(ctx, command); err == nil {
+				t.Fatal("fault accepted")
+			}
+			owner.fault = nil
+			head, err := owner.ProjectConfiguration().Head(ctx, key)
+			if err != nil || head.Activation.Generation != 1 {
+				t.Fatalf("partial rollback: %+v %v", head, err)
+			}
+		})
+	}
+}
+
+// TestPostgresProjectConfigurationNegativeQueriesAndCorruption proves safe missing and integrity failures.
+func TestPostgresProjectConfigurationNegativeQueriesAndCorruption(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store := owner.ProjectConfiguration()
+	prefix := fmt.Sprintf("%d-", time.Now().UnixNano())
+	missing, _ := pc.NewProjectKey(prefix+"missing-project", prefix+"missing-repo")
+	if _, err := store.Head(ctx, missing); !pc.IsCategory(err, pc.CategoryNotFound) {
+		t.Fatalf("head: %v", err)
+	}
+	if _, _, err := store.Version(ctx, missing, 1); !pc.IsCategory(err, pc.CategoryNotFound) {
+		t.Fatalf("version: %v", err)
+	}
+	if _, err := store.Effective(ctx, missing, 1); !pc.IsCategory(err, pc.CategoryNotFound) {
+		t.Fatalf("effective: %v", err)
+	}
+	if _, err := store.Binding(ctx, missing, "missing-run"); !pc.IsCategory(err, pc.CategoryNotFound) {
+		t.Fatalf("binding: %v", err)
+	}
+	if _, err := store.History(ctx, missing, 0, 0); !pc.IsCategory(err, pc.CategoryInvalid) {
+		t.Fatalf("history: %v", err)
+	}
+
+	key, _ := pc.NewProjectKey(prefix+"corrupt-project", prefix+"corrupt-repo")
+	binding := integrationProjectBinding(t, ctx, owner, key, prefix+"corrupt-run")
+	if _, err := store.Bind(ctx, pc.BindCommand{RunID: binding.RunID, ProjectKey: key, CreatedAt: time.Now().UTC(), Candidate: &pc.AdmissionCandidate{Binding: binding}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.pool.Exec(ctx, `UPDATE project_configuration_run_bindings SET binding_digest=$4 WHERE project_id=$1 AND repository_id=$2 AND run_id=$3`, key.ProjectID, key.RepositoryID, binding.RunID, integrationDigest("corrupt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Bind(ctx, pc.BindCommand{RunID: binding.RunID, ProjectKey: key, CreatedAt: time.Now().UTC(), Candidate: &pc.AdmissionCandidate{Binding: binding}}); !pc.IsCategory(err, pc.CategoryIntegrity) {
+		t.Fatalf("redelivery accepted corrupt durable binding digest: %v", err)
+	}
+	var redeliveryCount int
+	if err := owner.pool.QueryRow(ctx, `SELECT count(*) FROM project_configuration_run_bindings WHERE project_id=$1 AND repository_id=$2 AND run_id=$3`, key.ProjectID, key.RepositoryID, binding.RunID).Scan(&redeliveryCount); err != nil || redeliveryCount != 1 {
+		t.Fatalf("corrupt redelivery mutated binding: count=%d err=%v", redeliveryCount, err)
+	}
+	if _, err := store.Binding(ctx, key, binding.RunID); !pc.IsCategory(err, pc.CategoryIntegrity) {
+		t.Fatalf("corrupt binding: %v", err)
+	}
+	if _, err := owner.pool.Exec(ctx, `UPDATE project_configuration_run_bindings SET binding_digest=$4,binding=jsonb_set(binding,'{EffectiveDigest}',to_jsonb($5::text)) WHERE project_id=$1 AND repository_id=$2 AND run_id=$3`, key.ProjectID, key.RepositoryID, binding.RunID, binding.BindingDigest, integrationDigest("corrupt-binding-payload")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Binding(ctx, key, binding.RunID); !pc.IsCategory(err, pc.CategoryIntegrity) {
+		t.Fatalf("corrupt binding payload: %v", err)
+	}
+	if _, err := owner.pool.Exec(ctx, `UPDATE project_configuration_effective_snapshots SET effective_digest=$4 WHERE project_id=$1 AND repository_id=$2 AND generation=$3`, key.ProjectID, key.RepositoryID, 1, integrationDigest("corrupt-effective")); err != nil {
+		t.Fatal(err)
+	}
+	corruptEffectiveRun := prefix + "corrupt-effective-run"
+	if _, err := store.Bind(ctx, pc.BindCommand{RunID: corruptEffectiveRun, ProjectKey: key, CreatedAt: time.Now().UTC()}); !pc.IsCategory(err, pc.CategoryIntegrity) {
+		t.Fatalf("new binding accepted corrupt durable effective digest: %v", err)
+	}
+	var effectiveBindingCount int
+	if err := owner.pool.QueryRow(ctx, `SELECT count(*) FROM project_configuration_run_bindings WHERE project_id=$1 AND repository_id=$2 AND run_id=$3`, key.ProjectID, key.RepositoryID, corruptEffectiveRun).Scan(&effectiveBindingCount); err != nil || effectiveBindingCount != 0 {
+		t.Fatalf("corrupt effective bind mutated state: count=%d err=%v", effectiveBindingCount, err)
+	}
+	if _, err := store.Effective(ctx, key, 1); !pc.IsCategory(err, pc.CategoryIntegrity) {
+		t.Fatalf("corrupt effective: %v", err)
+	}
+
+	corruptions := []struct {
+		name   string
+		mutate func(pc.ProjectKey) error
+		read   func(pc.ProjectKey) error
+	}{
+		{"version_canonical", func(key pc.ProjectKey) error {
+			_, err := owner.pool.Exec(ctx, `UPDATE project_configuration_versions SET canonical=$3 WHERE project_id=$1 AND repository_id=$2`, key.ProjectID, key.RepositoryID, []byte(`{}`))
+			return err
+		}, func(key pc.ProjectKey) error { _, _, err := store.Version(ctx, key, 1); return err }},
+		{"version_digest", func(key pc.ProjectKey) error {
+			_, err := owner.pool.Exec(ctx, `UPDATE project_configuration_versions SET document_digest=$3 WHERE project_id=$1 AND repository_id=$2`, key.ProjectID, key.RepositoryID, integrationDigest("wrong-version"))
+			return err
+		}, func(key pc.ProjectKey) error { _, _, err := store.Version(ctx, key, 1); return err }},
+		{"effective_payload", func(key pc.ProjectKey) error {
+			_, err := owner.pool.Exec(ctx, `UPDATE project_configuration_effective_snapshots SET effective=jsonb_set(effective,'{Constraints,retention_days}','2'::jsonb) WHERE project_id=$1 AND repository_id=$2`, key.ProjectID, key.RepositoryID)
+			return err
+		}, func(key pc.ProjectKey) error { _, err := store.Effective(ctx, key, 1); return err }},
+		{"effective_embedded_digest", func(key pc.ProjectKey) error {
+			_, err := owner.pool.Exec(ctx, `UPDATE project_configuration_effective_snapshots SET effective=jsonb_set(effective,'{Digest}',to_jsonb($3::text)) WHERE project_id=$1 AND repository_id=$2`, key.ProjectID, key.RepositoryID, integrationDigest("wrong-embedded"))
+			return err
+		}, func(key pc.ProjectKey) error { _, err := store.Effective(ctx, key, 1); return err }},
+		{"activation", func(key pc.ProjectKey) error {
+			_, err := owner.pool.Exec(ctx, `UPDATE project_configuration_activations SET digest=$3 WHERE project_id=$1 AND repository_id=$2`, key.ProjectID, key.RepositoryID, integrationDigest("wrong-activation"))
+			return err
+		}, func(key pc.ProjectKey) error { _, err := store.Head(ctx, key); return err }},
+		{"head", func(key pc.ProjectKey) error { return corruptProjectConfigurationHead(ctx, owner, key) }, func(key pc.ProjectKey) error { _, err := store.Head(ctx, key); return err }},
+	}
+	for index, corruption := range corruptions {
+		t.Run(corruption.name, func(t *testing.T) {
+			project, _ := pc.NewProjectKey(fmt.Sprintf("%scorruption-project-%d", prefix, index), fmt.Sprintf("%scorruption-repo-%d", prefix, index))
+			integrationProjectBinding(t, ctx, owner, project, fmt.Sprintf("%scorruption-run-%d", prefix, index))
+			if err := corruption.mutate(project); err != nil {
+				t.Fatal(err)
+			}
+			if err := corruption.read(project); !pc.IsCategory(err, pc.CategoryIntegrity) {
+				t.Fatalf("corruption accepted: %v", err)
+			}
+		})
+	}
+}
+
+// corruptProjectConfigurationHead creates a dangling test-only projection while restoring constraint enforcement before commit.
+func corruptProjectConfigurationHead(ctx context.Context, owner *Store, key pc.ProjectKey) error {
+	tx, err := owner.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err = tx.Exec(ctx, `SET LOCAL session_replication_role=replica`); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE project_configuration_heads SET generation=999 WHERE project_id=$1 AND repository_id=$2`, key.ProjectID, key.RepositoryID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// integrationProjectPublishCommand creates one adapter-valid canonical publish command.
+func integrationProjectPublishCommand(t *testing.T, key pc.ProjectKey, operationID string) pc.PublishCommand {
+	t.Helper()
+	digest := integrationDigest("publish-command-fixture")
+	document := pc.Document{Schema: pc.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digest}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
+	canonical, err := pc.Canonicalize(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective, err := pc.ValidateAndMerge(canonical, pc.OrganizationPolicySnapshot{Version: 1, Digest: digest}, pc.ResourceCatalogSnapshot{Limits: integrationCatalogLimits(), ProjectKey: key, Digest: digest, Descriptors: []pc.ResourceDescriptor{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digest, ProjectKey: key}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pc.PublishCommand{OperationID: operationID, CommandDigest: integrationDigest("command-" + operationID), Actor: "actor", Document: canonical, Effective: effective, CreatedAt: time.Now().UTC()}
+}
 
 // integrationImportAuthorizer grants only the explicit isolated import test
 // operation and carries no reusable product credential.
@@ -52,6 +963,35 @@ func (integrationImportAuthorizer) Authorize(_ context.Context, operation, proje
 func integrationDigest(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+// integrationExternalBinding creates a complete immutable external-agent binding for one isolated PostgreSQL admission.
+func integrationExternalBinding(t *testing.T, repositoryID, runID string, version uint64) (pc.RunConfigurationBinding, pc.ResourceDescriptor) {
+	t.Helper()
+	key, err := pc.NewProjectKey("external-project", repositoryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := integrationDigest(fmt.Sprintf("external-%d", version))
+	references := []pc.ResourceReference{{Kind: pc.ResourceProvider, ID: "provider", Version: version, Digest: digest}, {Kind: pc.ResourceModelProfile, ID: "model", Version: version, Digest: digest}, {Kind: pc.ResourceRuntimeProfile, ID: "runtime", Version: version, Digest: digest}, {Kind: pc.ResourceContract, ID: "contract", Version: version, Digest: digest}, {Kind: pc.ResourceEnvironment, ID: "environment", Version: version, Digest: digest}}
+	document, err := pc.Canonicalize(pc.Document{Schema: pc.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 30}, Approval: "optional", RetentionDays: 7}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptors := make([]pc.ResourceDescriptor, len(references))
+	for index, reference := range references {
+		descriptors[index] = pc.ResourceDescriptor{Kind: reference.Kind, ID: reference.ID, Version: version, Digest: digest, ProjectKey: key, Selection: reference.ID}
+	}
+	descriptors[len(descriptors)-1].Selection = fmt.Sprintf("environment-%d", version)
+	effective, err := pc.ValidateAndMerge(document, pc.OrganizationPolicySnapshot{Version: version, Digest: digest, MaximumLimits: pc.Limits{DurationSeconds: 100, ToolCalls: 100, ModelTokens: 1000, Replans: 100}, MinimumRetentionDays: 1, MaximumRetentionDays: 30}, pc.ResourceCatalogSnapshot{ProjectKey: key, Digest: digest, Descriptors: descriptors, Limits: integrationCatalogLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := pc.SealRunBinding(pc.RunConfigurationBinding{RunID: runID, ProjectKey: key, Version: version, VersionDigest: document.Digest, ActivationGeneration: version, ActivationDigest: digest, PolicyVersion: effective.PolicyVersion, PolicyDigest: effective.PolicyDigest, CatalogDigest: effective.CatalogDigest, EffectiveDigest: effective.Digest, Effective: effective})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return binding, descriptors[len(descriptors)-1]
 }
 
 // integrationEnvironmentEvent seals one consumer-valid lifecycle event for
@@ -906,7 +1846,33 @@ func TestPostgresNewAdaptersMapClosedPoolFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	externalRegistry := store.ExternalAgentRegistry()
 	store.Close()
+	externalRecord := externalagent.RunRecord{Handle: "closed-external", InternalID: "closed-external-internal", PrincipalID: "closed-principal", SelectionAlias: "selection", RequestHash: integrationDigest("closed-request"), SubmitKeyHash: integrationDigest("closed-key"), Phase: externalagent.PhaseQueued, Owner: "closed-owner", UpdatedAt: time.Now().UTC()}
+	if _, err = externalRegistry.ClaimSubmit(ctx, externalRecord.PrincipalID, externalRecord.SubmitKeyHash, externalRecord.RequestHash); err == nil {
+		t.Fatal("closed external claim succeeded")
+	}
+	if _, err = externalRegistry.Reserve(ctx, externalRecord); err == nil {
+		t.Fatal("closed external reserve succeeded")
+	}
+	if _, err = externalRegistry.Get(ctx, externalRecord.Handle); err == nil {
+		t.Fatal("closed external get succeeded")
+	}
+	if _, err = externalRegistry.Transition(ctx, externalRecord.Handle, externalagent.PhaseQueued, externalagent.PhaseRunning, "", "", "worker", time.Now().UTC()); err == nil {
+		t.Fatal("closed external transition succeeded")
+	}
+	if _, _, err = externalRegistry.ReserveCancel(ctx, externalRecord.Handle, integrationDigest("closed-cancel"), integrationDigest("closed-cancel-request")); err == nil {
+		t.Fatal("closed external cancel succeeded")
+	}
+	if err = externalRegistry.Recover(ctx, "new-owner", time.Now().UTC()); err == nil {
+		t.Fatal("closed external recovery succeeded")
+	}
+	if _, err = externalRegistry.Events(ctx, externalRecord.Handle); err == nil {
+		t.Fatal("closed external events succeeded")
+	}
+	if err = externalRegistry.MarkPublicationFailure(ctx, externalRecord.Handle, time.Now().UTC()); err == nil {
+		t.Fatal("closed external publication failure succeeded")
+	}
 	snapshot := contextassembly.Snapshot{RunID: "closed-context-run", Digest: integrationDigest("closed-context")}
 	if _, _, err = contextStore.CommitSnapshot(ctx, "closed-key", contextassembly.Request{RunID: snapshot.RunID}, snapshot); err == nil {
 		t.Fatal("closed context snapshot commit succeeded")

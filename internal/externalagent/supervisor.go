@@ -32,21 +32,25 @@ func NewSupervisor(service *Service) *Supervisor {
 }
 
 // Start registers ownership before launching exactly one execution goroutine.
-func (s *Supervisor) Start(record RunRecord, selection Selection) {
+func (s *Supervisor) Start(record RunRecord, selection Selection, selected ...ProjectBoundResources) {
+	resources := ProjectBoundResources{Catalog: s.service.deps.Catalog, Executor: s.service.deps.Executor, Retention: s.service.deps.Retention, RunTimeout: s.service.deps.RunTimeout}
+	if len(selected) == 1 {
+		resources = selected[0]
+	}
 	s.mu.Lock()
 	if _, exists := s.workers[record.Handle]; exists {
 		s.mu.Unlock()
 		return
 	}
-	ctx, cancel := context.WithTimeout(s.root, s.service.deps.RunTimeout)
+	ctx, cancel := context.WithTimeout(s.root, resources.RunTimeout)
 	entry := &worker{cancel: cancel, done: make(chan struct{})}
 	s.workers[record.Handle] = entry
 	s.mu.Unlock()
-	go s.run(ctx, entry, record, selection)
+	go s.run(ctx, entry, record, selection, resources)
 }
 
 // run executes transitions without retaining the supervisor mutex across callbacks or disk I/O.
-func (s *Supervisor) run(ctx context.Context, entry *worker, record RunRecord, selection Selection) {
+func (s *Supervisor) run(ctx context.Context, entry *worker, record RunRecord, selection Selection, resources ProjectBoundResources) {
 	defer func() {
 		s.service.deps.Registry.ReleaseOwner(record.Handle)
 		s.finish(record.Handle, entry)
@@ -65,7 +69,7 @@ func (s *Supervisor) run(ctx context.Context, entry *worker, record RunRecord, s
 	monitorCtx, stopMonitor := context.WithCancel(ctx)
 	monitorDone := make(chan struct{})
 	go s.watchCancellation(monitorCtx, record.Handle, entry.cancel, monitorDone)
-	result, executionErr := s.service.deps.Executor.Execute(ctx, selection, current.InternalID)
+	result, executionErr := resources.Executor.Execute(ctx, selection, current.InternalID)
 	stopMonitor()
 	<-monitorDone
 	status := result.Status

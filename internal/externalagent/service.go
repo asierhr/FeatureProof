@@ -8,9 +8,11 @@ import (
 	"errors"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/asierhr/featureProof/internal/localvalidation"
+	"github.com/asierhr/featureProof/internal/projectconfig"
 )
 
 const (
@@ -42,6 +44,31 @@ type Selection struct {
 // SelectionCatalog authorizes a local alias for the current principal.
 type SelectionCatalog interface {
 	Resolve(context.Context, Principal, string) (Selection, error)
+}
+
+// ProjectConfigurationResolver captures the active project head for every newly admitted run.
+type ProjectConfigurationResolver interface {
+	PrepareForWorkflow(context.Context, string, string) (projectconfig.AdmissionCandidate, error)
+}
+
+// ProjectResourceSnapshot identifies bytes created speculatively before the causal run commit.
+type ProjectResourceSnapshot struct {
+	Descriptor projectconfig.ResourceDescriptor
+	Payload    []byte
+}
+
+// ProjectBoundResources are the consumers and limits reconstructed from one immutable binding.
+type ProjectBoundResources struct {
+	Catalog    SelectionCatalog
+	Executor   ApprovedExecutor
+	Retention  time.Duration
+	RunTimeout time.Duration
+}
+
+// ProjectResourceMaterializer snapshots current backing during admission and reconstructs historical consumers by exact lookup.
+type ProjectResourceMaterializer interface {
+	PrepareAdmission(context.Context, projectconfig.RunConfigurationBinding) (ProjectResourceSnapshot, ProjectBoundResources, error)
+	Materialize(context.Context, projectconfig.RunConfigurationBinding) (ProjectBoundResources, error)
 }
 
 // ExecutionResult identifies the terminal outcome and internal package location.
@@ -85,20 +112,23 @@ type IDSource interface {
 
 // RunRecord is the durable private state behind one opaque handle.
 type RunRecord struct {
-	Handle         string    `json:"handle"`
-	InternalID     string    `json:"internal_id"`
-	PrincipalID    string    `json:"principal_id"`
-	SelectionAlias string    `json:"selection_alias"`
-	RequestHash    string    `json:"request_hash"`
-	SubmitKeyHash  string    `json:"submit_key_hash"`
-	Phase          Phase     `json:"phase"`
-	Status         Outcome   `json:"status,omitempty"`
-	PackageDir     string    `json:"package_dir,omitempty"`
-	Owner          string    `json:"owner,omitempty"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	CancelKeyHash  string    `json:"cancel_key_hash,omitempty"`
-	CancelHash     string    `json:"cancel_hash,omitempty"`
-	Cause          string    `json:"cause,omitempty"`
+	Handle         string                                 `json:"handle"`
+	InternalID     string                                 `json:"internal_id"`
+	PrincipalID    string                                 `json:"principal_id"`
+	SelectionAlias string                                 `json:"selection_alias"`
+	RequestHash    string                                 `json:"request_hash"`
+	SubmitKeyHash  string                                 `json:"submit_key_hash"`
+	Phase          Phase                                  `json:"phase"`
+	Status         Outcome                                `json:"status,omitempty"`
+	PackageDir     string                                 `json:"package_dir,omitempty"`
+	Owner          string                                 `json:"owner,omitempty"`
+	UpdatedAt      time.Time                              `json:"updated_at"`
+	CancelKeyHash  string                                 `json:"cancel_key_hash,omitempty"`
+	CancelHash     string                                 `json:"cancel_hash,omitempty"`
+	Cause          string                                 `json:"cause,omitempty"`
+	Configuration  *projectconfig.RunConfigurationBinding `json:"configuration,omitempty"`
+	RetentionNS    int64                                  `json:"retention_ns,omitempty"`
+	RunTimeoutNS   int64                                  `json:"run_timeout_ns,omitempty"`
 }
 
 // RunEvent is one immutable, ordered audit fact committed with its snapshot.
@@ -118,6 +148,40 @@ type ReserveResult struct {
 	New    bool
 }
 
+// SubmissionClaim serializes configured admissions and carries an already committed idempotent replay when present.
+type SubmissionClaim struct {
+	Existing *RunRecord
+	once     sync.Once
+	release  func()
+}
+
+// NewSubmissionClaim constructs an adapter-owned lease without exposing its release internals.
+func NewSubmissionClaim(existing *RunRecord, release func()) *SubmissionClaim {
+	return &SubmissionClaim{Existing: existing, release: release}
+}
+
+// Release relinquishes admission ownership exactly once after commit or compensation.
+func (claim *SubmissionClaim) Release() {
+	if claim != nil {
+		claim.once.Do(func() {
+			if claim.release != nil {
+				claim.release()
+			}
+		})
+	}
+}
+
+// SubmissionClaimer prevents head resolution and artifact writes until idempotent replay has been decided.
+type SubmissionClaimer interface {
+	ClaimSubmit(context.Context, string, string, string) (*SubmissionClaim, error)
+}
+
+// ConfiguredAdmissionRegistry atomically confirms the artifact, binding-bearing run and first journal event.
+type ConfiguredAdmissionRegistry interface {
+	SubmissionClaimer
+	ReserveConfigured(context.Context, RunRecord, ProjectResourceSnapshot) (ReserveResult, error)
+}
+
 // Registry persists lifecycle, ownership, and idempotency independently of packages.
 type Registry interface {
 	Reserve(context.Context, RunRecord) (ReserveResult, error)
@@ -132,17 +196,20 @@ type Registry interface {
 
 // ServiceDependencies declares all trust, persistence, execution, and time boundaries.
 type ServiceDependencies struct {
-	Identity    IdentitySource
-	Catalog     SelectionCatalog
-	Registry    Registry
-	Executor    ApprovedExecutor
-	Packages    PackageReader
-	Clock       Clock
-	IDs         IDSource
-	Owner       string
-	Retention   time.Duration
-	RunTimeout  time.Duration
-	Corrections CorrectionUseCases
+	Identity         IdentitySource
+	Catalog          SelectionCatalog
+	Registry         Registry
+	Executor         ApprovedExecutor
+	Packages         PackageReader
+	Clock            Clock
+	IDs              IDSource
+	Owner            string
+	Retention        time.Duration
+	RunTimeout       time.Duration
+	RepositoryID     string
+	ProjectConfig    ProjectConfigurationResolver
+	ProjectResources ProjectResourceMaterializer
+	Corrections      CorrectionUseCases
 }
 
 // Service is the single application use case shared by CLI and MCP.
@@ -186,9 +253,37 @@ func (s *Service) Submit(ctx context.Context, input SubmitInput) (RunView, error
 	if err != nil {
 		return RunView{}, err
 	}
-	selection, err := s.deps.Catalog.Resolve(ctx, principal, input.SelectionAlias)
-	if err != nil {
-		return RunView{}, normalizeAuthorization(err, "selection_alias")
+	requestHash := digest("submit\x00" + input.SelectionAlias)
+	submitKeyHash := digest(principal.ID + "\x00submit\x00" + input.IdempotencyKey)
+	configured := s.deps.ProjectConfig != nil || s.deps.ProjectResources != nil
+	var claim *SubmissionClaim
+	if configured {
+		if s.deps.ProjectConfig == nil || s.deps.ProjectResources == nil || s.deps.RepositoryID == "" {
+			return RunView{}, &AppError{Code: CodeInternal}
+		}
+		claimer, ok := s.deps.Registry.(ConfiguredAdmissionRegistry)
+		if !ok {
+			return RunView{}, &AppError{Code: CodeInternal}
+		}
+		claim, err = claimer.ClaimSubmit(ctx, principal.ID, submitKeyHash, requestHash)
+		if err != nil {
+			return RunView{}, normalizeRegistry(err)
+		}
+		defer claim.Release()
+		if claim.Existing != nil {
+			existing := *claim.Existing
+			if existing.Configuration == nil || projectconfig.ValidateRunBinding(*existing.Configuration) != nil {
+				return RunView{}, &AppError{Code: CodeInternal}
+			}
+			resources, materializeErr := s.deps.ProjectResources.Materialize(ctx, existing.Configuration.Clone())
+			if materializeErr != nil || !validProjectResources(resources) {
+				return RunView{}, &AppError{Code: CodeInternal}
+			}
+			if _, resolveErr := resources.Catalog.Resolve(ctx, principal, existing.SelectionAlias); resolveErr != nil {
+				return RunView{}, normalizeAuthorization(resolveErr, "selection_alias")
+			}
+			return viewOf(existing), nil
+		}
 	}
 	handle, err := s.deps.IDs.Next()
 	if err != nil || !validHandle(handle) {
@@ -198,17 +293,44 @@ func (s *Service) Submit(ctx context.Context, input SubmitInput) (RunView, error
 	if err != nil || !validHandle(internalID) {
 		return RunView{}, &AppError{Code: CodeInternal}
 	}
-	requestHash := digest("submit\x00" + input.SelectionAlias)
-	record := RunRecord{Handle: handle, InternalID: internalID, PrincipalID: principal.ID, SelectionAlias: input.SelectionAlias, RequestHash: requestHash, SubmitKeyHash: digest(principal.ID + "\x00submit\x00" + input.IdempotencyKey), Phase: PhaseQueued, Owner: s.deps.Owner, UpdatedAt: s.deps.Clock.Now()}
-	reserved, err := s.deps.Registry.Reserve(ctx, record)
+	resources := ProjectBoundResources{Catalog: s.deps.Catalog, Executor: s.deps.Executor, Retention: s.deps.Retention, RunTimeout: s.deps.RunTimeout}
+	var binding *projectconfig.RunConfigurationBinding
+	var snapshot ProjectResourceSnapshot
+	if configured {
+		candidate, prepareErr := s.deps.ProjectConfig.PrepareForWorkflow(ctx, s.deps.RepositoryID, internalID)
+		captured := candidate.Binding
+		if prepareErr != nil || projectconfig.ValidateRunBinding(captured) != nil {
+			return RunView{}, &AppError{Code: CodeInternal}
+		}
+		snapshot, resources, err = s.deps.ProjectResources.PrepareAdmission(ctx, captured)
+		if err != nil || !validProjectResources(resources) {
+			return RunView{}, &AppError{Code: CodeInternal}
+		}
+		copy := captured.Clone()
+		binding = &copy
+	}
+	selection, err := resources.Catalog.Resolve(ctx, principal, input.SelectionAlias)
+	if err != nil {
+		return RunView{}, normalizeAuthorization(err, "selection_alias")
+	}
+	record := RunRecord{Handle: handle, InternalID: internalID, PrincipalID: principal.ID, SelectionAlias: input.SelectionAlias, RequestHash: requestHash, SubmitKeyHash: submitKeyHash, Phase: PhaseQueued, Owner: s.deps.Owner, UpdatedAt: s.deps.Clock.Now(), Configuration: binding, RetentionNS: int64(resources.Retention), RunTimeoutNS: int64(resources.RunTimeout)}
+	var reserved ReserveResult
+	if configured {
+		reserved, err = s.deps.Registry.(ConfiguredAdmissionRegistry).ReserveConfigured(ctx, record, snapshot)
+	} else {
+		reserved, err = s.deps.Registry.Reserve(ctx, record)
+	}
 	if err != nil {
 		return RunView{}, normalizeRegistry(err)
+	}
+	if configured && !reserved.New {
+		return RunView{}, &AppError{Code: CodeInternal}
 	}
 	if reserved.Record.PrincipalID != principal.ID {
 		return RunView{}, &AppError{Code: CodeNotFound}
 	}
 	if reserved.New {
-		if preparer, ok := s.deps.Executor.(SubmissionPreparer); ok {
+		if preparer, ok := resources.Executor.(SubmissionPreparer); ok {
 			if prepareErr := preparer.Prepare(ctx, selection, reserved.Record.InternalID); prepareErr != nil {
 				finalCtx, cancel := context.WithTimeout(context.Background(), s.deps.RunTimeout)
 				_, _ = s.deps.Registry.Transition(finalCtx, reserved.Record.Handle, PhaseQueued, PhaseTerminal, OutcomeError, "", "", s.deps.Clock.Now())
@@ -217,9 +339,14 @@ func (s *Service) Submit(ctx context.Context, input SubmitInput) (RunView, error
 				return RunView{}, &AppError{Code: CodeInternal}
 			}
 		}
-		s.supervisor.Start(reserved.Record, selection)
+		s.supervisor.Start(reserved.Record, selection, resources)
 	}
 	return viewOf(reserved.Record), nil
+}
+
+// validProjectResources prevents a partially materialized binding from reaching alias resolution or execution.
+func validProjectResources(resources ProjectBoundResources) bool {
+	return resources.Catalog != nil && resources.Executor != nil && resources.Retention > 0 && resources.RunTimeout > 0
 }
 
 // Status reauthorizes every handle lookup and reveals no foreign existence.
@@ -368,13 +495,19 @@ func (s *Service) Wait(ctx context.Context, handle string) error {
 
 // Close cancels and joins every owned worker before a transport process exits.
 func (s *Service) Close(ctx context.Context) error {
+	var closeErrors []error
 	if err := s.supervisor.Close(ctx); err != nil {
-		return err
+		closeErrors = append(closeErrors, err)
 	}
 	if closer, ok := s.deps.Executor.(interface{ Close(context.Context) error }); ok {
-		return closer.Close(ctx)
+		if err := closer.Close(ctx); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
 	}
-	return nil
+	if closer, ok := s.deps.Registry.(interface{ Close() }); ok {
+		closer.Close()
+	}
+	return errors.Join(closeErrors...)
 }
 
 // principal converts identity boundary failures to the closed authorization category.
@@ -405,8 +538,20 @@ func (s *Service) ownedRecord(ctx context.Context, handle, scope string) (RunRec
 		return RunRecord{}, err
 	}
 	record, err := s.deps.Registry.Get(ctx, handle)
-	if err != nil || record.PrincipalID != principal.ID || s.deps.Clock.Now().Sub(record.UpdatedAt) > s.deps.Retention {
+	retention := s.deps.Retention
+	if record.RetentionNS > 0 {
+		retention = time.Duration(record.RetentionNS)
+	}
+	if err != nil || record.PrincipalID != principal.ID || s.deps.Clock.Now().Sub(record.UpdatedAt) > retention {
 		return RunRecord{}, &AppError{Code: CodeNotFound}
+	}
+	if record.Configuration != nil {
+		if s.deps.ProjectResources == nil || projectconfig.ValidateRunBinding(*record.Configuration) != nil {
+			return RunRecord{}, &AppError{Code: CodeInternal}
+		}
+		if _, materializeErr := s.deps.ProjectResources.Materialize(ctx, record.Configuration.Clone()); materializeErr != nil {
+			return RunRecord{}, &AppError{Code: CodeInternal}
+		}
 	}
 	return record, nil
 }

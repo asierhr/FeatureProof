@@ -34,8 +34,11 @@ import (
 	controlplanepg "github.com/asierhr/featureProof/internal/controlplane/postgres"
 	"github.com/asierhr/featureProof/internal/correction"
 	"github.com/asierhr/featureProof/internal/environment"
+	"github.com/asierhr/featureProof/internal/externalagent"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/localvalidation"
+	"github.com/asierhr/featureProof/internal/projectconfig"
+	localprojectconfig "github.com/asierhr/featureProof/internal/projectconfig/local"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -228,8 +231,25 @@ func TestGitHubRuntimePostgresCompositionOwnsLifecycle(t *testing.T) {
 	}
 	_ = runtime.Close(context.Background())
 	serverContext, cancel := context.WithCancel(context.Background())
-	time.AfterFunc(100*time.Millisecond, cancel)
-	if code := runGitHubServer(serverContext, io.Discard); code != 0 {
+	ready := make(chan struct{})
+	result := make(chan int, 1)
+	go func() { result <- runGitHubServerWithReadiness(serverContext, io.Discard, ready) }()
+	select {
+	case <-ready:
+		cancel()
+	case code := <-result:
+		cancel()
+		t.Fatalf("server failed before listener ownership: %d", code)
+	}
+	shutdownDeadline, stopWaiting := context.WithTimeout(context.Background(), 15*time.Second)
+	defer stopWaiting()
+	var code int
+	select {
+	case code = <-result:
+	case <-shutdownDeadline.Done():
+		t.Fatal("server shutdown did not join")
+	}
+	if code != 0 {
 		t.Fatalf("shutdown server returned %d", code)
 	}
 	t.Setenv("FEATUREPROOF_GITHUB_LISTEN", "invalid address")
@@ -246,7 +266,66 @@ func TestGitHubRuntimePostgresCompositionOwnsLifecycle(t *testing.T) {
 // postgresWorkflowPersistence projects the complete consumer-owned PostgreSQL
 // graph into the exact ports used by productive workflow composition.
 func postgresWorkflowPersistence(domains *controlplanepg.DomainStores, store *controlplanepg.Store) *workflowPersistence {
-	return &workflowPersistence{workflows: domains.Workflow, artifacts: domains.PlanArtifacts, executables: domains.ExecutablePlan, approvals: domains.Approval, environments: domains.Environment, capacity: domains.Capacity, cleanupLedger: domains.CleanupLedger, cleanup: domains.Cleanup, functional: domains.Functional, journal: domains.Functional, packages: domains.Packages, corrections: domains.Correction, fixtures: domains.Fixtures, context: domains.Context, functionalRuntime: store}
+	return &workflowPersistence{workflows: domains.Workflow, artifacts: domains.PlanArtifacts, executables: domains.ExecutablePlan, approvals: domains.Approval, environments: domains.Environment, capacity: domains.Capacity, cleanupLedger: domains.CleanupLedger, cleanup: domains.Cleanup, functional: domains.Functional, journal: domains.Functional, packages: domains.Packages, corrections: domains.Correction, fixtures: domains.Fixtures, context: domains.Context, projectConfig: domains.ProjectConfig, resourceArtifacts: domains.ResourceArtifacts, functionalRuntime: store}
+}
+
+// TestPostgresWorkflowHistoricalReadNeverRepopulatesMissingArtifact proves restart recovery uses exact Get even when current backing remains valid.
+func TestPostgresWorkflowHistoricalReadNeverRepopulatesMissingArtifact(t *testing.T) {
+	dsn := os.Getenv("FEATUREPROOF_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Fatal("FEATUREPROOF_POSTGRES_TEST_DSN is required")
+	}
+	root := t.TempDir()
+	identity := sha256.Sum256([]byte(filepath.Clean(root)))
+	t.Setenv("FEATUREPROOF_TEST_PROJECT_ID", "artifact-"+hex.EncodeToString(identity[:8]))
+	configPath, _, contractPath := writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
+	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)
+	configuration, err := composeWorkflowProjectConfiguration(context.Background(), root, "test", "repo", nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := configuration.Resolver.BindForWorkflow(context.Background(), "repo", "postgres-missing-artifact")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstStore, err := controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: dsn, BackendIdentity: "artifact-admission", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = firstStore.Migrate(context.Background()); err != nil {
+		firstStore.Close()
+		t.Fatal(err)
+	}
+	first := &workflowProjectResourceMaterializer{artifacts: firstStore.ResourceArtifacts(), artifactRoot: filepath.Join(root, "materialized-admission")}
+	if err = first.SnapshotForAdmission(context.Background(), binding); err != nil {
+		firstStore.Close()
+		t.Fatal(err)
+	}
+	firstStore.Close()
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if _, err = pool.Exec(context.Background(), `DELETE FROM project_configuration_resource_artifacts WHERE project_id=$1 AND repository_id=$2`, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(contractPath, []byte(`{"openapi":"3.0.0","paths":{"/current-valid-and-distinct":{}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: dsn, BackendIdentity: "artifact-restart", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	second := &workflowProjectResourceMaterializer{artifacts: restarted.ResourceArtifacts(), artifactRoot: filepath.Join(root, "materialized-restart")}
+	if _, err = second.loadBoundConfig(context.Background(), binding); err == nil {
+		t.Fatal("postgres historical read adopted current backing")
+	}
+	var remaining int
+	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM project_configuration_resource_artifacts WHERE project_id=$1 AND repository_id=$2`, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("historical read repopulated postgres artifacts: rows=%d err=%v", remaining, err)
+	}
 }
 
 // routing GitHub and model traffic to deterministic in-process providers.
@@ -282,7 +361,7 @@ func (transport *postgresVerticalTransport) RoundTrip(request *http.Request) (*h
 
 // preparePostgresVerticalWorkflow writes the complete v3 fixture workflow
 // inputs without composing or opening any local persistence adapter.
-func preparePostgresVerticalWorkflow(t *testing.T, root, targetURL string) string {
+func preparePostgresVerticalWorkflow(t *testing.T, root, targetURL, dsn string) string {
 	t.Helper()
 	configPath, specPath, _ := writeWorkflowCompositionFixture(t, root, workflowFixtureContractFixture(), "/pets", workflowProjectionFixture())
 	specification := "version: 3\nfeature:\n  id: postgres-vertical\n  description: postgres vertical\ntarget:\n  id: deployed\n  base_url: " + targetURL + "\nconstraints:\n  - id: c1\n    description: selected contract\n    target_id: deployed\nlimits:\n  max_steps: 6\n  max_tool_calls: 3\n  max_retries: 0\nidentities:\n  - id: customer\n    target_id: deployed\n    credential_ref: cred_customer\n    mechanism:\n      type: bearer\n    operations:\n      - capability: http.request\n        method: GET\n        path: /pets\n      - capability: http.request\n        method: POST\n        path: /fixtures\n      - capability: http.request\n        method: DELETE\n        path: /fixtures/{id}\nfixtures:\n  - id: account\n    depends_on: []\n    create:\n      operation: {method: POST, path: /fixtures}\n      identity_id: customer\n      input:\n        body:\n          object:\n            name: {literal: product-fixture}\n      accepted_statuses: [201]\n      idempotency: contract\n    capture:\n      - name: id\n        path: [id]\n        value_type: string\n        max_bytes: 64\n    cleanup:\n      operation: {method: DELETE, path: \"/fixtures/{id}\"}\n      identity_id: customer\n      input:\n        path_parameters:\n          id:\n            reference: {fixture_id: account, output: id, value_type: string}\n      accepted_statuses: [204, 404]\n      idempotency: contract\n"
@@ -308,7 +387,160 @@ func preparePostgresVerticalWorkflow(t *testing.T, root, targetURL string) strin
 		item := catalog["items"].([]any)[0].(map[string]any)
 		item["alias"], item["project_id"], item["repository_id"] = "default", "202", "202"
 	})
+	writeWorkflowProjectConfigurationFixture(t, root, configPath)
+	seedPostgresProjectConfiguration(t, dsn, configPath)
 	return configPath
+}
+
+// seedPostgresProjectConfiguration copies the canonical fixture through the real PostgreSQL store before productive composition.
+func seedPostgresProjectConfiguration(t *testing.T, dsn, configPath string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: dsn, BackendIdentity: "project-config-fixture", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err = store.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	domains, err := store.DomainStores(controlplanepg.DomainStoreConfig{Clock: githubpr.WallClock{}, FunctionalTTL: time.Minute, CapacityLimits: map[string]environment.CapacityLimits{repositoryIDFromConfig(t, configPath): {Environments: 2, CPUMilli: 2000, MemoryBytes: 1 << 30, ObjectCount: 100, MaxTTL: time.Hour}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryID := readWorkflowRepositoryID(t, configPath)
+	key, _ := projectconfig.NewProjectKey(os.Getenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID"), repositoryID)
+	localStore, err := localprojectconfig.New(os.Getenv("FEATUREPROOF_PROJECT_CONFIG_ROOT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := localStore.Head(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	version, effective, err := localStore.Version(ctx, key, head.Activation.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedGeneration := uint64(0)
+	if current, headErr := domains.ProjectConfig.Head(ctx, key); headErr == nil {
+		expectedGeneration = current.Activation.Generation
+	} else if !projectconfig.IsCategory(headErr, projectconfig.CategoryNotFound) {
+		t.Fatal(headErr)
+	}
+	operationID := "postgres-fixture-" + repositoryID + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	_, err = domains.ProjectConfig.Publish(ctx, projectconfig.PublishCommand{OperationID: operationID, CommandDigest: projectconfigFixtureDigest(operationID + version.DocumentDigest), Actor: "test", ExpectedGeneration: expectedGeneration, Document: projectconfig.CanonicalDocument{Document: mustLoadProjectDocument(t, version.Canonical), Bytes: version.Canonical, Digest: version.DocumentDigest}, Effective: effective, CreatedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPostgresExternalAgentProductCompositionOwnsCausalAdmission proves the executable selects only PostgreSQL for configuration, run and artifact state.
+func TestPostgresExternalAgentProductCompositionOwnsCausalAdmission(t *testing.T) {
+	dsn := os.Getenv("FEATUREPROOF_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Fatal("FEATUREPROOF_POSTGRES_TEST_DSN is required")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	t.Chdir(root)
+	identity := sha256.Sum256([]byte(filepath.Clean(root)))
+	t.Setenv("FEATUREPROOF_TEST_PROJECT_ID", "external-product-"+hex.EncodeToString(identity[:8]))
+	configPath, _, _ := writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
+	rewriteWorkflowConfig(t, configPath, func(value map[string]any) {
+		value["target_alias"] = "preview"
+		value["environment_catalog"].(map[string]any)["items"].([]any)[0].(map[string]any)["alias"] = "preview"
+	})
+	writeWorkflowProjectConfigurationFixture(t, root, configPath)
+	seedPostgresProjectConfiguration(t, dsn, configPath)
+	for name, value := range map[string]string{
+		"FEATUREPROOF_CONTROL_PLANE_BACKEND":      string(controlplane.BackendPostgres),
+		"FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN": dsn,
+		"FEATUREPROOF_CONTROL_PLANE_IDENTITY":     "external-product-postgres",
+		"FEATUREPROOF_PREVIEW_CONFIG":             writeConfiguredPreviewFixture(t, root, server.URL+"/"),
+	} {
+		t.Setenv(name, value)
+	}
+	service, err := composeExternalAgentService()
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := service.Submit(context.Background(), externalagent.SubmitInput{SelectionAlias: "preview", IdempotencyKey: "postgres-product-key"})
+	if err != nil {
+		_ = service.Close(context.Background())
+		t.Fatal(err)
+	}
+	if err = service.Wait(context.Background(), view.RunHandle); err != nil {
+		_ = service.Close(context.Background())
+		t.Fatal(err)
+	}
+	replay, err := service.Submit(context.Background(), externalagent.SubmitInput{SelectionAlias: "preview", IdempotencyKey: "postgres-product-key"})
+	if err != nil || replay.RunHandle != view.RunHandle {
+		_ = service.Close(context.Background())
+		t.Fatalf("replay=%+v err=%v", replay, err)
+	}
+	if err = service.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var runs, events, artifacts, bindings int
+	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM external_agent_runs WHERE handle=$1`, view.RunHandle).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM external_agent_events WHERE run_handle=$1`, view.RunHandle).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM project_configuration_resource_artifacts`).Scan(&artifacts); err != nil {
+		t.Fatal(err)
+	}
+	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM project_configuration_run_bindings WHERE project_id=$1`, os.Getenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID")).Scan(&bindings); err != nil || runs != 1 || events < 3 || artifacts < 1 || bindings != 0 {
+		t.Fatalf("runs=%d events=%d artifacts=%d bindings=%d err=%v", runs, events, artifacts, bindings, err)
+	}
+}
+
+// repositoryIDFromConfig returns the fixture key before domain composition needs capacity ownership.
+func repositoryIDFromConfig(t *testing.T, configPath string) string {
+	return readWorkflowRepositoryID(t, configPath)
+}
+
+// readWorkflowRepositoryID reads the strict fixture identity used to scope the copied authority.
+func readWorkflowRepositoryID(t *testing.T, configPath string) string {
+	t.Helper()
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value struct {
+		RepositoryID string `json:"repository_id"`
+	}
+	if json.Unmarshal(raw, &value) != nil {
+		t.Fatal("workflow fixture identity unavailable")
+	}
+	return value.RepositoryID
+}
+
+// mustLoadProjectDocument strictly reconstructs the canonical typed fixture without changing its bytes.
+func mustLoadProjectDocument(t *testing.T, raw []byte) projectconfig.Document {
+	t.Helper()
+	canonical, err := projectconfig.LoadStrict(bytes.NewReader(raw), projectconfig.MaxCanonicalBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return canonical.Document
+}
+
+// projectconfigFixtureDigest returns a stable lowercase SHA-256 command identity.
+func projectconfigFixtureDigest(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
 }
 
 // deliverPostgresVerticalWebhook crosses the same authenticated HTTP handler
@@ -449,6 +681,8 @@ func TestPostgresProductRuntimeContinuesOnlyThroughDurableWorker(t *testing.T) {
 	}
 	root := t.TempDir()
 	t.Chdir(root)
+	fixtureIdentity := sha256.Sum256([]byte(filepath.Clean(root)))
+	t.Setenv("FEATUREPROOF_TEST_PROJECT_ID", "project-"+hex.EncodeToString(fixtureIdentity[:8]))
 	var creates, reads, deletes atomic.Int32
 	readStarted, releaseRead := make(chan struct{}), make(chan struct{})
 	defer func() {
@@ -478,7 +712,7 @@ func TestPostgresProductRuntimeContinuesOnlyThroughDurableWorker(t *testing.T) {
 		}
 	}))
 	defer target.Close()
-	configPath := preparePostgresVerticalWorkflow(t, root, target.URL)
+	configPath := preparePostgresVerticalWorkflow(t, root, target.URL, dsn)
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -560,6 +794,13 @@ func TestPostgresProductRuntimeContinuesOnlyThroughDurableWorker(t *testing.T) {
 	if _, statErr := os.Stat(stateRoot); !os.IsNotExist(statErr) {
 		t.Fatalf("PostgreSQL runtime recreated LocalStore root: %v", statErr)
 	}
+	rewriteWorkflowConfig(t, configPath, func(value map[string]any) { value["environment_id"] = "drifted" })
+	if drifted, _, driftErr := composeGitHubRuntime(context.Background()); driftErr == nil {
+		_ = drifted.Close(context.Background())
+		t.Fatal("same project resource digest accepted changed inventory payload")
+	} else if !strings.Contains(driftErr.Error(), "project resource inventory drift") {
+		t.Fatalf("unexpected inventory drift error: %v", driftErr)
+	}
 	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -596,6 +837,9 @@ func TestPostgresWorkflowCompositionSurvivesFilesystemRemoval(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	t.Chdir(root)
+	fixtureIdentity := sha256.Sum256([]byte(filepath.Clean(root)))
+	// Each invocation owns one project namespace while both compositions inside it retain the same immutable identity.
+	t.Setenv("FEATUREPROOF_TEST_PROJECT_ID", "filesystem-"+hex.EncodeToString(fixtureIdentity[:8]))
 	configPath, _, _ := writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)
 	store, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: dsn, BackendIdentity: "cmd-vertical", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
@@ -606,6 +850,7 @@ func TestPostgresWorkflowCompositionSurvivesFilesystemRemoval(t *testing.T) {
 	if err = store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
+	seedPostgresProjectConfiguration(t, dsn, configPath)
 	domains, err := store.DomainStores(controlplanepg.DomainStoreConfig{Clock: githubpr.WallClock{}, FunctionalTTL: time.Minute, CapacityLimits: map[string]environment.CapacityLimits{"repo": {Environments: 2, CPUMilli: 2000, MemoryBytes: 1 << 30, ObjectCount: 100, MaxTTL: time.Hour}}})
 	if err != nil {
 		t.Fatal(err)

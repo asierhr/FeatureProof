@@ -5,7 +5,7 @@
 > falla, implementación mínima, refactor y verificación. No se marcan checks en
 > fase de spec.
 
-- [ ] T1. Modelo, strict loader y representación canónica [R2, R3, R5, R17]
+- [x] T1. Modelo, strict loader y representación canónica [R2, R3, R5, R17]
 
   - Crear tests table/property-based para schema v1, límites de bytes,
   unknown/duplicate fields, trailing data, nulls, IDs, cardinalidades y ciclos.
@@ -17,7 +17,7 @@
   diagnostics ordenados/acotados.
   - Añadir comentarios sistémicos a todos los símbolos alcanzados por R17.
 
-- [ ] T2. Authority y frontera del application service [R1, R14, R15, R17]
+- [x] T2. Authority y frontera del application service [R1, R14, R15, R17]
 
   - Escribir tests de action/project/repository mismatch que demuestren que
   ningún store, catalog o policy source se invoca sin authority válida.
@@ -28,7 +28,7 @@
   - Documentar explícitamente que roles/membership/RBAC se delegan a feature
   37 y no se modelan en este paquete.
 
-- [ ] T3. Catálogo y validación semántica [R3, R4, R5, R14]
+- [x] T3. Catálogo y validación semántica [R3, R4, R5, R14]
 
   - Crear fakes contractuales de `ResourceCatalog` y matrices para contracts,
   providers/targets, identities, fixtures, runtime/model/auth profiles y policies.
@@ -39,7 +39,7 @@
   - Probar drift entre validación preliminar y confirmación y asegurar que
   collaborator errors/raw payloads no cruzan la frontera.
 
-- [ ] T4. Defaults organizativos monotónicos [R6, R12, R17]
+- [x] T4. Defaults organizativos monotónicos [R6, R12, R17]
 
   - Escribir tests de tabla/property para defaults ausentes, ceilings, valores
   más restrictivos, approval floor, retention range y allowlist subset.
@@ -49,7 +49,7 @@
   ampliar permisos, capacidades o recursos.
   - Probar policy ausente/corrupta/drift y cambio de effective digest.
 
-- [ ] T5. Contrato de persistencia e invariantes compartidas [R7, R8, R9, R10, R11, R13]
+- [x] T5. Contrato de persistencia e invariantes compartidas [R7, R8, R9, R10, R11, R13]
 
   - Definir contract suite para versions, activations, heads, effective
   snapshots, events, receipts, history y run bindings.
@@ -60,7 +60,7 @@
   - Definir comandos store ya canonicalizados, sin callbacks/I/O externo en
   locks o transacciones.
 
-- [ ] T6. Adapter local durable [R7, R8, R9, R10, R11, R13, R14]
+- [x] T6. Adapter local durable [R7, R8, R9, R10, R11, R13, R14]
 
   - Hacer fallar la contract suite contra un root temporal explícito y añadir
   tests de restart, segundo proceso, corrupción, cancelación y stale head.
@@ -70,7 +70,7 @@
   para no observar run sin binding.
   - Verificar que outage/integrity nunca activa fallback a otro backend.
 
-- [ ] T7. Migrations y adapter PostgreSQL [R7, R8, R9, R10, R11, R13, R14, R18]
+- [x] T7. Migrations y adapter PostgreSQL [R7, R8, R9, R10, R11, R13, R14, R18]
 
   - Añadir tests de manifest/migrations para empty/latest/idempotent/concurrent,
   checksums, schema future y ventana N/N+1 del control plane.
@@ -81,7 +81,7 @@
   - Ejecutar la misma contract suite del adapter local e inyectar rollback en
   cada statement boundary y resultado de commit desconocido.
 
-- [ ] T8. Publicación y activación atómicas [R1, R4, R7, R8, R14, R15]
+- [x] T8. Publicación y activación atómicas [R1, R4, R7, R8, R14, R15]
 
   - Escribir tests del flujo authority → load → snapshots → validate → commit,
   incluidos competing publishers y catalog/policy drift.
@@ -92,7 +92,7 @@
   - Emitir observabilidad best effort solo después de commit y probar que un
   evento durable fallido aborta la operación.
 
-- [ ] T9. Rollback por nueva activación [R1, R7, R9, R14, R15]
+- [x] T9. Rollback por nueva activación [R1, R7, R9, R14, R15]
 
   - Crear tests de versión histórica compatible/incompatible/corrupta,
   expected head stale, competing publish y redelivery idempotente.
@@ -100,7 +100,7 @@
   reason `rollback` sin copiar ni mutar la versión histórica.
   - Verificar journal causal, receipt y ausencia de cambios ante fallo.
 
-- [ ] T10. Query, history y export seguro [R1, R5, R7, R10, R15]
+- [x] T10. Query, history y export seguro [R1, R5, R7, R10, R15]
 
   - Probar active/version/effective/history, copias defensivas, response limits,
   stable ordering y cursors alterados/cross-project/expirados.
@@ -109,7 +109,7 @@
   - Añadir canaries para demostrar ausencia de secret values, resolver state,
   raw input y collaborator errors en DTOs, export, logs y events.
 
-- [ ] T11. Resolver de admisión y binding inmutable [R4, R6, R11, R12, R14]
+- [x] T11. Resolver de admisión y binding inmutable [R4, R6, R11, R12, R14]
 
   - Escribir tests de no-head, unsupported/obsolete schema, policy/catalog
   drift, reference retirada, concurrent head change y configuración válida.
@@ -120,7 +120,7 @@
   - Probar que un run bound continúa tras publish/rollback/drift sin consultar
   ni sustituir el active head.
 
-- [ ] T12. Transacción causal con workflow/control plane [R11, R12, R13, R16]
+- [x] T12. Transacción causal con workflow/control plane [R11, R12, R13, R16]
 
   - Añadir tests verticales que inyecten crash en cada boundary entre binding,
   run, first event/job e ingress receipt.
@@ -130,7 +130,7 @@
   model call si el binding no se confirmó.
   - Adaptar recovery para cargar siempre el binding del run y nunca el head.
 
-- [ ] T13. Adapters de recursos y separación de bootstrap [R4, R5, R6, R16]
+- [x] T13. Adapters de recursos y separación de bootstrap [R4, R5, R6, R16]
 
   - Crear tests para adapters de contract catalog, environments, identities,
   fixtures, runtime/model/auth profiles, approval, limits y retention.
@@ -141,7 +141,7 @@
   - Mantener secret resolver y credential env mappings únicamente en la
   frontera privada, resolviendo refs just-in-time para el binding/fence correcto.
 
-- [ ] T14. Superficies CLI, API/MCP y GitHub [R1, R10, R12, R16]
+- [x] T14. Superficies CLI, API/MCP y GitHub [R1, R10, R12, R16]
 
   - Probar comandos administrativos validate/publish/rollback/show/history/
   export sobre el mismo service y authority, sin escrituras directas al store.
@@ -152,7 +152,7 @@
   - Cubrir redelivery de webhook/API y ausencia de trabajo ante configuración
   ausente, inválida, obsolete o incompatible.
 
-- [ ] T15. Consumers de límites, approval, retención y refs [R5, R6, R11, R12, R16]
+- [x] T15. Consumers de límites, approval, retención y refs [R5, R6, R11, R12, R16]
 
   - Añadir tests que demuestren que planning/execution/evaluation/publication/
   cleanup usan límites, approval y retention del binding.
@@ -161,7 +161,7 @@
   - Probar old-run recovery y que secret ref revocada produce fallo operacional
   sin fallback, nueva identity o mutación del binding.
 
-- [ ] T16. Verificación y cierre [R1–R18]
+- [x] T16. Verificación y cierre [R1–R18]
 
   - Completar matriz `R<n>` ↔ tests concretos y ejecutar `gofmt`, diff-check,
   `go vet`, compile-only, `go test ./...`, race y cross-builds aplicables.

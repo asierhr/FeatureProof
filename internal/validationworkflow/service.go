@@ -15,6 +15,7 @@ import (
 	"github.com/asierhr/featureProof/internal/contextassembly"
 	"github.com/asierhr/featureProof/internal/fixture"
 	"github.com/asierhr/featureProof/internal/localvalidation"
+	"github.com/asierhr/featureProof/internal/projectconfig"
 	"github.com/asierhr/featureProof/internal/projectmemory"
 	"github.com/asierhr/featureProof/internal/testidentity"
 )
@@ -24,6 +25,37 @@ type Config struct{ LeaseTTL, HeartbeatInterval, FinalizeTimeout, ApprovalTTL ti
 
 // Dependencies supplies the existing planning, execution, package and lifecycle boundaries.
 type Dependencies struct {
+	Admission        AdmissionBuilder
+	Generation       GenerationPort
+	Preparation      PreparationPort
+	Approval         ApprovalPort
+	Execution        ExecutionPort
+	Packages         PackageReader
+	Authorization    AutoAuthorizationPolicy
+	Finalizer        Finalizer
+	Environment      EnvironmentPort
+	Store            WorkflowStore
+	Artifacts        PlanArtifactStore
+	Executables      ExecutablePlanStore
+	Clock            Clock
+	Waiter           Waiter
+	IDs              IDSource
+	Owner            string
+	ContractReview   ApprovedContractAuthority
+	Fixtures         FixtureLifecyclePort
+	FixturePackages  FixturePackageWriter
+	FunctionalFlow   FunctionalFlowExecutionPort
+	Memory           ProjectMemoryPort
+	MemoryObserver   ProjectMemoryObservationPort
+	Context          ContextAssemblyPort
+	TargetPlanning   TargetPlanningBinder
+	FlowAuthority    FunctionalFlowAuthorityLifecyclePort
+	ProjectConfig    ProjectConfigurationResolver
+	ProjectResources ProjectResourceMaterializer
+}
+
+// ProjectBoundResources contains only run-scoped consumers rebuilt from one immutable configuration binding.
+type ProjectBoundResources struct {
 	Admission       AdmissionBuilder
 	Generation      GenerationPort
 	Preparation     PreparationPort
@@ -31,24 +63,43 @@ type Dependencies struct {
 	Execution       ExecutionPort
 	Packages        PackageReader
 	Authorization   AutoAuthorizationPolicy
-	Finalizer       Finalizer
 	Environment     EnvironmentPort
-	Store           WorkflowStore
-	Artifacts       PlanArtifactStore
-	Executables     ExecutablePlanStore
-	Clock           Clock
-	Waiter          Waiter
-	IDs             IDSource
-	Owner           string
 	ContractReview  ApprovedContractAuthority
 	Fixtures        FixtureLifecyclePort
 	FixturePackages FixturePackageWriter
 	FunctionalFlow  FunctionalFlowExecutionPort
-	Memory          ProjectMemoryPort
-	MemoryObserver  ProjectMemoryObservationPort
+	FlowAuthority   FunctionalFlowAuthorityLifecyclePort
 	Context         ContextAssemblyPort
 	TargetPlanning  TargetPlanningBinder
-	FlowAuthority   FunctionalFlowAuthorityLifecyclePort
+}
+
+// ProjectResourceMaterializer snapshots resources only during admission and later reconstructs consumers by exact historical lookup.
+type ProjectResourceMaterializer interface {
+	SnapshotForAdmission(context.Context, projectconfig.RunConfigurationBinding) error
+	Materialize(context.Context, projectconfig.RunConfigurationBinding, StartCommand) (ProjectBoundResources, StartCommand, error)
+}
+
+// StaticProjectResourceMaterializer is an explicit test and compatibility composition for already bound resources.
+type StaticProjectResourceMaterializer struct{ Resources ProjectBoundResources }
+
+// SnapshotForAdmission is a no-op because static composition owns no mutable backing or durable artifact boundary.
+func (StaticProjectResourceMaterializer) SnapshotForAdmission(context.Context, projectconfig.RunConfigurationBinding) error {
+	return nil
+}
+
+// Materialize returns the explicitly supplied resources without consulting mutable project state.
+func (materializer StaticProjectResourceMaterializer) Materialize(_ context.Context, _ projectconfig.RunConfigurationBinding, command StartCommand) (ProjectBoundResources, StartCommand, error) {
+	return materializer.Resources, command, nil
+}
+
+// ProjectConfigurationResolver binds a generated workflow ID to one trusted repository configuration.
+type ProjectConfigurationResolver interface {
+	BindForWorkflow(context.Context, string, string) (projectconfig.RunConfigurationBinding, error)
+}
+
+// PreparedProjectConfigurationResolver leaves binding persistence to an atomic workflow store transaction.
+type PreparedProjectConfigurationResolver interface {
+	PrepareForWorkflow(context.Context, string, string) (projectconfig.AdmissionCandidate, error)
 }
 
 // ProjectMemorySelection is the trusted planning projection and its exact historical seal.
@@ -84,7 +135,7 @@ type FunctionalFlowAuthorityLifecyclePort interface {
 type Service struct {
 	deps      Dependencies
 	config    Config
-	mu        sync.Mutex
+	mu        *sync.Mutex
 	snapshots map[string]AdmissionSnapshot
 	workers   map[string]*workflowWorker
 }
@@ -98,10 +149,32 @@ type workflowWorker struct {
 
 // NewService validates every fail-closed orchestration dependency without starting background work.
 func NewService(config Config, deps Dependencies) (*Service, error) {
-	if config.LeaseTTL <= 0 || config.HeartbeatInterval <= 0 || config.HeartbeatInterval >= config.LeaseTTL || config.FinalizeTimeout <= 0 || config.ApprovalTTL <= 0 || deps.Admission == nil || deps.Generation == nil || deps.Preparation == nil || deps.Approval == nil || deps.Execution == nil && deps.FunctionalFlow == nil || deps.Packages == nil || deps.Authorization == nil || deps.Finalizer == nil || deps.Store == nil || deps.Artifacts == nil || deps.Executables == nil || deps.Clock == nil || deps.Waiter == nil || deps.IDs == nil || !safeID.MatchString(deps.Owner) {
+	if config.LeaseTTL <= 0 || config.HeartbeatInterval <= 0 || config.HeartbeatInterval >= config.LeaseTTL || config.FinalizeTimeout <= 0 || config.ApprovalTTL <= 0 || deps.ProjectConfig == nil || deps.ProjectResources == nil || deps.Admission == nil || deps.Generation == nil || deps.Preparation == nil || deps.Approval == nil || deps.Execution == nil && deps.FunctionalFlow == nil || deps.Packages == nil || deps.Authorization == nil || deps.Finalizer == nil || deps.Store == nil || deps.Artifacts == nil || deps.Executables == nil || deps.Clock == nil || deps.Waiter == nil || deps.IDs == nil || !safeID.MatchString(deps.Owner) {
 		return nil, &Error{Code: CodeInvalid, Operation: "compose"}
 	}
-	return &Service{deps: deps, config: config, snapshots: map[string]AdmissionSnapshot{}, workers: map[string]*workflowWorker{}}, nil
+	return &Service{deps: deps, config: config, mu: &sync.Mutex{}, snapshots: map[string]AdmissionSnapshot{}, workers: map[string]*workflowWorker{}}, nil
+}
+
+// materializeProjectResources returns a shallow service view whose run consumers come only from the sealed binding.
+func (s *Service) materializeProjectResources(ctx context.Context, binding projectconfig.RunConfigurationBinding, command StartCommand) (*Service, StartCommand, error) {
+	if _, static := s.deps.ProjectResources.(StaticProjectResourceMaterializer); static {
+		return s, command, nil
+	}
+	resources, selected, err := s.deps.ProjectResources.Materialize(ctx, binding, command)
+	if err != nil {
+		return nil, StartCommand{}, mapBoundaryError(ctx, "project_configuration_materialize", err)
+	}
+	if resources.Admission == nil || resources.Generation == nil || resources.Preparation == nil || resources.Approval == nil || resources.Execution == nil && resources.FunctionalFlow == nil || resources.Packages == nil || resources.Authorization == nil || resources.Environment == nil {
+		return nil, StartCommand{}, &Error{Code: CodeInvalid, Operation: "project_configuration_materialize"}
+	}
+	configured := *s
+	configured.deps.Admission, configured.deps.Generation, configured.deps.Preparation = resources.Admission, resources.Generation, resources.Preparation
+	configured.deps.Approval, configured.deps.Execution, configured.deps.Packages = resources.Approval, resources.Execution, resources.Packages
+	configured.deps.Authorization, configured.deps.Environment = resources.Authorization, resources.Environment
+	configured.deps.ContractReview, configured.deps.Fixtures, configured.deps.FixturePackages = resources.ContractReview, resources.Fixtures, resources.FixturePackages
+	configured.deps.FunctionalFlow, configured.deps.FlowAuthority = resources.FunctionalFlow, resources.FlowAuthority
+	configured.deps.Context, configured.deps.TargetPlanning = resources.Context, resources.TargetPlanning
+	return &configured, selected, nil
 }
 
 // Start performs side-effect-free preflight, durable admission and one confirmed generation attempt.
@@ -111,6 +184,42 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	}
 	if command.MemoryBinding != nil || command.MemoryAuthority != nil || len(command.MemoryDescriptors) != 0 {
 		return WorkflowView{}, &Error{Code: CodeUnauthorized, Operation: "memory_claim"}
+	}
+	handle, err := s.deps.IDs.Next()
+	if err != nil || !safeID.MatchString(handle) {
+		return WorkflowView{}, &Error{Code: CodeInternal, Operation: "identity"}
+	}
+	var binding projectconfig.RunConfigurationBinding
+	var bindingErr error
+	if _, atomicStore := s.deps.Store.(AtomicConfigurationWorkflowStore); atomicStore {
+		prepared, ok := s.deps.ProjectConfig.(PreparedProjectConfigurationResolver)
+		if !ok {
+			return WorkflowView{}, &Error{Code: CodeInvalid, Operation: "project_configuration_composition"}
+		}
+		candidate, prepareErr := prepared.PrepareForWorkflow(ctx, command.RepositoryID, handle)
+		binding, bindingErr = candidate.Binding, prepareErr
+	} else {
+		binding, bindingErr = s.deps.ProjectConfig.BindForWorkflow(ctx, command.RepositoryID, handle)
+	}
+	if bindingErr != nil {
+		return WorkflowView{}, mapBoundaryError(ctx, "project_configuration", bindingErr)
+	}
+	if binding.RunID != handle || binding.ProjectKey.RepositoryID != command.RepositoryID || projectconfig.ValidateRunBinding(binding) != nil {
+		return WorkflowView{}, &Error{Code: CodeInternal, Operation: "project_configuration"}
+	}
+	if err = s.deps.ProjectResources.SnapshotForAdmission(ctx, binding); err != nil {
+		return WorkflowView{}, mapBoundaryError(ctx, "project_configuration_snapshot", err)
+	}
+	s, command, err = s.materializeProjectResources(ctx, binding, command)
+	if err != nil {
+		return WorkflowView{}, err
+	}
+	if err = validateStart(command); err != nil {
+		return WorkflowView{}, err
+	}
+	configurationBinding := &binding
+	if err := validateProjectConfigurationSelection(command, binding); err != nil {
+		return WorkflowView{}, err
 	}
 	if s.deps.Memory != nil {
 		selection, memoryErr := s.deps.Memory.Prepare(ctx, command.RepositoryID, command.Revision)
@@ -133,21 +242,20 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	if err = validateSnapshot(snapshot, command); err != nil {
 		return WorkflowView{}, err
 	}
-	handle, err := s.deps.IDs.Next()
-	if err != nil || !safeID.MatchString(handle) {
-		return WorkflowView{}, &Error{Code: CodeInternal, Operation: "identity"}
-	}
 	digest, err := commandDigest(command)
 	if err != nil {
 		return WorkflowView{}, err
 	}
 	now := s.deps.Clock.Now().UTC()
-	record := Record{Version: 1, Handle: handle, Principal: command.Principal, IdempotencyKey: command.IdempotencyKey, RequestDigest: digest, RepositoryID: command.RepositoryID, Revision: command.Revision, Command: command, Phase: PhaseAdmitted, UpdatedAt: now}
+	record := Record{Version: 1, Handle: handle, Principal: command.Principal, IdempotencyKey: command.IdempotencyKey, RequestDigest: digest, RepositoryID: command.RepositoryID, Revision: command.Revision, Command: command, Phase: PhaseAdmitted, UpdatedAt: now, RetainUntil: now.Add(time.Duration(binding.Effective.Constraints.RetentionDays) * 24 * time.Hour), ProjectConfigurationBinding: configurationBinding}
 	record, created, ctx, err := s.reserveOperation(ctx, record, now)
 	if err != nil {
 		return WorkflowView{}, err
 	}
 	if !created {
+		if err := s.validateRecordProjectConfiguration(record); err != nil {
+			return WorkflowView{}, err
+		}
 		if record.Phase == PhaseTerminal && record.FunctionalFlowAdmitted && s.deps.FlowAuthority != nil {
 			s.deps.FlowAuthority.ConfirmTerminal(record.Handle)
 		}
@@ -158,6 +266,11 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 		return WorkflowView{}, err
 	}
 	defer s.endWork(handle, worker)
+	if seconds := binding.Effective.Constraints.Limits.DurationSeconds; seconds > 0 {
+		var cancelDuration context.CancelFunc
+		workCtx, cancelDuration = context.WithTimeout(workCtx, time.Duration(seconds)*time.Second)
+		defer cancelDuration()
+	}
 	if s.deps.Environment == nil {
 		return WorkflowView{}, &Error{Code: CodeInvalid, Operation: "environment_composition"}
 	}
@@ -257,6 +370,13 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	}
 	if result.Prepared == nil {
 		record, err = s.terminal(workCtx, record, OutcomeError, "generation_invalid")
+		if err != nil {
+			return WorkflowView{}, err
+		}
+		return viewOf(record), nil
+	}
+	if configurationBinding != nil && !usageWithinProjectConfiguration(usage, configurationBinding.Effective.Constraints.Limits) {
+		record, err = s.terminal(workCtx, record, OutcomeInconclusive, "project_configuration_limit_exceeded")
 		if err != nil {
 			return WorkflowView{}, err
 		}
@@ -374,6 +494,57 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	return viewOf(record), nil
 }
 
+// validateProjectConfigurationSelection prevents request aliases from expanding the bound snapshot.
+func validateProjectConfigurationSelection(command StartCommand, binding projectconfig.RunConfigurationBinding) error {
+	required := []struct {
+		kind projectconfig.ResourceKind
+		id   string
+	}{{projectconfig.ResourceProvider, command.Provider}, {projectconfig.ResourceModelProfile, command.Model}, {projectconfig.ResourceRuntimeProfile, command.RuntimeProfile}, {projectconfig.ResourceContract, command.ContractRef}}
+	target := ""
+	if command.Target.Direct != nil {
+		target = command.Target.Direct.Alias
+	}
+	if command.Target.Preview != nil {
+		target = command.Target.Preview.Alias
+	}
+	required = append(required, struct {
+		kind projectconfig.ResourceKind
+		id   string
+	}{projectconfig.ResourceEnvironment, target})
+	for _, selection := range required {
+		if !binding.Effective.AllowsReference(selection.kind, selection.id) {
+			return &Error{Code: CodeUnauthorized, Operation: "project_configuration_selection"}
+		}
+	}
+	if binding.Effective.Constraints.Approval == "required" && command.Approval != ApprovalRequired {
+		return &Error{Code: CodeUnauthorized, Operation: "project_configuration_approval"}
+	}
+	return nil
+}
+
+// usageWithinProjectConfiguration enforces run-bound call and token ceilings after confirmed model accounting.
+func usageWithinProjectConfiguration(usage ModelUsage, limits projectconfig.Limits) bool {
+	if limits.ToolCalls > 0 && uint64(usage.Calls) > limits.ToolCalls {
+		return false
+	}
+	tokens := usage.InputTokens + usage.OutputTokens
+	if tokens < 0 {
+		return false
+	}
+	if limits.ModelTokens > 0 && uint64(tokens) > limits.ModelTokens {
+		return false
+	}
+	return usage.Replans >= 0 && (limits.Replans == 0 || uint64(usage.Replans) <= limits.Replans)
+}
+
+// boundDurationContext derives every resumed phase deadline from the sealed run binding, never the current head.
+func boundDurationContext(ctx context.Context, record Record) (context.Context, context.CancelFunc) {
+	if record.ProjectConfigurationBinding == nil || record.ProjectConfigurationBinding.Effective.Constraints.Limits.DurationSeconds == 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, time.Duration(record.ProjectConfigurationBinding.Effective.Constraints.Limits.DurationSeconds)*time.Second)
+}
+
 // revalidateGeneratedPlan reloads contract policy and planning authority after inference and before approval or execution.
 func (s *Service) revalidateGeneratedPlan(ctx context.Context, command StartCommand, expected AdmissionSnapshot, prepared agentplanning.PreparedPlan) error {
 	if err := s.checkpointApprovedContract(ctx, command); err != nil {
@@ -444,6 +615,13 @@ func (s *Service) ApprovalView(ctx context.Context, handle string) (ApprovalView
 	if err != nil {
 		return ApprovalView{}, mapNotFound(err, "view")
 	}
+	if err = s.validateRecordProjectConfiguration(record); err != nil {
+		return ApprovalView{}, err
+	}
+	s, _, err = s.materializeProjectResources(ctx, *record.ProjectConfigurationBinding, record.Command)
+	if err != nil {
+		return ApprovalView{}, err
+	}
 	artifactValue, artifactErr := s.deps.Artifacts.Load(ctx, handle)
 	if record.Phase != PhaseAwaitingApproval || artifactErr != nil || record.Artifact == nil || artifactValue.ArtifactSHA256 != record.Artifact.ArtifactSHA256 {
 		return ApprovalView{}, &Error{Code: CodeConflict, Operation: "view"}
@@ -470,6 +648,10 @@ func (s *Service) Decide(ctx context.Context, command DecisionCommand) (Workflow
 	}
 	if record.Principal != command.Principal {
 		return WorkflowView{}, &Error{Code: CodeUnauthorized, Operation: "decision"}
+	}
+	s, _, err = s.materializeProjectResources(ctx, *record.ProjectConfigurationBinding, record.Command)
+	if err != nil {
+		return WorkflowView{}, err
 	}
 	if record.ApprovalDecisionID == command.DecisionID {
 		if record.ApprovalDecisionAction != command.Action || record.ApprovalDecisionRevision != command.Revision {
@@ -524,6 +706,8 @@ func (s *Service) Decide(ctx context.Context, command DecisionCommand) (Workflow
 		return WorkflowView{}, err
 	}
 	defer s.endWork(command.Handle, worker)
+	workCtx, cancelDuration := boundDurationContext(workCtx, record)
+	defer cancelDuration()
 	record, err = s.transition(workCtx, record, PhaseAuthorized, "approval_decided", record.Artifact.ArtifactSHA256)
 	if err != nil {
 		return WorkflowView{}, err
@@ -543,6 +727,10 @@ func (s *Service) Cancel(ctx context.Context, principal, handle string) (Workflo
 	}
 	if record.Principal != principal {
 		return WorkflowView{}, &Error{Code: CodeUnauthorized, Operation: "cancel"}
+	}
+	s, _, err = s.materializeProjectResources(ctx, *record.ProjectConfigurationBinding, record.Command)
+	if err != nil {
+		return WorkflowView{}, err
 	}
 	if record.Phase == PhaseTerminal {
 		return viewOf(record), nil
@@ -619,10 +807,25 @@ func (s *Service) reserveOperation(ctx context.Context, record Record, now time.
 // snapshot so no cutover can be adopted after work has been prepared.
 func (s *Service) loadOperation(ctx context.Context, handle string) (Record, context.Context, error) {
 	if bounded, ok := s.deps.Store.(BoundWorkflowStore); ok {
-		return bounded.LoadBound(ctx, handle)
+		record, bound, err := bounded.LoadBound(ctx, handle)
+		if err == nil {
+			err = s.validateRecordProjectConfiguration(record)
+		}
+		return record, bound, err
 	}
 	record, err := s.deps.Store.Load(ctx, handle)
+	if err == nil {
+		err = s.validateRecordProjectConfiguration(record)
+	}
 	return record, ctx, err
+}
+
+// validateRecordProjectConfiguration rejects recovery or redelivery without its original sealed binding.
+func (s *Service) validateRecordProjectConfiguration(record Record) error {
+	if record.ProjectConfigurationBinding == nil || record.ProjectConfigurationBinding.RunID != record.Handle || projectconfig.ValidateRunBinding(*record.ProjectConfigurationBinding) != nil {
+		return &Error{Code: CodeInternal, Operation: "project_configuration_recovery"}
+	}
+	return nil
 }
 
 // Result returns a closed terminal result and never invents functional status from control events.
@@ -655,12 +858,21 @@ func (s *Service) Recover(ctx context.Context) error {
 		if !claimed {
 			continue
 		}
+		if bindingErr := s.validateRecordProjectConfiguration(record); bindingErr != nil {
+			return bindingErr
+		}
+		s, _, err = s.materializeProjectResources(operationCtx, *record.ProjectConfigurationBinding, record.Command)
+		if err != nil {
+			return err
+		}
 		workCtx, worker, workErr := s.beginWork(operationCtx, record.Handle)
 		if workErr != nil {
 			return workErr
 		}
+		workCtx, cancelDuration := boundDurationContext(workCtx, record)
 		if record.CleanupPending && record.DesiredOutcome != nil && (!record.FunctionalFlowExecutionPending || record.FunctionalFlowPrimaryDurable) {
 			record, err = s.terminal(workCtx, record, *record.DesiredOutcome, "cleanup_recovered")
+			cancelDuration()
 			s.endWork(record.Handle, worker)
 			if err != nil {
 				return err
@@ -703,6 +915,7 @@ func (s *Service) Recover(ctx context.Context) error {
 				break
 			}
 			_, err = s.deps.Store.ReleaseOwner(workCtx, record.Handle, s.deps.Owner, record.VersionCAS, s.deps.Clock.Now())
+			cancelDuration()
 			s.endWork(record.Handle, worker)
 			if err != nil {
 				return err
@@ -750,6 +963,7 @@ func (s *Service) Recover(ctx context.Context) error {
 				record, err = s.terminal(workCtx, record, OutcomeError, "recovery_uncertain_finalization")
 			}
 		}
+		cancelDuration()
 		s.endWork(record.Handle, worker)
 		if err != nil {
 			return err

@@ -4679,3 +4679,211 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Aprobación registrada a las `2026-11-16T10:24:25+01:00`.
 - La feature pasa de `spec_ready` a `in_progress`; se autoriza al implementer a ejecutar T1–T16 en orden.
 
+## Feature 36 — implementación lista para review (2026-11-16)
+
+- T1–T16 completas: modelo canónico, authority, catálogo/policy, adapters local/PostgreSQL, publicación/rollback, queries, binding causal e integración de superficies.
+- El binding efectivo, run y primer evento se confirman atómicamente; recovery usa el snapshot sellado y no relee el head.
+- Pasan suite global normal/race serial, focales repetidos, PostgreSQL 16 aislado normal/race/runtime Linux, cross-builds y auditoría documental.
+- Cobertura diferencial determinista: `1101/1289 = 85.41505042668735453840186190845616757176 %`; dos bases independientes produjeron la misma firma por statement.
+- `feature_list.json` permanece intacto; no hubo commit ni push durante implementación.
+
+## Feature 36 — review 1 rechazada (2026-11-16)
+
+- Se reabren T1–T16 tras REV-1–REV-7; ninguna task volverá a `[x]` sin evidencia nueva.
+- Pendientes bloqueantes: composición productiva obligatoria y consumers completos del binding, integridad PostgreSQL, counters comunes, observabilidad, budgets estructurales y bootstrap PostgreSQL 16 reproducible.
+- La cifra `1101/1289` queda como evidencia histórica de la primera implementación, no como cierre vigente.
+
+## Feature 36 — review 1 rechazada (2026-11-16)
+
+- La review independiente devuelve REV-1–REV-7: falta composición productiva obligatoria, consumo completo del snapshot, integridad PostgreSQL, fencing de contadores, observabilidad, límites de grafo y gate PostgreSQL reproducible.
+- T1–T16 se reabren hasta que cada garantía tenga integración y test real; la feature permanece `in_progress`.
+- La suite global/race, formato, vet y cross-builds pasan, pero el gate PostgreSQL falló durante la instalación aislada y debe repararse antes de nueva review.
+
+## Feature 36 — corrección review 1 lista para nueva review (2026-11-17)
+
+- REV-1–REV-7 corregidas sin cambiar `feature_list.json`: composición productiva obligatoria y fail-closed, consumers del binding completo, integridad PostgreSQL compartida, contadores `bigint` exhaustivos, observabilidad allowlisted y budgets de catálogo/DFS previos a copy/traversal.
+- Gate exacto reviewer PASS: `-BootstrapWsl -AuthorizeIsolatedTestResources -Repeat 1 -Race -Coverage -Feature36Coverage -CCompiler C:\msys64\ucrt64\bin\gcc.exe`.
+- Coverage diferencial final y reproducida: `1442/1694 = 85.12396694214876033057851239669421487603%`.
+- Gate PostgreSQL 16 `Repeat 3`: PASS. Suite global, vet, compile-only y race global serial: PASS. Cross-builds CGO-disabled Windows amd64, Linux amd64/arm64 y Darwin amd64/arm64: PASS.
+- Cleanup verificado: una distro y su root temporal UUID residuales del último gate se eliminaron explícitamente; `wsl.exe --list --quiet` y la búsqueda de roots del gate quedaron vacías. Se eliminaron `.coverage36`, `feature36-local` y únicamente `scripts/__pycache__` propios.
+- T1–T16 vuelven a `[x]` con evidencia vigente en `progress/project-configuration/implementation.md`; se solicita review independiente nueva.
+- El cleanup WSL se reforzó para ejecutar unregister exacto antes de observar y exigir dos ausencias consecutivas; gate PostgreSQL 16 `Repeat 1` posterior PASS con listas de distro/root vacías.
+
+## Feature 36 — review 2 rechazada (2026-11-17)
+
+- REV2-1: un proceso ya compuesto no adopta el nuevo head activo para nuevas admisiones; la materialización de adapters debe hacerse desde el binding capturado sin requerir reinicio, incluyendo el caso mismo ID con nuevo digest.
+- REV2-2: `Postgres.Bind` debe comparar las columnas durables `binding_digest` y `effective_digest` en redelivery y creación, y fallar `integrity` sin mutación ante corrupción.
+- La feature permanece `in_progress`; el cierre requiere tests reproductores locales/PostgreSQL y una tercera review independiente.
+
+## Feature 36 — corrección review 2 bloqueada por gate (2026-11-17)
+
+- REV2-1 corregida: composición run-scoped obligatoria después de capturar el binding; nuevas admisiones adoptan un segundo head sin reinicio, mismo selector/nuevo digest crea un grafo nuevo y recovery rematerializa desde el binding histórico.
+- REV2-2 corregida: `Postgres.Bind` compara checksums durables de binding/effective; corrupción exclusiva devuelve `integrity` sin mutación. Tests compartidos, focales y PostgreSQL reales añadidos.
+- PASS: formato/diff/vet/compile, focal serial, race focal y global serial `-p=1` con timeout explícito.
+- El gate exacto PostgreSQL 16 pasó sus fases normal/race, PostgreSQL real y calculó coverage diferencial `1529/1797 = 85.08625486922648…%`, pero no alcanzó exit 0 dentro del único reintento autorizado de 25 minutos: expiró durante la tercera repetición determinista de coverage. Se registra como timeout, no como PASS.
+- Cleanup final estricto: cero procesos del gate, cero distros WSL, cero roots `%TEMP%/featureproof-pg35-gate-*`; `scripts/__pycache__` propio eliminado. `feature_list.json` intacto; sin commit ni push. Estado solicitado: `blocked` hasta disponer de un gate exacto terminal dentro del límite autorizado.
+
+## Feature 36 — gate terminal definitivo fallido (2026-11-17)
+
+- Última ejecución autorizada del comando exacto reviewer, con timeout operativo de 45 minutos: terminó antes del límite con exit 1.
+- Normal/race PostgreSQL 16 pasaron; la cobertura determinista `-count=3` falló en `TestProductIdentityFailureParityAcrossAllSurfaces/mcp` porque MCP devolvió `invalid_request`. `feature36_coverage.py` propagó `CalledProcessError` y no produjo coverage diferencial final válida.
+- Cleanup estricto final PASS: cero procesos, distros WSL, roots temporales, perfiles `.coverage36`/`feature36-local` o `scripts/__pycache__`.
+- No se autoriza otra repetición. Estado definitivo solicitado: `blocked`; `feature_list.json` intacto, sin commit ni push.
+
+## Feature 36 — defecto de coverage MCP corregido (2026-11-17)
+
+- Causa: el test de credencial ausente usaba `os.Unsetenv` y contaminaba el estado global entre repeticiones/composiciones del paquete. Se sustituyó por un resolver test-local que falla en la misma resolución JIT, sin suavizar la paridad esperada.
+- El input de idempotencia es ahora determinista y cada superficie mantiene root/service/cache/run IDs aislados.
+- PASS: test focal `count=20`, race `count=10` y comando exacto de coverage de `cmd/featureproof` con `-count=3 -coverpkg=./cmd/featureproof` (`74.8%`).
+- Estado solicitado: `ready_for_gate`; no se ejecutó WSL, `feature_list.json` sigue intacto y no hubo commit/push.
+
+## Feature 36 — gate posterior al fix MCP fallido (2026-11-17)
+
+- Única ejecución exacta reviewer con ventana 45m: exit 1 antes del timeout.
+- Normal/race y la primera base independiente de coverage pasaron; en la segunda base falló `TestPrePrepareTerminalsPublishRejectedLifecycleWithoutInventedWork/automatic-denial` con `executable_cleanup_pending: unavailable` bajo `validationworkflow -count=3 -coverpkg`.
+- La segunda base no terminó, por lo que no hay fracción/firma diferencial final válida. Sin reintento.
+- Cleanup estricto PASS: cero procesos, distros, roots y artefactos de coverage; `scripts/__pycache__` eliminado. Estado solicitado: `blocked`; sin cambios en `feature_list.json`, commit o push.
+
+## Feature 36 — deadline de harness coverage corregido (2026-11-17)
+
+- Causa del fallo `automatic-denial`: el harness semántico usaba finalización de 5 s y la instrumentación tardó 5,66 s; el contexto expiraba antes del borrado executable. No era contaminación de cache/env/ports.
+- El harness queda acotado a 30 s; los tests productivos y específicos de timeout no cambian.
+- PASS: subprueba `count=20`, race `count=20` y coverage exacta de `internal/validationworkflow` con `-count=3` (`141.860s`, `84.9%`).
+- Estado solicitado: `ready_for_gate`; no WSL, feature_list, commit ni push.
+
+## Feature 36 — gate bloqueado por inventario de coverage (2026-11-17)
+
+- Única gate exacta posterior a ambos fixes: exit 1 antes del timeout, después de normal/race PASS.
+- Coverage no arrancó: el manifest rechazó `internal/validationworkflow/functional_flow_test.go` como test modificado no declarado. No hay fracción/firma final válida y no hubo reintento.
+- El manifest se sincronizó con el diff añadiendo ese test; cleanup estricto PASS y estado solicitado `blocked`.
+- `feature_list.json` intacto; sin commit/push.
+
+## Feature 36 — gate exacto final PASS (2026-11-17)
+
+- Gate reviewer exacto, una ejecución tras sincronizar manifest: exit 0 dentro de 45m; normal, race, PostgreSQL 16 real, Linux y dos bases coverage independientes PASS.
+- Coverage diferencial exacta: `1529/1797 = 85.08625486922648859209794101279910962716%`.
+- Las firmas SHA-256 fueron comparadas iguales por el gate; sus valores no se imprimen y los archivos UUID se eliminan en cleanup, por diseño.
+- Cleanup final: cero procesos, distros WSL, roots, profiles y pycache. Estado solicitado: `ready_for_review`; feature_list intacto, sin commit/push.
+
+## Feature 36 — round 3 external-agent/artifact registry (2026-11-17)
+
+- External-agent captura y persiste un binding por Submit; worker/read/cancel usan catálogo, executor, retention y timeout del binding histórico. Head 1/head 2 en el mismo servicio: PASS count20.
+- Nuevo `ResourceArtifactStore` común: Local JSON y PostgreSQL tabla 0019 transaccional, namespace ProjectKey + `(kind,id,version,digest)`, verificación de payload digest y redelivery fail-closed.
+- Restart real con store reabierto y backing mutable: PASS; corrupción local y PostgreSQL: cubierta.
+- Gofmt/diff/vet/compile, focales y global serial `-timeout=12m`: PASS.
+- Primera focal WSL detectó colisión cross-project y se corrigió. Segunda focal: tres tests PostgreSQL PASS en Windows; exit 1 posterior por quoting del regex `|` en el runner Linux filtrado (`/bin/sh: <test>: not found`), no por producto. Cleanup estricto PASS.
+- Estado solicitado: `blocked` a la espera de nueva autorización; manifest sincronizado, sin gate completa posterior, feature_list/commit/push intactos.
+
+- Corrección de evidencia: el global exit 0 precede al namespace `ProjectKey` final. Después hubo compile/vet y tres focales PostgreSQL reales PASS, pero no un nuevo global por la orden de detenerse tras el fallo de quoting Linux. El filtro temporal se retiró del script y `featureproof-bound` fue eliminado con target absoluto verificado.
+
+## Feature 36 — árbol final local verificado (2026-11-17)
+
+- Gofmt/diff-check, vet y compile completa: PASS.
+- Global serial final `go test -p=1 -timeout=12m ./...`: PASS, exit 0.
+- Manifest validado con adapters/tests Go de artifacts/external-agent/restart; migración 0019 presente y cubierta por migración/focal PostgreSQL, pero deliberadamente fuera del array Go-only del auditor.
+- Cleanup local PASS; sin WSL en esta ronda. Estado solicitado: `ready_for_gate`; feature_list/commit/push intactos.
+
+## Feature 36 — gate final round 3 bloqueado (2026-11-17)
+
+- Única gate exacta: exit 1 antes de 45m. Normal, migración N/N+1 y Linux PASS.
+- Race: PostgreSQL y planapproval PASS; `TestPostgresProductRuntimeContinuesOnlyThroughDurableWorker` falló con `compose process N project resource inventory drift` al reutilizar el fixture el mismo ProjectKey/descriptor/digest con paths temporales distintos después de normal.
+- Coverage no arrancó: sin fracción ni firmas finales. Sin reintento ni cambios posteriores.
+- Cleanup estricto PASS, incluido `featureproof-bound`. Estado solicitado: `blocked`; feature_list/commit/push intactos.
+
+## Feature 36 — fixture PostgreSQL aislado (2026-11-17)
+
+- El fixture vertical usa ProjectID derivado de su root por invocación; normal/race ya no reutilizan la misma identidad durable con paths distintos.
+- Drift real permanece fail-closed: mutación de `environment_id` con igual identity/digest debe devolver `project resource inventory drift`.
+- Focal PG16 normal 5.207s y race UCRT 10.101s: PASS; global serial final: PASS; manifest exacto: PASS.
+- Cleanup completo y filtro temporal retirado. Estado solicitado: `ready_for_gate`; feature_list/commit/push intactos.
+
+## Feature 36 — gate exacto final bloqueado por coverage (2026-11-17)
+
+- Única gate completa: normal, Linux, race UCRT y suites de perfiles PASS.
+- Coverage diferencial final: `1791/2121 = 84.44130127298444130127298444130127298444%`; umbral 85% no alcanzado, exit 1.
+- La comparación final de firmas no se ejecutó; sin hashes finales. Sin reintento/cambios.
+- Cleanup estricto PASS, incluidos pycache y materialización temporal. Estado solicitado: `blocked`; feature_list/commit/push intactos.
+
+## Feature 36 — gap de coverage REV3 cerrado localmente (2026-11-17)
+
+- Nuevos tests fail-closed cubren binding/head/history/error del external-agent, artifacts local con restart/redelivery/integridad, errores y drift del contrato store compartido, ramas PostgreSQL de autoridad/conflicto/corrupción y workflow con artifact histórico missing/mismatch.
+- Sin ocultar código ni cambiar el umbral: artifacts pasa `47/68 -> 64/68` y contract store `62/83 -> 80/83`; focales `count=10` y race UCRT `count=3` PASS.
+- Global serial `go test -p=1 -timeout=12m ./...`: PASS, exit 0. Manifest exacto: production/tests missing/stale vacíos.
+- No WSL/gate completa en esta ronda; estado solicitado `ready_for_gate`. `feature_list.json` intacto, sin commit/push.
+
+## Feature 36 — gate fallida e aislamiento GitHub corregido (2026-11-17)
+
+- Única gate exacta: normal/race/primera base coverage PASS; segunda base falló en `TestProductIdentityFailureParityAcrossAllSurfaces/github` con `invalid_request`, exit 1. No produjo N/D ni firmas finales. Sin reintento.
+- Cleanup gate PASS: cero procesos, distros y roots; pycache propio eliminado.
+- Fixture aislado por superficie con root/witness/service/store/target/resolver/transport/contexto propios; GitHub corre primero y cada subtest valida sus expectativas de forma independiente. Timeouts productivos intactos.
+- PASS: cada superficie `count=10`, conjunto `count=20`, race UCRT `count=10` y coverage exacta cmd `count=3` (75.1%, 77.192s).
+- Estado solicitado: `ready_for_gate`; sin nueva WSL, feature_list, commit o push.
+
+## Feature 36 — auditoría de gate interrumpida (2026-11-19)
+
+- Gate sin exit terminal: interrupción externa a ~22m20s, antes de la ventana de 45m; no fue timeout ni fallo funcional observado.
+- Normal y race UCRT PASS. Primera base exterior PASS con cobertura exacta `1837/2125 = 86.44705882352941176470588235294117647059%`.
+- Firma 1 SHA-256: `f87050446cb1fd8732100ba905821a758fdc0f625f28c059790f4f59eb88ac35`; firma 2 ausente, por lo que no hubo comparación final y no se declara PASS.
+- Cleanup UUID estricto PASS en dos observaciones: cero procesos, distros, roots, pycache y perfiles/workspace temporales.
+- Estado `blocked` por ausencia de exit terminal/segunda firma. Auditoría sin ejecutar tests o gate; feature_list/commit/push intactos.
+
+## Feature 36 — gate exacta terminal PASS (2026-11-19)
+
+- Ejecución reviewer única: inicio `18:53:41.163158+01`, fin `19:22:59.376657+01`, duración `1758.213s` (`29m18.213s`), exit 0 dentro de 45m.
+- Normal y race UCRT PASS; ambas bases PostgreSQL independientes y Linux completaron.
+- Cobertura idéntica en ambas bases: `1837/2125 = 86.44705882352941176470588235294117647059%`.
+- Comparación bloqueante de firmas PASS. Hashes literales no disponibles después del cleanup automático del root UUID; no se reutilizan hashes de ejecuciones previas.
+- Cleanup estricto en dos checks: cero procesos, distros, roots, temporales coverage y artefactos workspace; pycache propio eliminado.
+- Estado `ready_for_review`; feature_list/commit/push intactos.
+
+## Feature 36 — REV4 corregido y estable para gate (2026-11-19)
+
+- Snapshot productivo separado de materialización histórica: solo admisión hace Put; recovery/read/status/result/cancel hacen Get exacto y fallan cerrado si falta el artifact.
+- ResourceArtifact local incluye y verifica ProjectKey en key/envelope/path; contrato compartido local+PostgreSQL cubre aislamiento cross-project, autoridad inválida y redelivery.
+- Restart productivo local, external-agent y PostgreSQL demuestra que backing actual válido/distinto no repuebla un artifact histórico eliminado.
+- Se eliminó la carrera del fixture GitHub: cancelación solo tras listener readiness y join explícito; el fixture filesystem usa ProjectKey único por invocación sin debilitar restart/drift.
+- PASS: focales locales count=10, race focal UCRT count=3, PostgreSQL exacto normal+race count=3, global serial, gofmt/diff/vet/compile y manifest completo.
+- Primera gate exacta previa a los fixes de sincronización: exit 1 antes de coverage; no se reutiliza como evidencia verde. Después de los fixes no se lanzó otra gate completa. Cleanup cero.
+- Estado `ready_for_gate`; feature_list/commit/push intactos.
+
+## Feature 36 — gate exacta final REV4 PASS (2026-11-19)
+
+- Única gate final post-lifecycle/fixture: inicio `20:18:19.862937+01`, fin `20:47:06.676008+01`, `1726.813s`, exit 0.
+- Normal PASS: cmd `26.501s`, PostgreSQL `40.004s`, planapproval `1.613s`; Linux PASS.
+- Race UCRT PASS: cmd `44.783s`, PostgreSQL `50.921s`, planapproval `3.184s`.
+- Dos bases independientes idénticas: `1870/2194 = 85.23245214220601640838650865998176845943%`; comparación bloqueante de firmas PASS.
+- Cleanup: cero procesos, distros, roots, perfiles/firmas; pycache propio eliminado tras validar path absoluto.
+- Estado `ready_for_review`; feature_list/commit/push intactos.
+
+## Feature 36 — REV5 causal external-agent y gate bloqueada por coverage (2026-11-19)
+
+- Submit reclama/resuelve la idempotency key antes de IDs/head/prepare; replay usa binding y artifact históricos sin nueva mutación.
+- Local confirma artifact+RunRecord(binding)+primer evento en un único journal atómico. PostgreSQL migración 0020 y `ExternalAgentRegistry` confirman la misma unidad junto al artifact 0019 en una transacción serializable; composición PG sin fallback/híbrido local.
+- Tests: restart pre/post commit, fault rollback, 12 concurrentes, cambio de head, pool PG reiniciado y cero bindings huérfanos.
+- PASS focales: local count=20; PG16 count=3 `6.530s`; PG16 race UCRT `3.601s`; gofmt/diff/vet/compile/manifest; global serial post-fix.
+- Única gate exacta: normal PASS (`33.386s`/`47.125s`/`0.590s`), race PASS (`49.672s`/`56.781s`/`3.973s`), Linux PASS; coverage `2092/2592 = 80.70987654320987654320987654320987654321%`, exit 1. No segunda firma ni reintento.
+- Cleanup completo de recursos propios; T16 reabierta. Estado `blocked`; feature_list intacto, sin commit/push.
+
+## Feature 36 — coverage REV5 cerrado y gate final PASS (2026-11-19)
+
+- Tests significativos cubren causalidad/replay/corrupción local; lifecycle, faults, recovery y closed-pool PostgreSQL; y composición productiva external-agent enteramente PG.
+- El perfil tagged ahora mide también `cmd/featureproof`, ya declarado en inventario, junto al adapter PG; no se excluyó código ni se cambió el 85%.
+- Cobertura exacta estable previa y en ambas bases de gate: `2230/2592 = 86.03395061728395061728395061728395061728%`.
+- Gate única: inicio `23:05:34.7930245`, fin `23:40:16.5144552`, `2081.721s`, exit 0. Normal PASS (`27.791s`/`50.641s`/`0.511s`), Linux PASS, race UCRT PASS (`50.270s`/`52.250s`/`3.182s`).
+- Firmas bloqueantes iguales; hashes literales no disponibles tras cleanup automático. Cleanup final sin procesos, distros, roots ni perfiles; pycache propio eliminado.
+- T16 `[x]`; estado `ready_for_review`. `feature_list.json` intacto, sin commit/push.
+
+## Feature 36 — cleanup posterior a review 6 (2026-11-19)
+
+- La review funcional aprobó REV4/REV5 y detectó únicamente el perfil temporal literal `$profile` en la raíz del workspace.
+- Se verificó su ruta exacta y se eliminó; no quedan `$profile`, `.coverage36` ni `feature36-local` en la raíz.
+- La feature permanece `in_progress` hasta el veredicto final independiente; no se modificó `feature_list.json` ni se hizo commit/push.
+- El scan de review 7 encontró además `scripts/__pycache__/feature35_coverage.cpython-314.pyc`; se eliminó el archivo por ruta exacta y el directorio quedó ausente.
+- El scan read-only de review 8 encontró el root temporal de tests `%TEMP%/featureproof-bound`; se verificó la ruta exacta y se eliminó recursivamente, quedando ausente y sin procesos asociados.
+
+## Feature 36 — cierre aprobado (2026-11-19)
+
+- Review independiente novena: `APPROVED`; REV1–REV5 y R1–R18 quedan cerrados con T1–T16 completas.
+- Gate terminal: `2230/2592 = 86.03395061728395061728395061728395061728%`, dos firmas iguales, normal/Linux/race PASS y cleanup vacío.
+- El leader cambia `feature_list.json` de `in_progress` a `done` y registra el cierre en `progress/history.md` antes de commit/push de `feature-36-project-configuration`.
+

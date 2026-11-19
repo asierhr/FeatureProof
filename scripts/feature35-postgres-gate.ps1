@@ -16,6 +16,8 @@ param(
 
     [switch]$Coverage,
 
+    [switch]$Feature36Coverage,
+
     [string]$CCompiler
 )
 
@@ -64,17 +66,20 @@ function Assert-GateCommand {
     }
 }
 
-# Invoke-GateNative suppresses expected native stderr warnings while preserving the exact process exit code.
+# Invoke-GateNative suppresses successful native chatter but returns bounded diagnostics when setup fails.
 function Invoke-GateNative {
     param([Parameter(Mandatory = $true)][scriptblock]$Command, [Parameter(Mandatory = $true)][string]$Description)
     $previousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $null = & $Command 2>&1
+        $nativeOutput = @(& $Command 2>&1)
         $exitCode = $LASTEXITCODE
     }
     finally { $ErrorActionPreference = $previousPreference }
-    if ($exitCode -ne 0) { throw "$Description failed with exit code $exitCode" }
+    if ($exitCode -ne 0) {
+        $diagnostic = (($nativeOutput | Select-Object -Last 20) -join [Environment]::NewLine)
+        throw "$Description failed with exit code $exitCode`n$diagnostic"
+    }
 }
 
 # New-TargetDsn replaces only the URI database path while retaining explicit caller connection options.
@@ -133,8 +138,8 @@ function Get-GateSha256 {
 
 # Initialize-WslPostgres creates a checksum-authenticated Alpine/PostgreSQL 16 service owned by this invocation.
 function Initialize-WslPostgres {
-    $archiveUri = 'https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.2-x86_64.tar.gz'
-    $archiveSha256 = '412454ed98025ad9cd910d13f3d448b184e81502baa83180e89f98d0f13674be'
+    $archiveUri = 'https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.9-x86_64.tar.gz'
+    $archiveSha256 = '3d5912d47e004ac77746d63ab848abd9e37164465cf1c866eb574bc526135012'
     $archive = Join-Path $gateRoot 'alpine-minirootfs.tar.gz'
     $install = Join-Path $gateRoot 'wsl'
     [IO.Directory]::CreateDirectory($gateRoot) | Out-Null
@@ -143,7 +148,7 @@ function Initialize-WslPostgres {
     if ($actualHash -ne $archiveSha256) { throw 'Alpine rootfs checksum mismatch' }
     $script:gateWslCreated = $true
     Invoke-GateNative -Description 'WSL import' -Command { & wsl.exe --import $gateDistro $install $archive --version 1 }
-    Invoke-GateNative -Description 'PostgreSQL 16 installation' -Command { & wsl.exe -d $gateDistro -- sh -lc 'apk add --no-cache postgresql16=16.15-r0 postgresql16-client=16.15-r0' }
+    Invoke-GateNative -Description 'PostgreSQL 16.16-r0 installation from pinned Alpine v3.21 main' -Command { & wsl.exe -d $gateDistro -- sh -lc 'echo https://dl-cdn.alpinelinux.org/alpine/v3.21/main > /etc/apk/repositories && apk add --no-cache postgresql16=16.16-r0 postgresql16-client=16.16-r0 && /usr/libexec/postgresql16/postgres --version | grep -q 16.16' }
     Invoke-GateNative -Description 'PostgreSQL cluster initialization' -Command { & wsl.exe -d $gateDistro -- sh -lc "mkdir -p /var/lib/postgresql/16/data /run/postgresql && chown -R postgres:postgres /var/lib/postgresql /run/postgresql && su postgres -c '/usr/libexec/postgresql16/initdb -D /var/lib/postgresql/16/data --auth=trust --encoding=UTF8'" }
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     $listener.Start()
@@ -290,7 +295,11 @@ try {
                 Assert-GateCommand 'coverage compatibility artifact N migrate'
                 & $gateCompatN1 migrate
                 Assert-GateCommand 'coverage compatibility artifact N+1 migrate'
-                & python ./scripts/feature35_coverage.py
+                if ($Feature36Coverage) {
+                    $env:FEATUREPROOF_COVERAGE_WSL_DISTRO = $gateDistro
+                    & python ./scripts/feature36_coverage.py
+                }
+                else { & python ./scripts/feature35_coverage.py }
                 Assert-GateCommand 'feature 35 differential coverage'
                 $gateCoverageSignatures += $gateCoverageSignature
             }
@@ -327,6 +336,7 @@ finally {
     Remove-Item Env:FEATUREPROOF_POSTGRES_ADMIN_DSN -ErrorAction SilentlyContinue
     Remove-Item Env:FEATUREPROOF_POSTGRES_TEST_DSN -ErrorAction SilentlyContinue
     Remove-Item Env:FEATUREPROOF_COVERAGE_SIGNATURE_PATH -ErrorAction SilentlyContinue
+    Remove-Item Env:FEATUREPROOF_COVERAGE_WSL_DISTRO -ErrorAction SilentlyContinue
     Remove-Item Env:FEATUREPROOF_POSTGRES_GATE_AUTHORIZED -ErrorAction SilentlyContinue
     $env:GOTOOLCHAIN = $gatePreviousToolchain
     if ($gateWslCreated) {
@@ -334,16 +344,23 @@ finally {
         $ErrorActionPreference = 'Continue'
         $null = & wsl.exe -d $gateDistro -- sh -lc "if test -x /usr/libexec/postgresql16/pg_ctl; then su postgres -c '/usr/libexec/postgresql16/pg_ctl -D /var/lib/postgresql/16/data stop -m fast'; fi" 2>&1
         $null = & wsl.exe --terminate $gateDistro 2>&1
-        # unregister can race WSL shutdown; retry only while the exact invocation-owned
-        # name is still registered and never broaden cleanup to another distribution.
+        # unregister can race WSL shutdown and an immediately empty listing can be
+        # transient. Issue the exact-name deletion first, then require two consecutive
+        # absent observations; retries never broaden cleanup to another distribution.
+        $null = & wsl.exe --unregister $gateDistro 2>&1
+        $absentObservations = 0
         for ($attempt = 0; $attempt -lt 20; $attempt++) {
-            $registered = (Get-GateWslDistros) -contains $gateDistro
-            if (-not $registered) { break }
-            $null = & wsl.exe --unregister $gateDistro 2>&1
             Start-Sleep -Milliseconds 500
+            $registered = (Get-GateWslDistros) -contains $gateDistro
+            if ($registered) {
+                $absentObservations = 0
+                $null = & wsl.exe --unregister $gateDistro 2>&1
+                continue
+            }
+            $absentObservations++
+            if ($absentObservations -eq 2) { break }
         }
-        $registered = (Get-GateWslDistros) -contains $gateDistro
-        if ($registered) { $cleanupFailed = $true }
+        if ($absentObservations -lt 2) { $cleanupFailed = $true }
         $ErrorActionPreference = $previousPreference
     }
     Remove-OwnedGateRoot

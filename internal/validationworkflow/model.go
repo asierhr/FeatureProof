@@ -17,6 +17,7 @@ import (
 	"github.com/asierhr/featureProof/internal/localvalidation"
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/projectconfig"
 	"github.com/asierhr/featureProof/internal/projectmemory"
 	"github.com/asierhr/featureProof/internal/testidentity"
 )
@@ -232,8 +233,8 @@ type PlanArtifact struct {
 	ContextInstructionsHash string                           `json:"context_instructions_hash,omitempty"`
 }
 
-// ModelUsage records allowlisted confirmed generation accounting.
-type ModelUsage struct{ Calls, InputTokens, OutputTokens int }
+// ModelUsage records allowlisted confirmed generation and replan accounting.
+type ModelUsage struct{ Calls, InputTokens, OutputTokens, Replans int }
 
 // MissingContext is a bounded safe terminal planning result.
 type MissingContext struct {
@@ -343,8 +344,12 @@ type Record struct {
 	EnvironmentDigest               string
 	OperationalCategory             string
 	ApprovalDeadline                time.Time
-	FixtureSummary                  *fixture.FixtureSummary
-	ContextBindingDigest            string
+	// RetainUntil is the sealed cleanup/publication retention boundary derived at admission.
+	RetainUntil          time.Time
+	FixtureSummary       *fixture.FixtureSummary
+	ContextBindingDigest string
+	// ProjectConfigurationBinding freezes active project authority for recovery and downstream consumers.
+	ProjectConfigurationBinding *projectconfig.RunConfigurationBinding
 }
 
 // ContextAssemblySelection is the detached planner envelope and immutable snapshot identity owned by composition.
@@ -481,6 +486,12 @@ type WorkflowReservationLookup interface {
 type BoundWorkflowStore interface {
 	ReserveBound(context.Context, Record, string, time.Time, time.Duration) (Record, bool, context.Context, error)
 	LoadBound(context.Context, string) (Record, context.Context, error)
+}
+
+// AtomicConfigurationWorkflowStore confirms binding, run and first event in one transaction.
+type AtomicConfigurationWorkflowStore interface {
+	WorkflowStore
+	AtomicConfigurationBinding()
 }
 
 // CausalWorkflowStore extends the workflow boundary with the atomic scheduling

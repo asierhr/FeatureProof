@@ -745,3 +745,13 @@ Bitácora append-only de features completadas.
 - Review independiente aprobada en la décima revisión. Pasan global serial/race, vet, compile-only, formato, seis cross-builds y gate PostgreSQL 16.15 normal/race/runtime Linux/coverage.
 - Cobertura diferencial exacta y reproducible: `5420/6370 = 85,08634222919937205651491365777080062794 %`; cleanup sin distros, roots ni perfiles propios.
 
+## 2026-11-19 — project-configuration
+
+- Estado final: `done`.
+- Resultado: configuración versionada por proyecto con schema estricto, canonicalización, catálogo/policy tipados, defaults monotónicos, publicación y rollback append-only, historial paginado y binding inmutable por run.
+- Integración: CLI, API/MCP, GitHub, workflow y external-agent convergen en la misma autoridad. Cada admisión materializa recursos desde su binding; recovery usa artifacts históricos exactos y falla cerrado ante ausencia, corrupción o drift.
+- Persistencia: adapters local y PostgreSQL equivalentes, registry de artifacts scopeado por `ProjectKey`, migraciones `0018`–`0020` y admisión external-agent causal/idempotente. En PostgreSQL artifact, run, binding y primer evento se confirman en una transacción serializable; local publica el mismo conjunto mediante escritura atómica durable.
+- Spec aprobada por el usuario el `2026-11-16T10:24:25+01:00`. Tasks T1–T16 y requirements R1–R18 trazados en `progress/project-configuration/{implementation,review}.md`.
+- Review independiente aprobada en la novena revisión. Pasan formato, vet, compile-only, suite global serial, focales/race, runtime Linux y gate PostgreSQL 16 normal/race/coverage.
+- Cobertura diferencial exacta y reproducible: `2230/2592 = 86.03395061728395061728395061728395061728%`; dos firmas independientes iguales y cleanup sin procesos, distros, roots, perfiles ni temporales propios.
+

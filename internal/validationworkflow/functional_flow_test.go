@@ -654,7 +654,10 @@ type rejectedFlowHarness struct {
 func newRejectedFlowHarness(t *testing.T) rejectedFlowHarness {
 	t.Helper()
 	service, _, _, _, _ := workflowFixture(t, validPlanResponse())
-	service.config.FinalizeTimeout = 5 * time.Second
+	// Coverage repeats instrument every durable finalization write; keep this
+	// semantic harness bounded without turning instrumentation latency into the
+	// executable-cleanup failure exercised by separate timeout tests.
+	service.config.FinalizeTimeout = 30 * time.Second
 	validated, artifact := workflowFlowFixture(t)
 	artifacts, err := OpenLocalFunctionalFlowArtifactStore(filepath.Join(t.TempDir(), "artifacts"))
 	if err != nil {

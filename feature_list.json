@@ -646,7 +646,7 @@
           "Una configuración ausente, inválida, obsoleta o incompatible impide admitir nuevo trabajo sin afectar runs ya vinculados",
           "Los tests cubren carga, validación cruzada, versionado, rollback, concurrencia, herencia de políticas, referencias secretas y binding a runs"
         ],
-        "status": "in_progress"
+        "status": "done"
     },
     {
         "id": 37,
