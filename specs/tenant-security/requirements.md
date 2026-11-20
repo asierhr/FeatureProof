@@ -516,6 +516,6 @@ validados por composición; no son defaults embebidos en el dominio.
 ## Aprobación humana
 
 ```yaml
-approved_by: null
-approved_at: null
+approved_by: user
+approved_at: 2026-11-20T08:52:19+01:00
 ```

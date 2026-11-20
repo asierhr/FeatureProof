@@ -4894,3 +4894,8 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Alcance: modelo tenant, resolución de principal, RBAC, aislamiento de datos/colas/caches/objetos, secrets cifrados y JIT, auditoría, retención/eliminación y quotas pre-effect en adapters local/PostgreSQL.
 - Estado cambiado por el leader de `pending` a `spec_ready`. No se ha modificado código ni tests; queda pendiente aprobación humana explícita.
 
+## Feature 37 — spec aprobada e implementación iniciada (2026-11-20)
+
+- El usuario aprobó explícitamente la spec; aprobación registrada como `user` a `2026-11-20T08:52:19+01:00`.
+- El leader cambia la feature 37 de `spec_ready` a `in_progress` y autoriza al implementer a ejecutar T1–T24 en orden.
+

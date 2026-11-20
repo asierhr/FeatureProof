@@ -663,7 +663,7 @@
           "Rate limits, cuotas y presupuestos se aplican por tenant y proyecto antes de reservar workers, modelos o infraestructura",
           "Los tests adversariales cubren acceso cruzado, escalada de rol, IDs manipulados, caches compartidas, rotación, eliminación, auditoría y aislamiento concurrente"
         ],
-        "status": "spec_ready"
+        "status": "in_progress"
     },
     {
         "id": 38,
