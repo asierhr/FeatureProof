@@ -4887,3 +4887,10 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - Gate terminal: `2230/2592 = 86.03395061728395061728395061728395061728%`, dos firmas iguales, normal/Linux/race PASS y cleanup vacío.
 - El leader cambia `feature_list.json` de `in_progress` a `done` y registra el cierre en `progress/history.md` antes de commit/push de `feature-36-project-configuration`.
 
+## Feature 37 — tenant-security spec lista (2026-11-20)
+
+- Rama `feature-37-tenant-security`, basada en la feature 36 aprobada porque tenant security extiende `ProjectKey`, configuration binding y el control plane persistente.
+- El spec author creó `specs/tenant-security/{requirements,design,tasks}.md`: R1–R20 y T1–T24 con trazabilidad completa.
+- Alcance: modelo tenant, resolución de principal, RBAC, aislamiento de datos/colas/caches/objetos, secrets cifrados y JIT, auditoría, retención/eliminación y quotas pre-effect en adapters local/PostgreSQL.
+- Estado cambiado por el leader de `pending` a `spec_ready`. No se ha modificado código ni tests; queda pendiente aprobación humana explícita.
+
