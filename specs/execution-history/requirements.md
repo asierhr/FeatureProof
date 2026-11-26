@@ -421,6 +421,6 @@ versionada y validada por composición; no son defaults permisivos del core.
 ## Aprobación humana
 
 ```yaml
-approved_by:
-approved_at:
+approved_by: user
+approved_at: 2026-11-26T11:57:17+01:00
 ```

@@ -5093,3 +5093,13 @@ feature a `done`; el trabajo queda listo para commit y push en
 - El leader cambió Feature 38 de `pending` a `spec_ready`. La aprobación humana
   continúa vacía y la implementación queda detenida hasta una declaración
   explícita del usuario.
+
+## Feature 38 execution-history — implementación iniciada (2026-11-26)
+
+- El usuario aprobó explícitamente la spec con la instrucción de continuar la
+  implementación; se registró `approved_by: user` y
+  `approved_at: 2026-11-26T11:57:17+01:00`.
+- El leader cambió Feature 38 de `spec_ready` a `in_progress` y autoriza la
+  ejecución ordenada de T1–T16.
+- Siguiente fase: implementación con tests y trazabilidad, gate canónica y
+  review independiente antes de cualquier transición a `done`.
