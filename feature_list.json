@@ -680,7 +680,7 @@
           "Las referencias de evidencia se resuelven mediante el lector verificado de paquetes y un artefacto ausente o expirado se indica sin alterar el resultado histórico",
           "Los tests cubren filtros, paginación, comparación, agregados, coste opcional, retención, evidencia expirada y acceso cruzado denegado"
         ],
-        "status": "pending"
+        "status": "spec_ready"
     },
     {
         "id": 39,

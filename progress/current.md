@@ -5066,3 +5066,30 @@ deterministas. PostgreSQL 16 normal/race/Linux/N→N+1, global normal/race,
 builds, módulos, comentarios, secretos y cleanup pasan. El leader cambia la
 feature a `done`; el trabajo queda listo para commit y push en
 `feature-37-tenant-security`.
+
+## Feature 38 execution-history — preflight y especificación (2026-11-26)
+
+- Feature 38 seleccionada: `pending`, `sdd: true`, con ocho criterios de
+  aceptación verificables y ninguna otra feature `in_progress`.
+- Rama `feature-38-execution-history` creada desde Feature 37: el historial
+  depende del control plane persistente y debe preservar aislamiento, RBAC,
+  retención y evidencia tenant-scoped.
+- Alcance actual: redactar exclusivamente
+  `specs/execution-history/{requirements,design,tasks}.md`; no se autoriza
+  código ni tests antes de la aprobación humana explícita.
+- La spec debe conservar la convención del proyecto: entidades y funciones
+  incorporadas por la feature tendrán comentarios que expliquen su función
+  dentro del sistema, además de los comentarios exigidos para APIs exportadas.
+
+## Feature 38 execution-history — spec lista (2026-11-26)
+
+- El `spec_author` entregó
+  `specs/execution-history/{requirements,design,tasks}.md` sin modificar código
+  productivo ni tests.
+- R1–R16 y T1–T16 tienen trazabilidad completa. El diseño cubre autorización
+  tenant-scoped, filtros y cursores estables, proyección histórica inmutable,
+  comparación determinista, agregados estructurados, usage/coste verificable,
+  resolución de evidencia y equivalencia local/PostgreSQL.
+- El leader cambió Feature 38 de `pending` a `spec_ready`. La aprobación humana
+  continúa vacía y la implementación queda detenida hasta una declaración
+  explícita del usuario.
