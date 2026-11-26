@@ -350,6 +350,8 @@ type Record struct {
 	ContextBindingDigest string
 	// ProjectConfigurationBinding freezes active project authority for recovery and downstream consumers.
 	ProjectConfigurationBinding *projectconfig.RunConfigurationBinding
+	// TenantAdmissionAuthority is an opaque, secret-free historical authority seal owned by tenant composition.
+	TenantAdmissionAuthority string
 }
 
 // ContextAssemblySelection is the detached planner envelope and immutable snapshot identity owned by composition.

@@ -371,26 +371,34 @@ func (r *LocalRegistry) ReserveCancel(ctx context.Context, handle, keyHash, requ
 
 // Recover closes nonterminal records owned by a previous process without rerunning them.
 func (r *LocalRegistry) Recover(ctx context.Context, owner string, now time.Time) error {
+	_, err := r.RecoverTerminal(ctx, owner, now)
+	return err
+}
+
+// RecoverTerminal closes abandoned runs and returns the exact durable records
+// whose terminal state was observed in this reconciliation.
+func (r *LocalRegistry) RecoverTerminal(ctx context.Context, owner string, now time.Time) ([]RunRecord, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	release, err := acquireRegistryLock(ctx, r.path+".lock")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer release()
 	document, err := r.loadLocked()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	changed := false
+	var recovered []RunRecord
 	for handle, record := range document.Runs {
 		if (record.Phase == PhaseQueued || record.Phase == PhaseRunning || record.Phase == PhaseFinalizing) && record.Owner != "" && record.Owner != owner {
 			releaseOwner, acquired, lockErr := tryRegistryLock(r.ownerPath(handle))
 			if lockErr != nil {
-				return lockErr
+				return nil, lockErr
 			}
 			if !acquired {
 				continue
@@ -398,15 +406,18 @@ func (r *LocalRegistry) Recover(ctx context.Context, owner string, now time.Time
 			releaseOwner()
 			record.Phase, record.Status, record.PackageDir, record.Owner, record.UpdatedAt, record.Cause = PhaseTerminal, OutcomeError, "", "", now.UTC(), "interrupted"
 			document.Runs[handle] = record
+			recovered = append(recovered, record)
 			appendRunEvent(&document, record, "recovered", "interrupted")
 			appendRunEvent(&document, record, "terminal", "interrupted")
 			changed = true
 		}
 	}
 	if changed {
-		return r.saveLocked(document)
+		if err := r.saveLocked(document); err != nil {
+			return nil, err
+		}
 	}
-	return nil
+	return recovered, nil
 }
 
 // Events returns a defensive, ordered audit prefix for one authorized internal caller.

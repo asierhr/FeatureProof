@@ -97,18 +97,18 @@ func fixedDigest(value string) string {
 
 // fixtureJob creates one valid due queue record for contract tests.
 func fixtureJob(now time.Time) Job {
-	job, _ := SealJob(Job{JobID: "job-1", ProjectID: "project-1", RunID: "run-1", BackendEpoch: 1, BindingDigest: fixedDigest("binding"), Phase: PhaseExecute, State: JobQueued, InputDigest: fixedDigest("input"), CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour)})
+	job, _ := SealJob(Job{OrganizationID: "organization", JobID: "job-1", ProjectID: "project-1", RunID: "run-1", BackendEpoch: 1, BindingDigest: fixedDigest("binding"), Phase: PhaseExecute, State: JobQueued, InputDigest: fixedDigest("input"), CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour)})
 	return job
 }
 
 // TestModelSealsAndDetectsTamper exercises binding, job and strict-document integrity.
 func TestModelSealsAndDetectsTamper(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.FixedZone("x", 3600))
-	epoch, err := SealBackendEpoch(BackendEpoch{RunID: "run-1", ProjectID: "project-1", Epoch: 1, Mode: BackendLocal, BackendIdentity: "local-1", SchemaVersion: 1, CreatedAt: now})
+	epoch, err := SealBackendEpoch(BackendEpoch{OrganizationID: "organization", RunID: "run-1", ProjectID: "project-1", Epoch: 1, Mode: BackendLocal, BackendIdentity: "local-1", SchemaVersion: 1, CreatedAt: now})
 	if err != nil || epoch.CreatedAt.Location() != time.UTC {
 		t.Fatalf("seal epoch: %#v %v", epoch, err)
 	}
-	head, _ := SealBindingHead(BindingHead{RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 1, EpochDigest: epoch.Digest, Revision: 1})
+	head, _ := SealBindingHead(BindingHead{OrganizationID: "organization", RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 1, EpochDigest: epoch.Digest, Revision: 1})
 	if VerifyBindingHead(head, epoch) != nil {
 		t.Fatal("valid binding rejected")
 	}
@@ -130,21 +130,21 @@ func TestMemoryQueueFencesAndRecovers(t *testing.T) {
 	if _, err := store.Enqueue(context.Background(), job); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := store.Claim(context.Background(), ClaimRequest{ProjectID: job.ProjectID, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
+	claimed, err := store.Claim(context.Background(), ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("claim %v %v", claimed, err)
 	}
-	second, _ := store.Claim(context.Background(), ClaimRequest{ProjectID: job.ProjectID, WorkerID: "worker-2", Now: now, Lease: time.Minute, Limit: 1})
+	second, _ := store.Claim(context.Background(), ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-2", Now: now, Lease: time.Minute, Limit: 1})
 	if len(second) != 0 {
 		t.Fatal("double lease")
 	}
-	if _, err = store.Complete(context.Background(), job.JobID, "worker-2", claimed[0].Fence, claimed[0].CancelRevision, now, JobSucceeded, ""); !errors.Is(err, ErrConflict) {
+	if _, err = store.Complete(context.Background(), ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, job.JobID, "worker-2", claimed[0].Fence, claimed[0].CancelRevision, now, JobSucceeded, ""); !errors.Is(err, ErrConflict) {
 		t.Fatal("stale owner accepted")
 	}
-	if count, err := store.Recover(context.Background(), now.Add(time.Minute), 1); err != nil || count != 1 {
+	if count, err := store.Recover(context.Background(), ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, now.Add(time.Minute), 1); err != nil || count != 1 {
 		t.Fatalf("recover %d %v", count, err)
 	}
-	again, _ := store.Claim(context.Background(), ClaimRequest{ProjectID: job.ProjectID, WorkerID: "worker-2", Now: now.Add(time.Minute), Lease: time.Minute, Limit: 1})
+	again, _ := store.Claim(context.Background(), ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-2", Now: now.Add(time.Minute), Lease: time.Minute, Limit: 1})
 	if len(again) != 1 || again[0].Fence <= claimed[0].Fence {
 		t.Fatal("fence did not advance")
 	}
@@ -154,12 +154,12 @@ func TestMemoryQueueFencesAndRecovers(t *testing.T) {
 func TestBackendCutoverCAS(t *testing.T) {
 	store := NewMemoryStore()
 	now := time.Now().UTC()
-	first, _ := SealBackendEpoch(BackendEpoch{RunID: "run-1", ProjectID: "project-1", Epoch: 1, Mode: BackendLocal, BackendIdentity: "local-1", SchemaVersion: 1, CreatedAt: now})
+	first, _ := SealBackendEpoch(BackendEpoch{OrganizationID: "organization", RunID: "run-1", ProjectID: "project-1", Epoch: 1, Mode: BackendLocal, BackendIdentity: "local-1", SchemaVersion: 1, CreatedAt: now})
 	head, err := store.ReserveInitial(context.Background(), first)
 	if err != nil {
 		t.Fatal(err)
 	}
-	next := BackendEpoch{RunID: "run-1", ProjectID: "project-1", Epoch: 2, Mode: BackendPostgres, BackendIdentity: "pg-1", SchemaVersion: 1, CreatedAt: now.Add(time.Second), PreviousDigest: first.Digest}
+	next := BackendEpoch{OrganizationID: "organization", RunID: "run-1", ProjectID: "project-1", Epoch: 2, Mode: BackendPostgres, BackendIdentity: "pg-1", SchemaVersion: 1, CreatedAt: now.Add(time.Second), PreviousDigest: first.Digest}
 	newHead, err := store.Cutover(context.Background(), head, next)
 	if err != nil || newHead.Epoch != 2 {
 		t.Fatalf("cutover %#v %v", newHead, err)
@@ -167,7 +167,7 @@ func TestBackendCutoverCAS(t *testing.T) {
 	if _, err = store.Cutover(context.Background(), head, next); !errors.Is(err, ErrConflict) {
 		t.Fatal("stale head accepted")
 	}
-	loaded, epoch, err := store.Load(context.Background(), "run-1")
+	loaded, epoch, err := store.Load(context.Background(), ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "run-1")
 	if err != nil || loaded.Digest != newHead.Digest || epoch.Mode != BackendPostgres {
 		t.Fatal("active backend mismatch")
 	}
@@ -186,7 +186,7 @@ func (resolver *recordingResolver) Resolve(context.Context, []string) (map[strin
 type fixedGrantStore struct{ grant AuthorityGrant }
 
 // LoadAuthorityGrant returns the sealed fixture only for its exact run and phase.
-func (store fixedGrantStore) LoadAuthorityGrant(_ context.Context, runID string, phase Phase) (AuthorityGrant, error) {
+func (store fixedGrantStore) LoadAuthorityGrant(_ context.Context, _ ProjectScope, runID string, phase Phase) (AuthorityGrant, error) {
 	if runID != store.grant.RunID || phase != store.grant.Phase {
 		return AuthorityGrant{}, ErrNotFound
 	}
@@ -217,7 +217,7 @@ func TestAuthorityMinimizesAndRejectsStaleFence(t *testing.T) {
 	store := NewMemoryStore()
 	job := fixtureJob(now)
 	store.Enqueue(context.Background(), job)
-	claimed, _ := store.Claim(context.Background(), ClaimRequest{ProjectID: job.ProjectID, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
+	claimed, _ := store.Claim(context.Background(), ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
 	leased := claimed[0]
 	envelope, err := BuildAuthority(leased, AuthorityRequest{EnvelopeID: "env-1", WorkerID: "worker-1", ExpiresAt: now.Add(30 * time.Second), Capabilities: []string{"http.execute", "http.execute"}, TargetBindingRef: "target-1", TargetBindingDigest: fixedDigest("target"), SecretReferenceIDs: []string{"secret-1"}}, now)
 	if err != nil || len(envelope.AllowedCapabilities) != 1 {
@@ -245,12 +245,12 @@ func TestAuthorityResolvesSecretsOnlyAfterBothLiveChecks(t *testing.T) {
 	if _, err := store.Enqueue(context.Background(), job); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := store.Claim(context.Background(), ClaimRequest{ProjectID: job.ProjectID, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
+	claimed, err := store.Claim(context.Background(), ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
 	if err != nil || len(claimed) != 1 {
 		t.Fatal("claim", err)
 	}
 	leased := claimed[0]
-	grant, err := SealAuthorityGrant(AuthorityGrant{ProjectID: leased.ProjectID, RunID: leased.RunID, BackendEpoch: leased.BackendEpoch, BindingDigest: leased.BindingDigest, Phase: leased.Phase, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "target-1", TargetBindingDigest: fixedDigest("target"), SecretReferenceIDs: []string{"secret-1"}})
+	grant, err := SealAuthorityGrant(AuthorityGrant{OrganizationID: "organization", ProjectID: leased.ProjectID, RunID: leased.RunID, BackendEpoch: leased.BackendEpoch, BindingDigest: leased.BindingDigest, Phase: leased.Phase, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "target-1", TargetBindingDigest: fixedDigest("target"), SecretReferenceIDs: []string{"secret-1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,9 +288,9 @@ func TestDerivedAuthorityUsesPersistedClosedMatrix(t *testing.T) {
 	store := NewMemoryStore()
 	job := fixtureJob(now)
 	store.Enqueue(context.Background(), job)
-	claimed, _ := store.Claim(context.Background(), ClaimRequest{ProjectID: job.ProjectID, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
+	claimed, _ := store.Claim(context.Background(), ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
 	leased := claimed[0]
-	grant, err := SealAuthorityGrant(AuthorityGrant{ProjectID: leased.ProjectID, RunID: leased.RunID, BackendEpoch: leased.BackendEpoch, BindingDigest: leased.BindingDigest, Phase: PhaseExecute, InputReferences: []string{"input-1"}, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "target-1", TargetBindingDigest: fixedDigest("target"), SecretReferenceIDs: []string{"secret-1"}})
+	grant, err := SealAuthorityGrant(AuthorityGrant{OrganizationID: "organization", ProjectID: leased.ProjectID, RunID: leased.RunID, BackendEpoch: leased.BackendEpoch, BindingDigest: leased.BindingDigest, Phase: PhaseExecute, InputReferences: []string{"input-1"}, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "target-1", TargetBindingDigest: fixedDigest("target"), SecretReferenceIDs: []string{"secret-1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +298,7 @@ func TestDerivedAuthorityUsesPersistedClosedMatrix(t *testing.T) {
 	if err != nil || len(envelope.AllowedCapabilities) != 1 || envelope.AllowedCapabilities[0] != "http.execute" {
 		t.Fatal("persisted grant was not derived exactly")
 	}
-	if _, err = SealAuthorityGrant(AuthorityGrant{ProjectID: leased.ProjectID, RunID: leased.RunID, Phase: PhasePlan, AllowedCapabilities: []string{"http.execute"}}); !errors.Is(err, ErrInvalid) {
+	if _, err = SealAuthorityGrant(AuthorityGrant{OrganizationID: "organization", ProjectID: leased.ProjectID, RunID: leased.RunID, Phase: PhasePlan, AllowedCapabilities: []string{"http.execute"}}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("cross-phase capability was accepted")
 	}
 	verifier := &rejectingLiveVerifier{}
@@ -313,7 +313,7 @@ func TestInboxAndEffectsEnforceStableIdentity(t *testing.T) {
 	store := NewMemoryStore()
 	now := time.Now().UTC()
 	job := fixtureJob(now)
-	in := InboxEnvelope{Source: "api", ExternalID: "request-1", IdempotencyKey: "key-1", ProjectID: job.ProjectID, RequestDigest: fixedDigest("request"), CommandKind: "validate"}
+	in := InboxEnvelope{OrganizationID: "organization", Source: "api", ExternalID: "request-1", IdempotencyKey: "key-1", ProjectID: job.ProjectID, RequestDigest: fixedDigest("request"), CommandKind: "validate"}
 	created, err := store.Accept(context.Background(), in, job)
 	if err != nil || !created {
 		t.Fatal("first ingress failed")
@@ -326,14 +326,14 @@ func TestInboxAndEffectsEnforceStableIdentity(t *testing.T) {
 	if _, err = store.Accept(context.Background(), in, job); !errors.Is(err, ErrConflict) {
 		t.Fatal("digest conflict accepted")
 	}
-	intent := EffectIntent{OperationID: "op-1", IdempotencyKey: "effect-1", ProjectID: job.ProjectID, RunID: job.RunID, Phase: PhasePublish, BindingDigest: job.BindingDigest, InputDigest: job.InputDigest, ReconcileMethod: "poll"}
+	intent := EffectIntent{OrganizationID: "organization", OperationID: "op-1", IdempotencyKey: "effect-1", ProjectID: job.ProjectID, RunID: job.RunID, Phase: PhasePublish, BindingDigest: job.BindingDigest, InputDigest: job.InputDigest, ReconcileMethod: "poll"}
 	if _, err = store.Prepare(context.Background(), intent); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.Confirm(context.Background(), intent.OperationID, fixedDigest("receipt")); err != nil {
+	if err = store.Confirm(context.Background(), ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, intent.OperationID, fixedDigest("receipt")); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.Confirm(context.Background(), intent.OperationID, fixedDigest("other")); !errors.Is(err, ErrConflict) {
+	if err = store.Confirm(context.Background(), ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, intent.OperationID, fixedDigest("other")); !errors.Is(err, ErrConflict) {
 		t.Fatal("conflicting receipt accepted")
 	}
 }
@@ -343,7 +343,7 @@ func TestMemoryAdmissionPublishesAndReloadsOneLocalAuthority(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 	store := NewMemoryStore()
-	epoch, err := SealBackendEpoch(BackendEpoch{RunID: "admission-run", ProjectID: "project-1", Epoch: 1, Mode: BackendLocal, BackendIdentity: "local-admission", SchemaVersion: 1, CreatedAt: now})
+	epoch, err := SealBackendEpoch(BackendEpoch{OrganizationID: "organization", RunID: "admission-run", ProjectID: "project-1", Epoch: 1, Mode: BackendLocal, BackendIdentity: "local-admission", SchemaVersion: 1, CreatedAt: now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +353,7 @@ func TestMemoryAdmissionPublishesAndReloadsOneLocalAuthority(t *testing.T) {
 	job.BackendEpoch = epoch.Epoch
 	job.BindingDigest = epoch.Digest
 	job.Digest = ""
-	envelope := InboxEnvelope{Source: "api", ExternalID: "admission-request", IdempotencyKey: "admission-key", ProjectID: epoch.ProjectID, RequestDigest: fixedDigest("admission-request"), CommandKind: "validate", CommandFields: map[string]string{"profile": "smoke"}}
+	envelope := InboxEnvelope{OrganizationID: "organization", Source: "api", ExternalID: "admission-request", IdempotencyKey: "admission-key", ProjectID: epoch.ProjectID, RequestDigest: fixedDigest("admission-request"), CommandKind: "validate", CommandFields: map[string]string{"profile": "smoke"}}
 	admission := IngressAdmission{Envelope: envelope, Epoch: epoch, Job: job}
 	created, err := store.Admit(ctx, admission)
 	if err != nil || !created {
@@ -363,24 +363,24 @@ func TestMemoryAdmissionPublishesAndReloadsOneLocalAuthority(t *testing.T) {
 	if err != nil || created {
 		t.Fatal("admission redelivery", err)
 	}
-	loaded, err := store.LoadIngress(ctx, epoch.RunID)
+	loaded, err := store.LoadIngress(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, epoch.RunID)
 	if err != nil || loaded.Envelope.CommandFields["profile"] != "smoke" {
 		t.Fatal("load ingress", err)
 	}
 	loaded.Envelope.CommandFields["profile"] = "mutated"
-	reloaded, err := store.LoadIngress(ctx, epoch.RunID)
+	reloaded, err := store.LoadIngress(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, epoch.RunID)
 	if err != nil || reloaded.Envelope.CommandFields["profile"] != "smoke" {
 		t.Fatal("ingress alias escaped", err)
 	}
-	head, active, err := store.Load(ctx, epoch.RunID)
+	head, active, err := store.Load(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, epoch.RunID)
 	if err != nil || head.EpochDigest != epoch.Digest || active.Digest != epoch.Digest {
 		t.Fatal("atomic authority missing", err)
 	}
-	claimed, err := store.Claim(ctx, ClaimRequest{ProjectID: epoch.ProjectID, WorkerID: "admission-worker", Now: now, Lease: time.Minute, Limit: 1})
+	claimed, err := store.Claim(ctx, ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: epoch.ProjectID}, WorkerID: "admission-worker", Now: now, Lease: time.Minute, Limit: 1})
 	if err != nil || len(claimed) != 1 || claimed[0].RunID != epoch.RunID {
 		t.Fatal("atomic job missing", err)
 	}
-	if _, err = store.LoadIngress(ctx, "missing-run"); !errors.Is(err, ErrNotFound) {
+	if _, err = store.LoadIngress(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "missing-run"); !errors.Is(err, ErrNotFound) {
 		t.Fatal("missing ingress accepted", err)
 	}
 	conflict := admission
@@ -395,13 +395,13 @@ func TestMemoryAdmissionRejectsInvalidAndCompetingAuthority(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 	store := NewMemoryStore()
-	epoch, err := SealBackendEpoch(BackendEpoch{RunID: "competing-run", ProjectID: "project-1", Epoch: 1, Mode: BackendLocal, BackendIdentity: "local-competing", SchemaVersion: 1, CreatedAt: now})
+	epoch, err := SealBackendEpoch(BackendEpoch{OrganizationID: "organization", RunID: "competing-run", ProjectID: "project-1", Epoch: 1, Mode: BackendLocal, BackendIdentity: "local-competing", SchemaVersion: 1, CreatedAt: now})
 	if err != nil {
 		t.Fatal(err)
 	}
 	job := fixtureJob(now)
 	job.JobID, job.RunID, job.BackendEpoch, job.BindingDigest, job.Digest = "competing-job", epoch.RunID, epoch.Epoch, epoch.Digest, ""
-	envelope := InboxEnvelope{Source: "api", ExternalID: "competing-request", IdempotencyKey: "competing-key", ProjectID: epoch.ProjectID, RequestDigest: fixedDigest("competing-request"), CommandKind: "validate"}
+	envelope := InboxEnvelope{OrganizationID: "organization", Source: "api", ExternalID: "competing-request", IdempotencyKey: "competing-key", ProjectID: epoch.ProjectID, RequestDigest: fixedDigest("competing-request"), CommandKind: "validate"}
 	admission := IngressAdmission{Envelope: envelope, Epoch: epoch, Job: job}
 	invalidEpoch := admission
 	invalidEpoch.Epoch.Mode, invalidEpoch.Epoch.Digest = BackendPostgres, ""
@@ -424,8 +424,8 @@ func TestMemoryAdmissionRejectsInvalidAndCompetingAuthority(t *testing.T) {
 	if _, err = store.Admit(ctx, admission); !errors.Is(err, ErrConflict) {
 		t.Fatal("competing authority accepted", err)
 	}
-	store.heads[epoch.RunID] = BindingHead{RunID: epoch.RunID}
-	if _, _, err = store.Load(ctx, epoch.RunID); !errors.Is(err, ErrIntegrity) {
+	store.heads[scopedMemoryKey(ProjectScope{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID}, epoch.RunID)] = BindingHead{RunID: epoch.RunID}
+	if _, _, err = store.Load(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, epoch.RunID); !errors.Is(err, ErrIntegrity) {
 		t.Fatal("corrupt head accepted", err)
 	}
 }
@@ -437,18 +437,18 @@ func TestCursorIsProjectScoped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, err := codec.Seal(PageCursor{ProjectID: "project-1", Filter: "jobs", LastKey: "job-9", SnapshotUnixNano: now.UnixNano(), LastUnixNano: now.UnixNano(), ExpiresAtUnixNano: now.Add(time.Hour).UnixNano()})
+	token, err := codec.Seal(PageCursor{OrganizationID: "organization-1", ProjectID: "project-1", Filter: "jobs", LastKey: "job-9", SnapshotUnixNano: now.UnixNano(), LastUnixNano: now.UnixNano(), ExpiresAtUnixNano: now.Add(time.Hour).UnixNano()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cursor, err := codec.Open(token, "project-1", "jobs", now)
+	cursor, err := codec.Open(token, "organization-1", "project-1", "jobs", now)
 	if err != nil || cursor.LastKey != "job-9" {
 		t.Fatal("cursor roundtrip")
 	}
-	if _, err = codec.Open(token, "project-2", "jobs", now); !errors.Is(err, ErrUnauthorized) {
+	if _, err = codec.Open(token, "organization-1", "project-2", "jobs", now); !errors.Is(err, ErrUnauthorized) {
 		t.Fatal("cross-project cursor accepted")
 	}
-	if _, err = codec.Open(token, "project-1", "other", now); !errors.Is(err, ErrUnauthorized) {
+	if _, err = codec.Open(token, "organization-1", "project-1", "other", now); !errors.Is(err, ErrUnauthorized) {
 		t.Fatal("cross-filter cursor accepted")
 	}
 	tamperedBytes := []byte(token)
@@ -458,10 +458,10 @@ func TestCursorIsProjectScoped(t *testing.T) {
 		tamperedBytes[10] = 'A'
 	}
 	tampered := string(tamperedBytes)
-	if _, err = codec.Open(tampered, "project-1", "jobs", now); !errors.Is(err, ErrIntegrity) {
+	if _, err = codec.Open(tampered, "organization-1", "project-1", "jobs", now); !errors.Is(err, ErrIntegrity) {
 		t.Fatal("tampered cursor accepted")
 	}
-	if _, err = codec.Open(token, "project-1", "jobs", now.Add(2*time.Hour)); !errors.Is(err, ErrDeadline) {
+	if _, err = codec.Open(token, "organization-1", "project-1", "jobs", now.Add(2*time.Hour)); !errors.Is(err, ErrDeadline) {
 		t.Fatal("expired cursor accepted")
 	}
 	if (RetentionPolicy{}).Validate() == nil {
@@ -475,7 +475,7 @@ func TestSchedulerPersistsRetry(t *testing.T) {
 	store := NewMemoryStore()
 	job := fixtureJob(now)
 	store.Enqueue(context.Background(), job)
-	scheduler, err := NewScheduler(store, fixedClock{now: now}, noopWaiter{}, failingHandler{err: errors.New("transient")}, fixedClassifier{decision: RetryDecision{Category: "transient", Backoff: time.Minute, MaxAttempts: 3}}, SchedulerConfig{ProjectID: job.ProjectID, WorkerID: "worker-1", Lease: time.Minute, BatchSize: 1, IdleWait: time.Second})
+	scheduler, err := NewScheduler(store, fixedClock{now: now}, noopWaiter{}, failingHandler{err: errors.New("transient")}, fixedClassifier{decision: RetryDecision{Category: "transient", Backoff: time.Minute, MaxAttempts: 3}}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Lease: time.Minute, BatchSize: 1, IdleWait: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,11 +483,11 @@ func TestSchedulerPersistsRetry(t *testing.T) {
 	if err != nil || count != 1 {
 		t.Fatalf("run once %d %v", count, err)
 	}
-	claimed, _ := store.Claim(context.Background(), ClaimRequest{ProjectID: job.ProjectID, WorkerID: "worker-2", Now: now, Lease: time.Minute, Limit: 1})
+	claimed, _ := store.Claim(context.Background(), ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-2", Now: now, Lease: time.Minute, Limit: 1})
 	if len(claimed) != 0 {
 		t.Fatal("retry was available before persisted backoff")
 	}
-	claimed, _ = store.Claim(context.Background(), ClaimRequest{ProjectID: job.ProjectID, WorkerID: "worker-2", Now: now.Add(time.Minute), Lease: time.Minute, Limit: 1})
+	claimed, _ = store.Claim(context.Background(), ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-2", Now: now.Add(time.Minute), Lease: time.Minute, Limit: 1})
 	if len(claimed) != 1 || claimed[0].Fence != 2 {
 		t.Fatal("durable retry missing")
 	}
@@ -497,7 +497,7 @@ func TestSchedulerPersistsRetry(t *testing.T) {
 func TestImportManifestDetachesMaps(t *testing.T) {
 	counts := map[string]uint64{"runs": 1}
 	digests := map[string]string{"runs": fixedDigest("runs")}
-	value, err := SealImportManifest(ImportManifest{ImportID: "import-1", RunID: "run-1", ProjectID: "project-1", SourceIdentity: "local-1", ExpectedHeadDigest: fixedDigest("head"), Counts: counts, StreamDigests: digests, State: ImportFrozen, CreatedAt: time.Now().UTC()})
+	value, err := SealImportManifest(ImportManifest{OrganizationID: "organization", ImportID: "import-1", RunID: "run-1", ProjectID: "project-1", SourceIdentity: "local-1", ExpectedHeadDigest: fixedDigest("head"), Counts: counts, StreamDigests: digests, State: ImportFrozen, CreatedAt: time.Now().UTC()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -515,12 +515,12 @@ func TestMemoryQueueLifecycle(t *testing.T) {
 	store := NewMemoryStore()
 	first := fixtureJob(now)
 	store.Enqueue(ctx, first)
-	claimed, _ := store.Claim(ctx, ClaimRequest{ProjectID: first.ProjectID, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
+	claimed, _ := store.Claim(ctx, ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: first.ProjectID}, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
 	leased := claimed[0]
-	if _, err := store.Heartbeat(ctx, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now, time.Minute); err != nil {
+	if _, err := store.Heartbeat(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now, time.Minute); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Complete(ctx, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now, JobSucceeded, ""); err != nil {
+	if _, err := store.Complete(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now, JobSucceeded, ""); err != nil {
 		t.Fatal(err)
 	}
 	if !IsTerminal(JobSucceeded) || IsTerminal(JobLeased) {
@@ -531,11 +531,11 @@ func TestMemoryQueueLifecycle(t *testing.T) {
 	second.Digest = ""
 	second, _ = SealJob(second)
 	store.Enqueue(ctx, second)
-	cancelled, err := store.Cancel(ctx, second.JobID, 1)
+	cancelled, err := store.Cancel(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, second.JobID, 1)
 	if err != nil || cancelled.State != JobCancelled {
 		t.Fatal("cancel")
 	}
-	same, err := store.Cancel(ctx, second.JobID, 1)
+	same, err := store.Cancel(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, second.JobID, 1)
 	if err != nil || same.CancelRevision != 1 {
 		t.Fatal("idempotent cancel")
 	}
@@ -544,8 +544,8 @@ func TestMemoryQueueLifecycle(t *testing.T) {
 	third.Digest = ""
 	third, _ = SealJob(third)
 	store.Enqueue(ctx, third)
-	claimed, _ = store.Claim(ctx, ClaimRequest{ProjectID: third.ProjectID, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
-	dead, err := store.Retry(ctx, third.JobID, "worker-1", claimed[0].Fence, claimed[0].CancelRevision, now, RetryDecision{Category: "permanent", MaxAttempts: 1}, now)
+	claimed, _ = store.Claim(ctx, ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: third.ProjectID}, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
+	dead, err := store.Retry(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, third.JobID, "worker-1", claimed[0].Fence, claimed[0].CancelRevision, now, RetryDecision{Category: "permanent", MaxAttempts: 1}, now)
 	if err != nil || dead.State != JobDead {
 		t.Fatal("retry exhaustion")
 	}
@@ -565,19 +565,19 @@ func TestMemoryQueueRejectsCancelledExpiredAndMisorderedOwners(t *testing.T) {
 	early, _ = SealJob(early)
 	store.Enqueue(ctx, late)
 	store.Enqueue(ctx, early)
-	claimed, _ := store.Claim(ctx, ClaimRequest{ProjectID: early.ProjectID, WorkerID: "worker-1", Now: available, Lease: time.Minute, Limit: 2})
+	claimed, _ := store.Claim(ctx, ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: early.ProjectID}, WorkerID: "worker-1", Now: available, Lease: time.Minute, Limit: 2})
 	if len(claimed) != 2 || claimed[0].JobID != early.JobID {
 		t.Fatal("queue ignored created_at ordering")
 	}
 	leased := claimed[0]
-	if _, err := store.Cancel(ctx, leased.JobID, 1); err != nil {
+	if _, err := store.Cancel(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, leased.JobID, 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Complete(ctx, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now.Add(time.Second), JobSucceeded, ""); !errors.Is(err, ErrConflict) {
+	if _, err := store.Complete(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now.Add(time.Second), JobSucceeded, ""); !errors.Is(err, ErrConflict) {
 		t.Fatal("cancelled owner confirmed a terminal")
 	}
 	expired := claimed[1]
-	if _, err := store.Complete(ctx, expired.JobID, expired.Owner, expired.Fence, expired.CancelRevision, expired.LeaseUntil, JobSucceeded, ""); !errors.Is(err, ErrConflict) {
+	if _, err := store.Complete(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, expired.JobID, expired.Owner, expired.Fence, expired.CancelRevision, expired.LeaseUntil, JobSucceeded, ""); !errors.Is(err, ErrConflict) {
 		t.Fatal("expired owner confirmed a terminal")
 	}
 }
@@ -603,7 +603,7 @@ func TestSelectionRetentionAndSchedulerSuccess(t *testing.T) {
 	now := time.Now().UTC()
 	job := fixtureJob(now)
 	store.Enqueue(context.Background(), job)
-	scheduler, _ := NewScheduler(store, fixedClock{now}, noopWaiter{}, successHandler{}, fixedClassifier{}, SchedulerConfig{ProjectID: job.ProjectID, WorkerID: "worker-1", Lease: time.Minute, BatchSize: 1})
+	scheduler, _ := NewScheduler(store, fixedClock{now}, noopWaiter{}, successHandler{}, fixedClassifier{}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Lease: time.Minute, BatchSize: 1})
 	if count, err := scheduler.RunOnce(context.Background()); err != nil || count != 1 {
 		t.Fatal("scheduler success")
 	}
@@ -630,7 +630,7 @@ func TestClosedErrorsAndImportTransitions(t *testing.T) {
 			t.Fatalf("category %s", item.category)
 		}
 	}
-	manifest, _ := SealImportManifest(ImportManifest{ImportID: "import-1", RunID: "run-1", ProjectID: "project-1", SourceIdentity: "local-1", ExpectedHeadDigest: fixedDigest("head"), State: ImportFrozen, CreatedAt: time.Now().UTC()})
+	manifest, _ := SealImportManifest(ImportManifest{OrganizationID: "organization", ImportID: "import-1", RunID: "run-1", ProjectID: "project-1", SourceIdentity: "local-1", ExpectedHeadDigest: fixedDigest("head"), State: ImportFrozen, CreatedAt: time.Now().UTC()})
 	candidate, err := AdvanceImport(manifest, ImportCandidate)
 	if err != nil {
 		t.Fatal(err)
@@ -664,25 +664,25 @@ func TestMemoryStoreRejectsConflicts(t *testing.T) {
 	if _, err := store.Enqueue(ctx, conflict); !errors.Is(err, ErrConflict) {
 		t.Fatal("enqueue conflict")
 	}
-	if _, err := store.Heartbeat(ctx, "missing", "worker", 1, 0, now, time.Minute); !errors.Is(err, ErrNotFound) {
+	if _, err := store.Heartbeat(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "missing", "worker", 1, 0, now, time.Minute); !errors.Is(err, ErrNotFound) {
 		t.Fatal("missing heartbeat")
 	}
-	if _, err := store.Complete(ctx, job.JobID, "worker", 1, 0, now, JobQueued, ""); !errors.Is(err, ErrInvalid) {
+	if _, err := store.Complete(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, job.JobID, "worker", 1, 0, now, JobQueued, ""); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid terminal")
 	}
-	if _, err := store.Retry(ctx, job.JobID, "worker", 1, 0, now, RetryDecision{}, now); !errors.Is(err, ErrInvalid) {
+	if _, err := store.Retry(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, job.JobID, "worker", 1, 0, now, RetryDecision{}, now); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid retry")
 	}
-	if _, err := store.Cancel(ctx, "missing", 1); !errors.Is(err, ErrNotFound) {
+	if _, err := store.Cancel(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "missing", 1); !errors.Is(err, ErrNotFound) {
 		t.Fatal("missing cancel")
 	}
-	if _, err := store.Recover(ctx, now, 0); !errors.Is(err, ErrInvalid) {
+	if _, err := store.Recover(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, now, 0); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid recovery")
 	}
-	if _, _, err := store.Load(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+	if _, _, err := store.Load(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatal("missing binding")
 	}
-	epoch, _ := SealBackendEpoch(BackendEpoch{RunID: "run-1", ProjectID: "project-1", Epoch: 1, Mode: BackendLocal, BackendIdentity: "local-1", SchemaVersion: 1, CreatedAt: now})
+	epoch, _ := SealBackendEpoch(BackendEpoch{OrganizationID: "organization", RunID: "run-1", ProjectID: "project-1", Epoch: 1, Mode: BackendLocal, BackendIdentity: "local-1", SchemaVersion: 1, CreatedAt: now})
 	if _, err := store.ReserveInitial(ctx, epoch); err != nil {
 		t.Fatal(err)
 	}
@@ -695,7 +695,7 @@ func TestMemoryStoreRejectsConflicts(t *testing.T) {
 	if _, err := store.ReserveInitial(ctx, other); !errors.Is(err, ErrConflict) {
 		t.Fatal("binding conflict")
 	}
-	intent := EffectIntent{OperationID: "op-1", IdempotencyKey: "key-1", ProjectID: "project-1", RunID: "run-1", Phase: PhasePublish, BindingDigest: fixedDigest("binding"), InputDigest: fixedDigest("input")}
+	intent := EffectIntent{OrganizationID: "organization", OperationID: "op-1", IdempotencyKey: "key-1", ProjectID: "project-1", RunID: "run-1", Phase: PhasePublish, BindingDigest: fixedDigest("binding"), InputDigest: fixedDigest("input")}
 	if _, err := store.Prepare(ctx, intent); err != nil {
 		t.Fatal(err)
 	}
@@ -707,7 +707,7 @@ func TestMemoryStoreRejectsConflicts(t *testing.T) {
 	if _, err := store.Prepare(ctx, otherIntent); !errors.Is(err, ErrConflict) {
 		t.Fatal("intent conflict")
 	}
-	if err := store.Confirm(ctx, "missing", fixedDigest("receipt")); !errors.Is(err, ErrNotFound) {
+	if err := store.Confirm(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "missing", fixedDigest("receipt")); !errors.Is(err, ErrNotFound) {
 		t.Fatal("missing confirmation")
 	}
 }
@@ -720,13 +720,13 @@ func TestMemoryStoreFailClosedBoundaryMatrix(t *testing.T) {
 	if _, err := store.Enqueue(ctx, Job{}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid enqueue accepted", err)
 	}
-	if _, err := store.Claim(ctx, ClaimRequest{ProjectID: "project-1", WorkerID: "worker-1", Now: now, Lease: 0, Limit: 1}); !errors.Is(err, ErrInvalid) {
+	if _, err := store.Claim(ctx, ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Now: now, Lease: 0, Limit: 1}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid claim accepted", err)
 	}
-	if _, err := store.Complete(ctx, "missing", "worker-1", 1, 0, now, JobSucceeded, ""); !errors.Is(err, ErrNotFound) {
+	if _, err := store.Complete(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "missing", "worker-1", 1, 0, now, JobSucceeded, ""); !errors.Is(err, ErrNotFound) {
 		t.Fatal("missing completion accepted", err)
 	}
-	if _, err := store.Retry(ctx, "missing", "worker-1", 1, 0, now, RetryDecision{Category: "transient", MaxAttempts: 1}, now); !errors.Is(err, ErrNotFound) {
+	if _, err := store.Retry(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "missing", "worker-1", 1, 0, now, RetryDecision{Category: "transient", MaxAttempts: 1}, now); !errors.Is(err, ErrNotFound) {
 		t.Fatal("missing retry accepted", err)
 	}
 	if _, err := store.ReserveInitial(ctx, BackendEpoch{}); !errors.Is(err, ErrInvalid) {
@@ -735,7 +735,7 @@ func TestMemoryStoreFailClosedBoundaryMatrix(t *testing.T) {
 	if _, err := store.Cutover(ctx, BindingHead{RunID: "missing-run"}, BackendEpoch{}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid cutover epoch accepted", err)
 	}
-	next, err := SealBackendEpoch(BackendEpoch{RunID: "missing-run", ProjectID: "project-1", Epoch: 2, Mode: BackendPostgres, BackendIdentity: "postgres-one", SchemaVersion: 1, CreatedAt: now, PreviousDigest: fixedDigest("previous")})
+	next, err := SealBackendEpoch(BackendEpoch{OrganizationID: "organization", RunID: "missing-run", ProjectID: "project-1", Epoch: 2, Mode: BackendPostgres, BackendIdentity: "postgres-one", SchemaVersion: 1, CreatedAt: now, PreviousDigest: fixedDigest("previous")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -746,7 +746,7 @@ func TestMemoryStoreFailClosedBoundaryMatrix(t *testing.T) {
 	if _, err = store.Accept(ctx, InboxEnvelope{}, job); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid inbox accepted", err)
 	}
-	envelope := InboxEnvelope{Source: "api", ExternalID: "boundary-request", IdempotencyKey: "boundary-key", ProjectID: job.ProjectID, RequestDigest: fixedDigest("boundary"), CommandKind: "validate"}
+	envelope := InboxEnvelope{OrganizationID: "organization", Source: "api", ExternalID: "boundary-request", IdempotencyKey: "boundary-key", ProjectID: job.ProjectID, RequestDigest: fixedDigest("boundary"), CommandKind: "validate"}
 	if _, err = store.Accept(ctx, envelope, Job{}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid inbox job accepted", err)
 	}
@@ -759,10 +759,10 @@ func TestMemoryStoreFailClosedBoundaryMatrix(t *testing.T) {
 	if _, err = store.Prepare(ctx, EffectIntent{}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid effect accepted", err)
 	}
-	if err = store.Confirm(ctx, "missing", "bad-digest"); !errors.Is(err, ErrInvalid) {
+	if err = store.Confirm(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "missing", "bad-digest"); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid receipt accepted", err)
 	}
-	claimed, err := store.Claim(ctx, ClaimRequest{ProjectID: job.ProjectID, WorkerID: "worker-1", Now: now, Lease: time.Second, Limit: 1})
+	claimed, err := store.Claim(ctx, ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Now: now, Lease: time.Second, Limit: 1})
 	if err != nil || len(claimed) != 1 {
 		t.Fatal("claim", err)
 	}
@@ -770,24 +770,24 @@ func TestMemoryStoreFailClosedBoundaryMatrix(t *testing.T) {
 	corrupt := leased
 	corrupt.Deadline = now
 	corrupt.LeaseUntil = now.Add(time.Second)
-	store.jobs[corrupt.JobID] = corrupt
-	if _, err = store.Heartbeat(ctx, corrupt.JobID, corrupt.Owner, corrupt.Fence, corrupt.CancelRevision, now, time.Second); !errors.Is(err, ErrDeadline) {
+	store.jobs[scopedMemoryKey(jobScope(corrupt), corrupt.JobID)] = corrupt
+	if _, err = store.Heartbeat(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, corrupt.JobID, corrupt.Owner, corrupt.Fence, corrupt.CancelRevision, now, time.Second); !errors.Is(err, ErrDeadline) {
 		t.Fatal("deadline-bounded heartbeat accepted", err)
 	}
-	store.jobs[leased.JobID] = leased
-	if _, err = store.Heartbeat(ctx, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, leased.Deadline, time.Second); !errors.Is(err, ErrConflict) {
+	store.jobs[scopedMemoryKey(jobScope(leased), leased.JobID)] = leased
+	if _, err = store.Heartbeat(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, leased.Deadline, time.Second); !errors.Is(err, ErrConflict) {
 		t.Fatal("expired heartbeat accepted", err)
 	}
-	if _, err = store.Complete(ctx, leased.JobID, "other-worker", leased.Fence, leased.CancelRevision, now, JobSucceeded, ""); !errors.Is(err, ErrConflict) {
+	if _, err = store.Complete(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, leased.JobID, "other-worker", leased.Fence, leased.CancelRevision, now, JobSucceeded, ""); !errors.Is(err, ErrConflict) {
 		t.Fatal("stale completion accepted", err)
 	}
-	if _, err = store.Retry(ctx, leased.JobID, "other-worker", leased.Fence, leased.CancelRevision, now, RetryDecision{Category: "transient", MaxAttempts: 2}, now.Add(time.Second)); !errors.Is(err, ErrConflict) {
+	if _, err = store.Retry(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, leased.JobID, "other-worker", leased.Fence, leased.CancelRevision, now, RetryDecision{Category: "transient", MaxAttempts: 2}, now.Add(time.Second)); !errors.Is(err, ErrConflict) {
 		t.Fatal("stale retry accepted", err)
 	}
-	if _, err = store.Cancel(ctx, leased.JobID, 2); err != nil {
+	if _, err = store.Cancel(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, leased.JobID, 2); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.Cancel(ctx, leased.JobID, 1); !errors.Is(err, ErrConflict) {
+	if _, err = store.Cancel(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, leased.JobID, 1); !errors.Is(err, ErrConflict) {
 		t.Fatal("stale cancellation accepted", err)
 	}
 }
@@ -806,25 +806,25 @@ func TestMemoryStorePropagatesCancellationAcrossContracts(t *testing.T) {
 	if _, err := store.Claim(ctx, ClaimRequest{}); !errors.Is(err, context.Canceled) {
 		t.Fatal("claim cancellation", err)
 	}
-	if _, err := store.Heartbeat(ctx, job.JobID, "worker", 1, 0, now, time.Minute); !errors.Is(err, context.Canceled) {
+	if _, err := store.Heartbeat(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, job.JobID, "worker", 1, 0, now, time.Minute); !errors.Is(err, context.Canceled) {
 		t.Fatal("heartbeat cancellation", err)
 	}
-	if _, err := store.Complete(ctx, job.JobID, "worker", 1, 0, now, JobSucceeded, ""); !errors.Is(err, context.Canceled) {
+	if _, err := store.Complete(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, job.JobID, "worker", 1, 0, now, JobSucceeded, ""); !errors.Is(err, context.Canceled) {
 		t.Fatal("complete cancellation", err)
 	}
-	if _, err := store.Retry(ctx, job.JobID, "worker", 1, 0, now, RetryDecision{}, now); !errors.Is(err, context.Canceled) {
+	if _, err := store.Retry(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, job.JobID, "worker", 1, 0, now, RetryDecision{}, now); !errors.Is(err, context.Canceled) {
 		t.Fatal("retry cancellation", err)
 	}
-	if _, err := store.Cancel(ctx, job.JobID, 1); !errors.Is(err, context.Canceled) {
+	if _, err := store.Cancel(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, job.JobID, 1); !errors.Is(err, context.Canceled) {
 		t.Fatal("cancel cancellation", err)
 	}
-	if _, err := store.Recover(ctx, now, 1); !errors.Is(err, context.Canceled) {
+	if _, err := store.Recover(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, now, 1); !errors.Is(err, context.Canceled) {
 		t.Fatal("recover cancellation", err)
 	}
 	if _, err := store.ReserveInitial(ctx, BackendEpoch{}); !errors.Is(err, context.Canceled) {
 		t.Fatal("reserve cancellation", err)
 	}
-	if _, _, err := store.Load(ctx, "run"); !errors.Is(err, context.Canceled) {
+	if _, _, err := store.Load(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "run"); !errors.Is(err, context.Canceled) {
 		t.Fatal("load cancellation", err)
 	}
 	if _, err := store.Cutover(ctx, BindingHead{}, BackendEpoch{}); !errors.Is(err, context.Canceled) {
@@ -836,13 +836,13 @@ func TestMemoryStorePropagatesCancellationAcrossContracts(t *testing.T) {
 	if _, err := store.Admit(ctx, IngressAdmission{}); !errors.Is(err, context.Canceled) {
 		t.Fatal("admit cancellation", err)
 	}
-	if _, err := store.LoadIngress(ctx, "run"); !errors.Is(err, context.Canceled) {
+	if _, err := store.LoadIngress(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "run"); !errors.Is(err, context.Canceled) {
 		t.Fatal("ingress cancellation", err)
 	}
 	if _, err := store.Prepare(ctx, EffectIntent{}); !errors.Is(err, context.Canceled) {
 		t.Fatal("prepare cancellation", err)
 	}
-	if err := store.Confirm(ctx, "operation", fixedDigest("receipt")); !errors.Is(err, context.Canceled) {
+	if err := store.Confirm(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "operation", fixedDigest("receipt")); !errors.Is(err, context.Canceled) {
 		t.Fatal("confirm cancellation", err)
 	}
 }
@@ -855,12 +855,12 @@ type heartbeatQueue struct {
 }
 
 // Heartbeat records one scheduler renewal and optionally simulates a lost fence.
-func (queue *heartbeatQueue) Heartbeat(ctx context.Context, id, owner string, fence, cancelRevision uint64, now time.Time, lease time.Duration) (Job, error) {
+func (queue *heartbeatQueue) Heartbeat(ctx context.Context, scope ProjectScope, id, owner string, fence, cancelRevision uint64, now time.Time, lease time.Duration) (Job, error) {
 	queue.beats <- struct{}{}
 	if queue.fail {
 		return Job{}, ErrConflict
 	}
-	return queue.MemoryStore.Heartbeat(ctx, id, owner, fence, cancelRevision, now, lease)
+	return queue.MemoryStore.Heartbeat(ctx, scope, id, owner, fence, cancelRevision, now, lease)
 }
 
 // channelHandler blocks product work on test-owned channels so heartbeat interleavings need no sleeps.
@@ -876,11 +876,11 @@ type schedulerFaultQueue struct {
 }
 
 // Recover injects the scheduler's pre-claim recovery failure boundary.
-func (queue schedulerFaultQueue) Recover(ctx context.Context, now time.Time, limit int) (int, error) {
+func (queue schedulerFaultQueue) Recover(ctx context.Context, scope ProjectScope, now time.Time, limit int) (int, error) {
 	if queue.failOperation == "recover" {
 		return 0, ErrUnavailable
 	}
-	return queue.MemoryStore.Recover(ctx, now, limit)
+	return queue.MemoryStore.Recover(ctx, scope, now, limit)
 }
 
 // Claim injects the scheduler's bounded claim failure boundary.
@@ -892,19 +892,19 @@ func (queue schedulerFaultQueue) Claim(ctx context.Context, request ClaimRequest
 }
 
 // Complete injects the scheduler's success persistence failure boundary.
-func (queue schedulerFaultQueue) Complete(ctx context.Context, id, owner string, fence, cancelRevision uint64, now time.Time, state JobState, category string) (Job, error) {
+func (queue schedulerFaultQueue) Complete(ctx context.Context, scope ProjectScope, id, owner string, fence, cancelRevision uint64, now time.Time, state JobState, category string) (Job, error) {
 	if queue.failOperation == "complete" {
 		return Job{}, ErrUnavailable
 	}
-	return queue.MemoryStore.Complete(ctx, id, owner, fence, cancelRevision, now, state, category)
+	return queue.MemoryStore.Complete(ctx, scope, id, owner, fence, cancelRevision, now, state, category)
 }
 
 // Retry injects the scheduler's classified outcome persistence failure boundary.
-func (queue schedulerFaultQueue) Retry(ctx context.Context, id, owner string, fence, cancelRevision uint64, now time.Time, decision RetryDecision, available time.Time) (Job, error) {
+func (queue schedulerFaultQueue) Retry(ctx context.Context, scope ProjectScope, id, owner string, fence, cancelRevision uint64, now time.Time, decision RetryDecision, available time.Time) (Job, error) {
 	if queue.failOperation == "retry" {
 		return Job{}, ErrUnavailable
 	}
-	return queue.MemoryStore.Retry(ctx, id, owner, fence, cancelRevision, now, decision, available)
+	return queue.MemoryStore.Retry(ctx, scope, id, owner, fence, cancelRevision, now, decision, available)
 }
 
 // Handle announces ownership then exits on explicit release or caller cancellation.
@@ -929,7 +929,7 @@ func TestSchedulerHeartbeatSuccessAndFenceLoss(t *testing.T) {
 				t.Fatal(err)
 			}
 			handler := channelHandler{entered: make(chan struct{}, 1), release: make(chan struct{})}
-			scheduler, err := NewScheduler(queue, SystemClock{}, noopWaiter{}, handler, fixedClassifier{decision: RetryDecision{Category: "heartbeat", Backoff: time.Millisecond, MaxAttempts: 3}}, SchedulerConfig{ProjectID: job.ProjectID, WorkerID: "heartbeat-worker", Lease: 200 * time.Millisecond, HeartbeatInterval: 10 * time.Millisecond, BatchSize: 1})
+			scheduler, err := NewScheduler(queue, SystemClock{}, noopWaiter{}, handler, fixedClassifier{decision: RetryDecision{Category: "heartbeat", Backoff: time.Millisecond, MaxAttempts: 3}}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "heartbeat-worker", Lease: 200 * time.Millisecond, HeartbeatInterval: 10 * time.Millisecond, BatchSize: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -972,7 +972,7 @@ func TestSchedulerPropagatesEveryDurableBoundaryFailure(t *testing.T) {
 			if operation == "retry" {
 				handler = failingHandler{err: errors.New("classified")}
 			}
-			scheduler, err := NewScheduler(schedulerFaultQueue{MemoryStore: memory, failOperation: operation}, fixedClock{now}, noopWaiter{}, handler, fixedClassifier{decision: RetryDecision{Category: "transient", Backoff: time.Second, MaxAttempts: 2}}, SchedulerConfig{ProjectID: "project-1", WorkerID: "fault-worker", Lease: time.Minute, BatchSize: 1})
+			scheduler, err := NewScheduler(schedulerFaultQueue{MemoryStore: memory, failOperation: operation}, fixedClock{now}, noopWaiter{}, handler, fixedClassifier{decision: RetryDecision{Category: "transient", Backoff: time.Second, MaxAttempts: 2}}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "fault-worker", Lease: time.Minute, BatchSize: 1})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -981,7 +981,7 @@ func TestSchedulerPropagatesEveryDurableBoundaryFailure(t *testing.T) {
 			}
 		})
 	}
-	if _, err := NewScheduler(NewMemoryStore(), fixedClock{now}, noopWaiter{}, successHandler{}, fixedClassifier{}, SchedulerConfig{ProjectID: "project-1", WorkerID: "worker-1", Lease: time.Minute, HeartbeatInterval: time.Minute, BatchSize: 1}); !errors.Is(err, ErrInvalid) {
+	if _, err := NewScheduler(NewMemoryStore(), fixedClock{now}, noopWaiter{}, successHandler{}, fixedClassifier{}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Lease: time.Minute, HeartbeatInterval: time.Minute, BatchSize: 1}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid heartbeat interval accepted", err)
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
@@ -999,7 +999,7 @@ func TestSchedulerCancellationAndLoopProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := channelHandler{entered: make(chan struct{}, 1), release: make(chan struct{})}
-	scheduler, err := NewScheduler(memory, fixedClock{now}, noopWaiter{}, handler, fixedClassifier{}, SchedulerConfig{ProjectID: "project-1", WorkerID: "cancel-worker", Lease: time.Minute, HeartbeatInterval: 30 * time.Second, BatchSize: 1})
+	scheduler, err := NewScheduler(memory, fixedClock{now}, noopWaiter{}, handler, fixedClassifier{}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "cancel-worker", Lease: time.Minute, HeartbeatInterval: 30 * time.Second, BatchSize: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1018,14 +1018,14 @@ func TestSchedulerCancellationAndLoopProgress(t *testing.T) {
 	if _, err = progressStore.Enqueue(context.Background(), fixtureJob(now)); err != nil {
 		t.Fatal(err)
 	}
-	progressScheduler, err := NewScheduler(progressStore, fixedClock{now}, noopWaiter{}, successHandler{}, fixedClassifier{}, SchedulerConfig{ProjectID: "project-1", WorkerID: "progress-worker", Lease: time.Minute, BatchSize: 1})
+	progressScheduler, err := NewScheduler(progressStore, fixedClock{now}, noopWaiter{}, successHandler{}, fixedClassifier{}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "progress-worker", Lease: time.Minute, BatchSize: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = progressScheduler.Run(context.Background()); !errors.Is(err, context.Canceled) {
 		t.Fatal("nonempty loop did not continue to waiter", err)
 	}
-	faultScheduler, err := NewScheduler(schedulerFaultQueue{MemoryStore: NewMemoryStore(), failOperation: "recover"}, fixedClock{now}, noopWaiter{}, successHandler{}, fixedClassifier{}, SchedulerConfig{ProjectID: "project-1", WorkerID: "runtime-fault-worker", Lease: time.Minute, BatchSize: 1})
+	faultScheduler, err := NewScheduler(schedulerFaultQueue{MemoryStore: NewMemoryStore(), failOperation: "recover"}, fixedClock{now}, noopWaiter{}, successHandler{}, fixedClassifier{}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "runtime-fault-worker", Lease: time.Minute, BatchSize: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1045,7 +1045,7 @@ func TestSchedulerCancellationAndLoopProgress(t *testing.T) {
 func TestSchedulerLoopReturnsCallerCancellation(t *testing.T) {
 	store := NewMemoryStore()
 	now := time.Now().UTC()
-	scheduler, _ := NewScheduler(store, fixedClock{now}, noopWaiter{}, successHandler{}, fixedClassifier{}, SchedulerConfig{ProjectID: "project-1", WorkerID: "worker-1", Lease: time.Minute, BatchSize: 1})
+	scheduler, _ := NewScheduler(store, fixedClock{now}, noopWaiter{}, successHandler{}, fixedClassifier{}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Lease: time.Minute, BatchSize: 1})
 	if err := scheduler.Run(context.Background()); !errors.Is(err, context.Canceled) {
 		t.Fatal("caller cancellation not returned")
 	}
@@ -1057,7 +1057,7 @@ func TestSchedulerLoopReturnsCallerCancellation(t *testing.T) {
 // TestWorkerRuntimeIsExplicitlyStartedStoppedAndJoined proves composition owns every scheduler goroutine.
 func TestWorkerRuntimeIsExplicitlyStartedStoppedAndJoined(t *testing.T) {
 	entered := make(chan struct{}, 1)
-	scheduler, err := NewScheduler(NewMemoryStore(), fixedClock{time.Now().UTC()}, blockingRuntimeWaiter{entered: entered}, successHandler{}, fixedClassifier{}, SchedulerConfig{ProjectID: "project-1", WorkerID: "worker-1", Lease: time.Minute, BatchSize: 1, IdleWait: time.Minute})
+	scheduler, err := NewScheduler(NewMemoryStore(), fixedClock{time.Now().UTC()}, blockingRuntimeWaiter{entered: entered}, successHandler{}, fixedClassifier{}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Lease: time.Minute, BatchSize: 1, IdleWait: time.Minute})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1085,7 +1085,7 @@ func TestWorkerRuntimeIsExplicitlyStartedStoppedAndJoined(t *testing.T) {
 func TestWorkerRuntimeJoinContextBoundsNonCooperativeHandler(t *testing.T) {
 	queue := NewMemoryStore()
 	clock := fixedClock{now: time.Unix(100, 0).UTC()}
-	job, err := SealJob(Job{JobID: "blocked-job", ProjectID: "project", RunID: "run", BackendEpoch: 1, BindingDigest: fixedDigest("binding"), Phase: PhaseExecute, State: JobQueued, InputDigest: fixedDigest("input"), CreatedAt: clock.Now(), AvailableAt: clock.Now(), Deadline: clock.Now().Add(time.Hour)})
+	job, err := SealJob(Job{OrganizationID: "organization", JobID: "blocked-job", ProjectID: "project", RunID: "run", BackendEpoch: 1, BindingDigest: fixedDigest("binding"), Phase: PhaseExecute, State: JobQueued, InputDigest: fixedDigest("input"), CreatedAt: clock.Now(), AvailableAt: clock.Now(), Deadline: clock.Now().Add(time.Hour)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1095,7 +1095,7 @@ func TestWorkerRuntimeJoinContextBoundsNonCooperativeHandler(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	handler := nonCooperativeHandler{entered: entered, release: release}
-	scheduler, err := NewScheduler(queue, clock, noopWaiter{}, handler, fixedClassifier{}, SchedulerConfig{ProjectID: "project", WorkerID: "worker", Lease: time.Minute, HeartbeatInterval: 20 * time.Second, BatchSize: 1, IdleWait: time.Second})
+	scheduler, err := NewScheduler(queue, clock, noopWaiter{}, handler, fixedClassifier{}, SchedulerConfig{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project"}, WorkerID: "worker", Lease: time.Minute, HeartbeatInterval: 20 * time.Second, BatchSize: 1, IdleWait: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1144,10 +1144,10 @@ func TestValidationMatrices(t *testing.T) {
 	if err := VerifyAuthorityGrant(AuthorityGrant{}); !errors.Is(err, ErrIntegrity) {
 		t.Fatal("invalid authority grant verified")
 	}
-	if _, err := SealAuthorityGrant(AuthorityGrant{ProjectID: "project-1", RunID: "run-1", Phase: PhaseExecute, InputReferences: []string{"unsafe value"}, TargetBindingRef: "target", TargetBindingDigest: fixedDigest("target")}); !errors.Is(err, ErrInvalid) {
+	if _, err := SealAuthorityGrant(AuthorityGrant{OrganizationID: "organization", ProjectID: "project-1", RunID: "run-1", Phase: PhaseExecute, InputReferences: []string{"unsafe value"}, TargetBindingRef: "target", TargetBindingDigest: fixedDigest("target")}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("unsafe authority reference accepted")
 	}
-	if _, err := SealImportManifest(ImportManifest{}); !errors.Is(err, ErrInvalid) {
+	if _, err := SealImportManifest(ImportManifest{OrganizationID: "organization"}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid import manifest")
 	}
 	if _, err := SealImportDocument(ImportDocument{}); !errors.Is(err, ErrInvalid) {
@@ -1172,7 +1172,7 @@ func TestValidationMatrices(t *testing.T) {
 	if _, err := codec.Seal(PageCursor{}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid cursor payload accepted")
 	}
-	if _, err := codec.Open("not-base64", "project-1", "jobs", now); !errors.Is(err, ErrInvalid) {
+	if _, err := codec.Open("not-base64", "organization-1", "project-1", "jobs", now); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid token")
 	}
 	if _, err := RunRetention(context.Background(), nil, &RetentionPolicy{BeforeUnix: 1, BatchSize: 1}); !errors.Is(err, ErrInvalid) {
@@ -1184,7 +1184,7 @@ func TestValidationMatrices(t *testing.T) {
 	store := NewMemoryStore()
 	job := fixtureJob(now)
 	store.Enqueue(context.Background(), job)
-	claimed, _ := store.Claim(context.Background(), ClaimRequest{ProjectID: job.ProjectID, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
+	claimed, _ := store.Claim(context.Background(), ClaimRequest{Scope: ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1})
 	leased := claimed[0]
 	leased.Phase = PhaseEvaluate
 	leased.Digest = ""
@@ -1217,26 +1217,26 @@ func TestCancelledMemoryOperations(t *testing.T) {
 	if _, err := store.Claim(ctx, ClaimRequest{}); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if _, err := store.Heartbeat(ctx, "x", "x", 1, 0, now, time.Minute); !errors.Is(err, context.Canceled) {
+	if _, err := store.Heartbeat(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "x", "x", 1, 0, now, time.Minute); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if _, err := store.Complete(ctx, "x", "x", 1, 0, now, JobSucceeded, ""); !errors.Is(err, context.Canceled) {
+	if _, err := store.Complete(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "x", "x", 1, 0, now, JobSucceeded, ""); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if _, err := store.Retry(ctx, "x", "x", 1, 0, now, RetryDecision{}, now); !errors.Is(err, context.Canceled) {
+	if _, err := store.Retry(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "x", "x", 1, 0, now, RetryDecision{}, now); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if _, err := store.Cancel(ctx, "x", 1); !errors.Is(err, context.Canceled) {
+	if _, err := store.Cancel(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "x", 1); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if _, err := store.Recover(ctx, now, 1); !errors.Is(err, context.Canceled) {
+	if _, err := store.Recover(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, now, 1); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	epoch := BackendEpoch{}
 	if _, err := store.ReserveInitial(ctx, epoch); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if _, _, err := store.Load(ctx, "x"); !errors.Is(err, context.Canceled) {
+	if _, _, err := store.Load(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "x"); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	if _, err := store.Cutover(ctx, BindingHead{}, epoch); !errors.Is(err, context.Canceled) {
@@ -1248,7 +1248,7 @@ func TestCancelledMemoryOperations(t *testing.T) {
 	if _, err := store.Prepare(ctx, EffectIntent{}); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if err := store.Confirm(ctx, "x", fixedDigest("x")); !errors.Is(err, context.Canceled) {
+	if err := store.Confirm(ctx, ProjectScope{OrganizationID: "organization", ProjectID: "project-1"}, "x", fixedDigest("x")); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 }

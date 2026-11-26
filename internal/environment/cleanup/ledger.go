@@ -611,7 +611,7 @@ func (l *CapacityLedger) ReleaseConfirmed(ctx context.Context, project, acquisit
 }
 
 // Snapshot returns one project's detached current aggregate.
-func (l *CapacityLedger) Snapshot(project string) (CapacitySnapshot, error) {
+func (l *CapacityLedger) Snapshot(_ context.Context, project string) (CapacitySnapshot, error) {
 	if err := l.refresh(context.Background()); err != nil {
 		return CapacitySnapshot{}, err
 	}

@@ -89,7 +89,7 @@ func (service *Service) Binding(ctx context.Context, authority ConfigurationAuth
 
 // encodeCursor binds pagination state to one project without exposing raw identifiers.
 func (service *Service) encodeCursor(key ProjectKey, sequence uint64) string {
-	payload := key.ProjectID + ":" + key.RepositoryID + ":" + strconv.FormatUint(sequence, 10) + ":" + strconv.FormatInt(service.now().UTC().Add(service.cursorTTL).Unix(), 10)
+	payload := key.OrganizationID + ":" + key.ProjectID + ":" + key.RepositoryID + ":" + strconv.FormatUint(sequence, 10) + ":" + strconv.FormatInt(service.now().UTC().Add(service.cursorTTL).Unix(), 10)
 	return base64.RawURLEncoding.EncodeToString([]byte(payload + ":" + service.cursorSignature(payload)))
 }
 
@@ -99,18 +99,18 @@ func (service *Service) decodeCursor(key ProjectKey, cursor string) (uint64, err
 		return 0, nil
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(cursor)
-	if err != nil {
+	if err != nil || base64.RawURLEncoding.EncodeToString(raw) != cursor {
 		return 0, invalid("history", "cursor")
 	}
 	parts := strings.Split(string(raw), ":")
-	if len(parts) != 5 || parts[0] != key.ProjectID || parts[1] != key.RepositoryID || !hmac.Equal([]byte(service.cursorSignature(strings.Join(parts[:4], ":"))), []byte(parts[4])) {
+	if len(parts) != 6 || parts[0] != key.OrganizationID || parts[1] != key.ProjectID || parts[2] != key.RepositoryID || !hmac.Equal([]byte(service.cursorSignature(strings.Join(parts[:5], ":"))), []byte(parts[5])) {
 		return 0, invalid("history", "cursor")
 	}
-	value, err := strconv.ParseUint(parts[2], 10, 64)
+	value, err := strconv.ParseUint(parts[3], 10, 64)
 	if err != nil {
 		return 0, invalid("history", "cursor")
 	}
-	expires, err := strconv.ParseInt(parts[3], 10, 64)
+	expires, err := strconv.ParseInt(parts[4], 10, 64)
 	if err != nil || !service.now().UTC().Before(time.Unix(expires, 0)) {
 		return 0, invalid("history", "cursor")
 	}
@@ -215,7 +215,7 @@ func (service *Service) Validate(ctx context.Context, authority ConfigurationAut
 		service.observeResult(ctx, "validate", authority, key, err)
 		return EffectiveConfiguration{}, classifyContext(ctx, err, "validate")
 	}
-	if canonical.Document.ProjectID != key.ProjectID || canonical.Document.RepositoryID != key.RepositoryID {
+	if canonical.Document.OrganizationID != key.OrganizationID || canonical.Document.ProjectID != key.ProjectID || canonical.Document.RepositoryID != key.RepositoryID {
 		err = &Error{Category: CategoryUnauthorized, Operation: "validate.scope"}
 		service.observeResult(ctx, "validate", authority, key, err)
 		return EffectiveConfiguration{}, err
@@ -241,7 +241,7 @@ func (service *Service) PublishAndActivate(ctx context.Context, authority Config
 		service.observeResult(ctx, "publish", authority, key, err)
 		return PublishReceipt{}, classifyContext(ctx, err, "publish")
 	}
-	if canonical.Document.ProjectID != key.ProjectID || canonical.Document.RepositoryID != key.RepositoryID {
+	if canonical.Document.OrganizationID != key.OrganizationID || canonical.Document.ProjectID != key.ProjectID || canonical.Document.RepositoryID != key.RepositoryID {
 		err = &Error{Category: CategoryUnauthorized, Operation: "publish.scope"}
 		service.observeResult(ctx, "publish", authority, key, err)
 		return PublishReceipt{}, err

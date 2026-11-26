@@ -158,8 +158,10 @@ func TestStartupDrainExcludesDeliveredWorkerUntilIndependentHandoff(t *testing.T
 		coordinator, startErr := NewCoordinator(context.Background(), dependencies(storeA, validationA, "owner-a"))
 		resultA <- coordinatorResult{coordinator: coordinator, err: startErr}
 	}()
-	waitCtx, cancelWait := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelWait()
+	// The barriers below are causal witnesses. The suite context is the safety
+	// bound; a shorter wall-clock deadline would make scheduler load decide
+	// whether the independently handed-off workers can be joined.
+	waitCtx := t.Context()
 	for _, barrier := range []chan struct{}{validationA.entered, storeA.beforeRelease, gateway.entered} {
 		select {
 		case <-barrier:

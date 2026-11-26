@@ -5,6 +5,31 @@ import (
 	"sync"
 )
 
+// authenticatedPrincipalContextKey is private so request payload packages
+// cannot forge a transport-authenticated principal context slot.
+type authenticatedPrincipalContextKey struct{}
+
+// WithAuthenticatedPrincipal seals a transport-authenticated principal into
+// the request context; application payload fields cannot construct this key.
+func WithAuthenticatedPrincipal(ctx context.Context, principal Principal) context.Context {
+	return context.WithValue(ctx, authenticatedPrincipalContextKey{}, clonePrincipal(principal))
+}
+
+// RequestIdentity resolves the principal authenticated at the current trusted
+// transport boundary, with an optional host fallback for non-remote surfaces.
+type RequestIdentity struct{ Fallback IdentitySource }
+
+// Resolve returns only a sealed request principal when present.
+func (identity RequestIdentity) Resolve(ctx context.Context) (Principal, error) {
+	if principal, ok := ctx.Value(authenticatedPrincipalContextKey{}).(Principal); ok && principal.ID != "" && principal.Scopes != nil {
+		return clonePrincipal(principal), nil
+	}
+	if identity.Fallback != nil {
+		return identity.Fallback.Resolve(ctx)
+	}
+	return Principal{}, &AppError{Code: CodeUnauthorized}
+}
+
 // LocalIdentity keeps a host-resolved principal and supports atomic scope revocation.
 type LocalIdentity struct {
 	mu        sync.RWMutex

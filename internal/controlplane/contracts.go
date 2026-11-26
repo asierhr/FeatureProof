@@ -8,6 +8,7 @@ import (
 // BackendCoordinate is the immutable authority observed before consumer work;
 // PostgreSQL mutations present it again so a cutover cannot adopt stale work.
 type BackendCoordinate struct {
+	OrganizationID, ProjectID             string
 	RunID, BackendIdentity, BindingDigest string
 	Epoch                                 uint64
 	Owner                                 string
@@ -34,28 +35,28 @@ func BackendCoordinateFromContext(ctx context.Context) (BackendCoordinate, bool)
 
 // ClaimRequest bounds one durable queue scan owned by a worker.
 type ClaimRequest struct {
-	ProjectID string
-	WorkerID  string
-	Now       time.Time
-	Lease     time.Duration
-	Limit     int
+	Scope    ProjectScope
+	WorkerID string
+	Now      time.Time
+	Lease    time.Duration
+	Limit    int
 }
 
 // JobQueue is the scheduler-owned persistence contract for fenced work.
 type JobQueue interface {
 	Enqueue(context.Context, Job) (Job, error)
 	Claim(context.Context, ClaimRequest) ([]Job, error)
-	Heartbeat(context.Context, string, string, uint64, uint64, time.Time, time.Duration) (Job, error)
-	Complete(context.Context, string, string, uint64, uint64, time.Time, JobState, string) (Job, error)
-	Retry(context.Context, string, string, uint64, uint64, time.Time, RetryDecision, time.Time) (Job, error)
-	Cancel(context.Context, string, uint64) (Job, error)
-	Recover(context.Context, time.Time, int) (int, error)
+	Heartbeat(context.Context, ProjectScope, string, string, uint64, uint64, time.Time, time.Duration) (Job, error)
+	Complete(context.Context, ProjectScope, string, string, uint64, uint64, time.Time, JobState, string) (Job, error)
+	Retry(context.Context, ProjectScope, string, string, uint64, uint64, time.Time, RetryDecision, time.Time) (Job, error)
+	Cancel(context.Context, ProjectScope, string, uint64) (Job, error)
+	Recover(context.Context, ProjectScope, time.Time, int) (int, error)
 }
 
 // BackendBindings owns immutable backend epochs and the single active head.
 type BackendBindings interface {
 	ReserveInitial(context.Context, BackendEpoch) (BindingHead, error)
-	Load(context.Context, string) (BindingHead, BackendEpoch, error)
+	Load(context.Context, ProjectScope, string) (BindingHead, BackendEpoch, error)
 	Cutover(context.Context, BindingHead, BackendEpoch) (BindingHead, error)
 }
 
@@ -66,7 +67,7 @@ type IngressStore interface {
 
 // IngressReader reloads the allowlisted command needed by a restarted worker without retaining raw webhook bytes.
 type IngressReader interface {
-	LoadIngress(context.Context, string) (IngressAdmission, error)
+	LoadIngress(context.Context, ProjectScope, string) (IngressAdmission, error)
 }
 
 // IngressAdmission binds one authenticated inbox identity to its initial backend epoch, run event, job, authority grant, and first external-effect intent.
@@ -81,13 +82,13 @@ type IngressAdmission struct {
 // EffectStore persists and fences side-effect intent before external I/O.
 type EffectStore interface {
 	Prepare(context.Context, EffectIntent) (EffectIntent, error)
-	Confirm(context.Context, string, string) error
+	Confirm(context.Context, ProjectScope, string, string) error
 }
 
 // EffectClaim is the durable owner/fence lease that alone authorizes one external effect attempt.
 type EffectClaim struct {
 	OperationID string
-	ProjectID   string
+	Scope       ProjectScope
 	Owner       string
 	LeaseUntil  time.Time
 	Fence       uint64
@@ -96,13 +97,13 @@ type EffectClaim struct {
 
 // EffectOutbox is the productive dispatcher protocol; callers cannot execute an effect without a live claim.
 type EffectOutbox interface {
-	ClaimEffect(context.Context, string, string, time.Time, time.Duration) (EffectClaim, error)
-	ClaimOutbox(context.Context, string, time.Time, time.Duration, int) ([]EffectClaim, error)
+	ClaimEffect(context.Context, ProjectScope, string, string, time.Time, time.Duration) (EffectClaim, error)
+	ClaimOutbox(context.Context, ProjectScope, string, time.Time, time.Duration, int) ([]EffectClaim, error)
 	LoadEffect(context.Context, EffectClaim) (EffectIntent, error)
 	HeartbeatOutbox(context.Context, EffectClaim, time.Time) error
 	RetryOutbox(context.Context, EffectClaim, time.Time, string) error
 	ConfirmOutbox(context.Context, EffectClaim, string) error
-	RecoverOutbox(context.Context, time.Time, int) (int, error)
+	RecoverOutbox(context.Context, ProjectScope, time.Time, int) (int, error)
 }
 
 // EffectJobCompleter atomically confirms an external effect and the exact
@@ -139,7 +140,7 @@ type SecretResolver interface {
 
 // AuthorityGrantStore loads composition-owned catalog, policy and binding grants without caller-supplied capabilities.
 type AuthorityGrantStore interface {
-	LoadAuthorityGrant(context.Context, string, Phase) (AuthorityGrant, error)
+	LoadAuthorityGrant(context.Context, ProjectScope, string, Phase) (AuthorityGrant, error)
 }
 
 // AuthorityEnvelopeStore persists and revalidates the exact worker envelope before product work or private secret resolution.
@@ -162,7 +163,7 @@ type LiveAuthorityVerifier interface {
 
 // SchedulerConfig bounds claims, leases, retries and idle waits.
 type SchedulerConfig struct {
-	ProjectID         string
+	Scope             ProjectScope
 	WorkerID          string
 	Lease             time.Duration
 	HeartbeatInterval time.Duration

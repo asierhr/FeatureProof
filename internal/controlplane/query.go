@@ -12,6 +12,7 @@ import (
 // PageCursor carries an authenticated, expiring keyset position for one stable project/filter snapshot.
 type PageCursor struct {
 	Version           string `json:"version"`
+	OrganizationID    string `json:"organization_id"`
 	ProjectID         string `json:"project_id"`
 	Filter            string `json:"filter"`
 	SnapshotUnixNano  int64  `json:"snapshot_unix_nano"`
@@ -22,12 +23,13 @@ type PageCursor struct {
 
 // JobQuery bounds one stable PostgreSQL keyset listing without offset semantics.
 type JobQuery struct {
-	ProjectID string
-	State     JobState
-	Cursor    string
-	Limit     int
-	Now       time.Time
-	CursorTTL time.Duration
+	OrganizationID string
+	ProjectID      string
+	State          JobState
+	Cursor         string
+	Limit          int
+	Now            time.Time
+	CursorTTL      time.Duration
 }
 
 // JobPage returns detached jobs plus an authenticated continuation when another page may exist.
@@ -57,7 +59,7 @@ func (codec *CursorCodec) Seal(cursor PageCursor) (string, error) {
 	if cursor.Version == "" {
 		cursor.Version = ModelVersion
 	}
-	if cursor.Version != ModelVersion || !safeID.MatchString(cursor.ProjectID) || !safeID.MatchString(cursor.Filter) || !safeID.MatchString(cursor.LastKey) || cursor.SnapshotUnixNano <= 0 || cursor.LastUnixNano <= 0 || cursor.LastUnixNano > cursor.SnapshotUnixNano || cursor.ExpiresAtUnixNano <= cursor.SnapshotUnixNano {
+	if cursor.Version != ModelVersion || !safeID.MatchString(cursor.OrganizationID) || !safeID.MatchString(cursor.ProjectID) || !safeID.MatchString(cursor.Filter) || !safeID.MatchString(cursor.LastKey) || cursor.SnapshotUnixNano <= 0 || cursor.LastUnixNano <= 0 || cursor.LastUnixNano > cursor.SnapshotUnixNano || cursor.ExpiresAtUnixNano <= cursor.SnapshotUnixNano {
 		return "", ErrInvalid
 	}
 	payload, err := json.Marshal(cursor)
@@ -71,8 +73,8 @@ func (codec *CursorCodec) Seal(cursor PageCursor) (string, error) {
 }
 
 // Open verifies authentication, scope, filter, version and expiry before database access.
-func (codec *CursorCodec) Open(token, projectID, filter string, now time.Time) (PageCursor, error) {
-	if codec == nil || len(codec.key) < 32 || !safeID.MatchString(projectID) || !safeID.MatchString(filter) || now.IsZero() {
+func (codec *CursorCodec) Open(token, organizationID, projectID, filter string, now time.Time) (PageCursor, error) {
+	if codec == nil || len(codec.key) < 32 || !safeID.MatchString(organizationID) || !safeID.MatchString(projectID) || !safeID.MatchString(filter) || now.IsZero() {
 		return PageCursor{}, ErrInvalid
 	}
 	encoded, err := base64.RawURLEncoding.DecodeString(token)
@@ -86,7 +88,7 @@ func (codec *CursorCodec) Open(token, projectID, filter string, now time.Time) (
 		return PageCursor{}, ErrIntegrity
 	}
 	var cursor PageCursor
-	if StrictDecode(payload, &cursor) != nil || cursor.Version != ModelVersion || cursor.ProjectID != projectID || cursor.Filter != filter {
+	if StrictDecode(payload, &cursor) != nil || cursor.Version != ModelVersion || cursor.OrganizationID != organizationID || cursor.ProjectID != projectID || cursor.Filter != filter {
 		return PageCursor{}, ErrUnauthorized
 	}
 	if cursor.ExpiresAtUnixNano <= now.UTC().UnixNano() {
@@ -140,7 +142,7 @@ type QueryController struct {
 // ProjectRetentionStore deletes only one authenticated project page and never
 // broadens an operator request to unrelated projects.
 type ProjectRetentionStore interface {
-	DeleteProjectTerminalBefore(context.Context, string, int64, int) (int, error)
+	DeleteProjectTerminalBefore(context.Context, ProjectScope, int64, int) (int, error)
 }
 
 // ListJobs executes one cancellable authenticated keyset page.
@@ -148,7 +150,7 @@ func (controller QueryController) ListJobs(ctx context.Context, query JobQuery) 
 	if controller.Store == nil || controller.Authorizer == nil || controller.Cursors == nil {
 		return JobPage{}, ErrInvalid
 	}
-	if err := controller.Authorizer.Authorize(ctx, "query_jobs", query.ProjectID); err != nil {
+	if err := controller.Authorizer.Authorize(ctx, "query_jobs", ProjectScope{OrganizationID: query.OrganizationID, ProjectID: query.ProjectID}); err != nil {
 		return JobPage{}, ErrUnauthorized
 	}
 	return controller.Store.ListJobs(ctx, query, controller.Cursors)
@@ -163,11 +165,11 @@ type RetentionController struct {
 
 // Run performs one cancellable retention batch and preserves the no-policy
 // no-delete invariant after authentication.
-func (controller RetentionController) Run(ctx context.Context, projectID string, policy *RetentionPolicy) (int, error) {
+func (controller RetentionController) Run(ctx context.Context, scope ProjectScope, policy *RetentionPolicy) (int, error) {
 	if controller.Store == nil || controller.Authorizer == nil {
 		return 0, ErrInvalid
 	}
-	if err := controller.Authorizer.Authorize(ctx, "retention", projectID); err != nil {
+	if scope.Validate() != nil || controller.Authorizer.Authorize(ctx, "retention", scope) != nil {
 		return 0, ErrUnauthorized
 	}
 	if policy == nil {
@@ -176,5 +178,5 @@ func (controller RetentionController) Run(ctx context.Context, projectID string,
 	if err := policy.Validate(); err != nil {
 		return 0, err
 	}
-	return controller.Store.DeleteProjectTerminalBefore(ctx, projectID, policy.BeforeUnix, policy.BatchSize)
+	return controller.Store.DeleteProjectTerminalBefore(ctx, scope, policy.BeforeUnix, policy.BatchSize)
 }

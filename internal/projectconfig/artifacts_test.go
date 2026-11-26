@@ -12,7 +12,7 @@ import (
 // TestLocalResourceArtifactStoreSurvivesRestartAndRejectsMutableBacking proves historical bytes do not depend on current paths or process memory.
 func TestLocalResourceArtifactStoreSurvivesRestartAndRejectsMutableBacking(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "artifacts")
-	key, _ := NewProjectKey("project", "repository")
+	key, _ := NewProjectKey("organization", "project", "repository")
 	oldDescriptor := ResourceDescriptor{Kind: ResourceContract, ID: "contract", Version: 1, Digest: strings.Repeat("a", 64), ProjectKey: key}
 	newDescriptor := oldDescriptor
 	newDescriptor.Version = 2
@@ -51,7 +51,7 @@ func TestLocalResourceArtifactStoreSurvivesRestartAndRejectsMutableBacking(t *te
 
 // TestLocalResourceArtifactStoreFailClosedBranches covers bounded input, redelivery, absence, cancellation and integrity failures.
 func TestLocalResourceArtifactStoreFailClosedBranches(t *testing.T) {
-	key, _ := NewProjectKey("project", "repository")
+	key, _ := NewProjectKey("organization", "project", "repository")
 	descriptor := ResourceDescriptor{Kind: ResourceContract, ID: "contract", Version: 1, Digest: strings.Repeat("a", 64), ProjectKey: key}
 	if _, err := NewLocalResourceArtifactStore("relative"); !IsCategory(err, CategoryInvalid) {
 		t.Fatalf("relative root = %v", err)
@@ -148,10 +148,10 @@ func TestLocalResourceArtifactStoreFailClosedBranches(t *testing.T) {
 		if createErr != nil {
 			t.Fatal(createErr)
 		}
-		if createErr = os.MkdirAll(filepath.Join(root, descriptor.ProjectKey.ProjectID, descriptor.ProjectKey.RepositoryID), 0o700); createErr != nil {
+		if createErr = os.MkdirAll(filepath.Join(root, descriptor.ProjectKey.OrganizationID, descriptor.ProjectKey.ProjectID, descriptor.ProjectKey.RepositoryID), 0o700); createErr != nil {
 			t.Fatal(createErr)
 		}
-		if createErr = os.WriteFile(filepath.Join(root, descriptor.ProjectKey.ProjectID, descriptor.ProjectKey.RepositoryID, string(descriptor.Kind)), []byte("blocked"), 0o600); createErr != nil {
+		if createErr = os.WriteFile(filepath.Join(root, descriptor.ProjectKey.OrganizationID, descriptor.ProjectKey.ProjectID, descriptor.ProjectKey.RepositoryID, string(descriptor.Kind)), []byte("blocked"), 0o600); createErr != nil {
 			t.Fatal(createErr)
 		}
 		if putErr := candidate.Put(context.Background(), descriptor, []byte("payload")); !IsCategory(putErr, CategoryUnavailable) {
@@ -184,7 +184,7 @@ func TestLocalResourceArtifactStoreRejectsLegacyUnscopedEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, _ := NewProjectKey("project", "repository")
+	key, _ := NewProjectKey("organization", "project", "repository")
 	descriptor := ResourceDescriptor{Kind: ResourceContract, ID: "contract", Version: 1, Digest: strings.Repeat("a", 64), ProjectKey: key}
 	artifact, err := SealResourceArtifact(descriptor, []byte("legacy"))
 	if err != nil {

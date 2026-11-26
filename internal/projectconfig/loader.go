@@ -43,7 +43,7 @@ func Canonicalize(document Document) (CanonicalDocument, error) {
 	if document.Schema != SchemaV1 {
 		return CanonicalDocument{}, &Error{Category: CategoryUnsupported, Operation: "canonicalize", Location: "schema"}
 	}
-	key, err := NewProjectKey(document.ProjectID, document.RepositoryID)
+	key, err := NewProjectKey(document.OrganizationID, document.ProjectID, document.RepositoryID)
 	if err != nil {
 		return CanonicalDocument{}, err
 	}

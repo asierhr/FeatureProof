@@ -31,13 +31,17 @@ func (store *Store) CommitPackage(ctx context.Context, value validationworkflow.
 	if value.CreatedAt.IsZero() {
 		return validationworkflow.PackageDocument{}, controlplane.ErrInvalid
 	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID != value.ProjectID || coordinate.RunID != value.RunID {
+		return validationworkflow.PackageDocument{}, controlplane.ErrNotFound
+	}
 	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return validationworkflow.PackageDocument{}, mapError(err)
 	}
 	defer tx.Rollback(ctx)
 	var headBytes, epochBytes []byte
-	if err = tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.run_id=$1 FOR UPDATE OF h`, value.RunID).Scan(&headBytes, &epochBytes); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.organization_id=$1 AND h.project_id=$2 AND h.run_id=$3 FOR UPDATE OF h`, coordinate.OrganizationID, coordinate.ProjectID, value.RunID).Scan(&headBytes, &epochBytes); err != nil {
 		return validationworkflow.PackageDocument{}, controlplane.ErrConflict
 	}
 	var head controlplane.BindingHead
@@ -45,7 +49,7 @@ func (store *Store) CommitPackage(ctx context.Context, value validationworkflow.
 	if controlplane.StrictDecode(headBytes, &head) != nil || controlplane.StrictDecode(epochBytes, &epoch) != nil || controlplane.VerifyBindingHead(head, epoch) != nil || head.ProjectID != value.ProjectID || head.Epoch != value.BackendEpoch || head.EpochDigest != value.BindingDigest || epoch.BackendIdentity != value.BackendIdentity || epoch.Mode != controlplane.BackendPostgres || epoch.BackendIdentity != store.backendIdentity {
 		return validationworkflow.PackageDocument{}, controlplane.ErrConflict
 	}
-	result, err := tx.Exec(ctx, `INSERT INTO packages(project_id,package_id,run_id,media_type,schema_version,artifact_digest,binding_digest,backend_epoch,backend_identity,document,digest,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`, value.ProjectID, value.PackageID, value.RunID, value.MediaType, value.SchemaVersion, value.ArtifactDigest, value.BindingDigest, value.BackendEpoch, value.BackendIdentity, value.Document, value.Digest, value.CreatedAt)
+	result, err := tx.Exec(ctx, `INSERT INTO packages(organization_id,project_id,package_id,run_id,media_type,schema_version,artifact_digest,binding_digest,backend_epoch,backend_identity,document,digest,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, value.ProjectID, value.PackageID, value.RunID, value.MediaType, value.SchemaVersion, value.ArtifactDigest, value.BindingDigest, value.BackendEpoch, value.BackendIdentity, value.Document, value.Digest, value.CreatedAt)
 	if err != nil {
 		return validationworkflow.PackageDocument{}, mapError(err)
 	}
@@ -61,7 +65,7 @@ func (store *Store) CommitPackage(ctx context.Context, value validationworkflow.
 	}
 	var current validationworkflow.PackageDocument
 	current.ProjectID, current.PackageID = value.ProjectID, value.PackageID
-	err = tx.QueryRow(ctx, `SELECT run_id,media_type,schema_version,artifact_digest,binding_digest,backend_epoch,backend_identity,document,digest,created_at FROM packages WHERE project_id=$1 AND package_id=$2`, value.ProjectID, value.PackageID).Scan(&current.RunID, &current.MediaType, &current.SchemaVersion, &current.ArtifactDigest, &current.BindingDigest, &current.BackendEpoch, &current.BackendIdentity, &current.Document, &current.Digest, &current.CreatedAt)
+	err = tx.QueryRow(ctx, `SELECT run_id,media_type,schema_version,artifact_digest,binding_digest,backend_epoch,backend_identity,document,digest,created_at FROM packages WHERE organization_id=$1 AND project_id=$2 AND package_id=$3`, coordinate.OrganizationID, value.ProjectID, value.PackageID).Scan(&current.RunID, &current.MediaType, &current.SchemaVersion, &current.ArtifactDigest, &current.BindingDigest, &current.BackendEpoch, &current.BackendIdentity, &current.Document, &current.Digest, &current.CreatedAt)
 	if err != nil {
 		return validationworkflow.PackageDocument{}, err
 	}
@@ -73,9 +77,13 @@ func (store *Store) CommitPackage(ctx context.Context, value validationworkflow.
 
 // GetPackage reloads immutable canonical bytes independent of local paths.
 func (store *Store) LoadPackage(ctx context.Context, projectID, packageID string) (validationworkflow.PackageDocument, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID != projectID {
+		return validationworkflow.PackageDocument{}, controlplane.ErrNotFound
+	}
 	var value validationworkflow.PackageDocument
 	value.ProjectID, value.PackageID = projectID, packageID
-	err := store.pool.QueryRow(ctx, `SELECT run_id,media_type,schema_version,artifact_digest,binding_digest,backend_epoch,backend_identity,document,digest,created_at FROM packages WHERE project_id=$1 AND package_id=$2`, projectID, packageID).Scan(&value.RunID, &value.MediaType, &value.SchemaVersion, &value.ArtifactDigest, &value.BindingDigest, &value.BackendEpoch, &value.BackendIdentity, &value.Document, &value.Digest, &value.CreatedAt)
+	err := store.pool.QueryRow(ctx, `SELECT run_id,media_type,schema_version,artifact_digest,binding_digest,backend_epoch,backend_identity,document,digest,created_at FROM packages WHERE organization_id=$1 AND project_id=$2 AND package_id=$3`, coordinate.OrganizationID, projectID, packageID).Scan(&value.RunID, &value.MediaType, &value.SchemaVersion, &value.ArtifactDigest, &value.BindingDigest, &value.BackendEpoch, &value.BackendIdentity, &value.Document, &value.Digest, &value.CreatedAt)
 	if err == pgx.ErrNoRows {
 		return validationworkflow.PackageDocument{}, controlplane.ErrNotFound
 	}

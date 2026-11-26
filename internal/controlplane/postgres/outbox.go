@@ -19,8 +19,8 @@ var effectOutboxContract controlplane.EffectOutbox = (*Store)(nil)
 var causalEffectJobContract controlplane.EffectJobCompleter = (*Store)(nil)
 
 // ClaimEffect leases exactly the operation selected by its causal job, preventing a worker from stranding unrelated outbox rows.
-func (store *Store) ClaimEffect(ctx context.Context, operationID, owner string, now time.Time, lease time.Duration) (OutboxClaim, error) {
-	if operationID == "" || owner == "" || lease <= 0 || lease > store.maxLease {
+func (store *Store) ClaimEffect(ctx context.Context, scope controlplane.ProjectScope, operationID, owner string, now time.Time, lease time.Duration) (OutboxClaim, error) {
+	if scope.Validate() != nil || operationID == "" || owner == "" || lease <= 0 || lease > store.maxLease {
 		return OutboxClaim{}, controlplane.ErrInvalid
 	}
 	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -28,15 +28,15 @@ func (store *Store) ClaimEffect(ctx context.Context, operationID, owner string, 
 		return OutboxClaim{}, mapError(err)
 	}
 	defer tx.Rollback(ctx)
-	claim := OutboxClaim{OperationID: operationID, Owner: owner, LeaseUntil: now.Add(lease)}
-	err = tx.QueryRow(ctx, `SELECT o.project_id,o.fence+1,o.attempts+1 FROM outbox o JOIN effect_intents i ON i.operation_id=o.operation_id JOIN backend_binding_heads h ON h.run_id=i.run_id AND h.project_id=i.project_id JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE o.operation_id=$1 AND o.state IN ('pending','retry_wait') AND o.available_at<=$2 AND convert_from(i.document,'UTF8')::jsonb->>'binding_digest'=h.epoch_digest AND convert_from(e.document,'UTF8')::jsonb->>'mode'='postgres' AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$3 FOR UPDATE OF o`, operationID, now, store.backendIdentity).Scan(&claim.ProjectID, &claim.Fence, &claim.Attempts)
+	claim := OutboxClaim{OperationID: operationID, Scope: scope, Owner: owner, LeaseUntil: now.Add(lease)}
+	err = tx.QueryRow(ctx, `SELECT o.fence+1,o.attempts+1 FROM outbox o JOIN effect_intents i ON i.organization_id=o.organization_id AND i.project_id=o.project_id AND i.operation_id=o.operation_id JOIN backend_binding_heads h ON h.organization_id=i.organization_id AND h.project_id=i.project_id AND h.run_id=i.run_id JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE o.organization_id=$1 AND o.project_id=$2 AND o.operation_id=$3 AND o.state IN ('pending','retry_wait') AND o.available_at<=$4 AND convert_from(i.document,'UTF8')::jsonb->>'binding_digest'=h.epoch_digest AND convert_from(e.document,'UTF8')::jsonb->>'mode'='postgres' AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$5 FOR UPDATE OF o`, scope.OrganizationID, scope.ProjectID, operationID, now, store.backendIdentity).Scan(&claim.Fence, &claim.Attempts)
 	if err == pgx.ErrNoRows {
 		return OutboxClaim{}, controlplane.ErrConflict
 	}
 	if err != nil {
 		return OutboxClaim{}, mapError(err)
 	}
-	result, err := tx.Exec(ctx, `UPDATE outbox SET state='leased',owner=$1,lease_until=$2,fence=$3,attempts=$4 WHERE operation_id=$5`, claim.Owner, claim.LeaseUntil, claim.Fence, claim.Attempts, claim.OperationID)
+	result, err := tx.Exec(ctx, `UPDATE outbox SET state='leased',owner=$1,lease_until=$2,fence=$3,attempts=$4 WHERE organization_id=$5 AND project_id=$6 AND operation_id=$7`, claim.Owner, claim.LeaseUntil, claim.Fence, claim.Attempts, claim.Scope.OrganizationID, claim.Scope.ProjectID, claim.OperationID)
 	if err != nil {
 		return OutboxClaim{}, mapError(err)
 	}
@@ -50,8 +50,8 @@ func (store *Store) ClaimEffect(ctx context.Context, operationID, owner string, 
 }
 
 // ClaimOutbox leases due effect intents without holding locks during I/O.
-func (store *Store) ClaimOutbox(ctx context.Context, owner string, now time.Time, lease time.Duration, limit int) ([]OutboxClaim, error) {
-	if owner == "" || lease <= 0 || lease > store.maxLease || limit <= 0 {
+func (store *Store) ClaimOutbox(ctx context.Context, scope controlplane.ProjectScope, owner string, now time.Time, lease time.Duration, limit int) ([]OutboxClaim, error) {
+	if scope.Validate() != nil || owner == "" || lease <= 0 || lease > store.maxLease || limit <= 0 {
 		return nil, controlplane.ErrInvalid
 	}
 	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
@@ -59,17 +59,18 @@ func (store *Store) ClaimOutbox(ctx context.Context, owner string, now time.Time
 		return nil, mapError(err)
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `SELECT o.operation_id,o.project_id,o.fence,o.attempts FROM outbox o JOIN effect_intents i ON i.operation_id=o.operation_id JOIN backend_binding_heads h ON h.run_id=i.run_id AND h.project_id=i.project_id JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE o.state IN ('pending','retry_wait') AND o.available_at <= $1 AND i.digest IS NOT NULL AND convert_from(i.document,'UTF8')::jsonb->>'binding_digest'=h.epoch_digest AND convert_from(e.document,'UTF8')::jsonb->>'mode'='postgres' AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2 ORDER BY o.available_at,o.operation_id FOR UPDATE OF o SKIP LOCKED LIMIT $3`, now, store.backendIdentity, limit)
+	rows, err := tx.Query(ctx, `SELECT o.operation_id,o.fence,o.attempts FROM outbox o JOIN effect_intents i ON i.organization_id=o.organization_id AND i.project_id=o.project_id AND i.operation_id=o.operation_id JOIN backend_binding_heads h ON h.organization_id=i.organization_id AND h.project_id=i.project_id AND h.run_id=i.run_id JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE o.organization_id=$1 AND o.project_id=$2 AND o.state IN ('pending','retry_wait') AND o.available_at <= $3 AND i.digest IS NOT NULL AND convert_from(i.document,'UTF8')::jsonb->>'binding_digest'=h.epoch_digest AND convert_from(e.document,'UTF8')::jsonb->>'mode'='postgres' AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4 ORDER BY o.available_at,o.operation_id FOR UPDATE OF o SKIP LOCKED LIMIT $5`, scope.OrganizationID, scope.ProjectID, now, store.backendIdentity, limit)
 	if err != nil {
 		return nil, mapError(err)
 	}
 	var claims []OutboxClaim
 	for rows.Next() {
 		var claim OutboxClaim
-		if err = rows.Scan(&claim.OperationID, &claim.ProjectID, &claim.Fence, &claim.Attempts); err != nil {
+		if err = rows.Scan(&claim.OperationID, &claim.Fence, &claim.Attempts); err != nil {
 			rows.Close()
 			return nil, mapError(err)
 		}
+		claim.Scope = scope
 		claim.Owner = owner
 		claim.LeaseUntil = now.Add(lease)
 		claim.Fence++
@@ -78,7 +79,7 @@ func (store *Store) ClaimOutbox(ctx context.Context, owner string, now time.Time
 	}
 	rows.Close()
 	for _, claim := range claims {
-		if _, err = tx.Exec(ctx, `UPDATE outbox SET state='leased',owner=$1,lease_until=$2,fence=$3,attempts=$4 WHERE operation_id=$5`, claim.Owner, claim.LeaseUntil, claim.Fence, claim.Attempts, claim.OperationID); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE outbox SET state='leased',owner=$1,lease_until=$2,fence=$3,attempts=$4 WHERE organization_id=$5 AND project_id=$6 AND operation_id=$7`, claim.Owner, claim.LeaseUntil, claim.Fence, claim.Attempts, claim.Scope.OrganizationID, claim.Scope.ProjectID, claim.OperationID); err != nil {
 			return nil, mapError(err)
 		}
 	}
@@ -95,7 +96,7 @@ func (store *Store) LoadEffect(ctx context.Context, claim controlplane.EffectCla
 		return controlplane.EffectIntent{}, mapError(err)
 	}
 	defer tx.Rollback(ctx)
-	intent, err := loadEffectTx(ctx, tx, claim.OperationID)
+	intent, err := loadEffectTx(ctx, tx, claim.Scope, claim.OperationID)
 	if err != nil {
 		return controlplane.EffectIntent{}, err
 	}
@@ -103,12 +104,12 @@ func (store *Store) LoadEffect(ctx context.Context, claim controlplane.EffectCla
 		return controlplane.EffectIntent{}, err
 	}
 	var projectID string
-	if err = tx.QueryRow(ctx, `SELECT project_id FROM outbox WHERE operation_id=$1 AND state='leased' AND owner=$2 AND fence=$3 AND lease_until>now() FOR UPDATE`, claim.OperationID, claim.Owner, claim.Fence).Scan(&projectID); err == pgx.ErrNoRows {
+	if err = tx.QueryRow(ctx, `SELECT project_id FROM outbox WHERE organization_id=$1 AND project_id=$2 AND operation_id=$3 AND state='leased' AND owner=$4 AND fence=$5 AND lease_until>now() FOR UPDATE`, claim.Scope.OrganizationID, claim.Scope.ProjectID, claim.OperationID, claim.Owner, claim.Fence).Scan(&projectID); err == pgx.ErrNoRows {
 		return controlplane.EffectIntent{}, controlplane.ErrConflict
 	} else if err != nil {
 		return controlplane.EffectIntent{}, mapError(err)
 	}
-	if projectID != claim.ProjectID || projectID != intent.ProjectID {
+	if projectID != claim.Scope.ProjectID || projectID != intent.ProjectID {
 		return controlplane.EffectIntent{}, controlplane.ErrConflict
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -122,7 +123,7 @@ func (store *Store) HeartbeatOutbox(ctx context.Context, claim OutboxClaim, unti
 	if until.After(time.Now().UTC().Add(store.maxLease)) {
 		return controlplane.ErrInvalid
 	}
-	result, err := store.pool.Exec(ctx, `UPDATE outbox o SET lease_until=$1 FROM effect_intents i,backend_binding_heads h,backend_binding_epochs e WHERE o.operation_id=$2 AND o.state='leased' AND o.owner=$3 AND o.fence=$4 AND o.lease_until>now() AND o.lease_until<$1 AND i.operation_id=o.operation_id AND h.run_id=i.run_id AND h.epoch_digest=convert_from(i.document,'UTF8')::jsonb->>'binding_digest' AND e.run_id=h.run_id AND e.epoch=h.epoch AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$5`, until, claim.OperationID, claim.Owner, claim.Fence, store.backendIdentity)
+	result, err := store.pool.Exec(ctx, `UPDATE outbox o SET lease_until=$1 FROM effect_intents i,backend_binding_heads h,backend_binding_epochs e WHERE o.organization_id=$2 AND o.project_id=$3 AND o.operation_id=$4 AND o.state='leased' AND o.owner=$5 AND o.fence=$6 AND o.lease_until>now() AND o.lease_until<$1 AND i.organization_id=o.organization_id AND i.project_id=o.project_id AND i.operation_id=o.operation_id AND h.organization_id=i.organization_id AND h.project_id=i.project_id AND h.run_id=i.run_id AND h.epoch_digest=convert_from(i.document,'UTF8')::jsonb->>'binding_digest' AND e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$7`, until, claim.Scope.OrganizationID, claim.Scope.ProjectID, claim.OperationID, claim.Owner, claim.Fence, store.backendIdentity)
 	if err != nil {
 		return mapError(err)
 	}
@@ -134,7 +135,7 @@ func (store *Store) HeartbeatOutbox(ctx context.Context, claim OutboxClaim, unti
 
 // RetryOutbox persists bounded delay before releasing a failed dispatch.
 func (store *Store) RetryOutbox(ctx context.Context, claim OutboxClaim, available time.Time, category string) error {
-	result, err := store.pool.Exec(ctx, `UPDATE outbox o SET state='retry_wait',available_at=$1,owner=NULL,lease_until=NULL,last_category=$2 FROM effect_intents i,backend_binding_heads h,backend_binding_epochs e WHERE o.operation_id=$3 AND o.state='leased' AND o.owner=$4 AND o.fence=$5 AND o.lease_until>now() AND i.operation_id=o.operation_id AND h.run_id=i.run_id AND h.epoch_digest=convert_from(i.document,'UTF8')::jsonb->>'binding_digest' AND e.run_id=h.run_id AND e.epoch=h.epoch AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$6`, available, category, claim.OperationID, claim.Owner, claim.Fence, store.backendIdentity)
+	result, err := store.pool.Exec(ctx, `UPDATE outbox o SET state='retry_wait',available_at=$1,owner=NULL,lease_until=NULL,last_category=$2 FROM effect_intents i,backend_binding_heads h,backend_binding_epochs e WHERE o.organization_id=$3 AND o.project_id=$4 AND o.operation_id=$5 AND o.state='leased' AND o.owner=$6 AND o.fence=$7 AND o.lease_until>now() AND i.organization_id=o.organization_id AND i.project_id=o.project_id AND i.operation_id=o.operation_id AND h.organization_id=i.organization_id AND h.project_id=i.project_id AND h.run_id=i.run_id AND h.epoch_digest=convert_from(i.document,'UTF8')::jsonb->>'binding_digest' AND e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$8`, available, category, claim.Scope.OrganizationID, claim.Scope.ProjectID, claim.OperationID, claim.Owner, claim.Fence, store.backendIdentity)
 	if err != nil {
 		return mapError(err)
 	}
@@ -154,21 +155,21 @@ func (store *Store) ConfirmOutbox(ctx context.Context, claim OutboxClaim, receip
 		return mapError(err)
 	}
 	defer tx.Rollback(ctx)
-	intent, err := loadEffectTx(ctx, tx, claim.OperationID)
+	intent, err := loadEffectTx(ctx, tx, claim.Scope, claim.OperationID)
 	if err != nil {
 		return err
 	}
 	if err = store.verifyEffectActiveTx(ctx, tx, intent); err != nil {
 		return err
 	}
-	result, err := tx.Exec(ctx, `UPDATE outbox SET state='confirmed',owner=NULL,lease_until=NULL WHERE operation_id=$1 AND state='leased' AND owner=$2 AND fence=$3 AND lease_until>now()`, claim.OperationID, claim.Owner, claim.Fence)
+	result, err := tx.Exec(ctx, `UPDATE outbox SET state='confirmed',owner=NULL,lease_until=NULL WHERE organization_id=$1 AND project_id=$2 AND operation_id=$3 AND state='leased' AND owner=$4 AND fence=$5 AND lease_until>now()`, claim.Scope.OrganizationID, claim.Scope.ProjectID, claim.OperationID, claim.Owner, claim.Fence)
 	if err != nil {
 		return mapError(err)
 	}
 	if result.RowsAffected() != 1 {
 		return controlplane.ErrConflict
 	}
-	if _, err = tx.Exec(ctx, `UPDATE effect_intents SET state='confirmed',receipt_digest=$1,updated_at=$2 WHERE operation_id=$3`, receiptDigest, time.Now().UTC(), claim.OperationID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE effect_intents SET state='confirmed',receipt_digest=$1,updated_at=$2 WHERE organization_id=$3 AND project_id=$4 AND operation_id=$5`, receiptDigest, time.Now().UTC(), claim.Scope.OrganizationID, claim.Scope.ProjectID, claim.OperationID); err != nil {
 		return mapError(err)
 	}
 	return mapError(tx.Commit(ctx))
@@ -185,14 +186,14 @@ func (store *Store) ConfirmEffectAndJob(ctx context.Context, claim OutboxClaim, 
 		return mapError(err)
 	}
 	defer tx.Rollback(ctx)
-	intent, err := loadEffectTx(ctx, tx, claim.OperationID)
+	intent, err := loadEffectTx(ctx, tx, claim.Scope, claim.OperationID)
 	if err != nil {
 		return err
 	}
 	if err = store.verifyEffectActiveTx(ctx, tx, intent); err != nil {
 		return err
 	}
-	job, err := loadJobTx(ctx, tx, expected.JobID, true)
+	job, err := loadJobTx(ctx, tx, controlplane.ProjectScope{OrganizationID: expected.OrganizationID, ProjectID: expected.ProjectID}, expected.JobID, true)
 	if err != nil {
 		return err
 	}
@@ -206,14 +207,14 @@ func (store *Store) ConfirmEffectAndJob(ctx context.Context, claim OutboxClaim, 
 	if job.State != controlplane.JobLeased || job.RunID != intent.RunID || job.ProjectID != intent.ProjectID || job.Owner != expected.Owner || job.Fence != expected.Fence || job.CancelRevision != expected.CancelRevision || !job.LeaseUntil.After(now) || !job.LeaseUntil.After(serverNow) {
 		return controlplane.ErrConflict
 	}
-	result, err := tx.Exec(ctx, `UPDATE outbox SET state='confirmed',owner=NULL,lease_until=NULL WHERE operation_id=$1 AND state='leased' AND owner=$2 AND fence=$3 AND lease_until>$4 AND lease_until>now()`, claim.OperationID, claim.Owner, claim.Fence, now)
+	result, err := tx.Exec(ctx, `UPDATE outbox SET state='confirmed',owner=NULL,lease_until=NULL WHERE organization_id=$1 AND project_id=$2 AND operation_id=$3 AND state='leased' AND owner=$4 AND fence=$5 AND lease_until>$6 AND lease_until>now()`, claim.Scope.OrganizationID, claim.Scope.ProjectID, claim.OperationID, claim.Owner, claim.Fence, now)
 	if err != nil {
 		return mapError(err)
 	}
 	if result.RowsAffected() != 1 {
 		return controlplane.ErrConflict
 	}
-	if _, err = tx.Exec(ctx, `UPDATE effect_intents SET state='confirmed',receipt_digest=$1,updated_at=$2 WHERE operation_id=$3`, receiptDigest, now.UTC(), claim.OperationID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE effect_intents SET state='confirmed',receipt_digest=$1,updated_at=$2 WHERE organization_id=$3 AND project_id=$4 AND operation_id=$5`, receiptDigest, now.UTC(), claim.Scope.OrganizationID, claim.Scope.ProjectID, claim.OperationID); err != nil {
 		return mapError(err)
 	}
 	job.State, job.Owner, job.LeaseUntil, job.LastCategory = controlplane.JobSucceeded, "", time.Time{}, ""
@@ -221,7 +222,7 @@ func (store *Store) ConfirmEffectAndJob(ctx context.Context, claim OutboxClaim, 
 		return err
 	}
 	if intent.Phase == controlplane.PhasePublish {
-		if _, err = tx.Exec(ctx, `UPDATE retention_references SET live=false WHERE project_id=$1 AND job_id=$2 AND reference_kind='package'`, job.ProjectID, job.JobID); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE retention_references SET live=false WHERE organization_id=$1 AND project_id=$2 AND job_id=$3 AND reference_kind='package'`, job.OrganizationID, job.ProjectID, job.JobID); err != nil {
 			return mapError(err)
 		}
 	}
@@ -233,7 +234,7 @@ func (store *Store) verifyEffectActiveTx(ctx context.Context, tx pgx.Tx, intent 
 	var epochBytes []byte
 	var projectID, digest string
 	var epoch uint64
-	if err := tx.QueryRow(ctx, `SELECT h.project_id,h.epoch,h.epoch_digest,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.run_id=$1 FOR UPDATE OF h`, intent.RunID).Scan(&projectID, &epoch, &digest, &epochBytes); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT h.project_id,h.epoch,h.epoch_digest,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.organization_id=$1 AND h.project_id=$2 AND h.run_id=$3 FOR UPDATE OF h`, intent.OrganizationID, intent.ProjectID, intent.RunID).Scan(&projectID, &epoch, &digest, &epochBytes); err != nil {
 		return controlplane.ErrConflict
 	}
 	var active controlplane.BackendEpoch
@@ -247,9 +248,9 @@ func (store *Store) verifyEffectActiveTx(ctx context.Context, tx pgx.Tx, intent 
 }
 
 // loadEffectTx reconstructs one immutable effect identity inside a fencing transaction.
-func loadEffectTx(ctx context.Context, tx pgx.Tx, operationID string) (controlplane.EffectIntent, error) {
+func loadEffectTx(ctx context.Context, tx pgx.Tx, scope controlplane.ProjectScope, operationID string) (controlplane.EffectIntent, error) {
 	var data []byte
-	if err := tx.QueryRow(ctx, `SELECT document FROM effect_intents WHERE operation_id=$1 FOR UPDATE`, operationID).Scan(&data); err == pgx.ErrNoRows {
+	if err := tx.QueryRow(ctx, `SELECT document FROM effect_intents WHERE organization_id=$1 AND project_id=$2 AND operation_id=$3 FOR UPDATE`, scope.OrganizationID, scope.ProjectID, operationID).Scan(&data); err == pgx.ErrNoRows {
 		return controlplane.EffectIntent{}, controlplane.ErrNotFound
 	} else if err != nil {
 		return controlplane.EffectIntent{}, mapError(err)
@@ -262,11 +263,11 @@ func loadEffectTx(ctx context.Context, tx pgx.Tx, operationID string) (controlpl
 }
 
 // RecoverOutbox releases expired dispatcher leases while preserving fencing history.
-func (store *Store) RecoverOutbox(ctx context.Context, now time.Time, limit int) (int, error) {
+func (store *Store) RecoverOutbox(ctx context.Context, scope controlplane.ProjectScope, now time.Time, limit int) (int, error) {
 	if limit <= 0 {
 		return 0, controlplane.ErrInvalid
 	}
-	result, err := store.pool.Exec(ctx, `UPDATE outbox SET state='retry_wait',available_at=$1,owner=NULL,lease_until=NULL,last_category='lease_expired' WHERE operation_id IN (SELECT o.operation_id FROM outbox o JOIN effect_intents i ON i.operation_id=o.operation_id JOIN backend_binding_heads h ON h.run_id=i.run_id AND h.epoch_digest=convert_from(i.document,'UTF8')::jsonb->>'binding_digest' JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE o.state='leased' AND o.lease_until <= $1 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2 ORDER BY o.lease_until,o.operation_id LIMIT $3)`, now, store.backendIdentity, limit)
+	result, err := store.pool.Exec(ctx, `UPDATE outbox SET state='retry_wait',available_at=$1,owner=NULL,lease_until=NULL,last_category='lease_expired' WHERE organization_id=$2 AND project_id=$3 AND operation_id IN (SELECT o.operation_id FROM outbox o JOIN effect_intents i ON i.organization_id=o.organization_id AND i.project_id=o.project_id AND i.operation_id=o.operation_id JOIN backend_binding_heads h ON h.organization_id=i.organization_id AND h.project_id=i.project_id AND h.run_id=i.run_id AND h.epoch_digest=convert_from(i.document,'UTF8')::jsonb->>'binding_digest' JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE o.organization_id=$2 AND o.project_id=$3 AND o.state='leased' AND o.lease_until <= $4 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$5 ORDER BY o.lease_until,o.operation_id LIMIT $6)`, now, scope.OrganizationID, scope.ProjectID, now, store.backendIdentity, limit)
 	if err != nil {
 		return 0, mapError(err)
 	}
@@ -284,14 +285,14 @@ func (store *Store) SaveAuthority(ctx context.Context, envelope controlplane.Aut
 		return mapError(err)
 	}
 	defer tx.Rollback(ctx)
-	current, err := loadJobTx(ctx, tx, job.JobID, true)
+	current, err := loadJobTx(ctx, tx, controlplane.ProjectScope{OrganizationID: job.OrganizationID, ProjectID: job.ProjectID}, job.JobID, true)
 	if err != nil {
 		return err
 	}
 	if err = store.verifyActiveJobTx(ctx, tx, current); err != nil || controlplane.VerifyAuthority(envelope, current, worker, now) != nil {
 		return controlplane.ErrUnauthorized
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO authority_envelopes(envelope_id,project_id,run_id,job_id,phase,fence,expires_at,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, envelope.EnvelopeID, envelope.ProjectID, envelope.RunID, envelope.JobID, envelope.Phase, envelope.Fence, envelope.ExpiresAt, data, envelope.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO authority_envelopes(organization_id,envelope_id,project_id,run_id,job_id,phase,fence,expires_at,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, envelope.OrganizationID, envelope.EnvelopeID, envelope.ProjectID, envelope.RunID, envelope.JobID, envelope.Phase, envelope.Fence, envelope.ExpiresAt, data, envelope.Digest); err != nil {
 		return mapError(err)
 	}
 	return mapError(tx.Commit(ctx))
@@ -309,7 +310,7 @@ func (store *Store) SaveAuthorityGrant(ctx context.Context, grant controlplane.A
 	}
 	defer tx.Rollback(ctx)
 	var headBytes, epochBytes []byte
-	if err = tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.run_id=$1 FOR UPDATE OF h`, sealed.RunID).Scan(&headBytes, &epochBytes); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.organization_id=$1 AND h.project_id=$2 AND h.run_id=$3 FOR UPDATE OF h`, sealed.OrganizationID, sealed.ProjectID, sealed.RunID).Scan(&headBytes, &epochBytes); err != nil {
 		return controlplane.ErrUnauthorized
 	}
 	var head controlplane.BindingHead
@@ -320,7 +321,7 @@ func (store *Store) SaveAuthorityGrant(ctx context.Context, grant controlplane.A
 	data, _ := canonical(sealed)
 	var priorData []byte
 	var priorDigest string
-	scanErr := tx.QueryRow(ctx, `SELECT document,digest FROM authority_grants WHERE run_id=$1 AND phase=$2 FOR UPDATE`, sealed.RunID, sealed.Phase).Scan(&priorData, &priorDigest)
+	scanErr := tx.QueryRow(ctx, `SELECT document,digest FROM authority_grants WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND phase=$4 FOR UPDATE`, sealed.OrganizationID, sealed.ProjectID, sealed.RunID, sealed.Phase).Scan(&priorData, &priorDigest)
 	if scanErr == nil {
 		var prior controlplane.AuthorityGrant
 		if controlplane.StrictDecode(priorData, &prior) != nil || controlplane.VerifyAuthorityGrant(prior) != nil {
@@ -332,9 +333,9 @@ func (store *Store) SaveAuthorityGrant(ctx context.Context, grant controlplane.A
 			}
 			return controlplane.ErrConflict
 		}
-		_, err = tx.Exec(ctx, `UPDATE authority_grants SET project_id=$1,document=$2,digest=$3 WHERE run_id=$4 AND phase=$5 AND digest=$6`, sealed.ProjectID, data, sealed.Digest, sealed.RunID, sealed.Phase, priorDigest)
+		_, err = tx.Exec(ctx, `UPDATE authority_grants SET document=$1,digest=$2 WHERE organization_id=$3 AND project_id=$4 AND run_id=$5 AND phase=$6 AND digest=$7`, data, sealed.Digest, sealed.OrganizationID, sealed.ProjectID, sealed.RunID, sealed.Phase, priorDigest)
 	} else if scanErr == pgx.ErrNoRows {
-		_, err = tx.Exec(ctx, `INSERT INTO authority_grants(run_id,phase,project_id,document,digest) VALUES($1,$2,$3,$4,$5)`, sealed.RunID, sealed.Phase, sealed.ProjectID, data, sealed.Digest)
+		_, err = tx.Exec(ctx, `INSERT INTO authority_grants(organization_id,run_id,phase,project_id,document,digest) VALUES($1,$2,$3,$4,$5,$6)`, sealed.OrganizationID, sealed.RunID, sealed.Phase, sealed.ProjectID, data, sealed.Digest)
 	} else {
 		err = scanErr
 	}
@@ -345,9 +346,12 @@ func (store *Store) SaveAuthorityGrant(ctx context.Context, grant controlplane.A
 }
 
 // LoadAuthorityGrant verifies one persisted minimal grant before derivation.
-func (store *Store) LoadAuthorityGrant(ctx context.Context, runID string, phase controlplane.Phase) (controlplane.AuthorityGrant, error) {
+func (store *Store) LoadAuthorityGrant(ctx context.Context, scope controlplane.ProjectScope, runID string, phase controlplane.Phase) (controlplane.AuthorityGrant, error) {
+	if scope.Validate() != nil {
+		return controlplane.AuthorityGrant{}, controlplane.ErrInvalid
+	}
 	var data, headBytes, epochBytes []byte
-	if err := store.pool.QueryRow(ctx, `SELECT g.document,h.document,e.document FROM authority_grants g JOIN backend_binding_heads h ON h.run_id=g.run_id JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE g.run_id=$1 AND g.phase=$2`, runID, phase).Scan(&data, &headBytes, &epochBytes); err == pgx.ErrNoRows {
+	if err := store.pool.QueryRow(ctx, `SELECT g.document,h.document,e.document FROM authority_grants g JOIN backend_binding_heads h ON h.organization_id=g.organization_id AND h.project_id=g.project_id AND h.run_id=g.run_id JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE g.organization_id=$1 AND g.project_id=$2 AND g.run_id=$3 AND g.phase=$4`, scope.OrganizationID, scope.ProjectID, runID, phase).Scan(&data, &headBytes, &epochBytes); err == pgx.ErrNoRows {
 		return controlplane.AuthorityGrant{}, controlplane.ErrNotFound
 	} else if err != nil {
 		return controlplane.AuthorityGrant{}, mapError(err)
@@ -368,7 +372,7 @@ func (store *Store) VerifyLiveAuthority(ctx context.Context, envelope controlpla
 		return mapError(err)
 	}
 	defer tx.Rollback(ctx)
-	job, err := loadJobTx(ctx, tx, envelope.JobID, true)
+	job, err := loadJobTx(ctx, tx, controlplane.ProjectScope{OrganizationID: envelope.OrganizationID, ProjectID: envelope.ProjectID}, envelope.JobID, true)
 	if err != nil {
 		return err
 	}

@@ -166,7 +166,7 @@ func TestCapacityRemainsReservedUntilCleanupConfirmation(t *testing.T) {
 	ledger := NewCapacityLedger()
 	receipt, _, _ := ledger.Reserve(context.Background(), CapacityRequest{ProjectID: "project", RunID: "run-one", AcquisitionKey: "acquire-one", SelectionDigest: testDigest("selection"), Demand: ResourceDemand{Environments: 1, CPUMilli: 1, MemoryBytes: 1, ObjectCount: 1}, TTL: time.Hour, Policy: policy})
 	receipt, _ = ledger.ConfirmEnvironment(context.Background(), receipt, testDigest("env"), testDigest("uid"))
-	before, _ := ledger.Snapshot("project")
+	before, _ := ledger.Snapshot(context.Background(), "project")
 	if before.Reserved.Environments != 1 {
 		t.Fatal("released early")
 	}
@@ -178,7 +178,7 @@ func TestCapacityRemainsReservedUntilCleanupConfirmation(t *testing.T) {
 	if _, changed, err = ledger.Release(context.Background(), released, "cleanup-capacity", confirmation); err != nil || changed {
 		t.Fatalf("repeat release: %v %v", changed, err)
 	}
-	after, _ := ledger.Snapshot("project")
+	after, _ := ledger.Snapshot(context.Background(), "project")
 	if after.Reserved.Environments != 0 {
 		t.Fatal("capacity retained")
 	}

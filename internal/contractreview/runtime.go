@@ -175,6 +175,29 @@ func errorCategoryOf(err error) ErrorCategory {
 type MCPServer struct {
 	Adapter MCPAdapter
 	MaxLine int
+	Auth    MCPAuthenticator
+}
+
+// MCPAuthenticator resolves one transport credential into an authenticated
+// principal before any tool arguments are decoded.
+type MCPAuthenticator interface {
+	AuthenticateMCP(context.Context, string) (string, error)
+}
+
+// MCPBearerAuthenticator validates a composition-owned bearer credential in
+// constant time and returns no caller-supplied identity fields.
+type MCPBearerAuthenticator struct {
+	Token     []byte
+	Principal string
+}
+
+// AuthenticateMCP resolves the exact configured principal for one MCP request.
+func (authenticator MCPBearerAuthenticator) AuthenticateMCP(_ context.Context, credential string) (string, error) {
+	provided := strings.TrimPrefix(credential, "Bearer ")
+	if len(authenticator.Token) < 16 || !safeReference(authenticator.Principal) || len(provided) != len(authenticator.Token) || subtle.ConstantTimeCompare([]byte(provided), authenticator.Token) != 1 {
+		return "", typedError(CategoryUnauthorized, "mcp.authentication", nil)
+	}
+	return authenticator.Principal, nil
 }
 
 // mcpRequest is the minimal closed JSON-RPC request accepted by the review server.
@@ -183,8 +206,9 @@ type mcpRequest struct {
 	ID      json.RawMessage `json:"id"`
 	Method  string          `json:"method"`
 	Params  struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
+		Name       string          `json:"name"`
+		Credential string          `json:"credential,omitempty"`
+		Arguments  json.RawMessage `json:"arguments"`
 	} `json:"params"`
 }
 
@@ -211,7 +235,16 @@ func (m MCPServer) Serve(ctx context.Context, input io.Reader, output io.Writer)
 		case "tools/list":
 			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": map[string]any{"tools": reviewTools()}})
 		case "tools/call":
-			value, err := m.Adapter.Call(ctx, request.Params.Name, request.Params.Arguments)
+			adapter := m.Adapter
+			if m.Auth != nil {
+				principal, authErr := m.Auth.AuthenticateMCP(ctx, request.Params.Credential)
+				if authErr != nil {
+					_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": string(errorCategoryOf(authErr))}}}})
+					continue
+				}
+				adapter.API.Config.PrincipalID = principal
+			}
+			value, err := adapter.Call(ctx, request.Params.Name, request.Params.Arguments)
 			if err != nil {
 				_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": string(errorCategoryOf(err))}}}})
 				continue

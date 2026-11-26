@@ -132,8 +132,7 @@ func (a *Acquirer) Acquire(ctx context.Context, request Request, policy Policy) 
 	attempts := 0
 	defer func() {
 		record := terminalRecord(request, result, err, attempts, a.deps.Clock.Now().Sub(started))
-		observerCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-		defer cancel()
+		observerCtx := context.WithoutCancel(ctx)
 		if observeErr := a.deps.Observer.Observe(observerCtx, record); observeErr != nil {
 			err = terminalObserverError(observerCtx, err, observeErr)
 		}

@@ -17,6 +17,7 @@ param(
     [switch]$Coverage,
 
     [switch]$Feature36Coverage,
+	[switch]$Feature37Coverage,
 
     [string]$CCompiler
 )
@@ -295,7 +296,12 @@ try {
                 Assert-GateCommand 'coverage compatibility artifact N migrate'
                 & $gateCompatN1 migrate
                 Assert-GateCommand 'coverage compatibility artifact N+1 migrate'
-                if ($Feature36Coverage) {
+                if ($Feature37Coverage) {
+					$env:FEATUREPROOF_COVERAGE_WSL_DISTRO = $gateDistro
+					& python ./scripts/feature37_coverage.py
+					if ($LASTEXITCODE -ne 0) { throw "feature37 coverage failed" }
+				}
+				elseif ($Feature36Coverage) {
                     $env:FEATUREPROOF_COVERAGE_WSL_DISTRO = $gateDistro
                     & python ./scripts/feature36_coverage.py
                 }

@@ -502,11 +502,11 @@ func TestExternalAgentProjectBindingFailuresStayClosed(t *testing.T) {
 
 // externalBinding builds a valid immutable head whose environment selector changes with its version.
 func externalBinding(repositoryID, runID string, version uint64) (projectconfig.RunConfigurationBinding, error) {
-	key, _ := projectconfig.NewProjectKey("project", repositoryID)
+	key, _ := projectconfig.NewProjectKey("organization", "project", repositoryID)
 	digest := strings.Repeat(string(rune('a'+version-1)), 64)
 	alias := "environment-" + string(rune('0'+version))
 	references := []projectconfig.ResourceReference{{Kind: projectconfig.ResourceProvider, ID: "provider", Version: version, Digest: digest}, {Kind: projectconfig.ResourceModelProfile, ID: "model", Version: version, Digest: digest}, {Kind: projectconfig.ResourceRuntimeProfile, ID: "runtime", Version: version, Digest: digest}, {Kind: projectconfig.ResourceContract, ID: "contract", Version: version, Digest: digest}, {Kind: projectconfig.ResourceEnvironment, ID: "environment", Version: version, Digest: digest}}
-	document, err := projectconfig.Canonicalize(projectconfig.Document{Schema: projectconfig.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Limits: projectconfig.Limits{DurationSeconds: 30}, Approval: "optional", RetentionDays: 7}})
+	document, err := projectconfig.Canonicalize(projectconfig.Document{Schema: projectconfig.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Limits: projectconfig.Limits{DurationSeconds: 30}, Approval: "optional", RetentionDays: 7}})
 	if err != nil {
 		return projectconfig.RunConfigurationBinding{}, err
 	}

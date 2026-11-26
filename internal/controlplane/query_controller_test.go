@@ -25,9 +25,9 @@ type projectRetentionProbe struct {
 }
 
 // DeleteProjectTerminalBefore records one bounded authorized retention page.
-func (probe *projectRetentionProbe) DeleteProjectTerminalBefore(_ context.Context, projectID string, _ int64, _ int) (int, error) {
+func (probe *projectRetentionProbe) DeleteProjectTerminalBefore(_ context.Context, scope ProjectScope, _ int64, _ int) (int, error) {
 	probe.called = true
-	probe.projectID = projectID
+	probe.projectID = scope.ProjectID
 	return 1, nil
 }
 
@@ -40,7 +40,7 @@ func TestQueryControllerAuthorizesBeforeStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = (QueryController{Store: reader, Authorizer: authorizer, Cursors: codec}).ListJobs(context.Background(), JobQuery{ProjectID: "project-1", Limit: 1, Now: time.Now().UTC(), CursorTTL: time.Minute})
+	_, err = (QueryController{Store: reader, Authorizer: authorizer, Cursors: codec}).ListJobs(context.Background(), JobQuery{OrganizationID: "controller-organization", ProjectID: "project-1", Limit: 1, Now: time.Now().UTC(), CursorTTL: time.Minute})
 	if !errors.Is(err, ErrUnauthorized) || reader.called {
 		t.Fatalf("denied query reached store: called=%v err=%v", reader.called, err)
 	}
@@ -52,11 +52,12 @@ func TestRetentionControllerIsProjectScopedAndNoPolicySafe(t *testing.T) {
 	store := &projectRetentionProbe{}
 	authorizer := &importAuthorizerProbe{}
 	controller := RetentionController{Store: store, Authorizer: authorizer}
-	if count, err := controller.Run(context.Background(), "project-1", nil); err != nil || count != 0 || store.called {
+	scope := ProjectScope{OrganizationID: "controller-organization", ProjectID: "controller-project"}
+	if count, err := controller.Run(context.Background(), scope, nil); err != nil || count != 0 || store.called {
 		t.Fatalf("no-policy retention mutated: count=%d called=%v err=%v", count, store.called, err)
 	}
-	count, err := controller.Run(context.Background(), "project-1", &RetentionPolicy{BeforeUnix: time.Now().UTC().Unix(), BatchSize: 1})
-	if err != nil || count != 1 || !store.called || store.projectID != "project-1" {
+	count, err := controller.Run(context.Background(), scope, &RetentionPolicy{BeforeUnix: time.Now().UTC().Unix(), BatchSize: 1})
+	if err != nil || count != 1 || !store.called || store.projectID != "controller-project" {
 		t.Fatalf("project scope lost: count=%d project=%q err=%v", count, store.projectID, err)
 	}
 }
@@ -66,7 +67,7 @@ func TestRetentionControllerIsProjectScopedAndNoPolicySafe(t *testing.T) {
 func TestRetentionControllerDenialPrecedesStore(t *testing.T) {
 	store := &projectRetentionProbe{}
 	controller := RetentionController{Store: store, Authorizer: &importAuthorizerProbe{err: ErrUnauthorized}}
-	_, err := controller.Run(context.Background(), "project-1", &RetentionPolicy{BeforeUnix: time.Now().UTC().Unix(), BatchSize: 1})
+	_, err := controller.Run(context.Background(), ProjectScope{OrganizationID: "controller-organization", ProjectID: "controller-project"}, &RetentionPolicy{BeforeUnix: time.Now().UTC().Unix(), BatchSize: 1})
 	if !errors.Is(err, ErrUnauthorized) || store.called {
 		t.Fatalf("denied retention reached store: called=%v err=%v", store.called, err)
 	}

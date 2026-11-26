@@ -9,7 +9,7 @@ import (
 
 // ValidatePublishCommand enforces canonical scope and digests at every store boundary.
 func ValidatePublishCommand(command PublishCommand) (ProjectKey, error) {
-	key := ProjectKey{ProjectID: command.Document.Document.ProjectID, RepositoryID: command.Document.Document.RepositoryID}
+	key := ProjectKey{OrganizationID: command.Document.Document.OrganizationID, ProjectID: command.Document.Document.ProjectID, RepositoryID: command.Document.Document.RepositoryID}
 	if key.Validate() != nil || !canonicalID.MatchString(command.OperationID) || !validDigest(command.CommandDigest) || !safeActor(command.Actor) || command.CreatedAt.IsZero() {
 		return ProjectKey{}, invalid("store.publish", "command")
 	}

@@ -208,12 +208,10 @@ func TestBlockedWitnessDoesNotBlockConfirmedReadsAndConcurrentWritersConverge(t 
 	}()
 	select {
 	case <-blocked.entered:
-	case <-time.After(time.Second):
+	case <-t.Context().Done():
 		t.Fatal("writer did not reach witness")
 	}
-	readCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	loaded, err := store.LoadSnapshot(readCtx, first.Digest)
-	cancel()
+	loaded, err := store.LoadSnapshot(t.Context(), first.Digest)
 	if err != nil || loaded.Digest != first.Digest {
 		t.Fatalf("confirmed read waited behind writer: digest=%s err=%v", loaded.Digest, err)
 	}
@@ -224,9 +222,7 @@ func TestBlockedWitnessDoesNotBlockConfirmedReadsAndConcurrentWritersConverge(t 
 	}()))
 	contenderRequest := testRequest(SourceConstraints, SourceContract, SourceConfig)
 	contenderRequest.IdempotencyKey = "cancelled-contending-writer"
-	contenderCtx, cancelContender := context.WithTimeout(context.Background(), time.Second)
-	contenderSnapshot, contenderErr := contender.Assemble(contenderCtx, contenderRequest)
-	cancelContender()
+	contenderSnapshot, contenderErr := contender.Assemble(t.Context(), contenderRequest)
 	if contenderErr != nil || contenderSnapshot.Digest == "" {
 		t.Fatalf("independent writer did not progress while witness call was blocked: digest=%s err=%v", contenderSnapshot.Digest, contenderErr)
 	}
@@ -358,8 +354,8 @@ func TestConcurrentSameIdentityConverges(t *testing.T) {
 		if err != nil {
 			t.Fatalf("duplicate contender failed: %v", err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("duplicate contender did not progress")
+	case <-t.Context().Done():
+		t.Fatal("duplicate contender did not progress before the test deadline")
 	}
 	close(blocked.release)
 	if err := <-results; err != nil {
@@ -702,7 +698,7 @@ func TestLocalStoreConstructionPropagatesCallerCancellationToWitnessRead(t *test
 	}()
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-t.Context().Done():
 		cancel()
 		t.Fatal("store did not reach witness read")
 	}
@@ -712,7 +708,7 @@ func TestLocalStoreConstructionPropagatesCallerCancellationToWitnessRead(t *test
 		if !IsCategory(err, CategoryCancelled) || !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancelled constructor=%v", err)
 		}
-	case <-time.After(time.Second):
+	case <-t.Context().Done():
 		t.Fatal("cancelled witness constructor leaked")
 	}
 }

@@ -82,6 +82,12 @@ type ApprovedExecutor interface {
 	Execute(context.Context, Selection, string) (ExecutionResult, error)
 }
 
+// UnknownEffectReconciler proves that a previously uncertain provider effect
+// has reached durable cleanup before quota capacity may be released.
+type UnknownEffectReconciler interface {
+	ReconcileUnknown(context.Context, string) error
+}
+
 // SubmissionPreparer establishes an idempotent durable handoff before Submit acknowledges queued work.
 type SubmissionPreparer interface {
 	Prepare(context.Context, Selection, string) error
@@ -192,6 +198,12 @@ type Registry interface {
 	Events(context.Context, string) ([]RunEvent, error)
 	MarkPublicationFailure(context.Context, string, time.Time) error
 	ReleaseOwner(string)
+}
+
+// RecoveryReportingRegistry returns the exact records it terminalized so
+// wrappers can reconcile durable resources without process-local associations.
+type RecoveryReportingRegistry interface {
+	RecoverTerminal(context.Context, string, time.Time) ([]RunRecord, error)
 }
 
 // ServiceDependencies declares all trust, persistence, execution, and time boundaries.

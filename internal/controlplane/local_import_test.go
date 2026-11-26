@@ -63,8 +63,8 @@ type importAuthorizerProbe struct {
 
 // Authorize records the closed operation/project tuple without granting any
 // additional stream or backend capability.
-func (probe *importAuthorizerProbe) Authorize(_ context.Context, operation, projectID string) error {
-	probe.called = operation == "offline_import" && projectID == "controller-project"
+func (probe *importAuthorizerProbe) Authorize(_ context.Context, operation string, scope ProjectScope) error {
+	probe.called = operation == "offline_import" && scope.OrganizationID == "controller-organization" && scope.ProjectID == "controller-project"
 	return probe.err
 }
 
@@ -88,7 +88,7 @@ type importSourceFailureProbe struct {
 }
 
 // FreezeLocalStores returns the configured frozen source result.
-func (probe *importSourceFailureProbe) FreezeLocalStores(context.Context, string, string, string, string, uint64, time.Time) (ImportManifest, error) {
+func (probe *importSourceFailureProbe) FreezeLocalStores(context.Context, string, string, string, string, string, uint64, time.Time) (ImportManifest, error) {
 	return probe.manifest, probe.freezeErr
 }
 
@@ -165,7 +165,7 @@ func (probe *importTargetProbe) VerifyImport(_ context.Context, _ string) (Impor
 
 // CutoverImport records a stable receipt and simulates response loss once.
 func (probe *importTargetProbe) CutoverImport(_ context.Context, _ string, now time.Time) (ImportCutoverReceipt, error) {
-	probe.receipt, _ = SealImportCutoverReceipt(ImportCutoverReceipt{ImportID: probe.manifest.ImportID, RunID: probe.manifest.RunID, SourceHead: probe.manifest.ExpectedHeadDigest, TargetHead: fixedDigest("controller-target"), ArchivedEpoch: probe.manifest.ExpectedEpoch, ActiveEpoch: probe.manifest.ExpectedEpoch + 1, CommittedAt: now})
+	probe.receipt, _ = SealImportCutoverReceipt(ImportCutoverReceipt{OrganizationID: probe.manifest.OrganizationID, ProjectID: probe.manifest.ProjectID, ImportID: probe.manifest.ImportID, RunID: probe.manifest.RunID, SourceHead: probe.manifest.ExpectedHeadDigest, TargetHead: fixedDigest("controller-target"), ArchivedEpoch: probe.manifest.ExpectedEpoch, ActiveEpoch: probe.manifest.ExpectedEpoch + 1, CommittedAt: now})
 	if !probe.lost {
 		probe.lost = true
 		return ImportCutoverReceipt{}, ErrUnavailable
@@ -201,7 +201,7 @@ func TestLocalImportFreezeResumeArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	manifest, err := store.Freeze(ctx, "import-1", "run-1", "project-1", fixedDigest("head"), 1, now)
+	manifest, err := store.Freeze(ctx, "organization", "import-1", "run-1", "project-1", fixedDigest("head"), 1, now)
 	if err != nil || manifest.Counts["runs"] != 1 || manifest.RelationDigests["runs"] == "" {
 		t.Fatal("freeze", err)
 	}
@@ -216,7 +216,7 @@ func TestLocalImportFreezeResumeArchive(t *testing.T) {
 	if err != nil || len(page) != 1 || string(page[0].Document) != string(document.Document) {
 		t.Fatal("resume", err)
 	}
-	receipt, _ := SealImportCutoverReceipt(ImportCutoverReceipt{ImportID: manifest.ImportID, RunID: manifest.RunID, SourceHead: manifest.ExpectedHeadDigest, TargetHead: fixedDigest("target"), ArchivedEpoch: 1, ActiveEpoch: 2, CommittedAt: now})
+	receipt, _ := SealImportCutoverReceipt(ImportCutoverReceipt{OrganizationID: manifest.OrganizationID, ProjectID: manifest.ProjectID, ImportID: manifest.ImportID, RunID: manifest.RunID, SourceHead: manifest.ExpectedHeadDigest, TargetHead: fixedDigest("target"), ArchivedEpoch: 1, ActiveEpoch: 2, CommittedAt: now})
 	if err = reopened.Archive(ctx, receipt); err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestLocalImportSnapshotsRealStoreFiles(t *testing.T) {
 	if err = store.SnapshotLocalStores(ctx); err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := store.Freeze(ctx, "real-import", "real-run", "real-project", fixedDigest("head"), 1, time.Now().UTC())
+	manifest, err := store.Freeze(ctx, "organization", "real-import", "real-run", "real-project", fixedDigest("head"), 1, time.Now().UTC())
 	if err != nil || manifest.Counts["workflow"] != 1 || manifest.Counts["cleanup"] != 1 {
 		t.Fatal("real store inventory", err)
 	}
@@ -286,7 +286,7 @@ func TestFreezeLocalStoresPublishesTypedSnapshotUnderOneExclusion(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := store.FreezeLocalStores(ctx, "typed-import", "typed-run", "typed-project", fixedDigest("typed-head"), 1, time.Now().UTC())
+	manifest, err := store.FreezeLocalStores(ctx, "organization", "typed-import", "typed-run", "typed-project", fixedDigest("typed-head"), 1, time.Now().UTC())
 	if err != nil || manifest.Counts["workflow"] != 1 {
 		t.Fatal("atomic freeze", err)
 	}
@@ -301,7 +301,7 @@ func TestFreezeLocalStoresPublishesTypedSnapshotUnderOneExclusion(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = unknown.FreezeLocalStores(ctx, "unknown-import", "unknown-run", "unknown-project", fixedDigest("unknown-head"), 1, time.Now().UTC()); !errors.Is(err, ErrIntegrity) {
+	if _, err = unknown.FreezeLocalStores(ctx, "organization", "unknown-import", "unknown-run", "unknown-project", fixedDigest("unknown-head"), 1, time.Now().UTC()); !errors.Is(err, ErrIntegrity) {
 		t.Fatal("unknown file entered candidate", err)
 	}
 }
@@ -326,7 +326,7 @@ func TestFreezeAggregatesConsumerExportersWithoutPrivateFiles(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := store.FreezeLocalStores(context.Background(), "aggregate-import", "aggregate-run", "aggregate-project", fixedDigest("aggregate-head"), 1, time.Now().UTC())
+	manifest, err := store.FreezeLocalStores(context.Background(), "organization", "aggregate-import", "aggregate-run", "aggregate-project", fixedDigest("aggregate-head"), 1, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,12 +360,12 @@ func TestLocalWriterHoldsFreezeExclusionThroughPublication(t *testing.T) {
 		release()
 		t.Fatal(err)
 	}
-	if _, err = store.FreezeLocalStores(ctx, "exclusive-import", "exclusive-run", "exclusive-project", fixedDigest("exclusive-head"), 1, time.Now().UTC()); !errors.Is(err, ErrConflict) {
+	if _, err = store.FreezeLocalStores(ctx, "organization", "exclusive-import", "exclusive-run", "exclusive-project", fixedDigest("exclusive-head"), 1, time.Now().UTC()); !errors.Is(err, ErrConflict) {
 		release()
 		t.Fatal("freeze crossed active writer", err)
 	}
 	release()
-	manifest, err := store.FreezeLocalStores(ctx, "exclusive-import", "exclusive-run", "exclusive-project", fixedDigest("exclusive-head"), 1, time.Now().UTC())
+	manifest, err := store.FreezeLocalStores(ctx, "organization", "exclusive-import", "exclusive-run", "exclusive-project", fixedDigest("exclusive-head"), 1, time.Now().UTC())
 	if err != nil || manifest.Counts["workflow"] != 1 {
 		t.Fatal("published file absent after exclusive freeze", err)
 	}
@@ -390,7 +390,7 @@ func TestOfflineImportControllerAuthenticatesCopiesAndReconcilesCutover(t *testi
 	authorizer := &importAuthorizerProbe{}
 	target := &importTargetProbe{}
 	now := time.Now().UTC()
-	receipt, err := (OfflineImportController{Source: source, Target: target, Authorizer: authorizer}).Run(ctx, OfflineImportRequest{ImportID: "controller-import", RunID: "controller-run", ProjectID: "controller-project", ExpectedHead: fixedDigest("controller-head"), ExpectedEpoch: 1, PageSize: 1, Now: now, ReconcileTimeout: time.Second})
+	receipt, err := (OfflineImportController{Source: source, Target: target, Authorizer: authorizer}).Run(ctx, OfflineImportRequest{OrganizationID: "controller-organization", ImportID: "controller-import", RunID: "controller-run", ProjectID: "controller-project", ExpectedHead: fixedDigest("controller-head"), ExpectedEpoch: 1, PageSize: 1, Now: now, ReconcileTimeout: time.Second})
 	if err != nil || !authorizer.called || len(target.docs) != 1 || receipt.Digest == "" {
 		t.Fatal("offline controller", err)
 	}
@@ -408,15 +408,15 @@ func TestOfflineImportControllerFailsClosedAtEveryBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := SealImportManifest(ImportManifest{ImportID: "failure-import", RunID: "failure-run", ProjectID: "failure-project", SourceIdentity: "failure-source", ExpectedHeadDigest: fixedDigest("failure-head"), ExpectedEpoch: 1, Counts: map[string]uint64{"events": 1}, StreamDigests: map[string]string{"events": importDocumentsDigest([]ImportDocument{document}, false)}, RelationDigests: map[string]string{"events": importDocumentsDigest([]ImportDocument{document}, true)}, EventDigests: map[string]string{"events": importDocumentsDigest([]ImportDocument{document}, false)}, State: ImportFrozen, CreatedAt: now})
+	manifest, err := SealImportManifest(ImportManifest{OrganizationID: "organization", ImportID: "failure-import", RunID: "failure-run", ProjectID: "failure-project", SourceIdentity: "failure-source", ExpectedHeadDigest: fixedDigest("failure-head"), ExpectedEpoch: 1, Counts: map[string]uint64{"events": 1}, StreamDigests: map[string]string{"events": importDocumentsDigest([]ImportDocument{document}, false)}, RelationDigests: map[string]string{"events": importDocumentsDigest([]ImportDocument{document}, true)}, EventDigests: map[string]string{"events": importDocumentsDigest([]ImportDocument{document}, false)}, State: ImportFrozen, CreatedAt: now})
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := SealImportCutoverReceipt(ImportCutoverReceipt{ImportID: manifest.ImportID, RunID: manifest.RunID, SourceHead: manifest.ExpectedHeadDigest, TargetHead: fixedDigest("failure-target"), ArchivedEpoch: 1, ActiveEpoch: 2, CommittedAt: now})
+	receipt, err := SealImportCutoverReceipt(ImportCutoverReceipt{OrganizationID: manifest.OrganizationID, ProjectID: manifest.ProjectID, ImportID: manifest.ImportID, RunID: manifest.RunID, SourceHead: manifest.ExpectedHeadDigest, TargetHead: fixedDigest("failure-target"), ArchivedEpoch: 1, ActiveEpoch: 2, CommittedAt: now})
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := OfflineImportRequest{ImportID: manifest.ImportID, RunID: manifest.RunID, ProjectID: manifest.ProjectID, ExpectedHead: manifest.ExpectedHeadDigest, ExpectedEpoch: 1, PageSize: 1, Now: now, ReconcileTimeout: time.Second}
+	request := OfflineImportRequest{OrganizationID: "organization", ImportID: manifest.ImportID, RunID: manifest.RunID, ProjectID: manifest.ProjectID, ExpectedHead: manifest.ExpectedHeadDigest, ExpectedEpoch: 1, PageSize: 1, Now: now, ReconcileTimeout: time.Second}
 	boundaryErr := errors.New("boundary failure")
 	tests := []struct {
 		name       string
@@ -486,19 +486,19 @@ func TestLocalImportExporterAndLifecycleFailures(t *testing.T) {
 	if _, err = AcquireLocalImportWrite(ctx, cancelRoot); !errors.Is(err, ErrConflict) {
 		t.Fatal("concurrent writer admitted", err)
 	}
-	if _, err = (*LocalImportStore)(nil).FreezeLocalStores(ctx, "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(err, ErrInvalid) {
+	if _, err = (*LocalImportStore)(nil).FreezeLocalStores(ctx, "organization", "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(err, ErrInvalid) {
 		t.Fatal("nil freeze owner accepted", err)
 	}
 	if err = store.writeState(localImportState{Archived: true, Streams: map[string][]ImportDocument{}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.FreezeLocalStores(ctx, "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(err, ErrConflict) {
+	if _, err = store.FreezeLocalStores(ctx, "organization", "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(err, ErrConflict) {
 		t.Fatal("archived source frozen", err)
 	}
 	if err = store.writeState(localImportState{Frozen: true, ImportID: "other", Streams: map[string][]ImportDocument{}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.FreezeLocalStores(ctx, "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(err, ErrConflict) {
+	if _, err = store.FreezeLocalStores(ctx, "organization", "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(err, ErrConflict) {
 		t.Fatal("foreign freeze resumed", err)
 	}
 	sealed, err := SealImportDocument(ImportDocument{Stream: "events", RelationKey: "event", Document: []byte(`{}`)})
@@ -511,7 +511,7 @@ func TestLocalImportExporterAndLifecycleFailures(t *testing.T) {
 	if err = store.RegisterSnapshotExporter(func(context.Context, string) ([]LocalSnapshotExport, error) { return nil, nil }); !errors.Is(err, ErrConflict) {
 		t.Fatal("exporter registered after capture", err)
 	}
-	if _, err = store.FreezeLocalStores(ctx, "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(err, ErrConflict) {
+	if _, err = store.FreezeLocalStores(ctx, "organization", "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(err, ErrConflict) {
 		t.Fatal("captured stream frozen twice", err)
 	}
 
@@ -526,7 +526,7 @@ func TestLocalImportExporterAndLifecycleFailures(t *testing.T) {
 	t.Run("exporter error", func(t *testing.T) {
 		value := newStore(t)
 		_ = value.RegisterSnapshotExporter(func(context.Context, string) ([]LocalSnapshotExport, error) { return nil, ErrUnavailable })
-		if _, freezeErr := value.FreezeLocalStores(ctx, "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(freezeErr, ErrUnavailable) {
+		if _, freezeErr := value.FreezeLocalStores(ctx, "organization", "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(freezeErr, ErrUnavailable) {
 			t.Fatal(freezeErr)
 		}
 	})
@@ -535,7 +535,7 @@ func TestLocalImportExporterAndLifecycleFailures(t *testing.T) {
 		_ = value.RegisterSnapshotExporter(func(context.Context, string) ([]LocalSnapshotExport, error) {
 			return []LocalSnapshotExport{{Stream: "unknown", RelationKey: "item", Document: []byte(`{}`)}}, nil
 		})
-		if _, freezeErr := value.FreezeLocalStores(ctx, "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(freezeErr, ErrIntegrity) {
+		if _, freezeErr := value.FreezeLocalStores(ctx, "organization", "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(freezeErr, ErrIntegrity) {
 			t.Fatal(freezeErr)
 		}
 	})
@@ -545,7 +545,7 @@ func TestLocalImportExporterAndLifecycleFailures(t *testing.T) {
 		_ = value.RegisterSnapshotExporter(func(context.Context, string) ([]LocalSnapshotExport, error) {
 			return []LocalSnapshotExport{{Stream: "events", RelationKey: "item", Document: []byte(`{}`), ClaimedPaths: []string{outside}}}, nil
 		})
-		if _, freezeErr := value.FreezeLocalStores(ctx, "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(freezeErr, ErrIntegrity) {
+		if _, freezeErr := value.FreezeLocalStores(ctx, "organization", "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(freezeErr, ErrIntegrity) {
 			t.Fatal(freezeErr)
 		}
 	})
@@ -554,36 +554,36 @@ func TestLocalImportExporterAndLifecycleFailures(t *testing.T) {
 		_ = value.RegisterSnapshotExporter(func(context.Context, string) ([]LocalSnapshotExport, error) {
 			return []LocalSnapshotExport{{Stream: "events", RelationKey: "second", Document: []byte(`{"n":2}`)}, {Stream: "events", RelationKey: "first", Document: []byte(`{"n":1}`)}}, nil
 		})
-		manifest, freezeErr := value.FreezeLocalStores(ctx, "ordered-import", "ordered-run", "ordered-project", fixedDigest("ordered-head"), 1, time.Now().UTC())
+		manifest, freezeErr := value.FreezeLocalStores(ctx, "organization", "ordered-import", "ordered-run", "ordered-project", fixedDigest("ordered-head"), 1, time.Now().UTC())
 		if freezeErr != nil || manifest.Counts["events"] != 2 {
 			t.Fatal("same-stream export ordering", freezeErr)
 		}
 	})
 	t.Run("invalid manifest", func(t *testing.T) {
 		value := newStore(t)
-		if _, freezeErr := value.FreezeLocalStores(ctx, "", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(freezeErr, ErrInvalid) {
+		if _, freezeErr := value.FreezeLocalStores(ctx, "organization", "", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(freezeErr, ErrInvalid) {
 			t.Fatal(freezeErr)
 		}
 	})
 	t.Run("frozen replay", func(t *testing.T) {
 		value := newStore(t)
 		now := time.Now().UTC()
-		manifest, freezeErr := value.FreezeLocalStores(ctx, "replay-import", "replay-run", "replay-project", fixedDigest("replay-head"), 1, now)
+		manifest, freezeErr := value.FreezeLocalStores(ctx, "organization", "replay-import", "replay-run", "replay-project", fixedDigest("replay-head"), 1, now)
 		if freezeErr != nil {
 			t.Fatal(freezeErr)
 		}
-		replayed, freezeErr := value.FreezeLocalStores(ctx, manifest.ImportID, manifest.RunID, manifest.ProjectID, manifest.ExpectedHeadDigest, manifest.ExpectedEpoch, now)
+		replayed, freezeErr := value.FreezeLocalStores(ctx, "organization", manifest.ImportID, manifest.RunID, manifest.ProjectID, manifest.ExpectedHeadDigest, manifest.ExpectedEpoch, now)
 		if freezeErr != nil || replayed.Digest != manifest.Digest {
 			t.Fatal("frozen replay changed", freezeErr)
 		}
 	})
 	t.Run("legacy freeze and archive guards", func(t *testing.T) {
 		value := newStore(t)
-		if _, freezeErr := value.Freeze(ctx, "", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(freezeErr, ErrInvalid) {
+		if _, freezeErr := value.Freeze(ctx, "organization", "", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(freezeErr, ErrInvalid) {
 			t.Fatal("invalid legacy freeze accepted", freezeErr)
 		}
 		now := time.Now().UTC()
-		receipt, sealErr := SealImportCutoverReceipt(ImportCutoverReceipt{ImportID: "other-import", RunID: "other-run", SourceHead: fixedDigest("source"), TargetHead: fixedDigest("target"), ArchivedEpoch: 1, ActiveEpoch: 2, CommittedAt: now})
+		receipt, sealErr := SealImportCutoverReceipt(ImportCutoverReceipt{OrganizationID: "organization", ProjectID: "project", ImportID: "other-import", RunID: "other-run", SourceHead: fixedDigest("source"), TargetHead: fixedDigest("target"), ArchivedEpoch: 1, ActiveEpoch: 2, CommittedAt: now})
 		if sealErr != nil {
 			t.Fatal(sealErr)
 		}
@@ -638,7 +638,7 @@ func TestLocalImportSnapshotRejectsUnownedAndMalformedFiles(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err = store.FreezeLocalStores(context.Background(), "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(err, ErrIntegrity) {
+			if _, err = store.FreezeLocalStores(context.Background(), "organization", "import", "run", "project", fixedDigest("head"), 1, time.Now().UTC()); !errors.Is(err, ErrIntegrity) {
 				t.Fatal("unsafe source accepted", err)
 			}
 		})
@@ -649,7 +649,7 @@ func TestLocalImportSnapshotRejectsUnownedAndMalformedFiles(t *testing.T) {
 // deterministic future-stream ordering and explicit retention bounds.
 func TestImportHelpersRejectMalformedMetadata(t *testing.T) {
 	now := time.Now().UTC()
-	if _, err := SealImportManifest(ImportManifest{ImportID: "metadata-import", RunID: "metadata-run", ProjectID: "metadata-project", SourceIdentity: "metadata-source", ExpectedHeadDigest: fixedDigest("head"), Counts: map[string]uint64{}, StreamDigests: map[string]string{"unsafe key": fixedDigest("stream")}, State: ImportFrozen, CreatedAt: now}); !errors.Is(err, ErrInvalid) {
+	if _, err := SealImportManifest(ImportManifest{OrganizationID: "organization", ImportID: "metadata-import", RunID: "metadata-run", ProjectID: "metadata-project", SourceIdentity: "metadata-source", ExpectedHeadDigest: fixedDigest("head"), Counts: map[string]uint64{}, StreamDigests: map[string]string{"unsafe key": fixedDigest("stream")}, State: ImportFrozen, CreatedAt: now}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("unsafe digest map accepted", err)
 	}
 	ordered := orderedImportStreams(map[string]uint64{"future": 1, "events": 1})
@@ -740,14 +740,14 @@ func TestLocalImportRejectsInvalidConcurrencyAndCorruption(t *testing.T) {
 		t.Fatal("duplicate relation accepted")
 	}
 	now := time.Now().UTC()
-	manifest, err := store.Freeze(ctx, "boundary-import", "boundary-run", "boundary-project", fixedDigest("head"), 1, now)
+	manifest, err := store.Freeze(ctx, "organization", "boundary-import", "boundary-run", "boundary-project", fixedDigest("head"), 1, now)
 	if err != nil || manifest.EventDigests["events"] == "" {
 		t.Fatal("freeze", err)
 	}
-	if replay, replayErr := store.Freeze(ctx, manifest.ImportID, manifest.RunID, manifest.ProjectID, manifest.ExpectedHeadDigest, manifest.ExpectedEpoch, now); replayErr != nil || replay.Digest != manifest.Digest {
+	if replay, replayErr := store.Freeze(ctx, "organization", manifest.ImportID, manifest.RunID, manifest.ProjectID, manifest.ExpectedHeadDigest, manifest.ExpectedEpoch, now); replayErr != nil || replay.Digest != manifest.Digest {
 		t.Fatal("freeze replay", replayErr)
 	}
-	if _, err = store.Freeze(ctx, "other-import", manifest.RunID, manifest.ProjectID, manifest.ExpectedHeadDigest, manifest.ExpectedEpoch, now); !errors.Is(err, ErrConflict) {
+	if _, err = store.Freeze(ctx, "organization", "other-import", manifest.RunID, manifest.ProjectID, manifest.ExpectedHeadDigest, manifest.ExpectedEpoch, now); !errors.Is(err, ErrConflict) {
 		t.Fatal("second freeze accepted")
 	}
 	if err = EnsureLocalImportWritable(root); !errors.Is(err, ErrConflict) {
@@ -812,7 +812,7 @@ func TestLocalImportPreCutoverUnfreeze(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := store.Freeze(ctx, "import-2", "run-2", "project-1", fixedDigest("head"), 1, time.Now().UTC())
+	manifest, err := store.Freeze(ctx, "organization", "import-2", "run-2", "project-1", fixedDigest("head"), 1, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -848,25 +848,25 @@ func TestLocalImportFilesystemAndReceiptFailures(t *testing.T) {
 	if err = store.Put(ctx, ImportDocument{}); !errors.Is(err, ErrInvalid) {
 		t.Fatal("invalid source document accepted", err)
 	}
-	manifest, err := store.Freeze(ctx, "filesystem-import", "filesystem-run", "filesystem-project", fixedDigest("head"), 1, time.Now().UTC())
+	manifest, err := store.Freeze(ctx, "organization", "filesystem-import", "filesystem-run", "filesystem-project", fixedDigest("head"), 1, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := SealImportCutoverReceipt(ImportCutoverReceipt{ImportID: manifest.ImportID, RunID: manifest.RunID, SourceHead: manifest.ExpectedHeadDigest, TargetHead: fixedDigest("target-one"), ArchivedEpoch: 1, ActiveEpoch: 2, CommittedAt: time.Now().UTC()})
+	receipt, err := SealImportCutoverReceipt(ImportCutoverReceipt{OrganizationID: manifest.OrganizationID, ProjectID: manifest.ProjectID, ImportID: manifest.ImportID, RunID: manifest.RunID, SourceHead: manifest.ExpectedHeadDigest, TargetHead: fixedDigest("target-one"), ArchivedEpoch: 1, ActiveEpoch: 2, CommittedAt: time.Now().UTC()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = store.Archive(ctx, receipt); err != nil {
 		t.Fatal(err)
 	}
-	conflictingReceipt, err := SealImportCutoverReceipt(ImportCutoverReceipt{ImportID: manifest.ImportID, RunID: manifest.RunID, SourceHead: manifest.ExpectedHeadDigest, TargetHead: fixedDigest("target-two"), ArchivedEpoch: 1, ActiveEpoch: 2, CommittedAt: receipt.CommittedAt})
+	conflictingReceipt, err := SealImportCutoverReceipt(ImportCutoverReceipt{OrganizationID: manifest.OrganizationID, ProjectID: manifest.ProjectID, ImportID: manifest.ImportID, RunID: manifest.RunID, SourceHead: manifest.ExpectedHeadDigest, TargetHead: fixedDigest("target-two"), ArchivedEpoch: 1, ActiveEpoch: 2, CommittedAt: receipt.CommittedAt})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = store.Archive(ctx, conflictingReceipt); !errors.Is(err, ErrConflict) {
 		t.Fatal("conflicting archive accepted", err)
 	}
-	if _, err = store.Freeze(ctx, "other-import", manifest.RunID, manifest.ProjectID, manifest.ExpectedHeadDigest, 1, time.Now().UTC()); !errors.Is(err, ErrConflict) {
+	if _, err = store.Freeze(ctx, "organization", "other-import", manifest.RunID, manifest.ProjectID, manifest.ExpectedHeadDigest, 1, time.Now().UTC()); !errors.Is(err, ErrConflict) {
 		t.Fatal("archived source frozen again", err)
 	}
 	missingState, err := OpenLocalImportStore(t.TempDir(), "missing-state-source")

@@ -177,7 +177,7 @@ func TestExecuteClosesBlockedOperation(t *testing.T) {
 	_, _ = tool.Execute(context.Background(), harness.ToolCall{Input: map[string]any{"method": "GET", "path": "wait"}})
 	select {
 	case <-closed:
-	case <-time.After(time.Second):
+	case <-t.Context().Done():
 		t.Fatal("server request context was not closed")
 	}
 }

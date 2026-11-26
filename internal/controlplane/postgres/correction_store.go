@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	"github.com/asierhr/featureProof/internal/correction"
 	"github.com/jackc/pgx/v5"
 )
@@ -38,12 +39,13 @@ func (adapter *PostgresCorrectionStore) Reserve(ctx context.Context, input corre
 	}
 	result := correction.ReserveResult{}
 	err := retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "correction.reserve", adapter.store.observer, func(tx pgx.Tx) error {
-		if _, _, fenceErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, root); fenceErr != nil {
+		head, _, fenceErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, root)
+		if fenceErr != nil {
 			return correctionFailure(correction.Conflict, "backend_head")
 		}
 		var priorData []byte
 		var priorRequest string
-		scanErr := tx.QueryRow(ctx, `SELECT record,convert_from(record,'UTF8')::jsonb->>'request_hash' FROM correction_records WHERE root_run_id=$1 AND convert_from(record,'UTF8')::jsonb->>'key_hash'=$2 FOR UPDATE`, root, candidate.KeyHash).Scan(&priorData, &priorRequest)
+		scanErr := tx.QueryRow(ctx, `SELECT record,convert_from(record,'UTF8')::jsonb->>'request_hash' FROM correction_records WHERE organization_id=$1 AND project_id=$2 AND root_run_id=$3 AND convert_from(record,'UTF8')::jsonb->>'key_hash'=$4 FOR UPDATE`, head.OrganizationID, head.ProjectID, root, candidate.KeyHash).Scan(&priorData, &priorRequest)
 		if scanErr == nil {
 			if priorRequest != candidate.RequestHash {
 				return correctionFailure(correction.Conflict, "idempotency_key")
@@ -60,7 +62,7 @@ func (adapter *PostgresCorrectionStore) Reserve(ctx context.Context, input corre
 		}
 		var tail string
 		var position uint64
-		tailErr := tx.QueryRow(ctx, `SELECT child_run_id,position FROM correction_relations WHERE root_run_id=$1 ORDER BY position DESC LIMIT 1 FOR UPDATE`, root).Scan(&tail, &position)
+		tailErr := tx.QueryRow(ctx, `SELECT child_run_id,position FROM correction_relations WHERE organization_id=$1 AND project_id=$2 AND root_run_id=$3 ORDER BY position DESC LIMIT 1 FOR UPDATE`, head.OrganizationID, head.ProjectID, root).Scan(&tail, &position)
 		if tailErr == pgx.ErrNoRows {
 			tail = candidate.Link.ParentRunID
 		} else if tailErr != nil {
@@ -72,19 +74,19 @@ func (adapter *PostgresCorrectionStore) Reserve(ctx context.Context, input corre
 		candidate.ChainLimits = input.Limits
 		candidate.ChainDeadline = candidate.Link.CreatedAt.Add(input.Limits.MaxDuration)
 		data, _ := canonical(candidate)
-		if _, execErr := tx.Exec(ctx, `INSERT INTO correction_records(run_id,project_id,root_run_id,parent_run_id,revision,phase,record,digest) VALUES($1,$2,$3,$4,1,$5,$6,$7)`, candidate.Link.Handle, candidate.Link.PrincipalID, root, candidate.Link.ParentRunID, candidate.Phase, data, digestBytes(data)); execErr != nil {
+		if _, execErr := tx.Exec(ctx, `INSERT INTO correction_records(organization_id,run_id,project_id,root_run_id,parent_run_id,revision,phase,record,digest) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8)`, head.OrganizationID, candidate.Link.Handle, head.ProjectID, root, candidate.Link.ParentRunID, candidate.Phase, data, digestBytes(data)); execErr != nil {
 			return execErr
 		}
-		if _, execErr := tx.Exec(ctx, `INSERT INTO correction_relations(root_run_id,parent_run_id,child_run_id,position) VALUES($1,$2,$3,$4)`, root, candidate.Link.ParentRunID, candidate.Link.Handle, position+1); execErr != nil {
+		if _, execErr := tx.Exec(ctx, `INSERT INTO correction_relations(organization_id,project_id,root_run_id,parent_run_id,child_run_id,position) VALUES($1,$2,$3,$4,$5,$6)`, head.OrganizationID, head.ProjectID, root, candidate.Link.ParentRunID, candidate.Link.Handle, position+1); execErr != nil {
 			return execErr
 		}
 		var eventSequence uint64
-		if sequenceErr := tx.QueryRow(ctx, `SELECT COALESCE(max(sequence),0)+1 FROM correction_events WHERE root_run_id=$1`, root).Scan(&eventSequence); sequenceErr != nil {
+		if sequenceErr := tx.QueryRow(ctx, `SELECT COALESCE(max(sequence),0)+1 FROM correction_events WHERE organization_id=$1 AND project_id=$2 AND root_run_id=$3`, head.OrganizationID, head.ProjectID, root).Scan(&eventSequence); sequenceErr != nil {
 			return sequenceErr
 		}
 		event := correction.Event{Version: correction.Version, Sequence: eventSequence, Type: "correction_reserved", At: candidate.Link.CreatedAt, Record: candidate}
 		eventData, _ := canonical(event)
-		if _, eventErr := tx.Exec(ctx, `INSERT INTO correction_events(root_run_id,sequence,run_id,event,digest) VALUES($1,$2,$3,$4,$5)`, root, event.Sequence, candidate.Link.Handle, eventData, digestBytes(eventData)); eventErr != nil {
+		if _, eventErr := tx.Exec(ctx, `INSERT INTO correction_events(organization_id,project_id,root_run_id,sequence,run_id,event,digest) VALUES($1,$2,$3,$4,$5,$6,$7)`, head.OrganizationID, head.ProjectID, root, event.Sequence, candidate.Link.Handle, eventData, digestBytes(eventData)); eventErr != nil {
 			return eventErr
 		}
 		result = correction.ReserveResult{Record: candidate.Clone(), New: true}
@@ -98,8 +100,12 @@ func (adapter *PostgresCorrectionStore) Reserve(ctx context.Context, input corre
 
 // Get returns one detached correction record.
 func (adapter *PostgresCorrectionStore) Get(ctx context.Context, handle string) (correction.Record, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return correction.Record{}, correctionFailure(correction.NotFound, "correction_handle")
+	}
 	var data []byte
-	if err := adapter.store.pool.QueryRow(ctx, `SELECT record FROM correction_records WHERE run_id=$1`, handle).Scan(&data); err == pgx.ErrNoRows {
+	if err := adapter.store.pool.QueryRow(ctx, `SELECT record FROM correction_records WHERE organization_id=$1 AND project_id=$2 AND run_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&data); err == pgx.ErrNoRows {
 		return correction.Record{}, correctionFailure(correction.NotFound, "correction_handle")
 	} else if err != nil {
 		return correction.Record{}, correctionFailure(correction.Infrastructure, "record")
@@ -120,10 +126,14 @@ func (adapter *PostgresCorrectionStore) Update(ctx context.Context, handle strin
 func (adapter *PostgresCorrectionStore) updateRecord(ctx context.Context, handle string, expected correction.Phase, next correction.Record, eventType string, at time.Time) (correction.Record, error) {
 	result := next.Clone()
 	err := retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "correction.update", adapter.store.observer, func(tx pgx.Tx) error {
+		coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+		if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+			return correctionFailure(correction.Conflict, "scope")
+		}
 		var root string
 		var revision uint64
 		var currentData []byte
-		if scanErr := tx.QueryRow(ctx, `SELECT root_run_id,revision,record FROM correction_records WHERE run_id=$1 AND phase=$2 FOR UPDATE`, handle, expected).Scan(&root, &revision, &currentData); scanErr != nil {
+		if scanErr := tx.QueryRow(ctx, `SELECT root_run_id,revision,record FROM correction_records WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND phase=$4 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, handle, expected).Scan(&root, &revision, &currentData); scanErr != nil {
 			return correctionFailure(correction.Conflict, "phase")
 		}
 		if _, _, fenceErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, root); fenceErr != nil {
@@ -137,17 +147,17 @@ func (adapter *PostgresCorrectionStore) updateRecord(ctx context.Context, handle
 			return transitionErr
 		}
 		data, _ := canonical(next)
-		tag, execErr := tx.Exec(ctx, `UPDATE correction_records SET revision=$1,phase=$2,record=$3,digest=$4 WHERE run_id=$5 AND revision=$6`, revision+1, next.Phase, data, digestBytes(data), handle, revision)
+		tag, execErr := tx.Exec(ctx, `UPDATE correction_records SET revision=$1,phase=$2,record=$3,digest=$4 WHERE organization_id=$5 AND project_id=$6 AND run_id=$7 AND revision=$8`, revision+1, next.Phase, data, digestBytes(data), coordinate.OrganizationID, coordinate.ProjectID, handle, revision)
 		if execErr != nil || tag.RowsAffected() != 1 {
 			return correctionFailure(correction.Conflict, "phase")
 		}
 		var sequence uint64
-		if sequenceErr := tx.QueryRow(ctx, `SELECT COALESCE(max(sequence),0)+1 FROM correction_events WHERE root_run_id=$1`, root).Scan(&sequence); sequenceErr != nil {
+		if sequenceErr := tx.QueryRow(ctx, `SELECT COALESCE(max(sequence),0)+1 FROM correction_events WHERE organization_id=$1 AND project_id=$2 AND root_run_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, root).Scan(&sequence); sequenceErr != nil {
 			return sequenceErr
 		}
 		event := correction.Event{Version: correction.Version, Sequence: sequence, Type: eventType, At: at, Record: next.Clone()}
 		eventData, _ := canonical(event)
-		_, eventErr := tx.Exec(ctx, `INSERT INTO correction_events(root_run_id,sequence,run_id,event,digest) VALUES($1,$2,$3,$4,$5)`, root, sequence, handle, eventData, digestBytes(eventData))
+		_, eventErr := tx.Exec(ctx, `INSERT INTO correction_events(organization_id,project_id,root_run_id,sequence,run_id,event,digest) VALUES($1,$2,$3,$4,$5,$6,$7)`, coordinate.OrganizationID, coordinate.ProjectID, root, sequence, handle, eventData, digestBytes(eventData))
 		if eventErr != nil {
 			return eventErr
 		}
@@ -227,11 +237,15 @@ func (adapter *PostgresCorrectionStore) ConfirmBudget(ctx context.Context, handl
 
 // Events returns the exact append-only chain prefix containing a handle.
 func (adapter *PostgresCorrectionStore) Events(ctx context.Context, handle string) ([]correction.Event, error) {
-	var root string
-	if err := adapter.store.pool.QueryRow(ctx, `SELECT root_run_id FROM correction_records WHERE run_id=$1`, handle).Scan(&root); err != nil {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
 		return nil, correctionFailure(correction.NotFound, "correction_handle")
 	}
-	rows, err := adapter.store.pool.Query(ctx, `SELECT event FROM correction_events WHERE root_run_id=$1 ORDER BY sequence`, root)
+	var root string
+	if err := adapter.store.pool.QueryRow(ctx, `SELECT root_run_id FROM correction_records WHERE organization_id=$1 AND project_id=$2 AND run_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&root); err != nil {
+		return nil, correctionFailure(correction.NotFound, "correction_handle")
+	}
+	rows, err := adapter.store.pool.Query(ctx, `SELECT event FROM correction_events WHERE organization_id=$1 AND project_id=$2 AND root_run_id=$3 ORDER BY sequence`, coordinate.OrganizationID, coordinate.ProjectID, root)
 	if err != nil {
 		return nil, correctionFailure(correction.Infrastructure, "events")
 	}
@@ -250,7 +264,11 @@ func (adapter *PostgresCorrectionStore) Events(ctx context.Context, handle strin
 
 // Recover terminalizes interrupted owned records without external callbacks.
 func (adapter *PostgresCorrectionStore) Recover(ctx context.Context, owner string, at time.Time) error {
-	rows, err := adapter.store.pool.Query(ctx, `SELECT record FROM correction_records WHERE phase<>$1 AND convert_from(record,'UTF8')::jsonb->>'owner'<>'' ORDER BY run_id`, correction.PhaseTerminal)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return correctionFailure(correction.NotFound, "scope")
+	}
+	rows, err := adapter.store.pool.Query(ctx, `SELECT record FROM correction_records WHERE organization_id=$1 AND project_id=$2 AND phase<>$3 AND convert_from(record,'UTF8')::jsonb->>'owner'<>'' ORDER BY run_id`, coordinate.OrganizationID, coordinate.ProjectID, correction.PhaseTerminal)
 	if err != nil {
 		return correctionFailure(correction.Infrastructure, "recover")
 	}
@@ -278,7 +296,11 @@ func (adapter *PostgresCorrectionStore) Recover(ctx context.Context, owner strin
 
 // ClaimPendingComparisons reassigns abandoned finalization intents in stable order.
 func (adapter *PostgresCorrectionStore) ClaimPendingComparisons(ctx context.Context, owner string, at time.Time) ([]correction.Record, error) {
-	rows, err := adapter.store.pool.Query(ctx, `SELECT record FROM correction_records WHERE phase=$1 ORDER BY run_id`, correction.PhaseFinalizing)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, correctionFailure(correction.NotFound, "scope")
+	}
+	rows, err := adapter.store.pool.Query(ctx, `SELECT record FROM correction_records WHERE organization_id=$1 AND project_id=$2 AND phase=$3 ORDER BY run_id`, coordinate.OrganizationID, coordinate.ProjectID, correction.PhaseFinalizing)
 	if err != nil {
 		return nil, correctionFailure(correction.Infrastructure, "comparison_claim")
 	}
@@ -307,9 +329,10 @@ func (adapter *PostgresCorrectionStore) ClaimPendingComparisons(ctx context.Cont
 }
 
 // ReleaseOwner clears one process owner for shutdown recovery.
-func (adapter *PostgresCorrectionStore) ReleaseOwner(handle string) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+func (adapter *PostgresCorrectionStore) ReleaseOwner(ctx context.Context, handle string) {
+	if ctx == nil || ctx.Err() != nil {
+		return
+	}
 	record, err := adapter.Get(ctx, handle)
 	if err != nil {
 		return

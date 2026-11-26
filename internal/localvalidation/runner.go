@@ -436,10 +436,12 @@ func (r *Runner) Run(ctx context.Context) int {
 		fmt.Fprintln(r.deps.Stderr, "featureproof_error=execution")
 	}
 	finalBase := ctx
+	finalCtx := ctx
+	cancel := func() {}
 	if status == ResultCancelled || (status == ResultError && ctx.Err() != nil) {
 		finalBase = context.WithoutCancel(ctx)
+		finalCtx, cancel = context.WithTimeout(finalBase, r.deps.FinalizeTimeout)
 	}
-	finalCtx, cancel := context.WithTimeout(finalBase, r.deps.FinalizeTimeout)
 	defer cancel()
 	terminalType := harness.EventRunCompleted
 	if status == ResultCancelled {

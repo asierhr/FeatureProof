@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/asierhr/featureProof/internal/controlplane"
+	"github.com/asierhr/featureProof/internal/tenantsecurity"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -24,6 +26,8 @@ type Config struct {
 	MaxSchema        int
 	MaxTxAttempts    int
 	Observer         controlplane.Observer
+	// IsolatedLoopbackTest permits plaintext only for an explicitly isolated loopback test database.
+	IsolatedLoopbackTest bool
 }
 
 // Store owns the private driver pool implementing consumer contracts.
@@ -56,6 +60,15 @@ func Open(ctx context.Context, config Config) (*Store, error) {
 	}
 	parsed, err := pgxpool.ParseConfig(config.DSN)
 	if err != nil {
+		return nil, controlplane.ErrInvalid
+	}
+	host := parsed.ConnConfig.Host
+	serverName := host
+	if parsed.ConnConfig.Port != 0 {
+		serverName = net.JoinHostPort(host, fmt.Sprint(parsed.ConnConfig.Port))
+	}
+	transport := tenantsecurity.TransportSecurity{TLS: parsed.ConnConfig.TLSConfig != nil, PeerAuthenticated: parsed.ConnConfig.TLSConfig != nil && !parsed.ConnConfig.TLSConfig.InsecureSkipVerify, ServerName: serverName, IsolatedLoopbackTest: config.IsolatedLoopbackTest}
+	if err = tenantsecurity.ValidateTransport(transport); err != nil {
 		return nil, controlplane.ErrInvalid
 	}
 	parsed.MaxConns = config.MaxConnections
@@ -139,18 +152,18 @@ func mapOperationError(err error, operation string) error {
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
 		case "23505":
-			return &controlplane.Error{Category: controlplane.CategoryConflict, Operation: operation}
+			return &controlplane.Error{Category: controlplane.CategoryConflict, Operation: operation, Cause: err}
 		case "23503", "23514":
-			return &controlplane.Error{Category: controlplane.CategoryIntegrity, Operation: operation}
+			return &controlplane.Error{Category: controlplane.CategoryIntegrity, Operation: operation, Cause: err}
 		case "40001", "40P01":
-			return &controlplane.Error{Category: controlplane.CategoryTransient, Operation: operation}
+			return &controlplane.Error{Category: controlplane.CategoryTransient, Operation: operation, Cause: err}
 		case "42501":
-			return &controlplane.Error{Category: controlplane.CategoryUnauthorized, Operation: operation}
+			return &controlplane.Error{Category: controlplane.CategoryUnauthorized, Operation: operation, Cause: err}
 		case "42P01", "42703":
 			return fmt.Errorf("%w: sqlstate %s", ErrSchema, pgErr.Code)
 		}
 	}
-	return &controlplane.Error{Category: controlplane.CategoryUnavailable, Operation: operation}
+	return &controlplane.Error{Category: controlplane.CategoryUnavailable, Operation: operation, Cause: err}
 }
 
 // observe emits one best-effort content-free signal whose sink cannot affect authoritative behavior.

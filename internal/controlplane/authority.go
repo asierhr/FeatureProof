@@ -22,11 +22,11 @@ func BuildAuthority(job Job, request AuthorityRequest, now time.Time) (Authority
 	if VerifyJob(job) != nil || job.State != JobLeased || request.WorkerID != job.Owner || request.ExpiresAt.After(job.LeaseUntil) {
 		return AuthorityEnvelope{}, ErrUnauthorized
 	}
-	grant, err := SealAuthorityGrant(AuthorityGrant{ProjectID: job.ProjectID, RunID: job.RunID, BackendEpoch: job.BackendEpoch, BindingDigest: job.BindingDigest, Phase: job.Phase, InputReferences: request.InputReferences, AllowedCapabilities: request.Capabilities, TargetBindingRef: request.TargetBindingRef, TargetBindingDigest: request.TargetBindingDigest, SecretReferenceIDs: request.SecretReferenceIDs})
+	grant, err := SealAuthorityGrant(AuthorityGrant{OrganizationID: job.OrganizationID, ProjectID: job.ProjectID, RunID: job.RunID, BackendEpoch: job.BackendEpoch, BindingDigest: job.BindingDigest, Phase: job.Phase, InputReferences: request.InputReferences, AllowedCapabilities: request.Capabilities, TargetBindingRef: request.TargetBindingRef, TargetBindingDigest: request.TargetBindingDigest, SecretReferenceIDs: request.SecretReferenceIDs})
 	if err != nil {
 		return AuthorityEnvelope{}, ErrUnauthorized
 	}
-	value := AuthorityEnvelope{Version: ModelVersion, EnvelopeID: request.EnvelopeID, ProjectID: job.ProjectID, RunID: job.RunID, JobID: job.JobID, WorkerID: request.WorkerID, BackendEpoch: job.BackendEpoch, BindingDigest: job.BindingDigest, Phase: job.Phase, Attempt: job.Attempt, Fence: job.Fence, ExpiresAt: request.ExpiresAt, InputReferences: grant.InputReferences, AllowedCapabilities: grant.AllowedCapabilities, TargetBindingRef: grant.TargetBindingRef, TargetBindingDigest: grant.TargetBindingDigest, SecretReferenceIDs: grant.SecretReferenceIDs}
+	value := AuthorityEnvelope{OrganizationID: job.OrganizationID, Version: ModelVersion, EnvelopeID: request.EnvelopeID, ProjectID: job.ProjectID, RunID: job.RunID, JobID: job.JobID, WorkerID: request.WorkerID, BackendEpoch: job.BackendEpoch, BindingDigest: job.BindingDigest, Phase: job.Phase, Attempt: job.Attempt, Fence: job.Fence, ExpiresAt: request.ExpiresAt, InputReferences: grant.InputReferences, AllowedCapabilities: grant.AllowedCapabilities, TargetBindingRef: grant.TargetBindingRef, TargetBindingDigest: grant.TargetBindingDigest, SecretReferenceIDs: grant.SecretReferenceIDs}
 	return SealAuthority(value, now)
 }
 
@@ -35,7 +35,7 @@ func DeriveAuthority(ctx context.Context, grants AuthorityGrantStore, job Job, e
 	if grants == nil || worker != job.Owner {
 		return AuthorityEnvelope{}, ErrUnauthorized
 	}
-	grant, err := grants.LoadAuthorityGrant(ctx, job.RunID, job.Phase)
+	grant, err := grants.LoadAuthorityGrant(ctx, ProjectScope{OrganizationID: job.OrganizationID, ProjectID: job.ProjectID}, job.RunID, job.Phase)
 	if err != nil || VerifyAuthorityGrant(grant) != nil || grant.ProjectID != job.ProjectID || grant.RunID != job.RunID || grant.BackendEpoch != job.BackendEpoch || grant.BindingDigest != job.BindingDigest || grant.Phase != job.Phase {
 		return AuthorityEnvelope{}, ErrUnauthorized
 	}

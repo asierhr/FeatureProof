@@ -50,6 +50,26 @@ var (
 	digestPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 )
 
+// ProjectScope is the validated composite tenant coordinate required by every tenant-owned control-plane operation.
+type ProjectScope struct {
+	OrganizationID string `json:"organization_id"`
+	ProjectID      string `json:"project_id"`
+}
+
+// NewProjectScope validates organization and project before a caller can address tenant-owned state.
+func NewProjectScope(organizationID, projectID string) (ProjectScope, error) {
+	if !safeID.MatchString(organizationID) || !safeID.MatchString(projectID) {
+		return ProjectScope{}, ErrInvalid
+	}
+	return ProjectScope{OrganizationID: organizationID, ProjectID: projectID}, nil
+}
+
+// Validate rejects zero, malformed, or partially populated tenant coordinates at adapter boundaries.
+func (scope ProjectScope) Validate() error {
+	_, err := NewProjectScope(scope.OrganizationID, scope.ProjectID)
+	return err
+}
+
 // SafeID reports whether an external identifier fits the bounded canonical
 // alphabet shared by persistence and authority boundaries.
 func SafeID(value string) bool {
@@ -143,6 +163,7 @@ const (
 // BackendEpoch is an immutable append-only backend authority record.
 type BackendEpoch struct {
 	Version         string      `json:"version"`
+	OrganizationID  string      `json:"organization_id"`
 	RunID           string      `json:"run_id"`
 	ProjectID       string      `json:"project_id"`
 	Epoch           uint64      `json:"epoch"`
@@ -156,12 +177,13 @@ type BackendEpoch struct {
 
 // BindingHead points to the only active backend epoch for one run.
 type BindingHead struct {
-	RunID       string `json:"run_id"`
-	ProjectID   string `json:"project_id"`
-	Epoch       uint64 `json:"epoch"`
-	EpochDigest string `json:"epoch_digest"`
-	Revision    uint64 `json:"revision"`
-	Digest      string `json:"digest"`
+	OrganizationID string `json:"organization_id"`
+	RunID          string `json:"run_id"`
+	ProjectID      string `json:"project_id"`
+	Epoch          uint64 `json:"epoch"`
+	EpochDigest    string `json:"epoch_digest"`
+	Revision       uint64 `json:"revision"`
+	Digest         string `json:"digest"`
 }
 
 // JobState is the closed durable scheduling state machine.
@@ -203,6 +225,7 @@ const (
 // Job is the durable unit claimed by a worker for one phase.
 type Job struct {
 	Version        string    `json:"version"`
+	OrganizationID string    `json:"organization_id"`
 	JobID          string    `json:"job_id"`
 	ProjectID      string    `json:"project_id"`
 	RunID          string    `json:"run_id"`
@@ -226,6 +249,7 @@ type Job struct {
 // AuthorityEnvelope is the minimal temporary authority issued for one claimed job.
 type AuthorityEnvelope struct {
 	Version             string    `json:"version"`
+	OrganizationID      string    `json:"organization_id"`
 	EnvelopeID          string    `json:"envelope_id"`
 	ProjectID           string    `json:"project_id"`
 	RunID               string    `json:"run_id"`
@@ -248,6 +272,7 @@ type AuthorityEnvelope struct {
 // AuthorityGrant is the persisted intersection of catalog, policy and binding authority for one run phase.
 type AuthorityGrant struct {
 	Version             string   `json:"version"`
+	OrganizationID      string   `json:"organization_id"`
 	ProjectID           string   `json:"project_id"`
 	RunID               string   `json:"run_id"`
 	BackendEpoch        uint64   `json:"backend_epoch"`
@@ -273,6 +298,7 @@ type InboxEnvelope struct {
 	Source         string            `json:"source"`
 	ExternalID     string            `json:"external_id"`
 	IdempotencyKey string            `json:"idempotency_key"`
+	OrganizationID string            `json:"organization_id"`
 	ProjectID      string            `json:"project_id"`
 	RequestDigest  string            `json:"request_digest"`
 	CommandKind    string            `json:"command_kind"`
@@ -281,7 +307,7 @@ type InboxEnvelope struct {
 
 // SealInboxEnvelope validates and detaches one payload-minimal authenticated command projection.
 func SealInboxEnvelope(value InboxEnvelope) (InboxEnvelope, error) {
-	if !safeID.MatchString(value.Source) || !safeID.MatchString(value.ExternalID) || !safeID.MatchString(value.IdempotencyKey) || !safeID.MatchString(value.ProjectID) || !digestPattern.MatchString(value.RequestDigest) || !safeID.MatchString(value.CommandKind) || len(value.CommandFields) > 32 {
+	if !safeID.MatchString(value.Source) || !safeID.MatchString(value.ExternalID) || !safeID.MatchString(value.IdempotencyKey) || !safeID.MatchString(value.OrganizationID) || !safeID.MatchString(value.ProjectID) || !digestPattern.MatchString(value.RequestDigest) || !safeID.MatchString(value.CommandKind) || len(value.CommandFields) > 32 {
 		return InboxEnvelope{}, ErrInvalid
 	}
 	fields := make(map[string]string, len(value.CommandFields))
@@ -299,6 +325,7 @@ func SealInboxEnvelope(value InboxEnvelope) (InboxEnvelope, error) {
 type EffectIntent struct {
 	OperationID     string `json:"operation_id"`
 	IdempotencyKey  string `json:"idempotency_key"`
+	OrganizationID  string `json:"organization_id"`
 	ProjectID       string `json:"project_id"`
 	RunID           string `json:"run_id"`
 	Phase           Phase  `json:"phase"`
@@ -315,7 +342,7 @@ func SealBackendEpoch(value BackendEpoch) (BackendEpoch, error) {
 	if value.Version == "" {
 		value.Version = ModelVersion
 	}
-	if value.Version != ModelVersion || !safeID.MatchString(value.RunID) || !safeID.MatchString(value.ProjectID) || value.Epoch == 0 || (value.Mode != BackendLocal && value.Mode != BackendPostgres) || !safeID.MatchString(value.BackendIdentity) || value.SchemaVersion == 0 || value.CreatedAt.IsZero() || (value.Epoch == 1) != (value.PreviousDigest == "") || (value.PreviousDigest != "" && !digestPattern.MatchString(value.PreviousDigest)) {
+	if value.Version != ModelVersion || !safeID.MatchString(value.RunID) || !safeID.MatchString(value.OrganizationID) || !safeID.MatchString(value.ProjectID) || value.Epoch == 0 || (value.Mode != BackendLocal && value.Mode != BackendPostgres) || !safeID.MatchString(value.BackendIdentity) || value.SchemaVersion == 0 || value.CreatedAt.IsZero() || (value.Epoch == 1) != (value.PreviousDigest == "") || (value.PreviousDigest != "" && !digestPattern.MatchString(value.PreviousDigest)) {
 		return BackendEpoch{}, ErrInvalid
 	}
 	value.Digest = ""
@@ -335,7 +362,7 @@ func VerifyBackendEpoch(value BackendEpoch) error {
 
 // SealBindingHead validates the active pointer without mutating its epoch.
 func SealBindingHead(value BindingHead) (BindingHead, error) {
-	if !safeID.MatchString(value.RunID) || !safeID.MatchString(value.ProjectID) || value.Epoch == 0 || !digestPattern.MatchString(value.EpochDigest) || value.Revision == 0 {
+	if !safeID.MatchString(value.RunID) || !safeID.MatchString(value.OrganizationID) || !safeID.MatchString(value.ProjectID) || value.Epoch == 0 || !digestPattern.MatchString(value.EpochDigest) || value.Revision == 0 {
 		return BindingHead{}, ErrInvalid
 	}
 	value.Digest = ""
@@ -347,7 +374,7 @@ func SealBindingHead(value BindingHead) (BindingHead, error) {
 func VerifyBindingHead(value BindingHead, epoch BackendEpoch) error {
 	expected := value.Digest
 	sealed, err := SealBindingHead(value)
-	if err != nil || expected == "" || sealed.Digest != expected || VerifyBackendEpoch(epoch) != nil || value.RunID != epoch.RunID || value.ProjectID != epoch.ProjectID || value.Epoch != epoch.Epoch || value.EpochDigest != epoch.Digest {
+	if err != nil || expected == "" || sealed.Digest != expected || VerifyBackendEpoch(epoch) != nil || value.RunID != epoch.RunID || value.OrganizationID != epoch.OrganizationID || value.ProjectID != epoch.ProjectID || value.Epoch != epoch.Epoch || value.EpochDigest != epoch.Digest {
 		return ErrIntegrity
 	}
 	return nil
@@ -362,7 +389,7 @@ func SealJob(value Job) (Job, error) {
 	validState := slices.Contains([]JobState{JobQueued, JobLeased, JobRetryWait, JobSucceeded, JobFailed, JobDead, JobCancelled}, value.State)
 	validPhase := slices.Contains([]Phase{PhasePlan, PhaseExecute, PhaseEvaluate, PhasePublish, PhaseCleanup}, value.Phase)
 	leased := value.State == JobLeased
-	if value.Version != ModelVersion || !safeID.MatchString(value.JobID) || !safeID.MatchString(value.ProjectID) || !safeID.MatchString(value.RunID) || value.BackendEpoch == 0 || !digestPattern.MatchString(value.BindingDigest) || !validPhase || !validState || !digestPattern.MatchString(value.InputDigest) || value.CreatedAt.IsZero() || value.AvailableAt.Before(value.CreatedAt) || value.Deadline.Before(value.AvailableAt) || leased != (value.Owner != "") || (leased && (!safeID.MatchString(value.Owner) || value.LeaseUntil.IsZero() || value.Fence == 0)) || (!leased && !value.LeaseUntil.IsZero()) {
+	if value.Version != ModelVersion || !safeID.MatchString(value.JobID) || !safeID.MatchString(value.OrganizationID) || !safeID.MatchString(value.ProjectID) || !safeID.MatchString(value.RunID) || value.BackendEpoch == 0 || !digestPattern.MatchString(value.BindingDigest) || !validPhase || !validState || !digestPattern.MatchString(value.InputDigest) || value.CreatedAt.IsZero() || value.AvailableAt.Before(value.CreatedAt) || value.Deadline.Before(value.AvailableAt) || leased != (value.Owner != "") || (leased && (!safeID.MatchString(value.Owner) || value.LeaseUntil.IsZero() || value.Fence == 0)) || (!leased && !value.LeaseUntil.IsZero()) {
 		return Job{}, ErrInvalid
 	}
 	value.Digest = ""
@@ -390,7 +417,7 @@ func SealAuthority(value AuthorityEnvelope, now time.Time) (AuthorityEnvelope, e
 		value.Version = ModelVersion
 	}
 	validPhase := slices.Contains([]Phase{PhasePlan, PhaseExecute, PhaseEvaluate, PhasePublish, PhaseCleanup}, value.Phase)
-	if value.Version != ModelVersion || !safeID.MatchString(value.EnvelopeID) || !safeID.MatchString(value.ProjectID) || !safeID.MatchString(value.RunID) || !safeID.MatchString(value.JobID) || !safeID.MatchString(value.WorkerID) || value.BackendEpoch == 0 || !digestPattern.MatchString(value.BindingDigest) || !validPhase || value.Fence == 0 || value.ExpiresAt.IsZero() || !value.ExpiresAt.After(now.UTC()) || !allSafe(value.InputReferences) || !allSafe(value.AllowedCapabilities) || !allSafe(value.SecretReferenceIDs) || (value.TargetBindingRef == "") != (value.TargetBindingDigest == "") || (value.TargetBindingDigest != "" && !digestPattern.MatchString(value.TargetBindingDigest)) {
+	if value.Version != ModelVersion || !safeID.MatchString(value.EnvelopeID) || !safeID.MatchString(value.OrganizationID) || !safeID.MatchString(value.ProjectID) || !safeID.MatchString(value.RunID) || !safeID.MatchString(value.JobID) || !safeID.MatchString(value.WorkerID) || value.BackendEpoch == 0 || !digestPattern.MatchString(value.BindingDigest) || !validPhase || value.Fence == 0 || value.ExpiresAt.IsZero() || !value.ExpiresAt.After(now.UTC()) || !allSafe(value.InputReferences) || !allSafe(value.AllowedCapabilities) || !allSafe(value.SecretReferenceIDs) || (value.TargetBindingRef == "") != (value.TargetBindingDigest == "") || (value.TargetBindingDigest != "" && !digestPattern.MatchString(value.TargetBindingDigest)) {
 		return AuthorityEnvelope{}, ErrInvalid
 	}
 	value.Digest = ""
@@ -405,7 +432,7 @@ func VerifyAuthority(value AuthorityEnvelope, job Job, worker string, now time.T
 	if err != nil || expected == "" || sealed.Digest != expected {
 		return ErrIntegrity
 	}
-	if VerifyJob(job) != nil || job.State != JobLeased || !value.ExpiresAt.After(now.UTC()) || value.ProjectID != job.ProjectID || value.RunID != job.RunID || value.JobID != job.JobID || value.WorkerID != worker || value.WorkerID != job.Owner || value.BackendEpoch != job.BackendEpoch || value.BindingDigest != job.BindingDigest || value.Phase != job.Phase || value.Attempt != job.Attempt || value.Fence != job.Fence || !job.LeaseUntil.After(now.UTC()) || value.ExpiresAt.After(job.LeaseUntil) {
+	if VerifyJob(job) != nil || job.State != JobLeased || !value.ExpiresAt.After(now.UTC()) || value.OrganizationID != job.OrganizationID || value.ProjectID != job.ProjectID || value.RunID != job.RunID || value.JobID != job.JobID || value.WorkerID != worker || value.WorkerID != job.Owner || value.BackendEpoch != job.BackendEpoch || value.BindingDigest != job.BindingDigest || value.Phase != job.Phase || value.Attempt != job.Attempt || value.Fence != job.Fence || !job.LeaseUntil.After(now.UTC()) || value.ExpiresAt.After(job.LeaseUntil) {
 		return ErrUnauthorized
 	}
 	return nil
@@ -419,7 +446,7 @@ func SealAuthorityGrant(value AuthorityGrant) (AuthorityGrant, error) {
 	value.InputReferences = sortedUnique(value.InputReferences)
 	value.AllowedCapabilities = sortedUnique(value.AllowedCapabilities)
 	value.SecretReferenceIDs = sortedUnique(value.SecretReferenceIDs)
-	if value.Version != ModelVersion || !safeID.MatchString(value.ProjectID) || !safeID.MatchString(value.RunID) || value.BackendEpoch == 0 || !digestPattern.MatchString(value.BindingDigest) || !allSafe(value.InputReferences) || !allSafe(value.AllowedCapabilities) || !allSafe(value.SecretReferenceIDs) || (value.TargetBindingRef == "") != (value.TargetBindingDigest == "") || value.TargetBindingDigest != "" && !digestPattern.MatchString(value.TargetBindingDigest) || !phaseGrantAllowed(value) {
+	if value.Version != ModelVersion || !safeID.MatchString(value.OrganizationID) || !safeID.MatchString(value.ProjectID) || !safeID.MatchString(value.RunID) || value.BackendEpoch == 0 || !digestPattern.MatchString(value.BindingDigest) || !allSafe(value.InputReferences) || !allSafe(value.AllowedCapabilities) || !allSafe(value.SecretReferenceIDs) || (value.TargetBindingRef == "") != (value.TargetBindingDigest == "") || value.TargetBindingDigest != "" && !digestPattern.MatchString(value.TargetBindingDigest) || !phaseGrantAllowed(value) {
 		return AuthorityGrant{}, ErrInvalid
 	}
 	value.Digest = ""

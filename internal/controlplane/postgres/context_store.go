@@ -40,22 +40,23 @@ func (adapter *PostgresContextStore) CommitSnapshot(ctx context.Context, key str
 		if err := adapter.requireActiveWorkflow(ctx, tx, snapshot.RunID); err != nil {
 			return err
 		}
+		coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
 		var existingRequest, existingObject string
-		scanErr := tx.QueryRow(ctx, `SELECT request_digest,object_digest FROM context_receipts WHERE kind='snapshot' AND key_digest=$1 FOR UPDATE`, keyDigest).Scan(&existingRequest, &existingObject)
+		scanErr := tx.QueryRow(ctx, `SELECT request_digest,object_digest FROM context_receipts WHERE organization_id=$1 AND project_id=$2 AND kind='snapshot' AND key_digest=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, keyDigest).Scan(&existingRequest, &existingObject)
 		if scanErr == nil {
 			if existingRequest != requestDigest || existingObject != snapshot.Digest {
 				return controlplane.ErrConflict
 			}
 			created = false
-			return tx.QueryRow(ctx, `SELECT document FROM context_snapshots WHERE digest=$1`, existingObject).Scan(&document)
+			return tx.QueryRow(ctx, `SELECT document FROM context_snapshots WHERE organization_id=$1 AND project_id=$2 AND digest=$3`, coordinate.OrganizationID, coordinate.ProjectID, existingObject).Scan(&document)
 		}
 		if scanErr != pgx.ErrNoRows {
 			return scanErr
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO context_snapshots(digest,run_id,document) VALUES($1,$2,$3) ON CONFLICT(digest) DO NOTHING`, snapshot.Digest, snapshot.RunID, document); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO context_snapshots(organization_id,project_id,digest,run_id,document) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, snapshot.Digest, snapshot.RunID, document); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO context_receipts(kind,key_digest,request_digest,object_digest,run_id) VALUES('snapshot',$1,$2,$3,$4)`, keyDigest, requestDigest, snapshot.Digest, snapshot.RunID); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO context_receipts(organization_id,project_id,kind,key_digest,request_digest,object_digest,run_id) VALUES($1,$2,'snapshot',$3,$4,$5,$6)`, coordinate.OrganizationID, coordinate.ProjectID, keyDigest, requestDigest, snapshot.Digest, snapshot.RunID); err != nil {
 			return err
 		}
 		created = true
@@ -78,7 +79,11 @@ func (adapter *PostgresContextStore) LoadSnapshot(ctx context.Context, digest st
 	if adapter == nil || adapter.store == nil || !validContextDigest(digest) {
 		return result, controlplane.ErrInvalid
 	}
-	err := adapter.store.pool.QueryRow(ctx, `SELECT s.document FROM context_snapshots s JOIN backend_binding_heads h ON h.run_id=s.run_id JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE s.digest=$1 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2`, digest, adapter.store.backendIdentity).Scan(&document)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return result, controlplane.ErrNotFound
+	}
+	err := adapter.store.pool.QueryRow(ctx, `SELECT s.document FROM context_snapshots s JOIN backend_binding_heads h ON h.organization_id=s.organization_id AND h.project_id=s.project_id AND h.run_id=s.run_id JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE s.organization_id=$1 AND s.project_id=$2 AND s.digest=$3 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4`, coordinate.OrganizationID, coordinate.ProjectID, digest, adapter.store.backendIdentity).Scan(&document)
 	if err == pgx.ErrNoRows {
 		return result, controlplane.ErrNotFound
 	}
@@ -108,22 +113,23 @@ func (adapter *PostgresContextStore) CommitBinding(ctx context.Context, key stri
 		if err := adapter.requireActiveWorkflow(ctx, tx, binding.RunID); err != nil {
 			return err
 		}
+		coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
 		var existingContext, existingObject string
-		scanErr := tx.QueryRow(ctx, `SELECT request_digest,object_digest FROM context_receipts WHERE kind='binding' AND key_digest=$1 FOR UPDATE`, keyDigest).Scan(&existingContext, &existingObject)
+		scanErr := tx.QueryRow(ctx, `SELECT request_digest,object_digest FROM context_receipts WHERE organization_id=$1 AND project_id=$2 AND kind='binding' AND key_digest=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, keyDigest).Scan(&existingContext, &existingObject)
 		if scanErr == nil {
 			if existingContext != binding.ContextDigest || existingObject != binding.Digest {
 				return controlplane.ErrConflict
 			}
 			created = false
-			return tx.QueryRow(ctx, `SELECT document FROM context_bindings WHERE digest=$1`, existingObject).Scan(&document)
+			return tx.QueryRow(ctx, `SELECT document FROM context_bindings WHERE organization_id=$1 AND project_id=$2 AND digest=$3`, coordinate.OrganizationID, coordinate.ProjectID, existingObject).Scan(&document)
 		}
 		if scanErr != pgx.ErrNoRows {
 			return scanErr
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO context_bindings(digest,run_id,context_digest,document) VALUES($1,$2,$3,$4) ON CONFLICT(digest) DO NOTHING`, binding.Digest, binding.RunID, binding.ContextDigest, document); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO context_bindings(organization_id,project_id,digest,run_id,context_digest,document) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, binding.Digest, binding.RunID, binding.ContextDigest, document); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO context_receipts(kind,key_digest,request_digest,object_digest,run_id) VALUES('binding',$1,$2,$3,$4)`, keyDigest, binding.ContextDigest, binding.Digest, binding.RunID); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO context_receipts(organization_id,project_id,kind,key_digest,request_digest,object_digest,run_id) VALUES($1,$2,'binding',$3,$4,$5,$6)`, coordinate.OrganizationID, coordinate.ProjectID, keyDigest, binding.ContextDigest, binding.Digest, binding.RunID); err != nil {
 			return err
 		}
 		created = true
@@ -146,7 +152,11 @@ func (adapter *PostgresContextStore) LoadBinding(ctx context.Context, digest str
 	if adapter == nil || adapter.store == nil || !validContextDigest(digest) {
 		return result, controlplane.ErrInvalid
 	}
-	err := adapter.store.pool.QueryRow(ctx, `SELECT b.document FROM context_bindings b JOIN backend_binding_heads h ON h.run_id=b.run_id JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE b.digest=$1 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2`, digest, adapter.store.backendIdentity).Scan(&document)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return result, controlplane.ErrNotFound
+	}
+	err := adapter.store.pool.QueryRow(ctx, `SELECT b.document FROM context_bindings b JOIN backend_binding_heads h ON h.organization_id=b.organization_id AND h.project_id=b.project_id AND h.run_id=b.run_id JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE b.organization_id=$1 AND b.project_id=$2 AND b.digest=$3 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4`, coordinate.OrganizationID, coordinate.ProjectID, digest, adapter.store.backendIdentity).Scan(&document)
 	if err == pgx.ErrNoRows {
 		return result, controlplane.ErrNotFound
 	}
@@ -162,8 +172,12 @@ func (adapter *PostgresContextStore) LoadBinding(ctx context.Context, digest str
 // requireActiveWorkflow locks and validates the selected backend before one
 // context object can become reachable by a workflow transition.
 func (adapter *PostgresContextStore) requireActiveWorkflow(ctx context.Context, tx pgx.Tx, runID string) error {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != runID {
+		return controlplane.ErrNotFound
+	}
 	var identity string
-	err := tx.QueryRow(ctx, `SELECT convert_from(e.document,'UTF8')::jsonb->>'backend_identity' FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.run_id=$1 FOR UPDATE OF h`, runID).Scan(&identity)
+	err := tx.QueryRow(ctx, `SELECT convert_from(e.document,'UTF8')::jsonb->>'backend_identity' FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.organization_id=$1 AND h.project_id=$2 AND h.run_id=$3 FOR UPDATE OF h`, coordinate.OrganizationID, coordinate.ProjectID, runID).Scan(&identity)
 	if err == pgx.ErrNoRows {
 		return controlplane.ErrNotFound
 	}

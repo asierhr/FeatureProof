@@ -116,7 +116,7 @@ func TestLocalWorkflowStoresHonorGlobalImportFreeze(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = importStore.Freeze(ctx, "workflow-import", "workflow-run", "project-1", strings.Repeat("a", 64), 1, time.Now().UTC()); err != nil {
+	if _, err = importStore.Freeze(ctx, "organization", "workflow-import", "workflow-run", "project-1", strings.Repeat("a", 64), 1, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	record := Record{Version: 1, Handle: "workflow-run", Principal: "principal-1", IdempotencyKey: "workflow-key", RequestDigest: strings.Repeat("b", 64), Phase: PhaseAdmitted}

@@ -755,3 +755,14 @@ Bitácora append-only de features completadas.
 - Review independiente aprobada en la novena revisión. Pasan formato, vet, compile-only, suite global serial, focales/race, runtime Linux y gate PostgreSQL 16 normal/race/coverage.
 - Cobertura diferencial exacta y reproducible: `2230/2592 = 86.03395061728395061728395061728395061728%`; dos firmas independientes iguales y cleanup sin procesos, distros, roots, perfiles ni temporales propios.
 
+## 2026-11-26 — tenant-security
+
+- Estado final: `done`.
+- Resultado: modelo multi-tenant explícito para organizaciones, proyectos, miembros e identidades de servicio; RBAC cerrado, capabilities selladas y bindings causales protegen runs, configuración, evidencias, entornos, workers, colas, caches y objetos en todas las superficies productivas.
+- Seguridad: secrets cifrados con envelope encryption, leases JIT single-use ligados a caller/run/fase/consumer/fence, rotación/revocación, transporte fail-closed y journal de auditoría durable/tamper-evident para allow, deny y mutaciones sensibles.
+- Operación: retención y deletion convergentes con intents/tombstones, quotas jerárquicas confirmadas antes del efecto y conservación de `EffectUnknown` hasta reconciliación provider-owned; recovery multi-principal conserva capabilities históricas y releases exactly-once.
+- Integración: CLI, API, MCP, GitHub, external-agent y workers autentican por request desde fronteras confiables y convergen en la misma autoridad durable, project configuration tenant-aware y saga `Prepare → Reserve → Confirm/Abort/Recover`.
+- Spec aprobada por el usuario el `2026-11-20T08:52:19+01:00`. Tasks T1–T24 y requirements R1–R20 trazados en `progress/tenant-security/{implementation,review}.md`.
+- Review independiente aprobada tras cerrar todos los hallazgos. Pasan formato, vet, compile-only, global normal, race canónico exacto sin `-p=1`, focales race repetidas, seis builds cruzados, módulos, comentarios, secretos y gate PostgreSQL 16 normal/race/Linux/N→N+1.
+- Manifest exacto: 89 fuentes productivas, 53 tests, 4 fuentes sin statements y 17 paquetes. Cobertura diferencial reproducible: `4725/5545 = 85.21190261496844003606853020739404869252%`; dos bases y cuatro generaciones con firma idéntica, cleanup sin recursos propios.
+

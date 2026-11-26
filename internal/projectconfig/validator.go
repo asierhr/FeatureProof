@@ -8,7 +8,7 @@ import (
 
 // ValidateAndMerge resolves references against one trusted catalog and applies policy monotonically.
 func ValidateAndMerge(document CanonicalDocument, policy OrganizationPolicySnapshot, catalog ResourceCatalogSnapshot) (EffectiveConfiguration, error) {
-	key := ProjectKey{ProjectID: document.Document.ProjectID, RepositoryID: document.Document.RepositoryID}
+	key := ProjectKey{OrganizationID: document.Document.OrganizationID, ProjectID: document.Document.ProjectID, RepositoryID: document.Document.RepositoryID}
 	if key.Validate() != nil || catalog.ProjectKey != key || !validDigest(policy.Digest) || !validDigest(catalog.Digest) || policy.Version == 0 {
 		return EffectiveConfiguration{}, &Error{Category: CategoryIntegrity, Operation: "validate.snapshots"}
 	}

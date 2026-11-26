@@ -40,7 +40,11 @@ func (adapter *PostgresEnvironmentStore) ScanCleanupLifecycle(ctx context.Contex
 	if limit <= 0 {
 		return nil, "", &environment.Error{Category: environment.CategoryInvalid, Operation: "cleanup_scan"}
 	}
-	rows, err := adapter.store.pool.Query(ctx, `SELECT run_id,record FROM environment_records WHERE run_id>$1 ORDER BY run_id LIMIT $2`, cursor, limit+1)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, "", &environment.Error{Category: environment.CategoryConflict, Operation: "cleanup_scan_scope"}
+	}
+	rows, err := adapter.store.pool.Query(ctx, `SELECT run_id,record FROM environment_records WHERE organization_id=$1 AND project_id=$2 AND run_id>$3 ORDER BY run_id LIMIT $4`, coordinate.OrganizationID, coordinate.ProjectID, cursor, limit+1)
 	if err != nil {
 		return nil, "", environmentError(mapError(err), "cleanup_scan")
 	}
@@ -120,7 +124,7 @@ func (adapter *PostgresEnvironmentStore) Reserve(ctx context.Context, candidate 
 		if head.ProjectID != candidate.Selection.ProjectID {
 			return controlplane.ErrConflict
 		}
-		tag, execErr := tx.Exec(ctx, `INSERT INTO environment_records(run_id,project_id,revision,state,record,digest) VALUES($1,$2,1,$3,$4,$5) ON CONFLICT DO NOTHING`, candidate.RunID, head.ProjectID, candidate.State, data, digestBytes(data))
+		tag, execErr := tx.Exec(ctx, `INSERT INTO environment_records(organization_id,run_id,project_id,revision,state,record,digest) VALUES($1,$2,$3,1,$4,$5,$6) ON CONFLICT DO NOTHING`, head.OrganizationID, candidate.RunID, head.ProjectID, candidate.State, data, digestBytes(data))
 		if execErr != nil {
 			return execErr
 		}
@@ -129,7 +133,7 @@ func (adapter *PostgresEnvironmentStore) Reserve(ctx context.Context, candidate 
 			return syncRunRetentionReferenceTx(ctx, tx, candidate.RunID, "environment", candidate.RunID, candidate.State != environment.StateReleased)
 		}
 		var currentData []byte
-		if scanErr := tx.QueryRow(ctx, `SELECT record FROM environment_records WHERE run_id=$1`, candidate.RunID).Scan(&currentData); scanErr != nil {
+		if scanErr := tx.QueryRow(ctx, `SELECT record FROM environment_records WHERE organization_id=$1 AND project_id=$2 AND run_id=$3`, head.OrganizationID, head.ProjectID, candidate.RunID).Scan(&currentData); scanErr != nil {
 			return scanErr
 		}
 		if json.Unmarshal(currentData, &result) != nil {
@@ -145,8 +149,12 @@ func (adapter *PostgresEnvironmentStore) Reserve(ctx context.Context, candidate 
 
 // Load returns one detached lifecycle record.
 func (adapter *PostgresEnvironmentStore) Load(ctx context.Context, runID string) (environment.Record, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != runID {
+		return environment.Record{}, environmentError(controlplane.ErrNotFound, "load")
+	}
 	var data []byte
-	if err := adapter.store.pool.QueryRow(ctx, `SELECT record FROM environment_records WHERE run_id=$1`, runID).Scan(&data); err != nil {
+	if err := adapter.store.pool.QueryRow(ctx, `SELECT record FROM environment_records WHERE organization_id=$1 AND project_id=$2 AND run_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, runID).Scan(&data); err != nil {
 		return environment.Record{}, environmentError(mapError(err), "load")
 	}
 	var value environment.Record
@@ -175,12 +183,13 @@ func (adapter *PostgresEnvironmentStore) SaveCausal(ctx context.Context, candida
 	recordData, _ := canonical(candidate)
 	eventData, _ := canonical(event)
 	err := retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "environment.save_causal", adapter.store.observer, func(tx pgx.Tx) error {
-		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, candidate.RunID); verifyErr != nil {
+		head, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, candidate.RunID)
+		if verifyErr != nil {
 			return verifyErr
 		}
 		var currentData []byte
 		var currentRevision uint64
-		if scanErr := tx.QueryRow(ctx, `SELECT record,revision FROM environment_records WHERE run_id=$1 FOR UPDATE`, candidate.RunID).Scan(&currentData, &currentRevision); scanErr != nil {
+		if scanErr := tx.QueryRow(ctx, `SELECT record,revision FROM environment_records WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 FOR UPDATE`, head.OrganizationID, head.ProjectID, candidate.RunID).Scan(&currentData, &currentRevision); scanErr != nil {
 			return scanErr
 		}
 		var current environment.Record
@@ -190,7 +199,7 @@ func (adapter *PostgresEnvironmentStore) SaveCausal(ctx context.Context, candida
 		if currentRevision != expected || current.Revision != expected || !environment.AllowedStoreTransition(current.State, candidate.State) {
 			return &environment.Error{Category: environment.CategoryConflict, Operation: "store_transition"}
 		}
-		tag, execErr := tx.Exec(ctx, `UPDATE environment_records SET revision=$1,state=$2,record=$3,digest=$4 WHERE run_id=$5 AND revision=$6`, candidate.Revision, candidate.State, recordData, digestBytes(recordData), candidate.RunID, expected)
+		tag, execErr := tx.Exec(ctx, `UPDATE environment_records SET revision=$1,state=$2,record=$3,digest=$4 WHERE organization_id=$5 AND project_id=$6 AND run_id=$7 AND revision=$8`, candidate.Revision, candidate.State, recordData, digestBytes(recordData), head.OrganizationID, head.ProjectID, candidate.RunID, expected)
 		if execErr != nil {
 			return execErr
 		}
@@ -200,7 +209,7 @@ func (adapter *PostgresEnvironmentStore) SaveCausal(ctx context.Context, candida
 		if faultErr := adapter.store.injectFault("environment.after_projection"); faultErr != nil {
 			return faultErr
 		}
-		if _, execErr = tx.Exec(ctx, `INSERT INTO environment_events(run_id,event) VALUES($1,$2)`, candidate.RunID, eventData); execErr != nil {
+		if _, execErr = tx.Exec(ctx, `INSERT INTO environment_events(organization_id,project_id,run_id,event) VALUES($1,$2,$3,$4)`, head.OrganizationID, head.ProjectID, candidate.RunID, eventData); execErr != nil {
 			return execErr
 		}
 		if faultErr := adapter.store.injectFault("environment.after_event"); faultErr != nil {
@@ -238,7 +247,11 @@ func (adapter *PostgresEnvironmentStore) SaveCausal(ctx context.Context, candida
 
 // Events returns lifecycle events in database sequence order.
 func (adapter *PostgresEnvironmentStore) Events(ctx context.Context, runID string) ([]environment.Event, error) {
-	rows, err := adapter.store.pool.Query(ctx, `SELECT event FROM environment_events WHERE run_id=$1 ORDER BY sequence`, runID)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != runID {
+		return nil, environmentError(controlplane.ErrNotFound, "events")
+	}
+	rows, err := adapter.store.pool.Query(ctx, `SELECT event FROM environment_events WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 ORDER BY sequence`, coordinate.OrganizationID, coordinate.ProjectID, runID)
 	if err != nil {
 		return nil, environmentError(mapError(err), "events")
 	}
@@ -270,11 +283,12 @@ func (adapter *PostgresCapacityAdmission) Reserve(ctx context.Context, request e
 	}{request, receipt})
 	result := receipt
 	err := retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "capacity.reserve", adapter.store.observer, func(tx pgx.Tx) error {
-		if _, _, err := adapter.store.verifyWorkflowBackendTx(ctx, tx, request.RunID); err != nil {
+		head, _, err := adapter.store.verifyWorkflowBackendTx(ctx, tx, request.RunID)
+		if err != nil {
 			return err
 		}
 		var currentData []byte
-		scanErr := tx.QueryRow(ctx, `SELECT receipt FROM environment_capacity_receipts WHERE acquisition_key=$1 FOR UPDATE`, request.AcquisitionKey).Scan(&currentData)
+		scanErr := tx.QueryRow(ctx, `SELECT receipt FROM environment_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND acquisition_key=$3 FOR UPDATE`, head.OrganizationID, head.ProjectID, request.AcquisitionKey).Scan(&currentData)
 		if scanErr == nil {
 			var current struct {
 				Request environment.CapacityRequest
@@ -290,13 +304,13 @@ func (adapter *PostgresCapacityAdmission) Reserve(ctx context.Context, request e
 			return scanErr
 		}
 		var environments, cpu, memory, objects uint64
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(sum((convert_from(receipt,'UTF8')::jsonb->'Request'->'Demand'->>'Environments')::numeric),0),COALESCE(sum((convert_from(receipt,'UTF8')::jsonb->'Request'->'Demand'->>'CPUMilli')::numeric),0),COALESCE(sum((convert_from(receipt,'UTF8')::jsonb->'Request'->'Demand'->>'MemoryBytes')::numeric),0),COALESCE(sum((convert_from(receipt,'UTF8')::jsonb->'Request'->'Demand'->>'ObjectCount')::numeric),0) FROM environment_capacity_receipts WHERE project_id=$1 AND state<>'released'`, request.ProjectID).Scan(&environments, &cpu, &memory, &objects); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(sum((convert_from(receipt,'UTF8')::jsonb->'Request'->'Demand'->>'Environments')::numeric),0),COALESCE(sum((convert_from(receipt,'UTF8')::jsonb->'Request'->'Demand'->>'CPUMilli')::numeric),0),COALESCE(sum((convert_from(receipt,'UTF8')::jsonb->'Request'->'Demand'->>'MemoryBytes')::numeric),0),COALESCE(sum((convert_from(receipt,'UTF8')::jsonb->'Request'->'Demand'->>'ObjectCount')::numeric),0) FROM environment_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND state<>'released'`, head.OrganizationID, request.ProjectID).Scan(&environments, &cpu, &memory, &objects); err != nil {
 			return err
 		}
 		if environments+request.Demand.Environments > limit.Environments || cpu+request.Demand.CPUMilli > limit.CPUMilli || memory+request.Demand.MemoryBytes > limit.MemoryBytes || objects+request.Demand.ObjectCount > limit.ObjectCount {
 			return &environment.Error{Category: environment.CategoryConflict, Operation: "capacity_limit"}
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO environment_capacity_receipts(receipt_id,project_id,run_id,acquisition_key,state,receipt,digest) VALUES($1,$2,$3,$4,'reserved',$5,$6)`, receipt.ID, request.ProjectID, request.RunID, request.AcquisitionKey, receiptData, receipt.Digest)
+		_, err = tx.Exec(ctx, `INSERT INTO environment_capacity_receipts(organization_id,receipt_id,project_id,run_id,acquisition_key,state,receipt,digest) VALUES($1,$2,$3,$4,$5,'reserved',$6,$7)`, head.OrganizationID, receipt.ID, request.ProjectID, request.RunID, request.AcquisitionKey, receiptData, receipt.Digest)
 		if err == nil {
 			err = syncRunRetentionReferenceTx(ctx, tx, request.RunID, "capacity", receipt.ID, true)
 		}
@@ -313,11 +327,15 @@ func (adapter *PostgresCapacityAdmission) Confirm(ctx context.Context, receipt e
 	if !environment.ValidCapacityProviderIdentity(environmentID, resource) {
 		return environment.CapacityReceipt{}, &environment.Error{Category: environment.CategoryIntegrity, Operation: "capacity_confirm"}
 	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return environment.CapacityReceipt{}, &environment.Error{Category: environment.CategoryUnauthorized, Operation: "capacity_confirm"}
+	}
 	err := retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "capacity.confirm", adapter.store.observer, func(tx pgx.Tx) error {
 		var state string
 		var runID string
 		var currentEnvironment, currentResource *string
-		if err := tx.QueryRow(ctx, `SELECT run_id,state,environment_id,resource_id FROM environment_capacity_receipts WHERE receipt_id=$1 AND digest=$2 FOR UPDATE`, receipt.ID, receipt.Digest).Scan(&runID, &state, &currentEnvironment, &currentResource); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT run_id,state,environment_id,resource_id FROM environment_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND receipt_id=$3 AND digest=$4 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, receipt.ID, receipt.Digest).Scan(&runID, &state, &currentEnvironment, &currentResource); err != nil {
 			return err
 		}
 		if _, _, err := adapter.store.verifyWorkflowBackendTx(ctx, tx, runID); err != nil {
@@ -326,7 +344,7 @@ func (adapter *PostgresCapacityAdmission) Confirm(ctx context.Context, receipt e
 		if state != "reserved" && state != "confirmed" || currentEnvironment != nil && *currentEnvironment != environmentID || currentResource != nil && *currentResource != resource {
 			return &environment.Error{Category: environment.CategoryConflict, Operation: "capacity_confirm"}
 		}
-		_, err := tx.Exec(ctx, `UPDATE environment_capacity_receipts SET state='confirmed',environment_id=$1,resource_id=$2 WHERE receipt_id=$3 AND digest=$4`, environmentID, resource, receipt.ID, receipt.Digest)
+		_, err := tx.Exec(ctx, `UPDATE environment_capacity_receipts SET state='confirmed',environment_id=$1,resource_id=$2 WHERE organization_id=$3 AND project_id=$4 AND receipt_id=$5 AND digest=$6`, environmentID, resource, coordinate.OrganizationID, coordinate.ProjectID, receipt.ID, receipt.Digest)
 		return err
 	})
 	if err != nil {
@@ -340,10 +358,14 @@ func (adapter *PostgresCapacityAdmission) Release(ctx context.Context, receipt e
 	if !environment.ValidCapacityReleaseInput(cleanupID, confirmation) {
 		return &environment.Error{Category: environment.CategoryIntegrity, Operation: "capacity_release"}
 	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return &environment.Error{Category: environment.CategoryUnauthorized, Operation: "capacity_release"}
+	}
 	err := retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "capacity.release", adapter.store.observer, func(tx pgx.Tx) error {
 		var runID, environmentID, resourceID, state string
 		var priorCleanupID, priorConfirmation *string
-		if err := tx.QueryRow(ctx, `SELECT run_id,environment_id,resource_id,state,cleanup_id,release_confirmation FROM environment_capacity_receipts WHERE receipt_id=$1 AND digest=$2 FOR UPDATE`, receipt.ID, receipt.Digest).Scan(&runID, &environmentID, &resourceID, &state, &priorCleanupID, &priorConfirmation); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT run_id,environment_id,resource_id,state,cleanup_id,release_confirmation FROM environment_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND receipt_id=$3 AND digest=$4 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, receipt.ID, receipt.Digest).Scan(&runID, &environmentID, &resourceID, &state, &priorCleanupID, &priorConfirmation); err != nil {
 			return err
 		}
 		if _, _, err := adapter.store.verifyWorkflowBackendTx(ctx, tx, runID); err != nil {
@@ -353,7 +375,7 @@ func (adapter *PostgresCapacityAdmission) Release(ctx context.Context, receipt e
 		if state != "confirmed" && state != "released" || confirmation != expected || priorCleanupID != nil && *priorCleanupID != cleanupID || priorConfirmation != nil && *priorConfirmation != confirmation {
 			return &environment.Error{Category: environment.CategoryConflict, Operation: "capacity_release_confirmation"}
 		}
-		_, err := tx.Exec(ctx, `UPDATE environment_capacity_receipts SET state='released',cleanup_id=$1,release_confirmation=$2 WHERE receipt_id=$3 AND digest=$4 AND state IN ('confirmed','released')`, cleanupID, confirmation, receipt.ID, receipt.Digest)
+		_, err := tx.Exec(ctx, `UPDATE environment_capacity_receipts SET state='released',cleanup_id=$1,release_confirmation=$2 WHERE organization_id=$3 AND project_id=$4 AND receipt_id=$5 AND digest=$6 AND state IN ('confirmed','released')`, cleanupID, confirmation, coordinate.OrganizationID, coordinate.ProjectID, receipt.ID, receipt.Digest)
 		if err == nil {
 			err = syncRunRetentionReferenceTx(ctx, tx, runID, "capacity", receipt.ID, false)
 		}

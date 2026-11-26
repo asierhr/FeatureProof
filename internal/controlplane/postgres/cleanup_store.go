@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	cleanup "github.com/asierhr/featureProof/internal/environment/cleanup"
 	"github.com/jackc/pgx/v5"
 )
@@ -39,16 +40,17 @@ func (adapter *PostgresCleanupStore) Reserve(ctx context.Context, item cleanup.I
 	result, created := sealed, false
 	err = retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "cleanup.reserve", adapter.store.observer, func(tx pgx.Tx) error {
 		result, created = sealed, false
-		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, sealed.RunID); verifyErr != nil {
+		head, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, sealed.RunID)
+		if verifyErr != nil {
 			return cleanupFailure(cleanup.CategoryConflict, "reserve_backend")
 		}
-		tag, execErr := tx.Exec(ctx, `INSERT INTO cleanup_items(cleanup_id,project_id,run_id,state,version,owner,lease_until,fence,next_attempt_at,item,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`, sealed.CleanupID, sealed.ProjectID, sealed.RunID, sealed.State, sealed.VersionNumber, nullString(sealed.LeaseOwner), nullTime(sealed.LeaseUntil), sealed.FencingVersion, nullTime(sealed.NextAttemptAt), data, sealed.Digest)
+		tag, execErr := tx.Exec(ctx, `INSERT INTO cleanup_items(organization_id,cleanup_id,project_id,run_id,state,version,owner,lease_until,fence,next_attempt_at,item,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`, head.OrganizationID, sealed.CleanupID, sealed.ProjectID, sealed.RunID, sealed.State, sealed.VersionNumber, nullString(sealed.LeaseOwner), nullTime(sealed.LeaseUntil), sealed.FencingVersion, nullTime(sealed.NextAttemptAt), data, sealed.Digest)
 		if execErr != nil {
 			return execErr
 		}
 		if tag.RowsAffected() == 0 {
 			var currentData []byte
-			if scanErr := tx.QueryRow(ctx, `SELECT item FROM cleanup_items WHERE cleanup_id=$1 FOR UPDATE`, sealed.CleanupID).Scan(&currentData); scanErr != nil {
+			if scanErr := tx.QueryRow(ctx, `SELECT item FROM cleanup_items WHERE organization_id=$1 AND project_id=$2 AND cleanup_id=$3 FOR UPDATE`, head.OrganizationID, head.ProjectID, sealed.CleanupID).Scan(&currentData); scanErr != nil {
 				return scanErr
 			}
 			current, decodeErr := cleanup.DecodeItem(currentData)
@@ -68,7 +70,7 @@ func (adapter *PostgresCleanupStore) Reserve(ctx context.Context, item cleanup.I
 				return bindErr
 			}
 			eventData, _ := canonical(boundEvent)
-			_, execErr = tx.Exec(ctx, `INSERT INTO cleanup_events(cleanup_id,event_id,event) VALUES($1,$2,$3)`, sealed.CleanupID, boundEvent.ID, eventData)
+			_, execErr = tx.Exec(ctx, `INSERT INTO cleanup_events(organization_id,project_id,cleanup_id,event_id,event) VALUES($1,$2,$3,$4,$5)`, head.OrganizationID, head.ProjectID, sealed.CleanupID, boundEvent.ID, eventData)
 			if execErr != nil {
 				return execErr
 			}
@@ -89,7 +91,11 @@ func (adapter *PostgresCleanupStore) Scan(ctx context.Context, cursor string, li
 	if limit <= 0 {
 		return cleanup.Page{}, cleanupFailure(cleanup.CategoryInvalid, "scan")
 	}
-	rows, err := adapter.store.pool.Query(ctx, `SELECT item FROM cleanup_items WHERE cleanup_id>$1 ORDER BY cleanup_id LIMIT $2`, cursor, limit+1)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return cleanup.Page{}, cleanupFailure(cleanup.CategoryConflict, "scan_scope")
+	}
+	rows, err := adapter.store.pool.Query(ctx, `SELECT item FROM cleanup_items WHERE organization_id=$1 AND project_id=$2 AND cleanup_id>$3 ORDER BY cleanup_id LIMIT $4`, coordinate.OrganizationID, coordinate.ProjectID, cursor, limit+1)
 	if err != nil {
 		return cleanup.Page{}, cleanupFailure(cleanup.CategoryTransient, "scan")
 	}
@@ -123,11 +129,15 @@ func (adapter *PostgresCleanupStore) Claim(ctx context.Context, id, owner string
 		return cleanup.Item{}, false, cleanupFailure(cleanup.CategoryInvalid, "claim")
 	}
 	var result cleanup.Item
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return cleanup.Item{}, false, cleanupFailure(cleanup.CategoryConflict, "claim_scope")
+	}
 	claimed := false
 	err := retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "cleanup.claim", adapter.store.observer, func(tx pgx.Tx) error {
 		claimed = false
 		var data []byte
-		if scanErr := tx.QueryRow(ctx, `SELECT item FROM cleanup_items WHERE cleanup_id=$1 FOR UPDATE`, id).Scan(&data); scanErr != nil {
+		if scanErr := tx.QueryRow(ctx, `SELECT item FROM cleanup_items WHERE organization_id=$1 AND project_id=$2 AND cleanup_id=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, id).Scan(&data); scanErr != nil {
 			return cleanupFailure(cleanup.CategoryInvalid, "claim")
 		}
 		item, decodeErr := cleanup.DecodeItem(data)
@@ -135,7 +145,8 @@ func (adapter *PostgresCleanupStore) Claim(ctx context.Context, id, owner string
 			return decodeErr
 		}
 		result = item
-		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, item.RunID); verifyErr != nil {
+		head, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, item.RunID)
+		if verifyErr != nil {
 			return cleanupFailure(cleanup.CategoryConflict, "claim_backend")
 		}
 		if item.LeaseOwner != "" && item.LeaseUntil.After(now) || !cleanup.EligibleForClaim(item, now) {
@@ -155,7 +166,7 @@ func (adapter *PostgresCleanupStore) Claim(ctx context.Context, id, owner string
 			return bindErr
 		}
 		claimData, _ := canonical(claimEvent)
-		if _, execErr := tx.Exec(ctx, `INSERT INTO cleanup_events(cleanup_id,event_id,event) VALUES($1,$2,$3)`, id, claimEvent.ID, claimData); execErr != nil {
+		if _, execErr := tx.Exec(ctx, `INSERT INTO cleanup_events(organization_id,project_id,cleanup_id,event_id,event) VALUES($1,$2,$3,$4,$5)`, head.OrganizationID, head.ProjectID, id, claimEvent.ID, claimData); execErr != nil {
 			return execErr
 		}
 		result, claimed = item, true
@@ -208,10 +219,11 @@ func (adapter *PostgresCleanupStore) saveCleanupEvent(ctx context.Context, item 
 	}
 	data, _ := canonical(sealed)
 	err = retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "cleanup.save", adapter.store.observer, func(tx pgx.Tx) error {
-		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, sealed.RunID); verifyErr != nil {
+		head, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, sealed.RunID)
+		if verifyErr != nil {
 			return cleanupFailure(cleanup.CategoryConflict, "save_backend")
 		}
-		tag, execErr := tx.Exec(ctx, `UPDATE cleanup_items SET state=$1,version=$2,owner=$3,lease_until=$4,fence=$5,next_attempt_at=$6,item=$7,digest=$8 WHERE cleanup_id=$9 AND (($10='' AND owner IS NULL) OR (owner=$10 AND lease_until>now())) AND fence=$11 AND version=$12`, sealed.State, sealed.VersionNumber, nullString(sealed.LeaseOwner), nullTime(sealed.LeaseUntil), sealed.FencingVersion, nullTime(sealed.NextAttemptAt), data, sealed.Digest, sealed.CleanupID, owner, fence, expectedVersion)
+		tag, execErr := tx.Exec(ctx, `UPDATE cleanup_items SET state=$1,version=$2,owner=$3,lease_until=$4,fence=$5,next_attempt_at=$6,item=$7,digest=$8 WHERE organization_id=$9 AND project_id=$10 AND cleanup_id=$11 AND (($12='' AND owner IS NULL) OR (owner=$12 AND lease_until>now())) AND fence=$13 AND version=$14`, sealed.State, sealed.VersionNumber, nullString(sealed.LeaseOwner), nullTime(sealed.LeaseUntil), sealed.FencingVersion, nullTime(sealed.NextAttemptAt), data, sealed.Digest, head.OrganizationID, head.ProjectID, sealed.CleanupID, owner, fence, expectedVersion)
 		if execErr != nil {
 			return execErr
 		}
@@ -224,7 +236,7 @@ func (adapter *PostgresCleanupStore) saveCleanupEvent(ctx context.Context, item 
 				return bindErr
 			}
 			eventData, _ := canonical(boundEvent)
-			_, execErr = tx.Exec(ctx, `INSERT INTO cleanup_events(cleanup_id,event_id,event) VALUES($1,$2,$3)`, sealed.CleanupID, boundEvent.ID, eventData)
+			_, execErr = tx.Exec(ctx, `INSERT INTO cleanup_events(organization_id,project_id,cleanup_id,event_id,event) VALUES($1,$2,$3,$4,$5)`, head.OrganizationID, head.ProjectID, sealed.CleanupID, boundEvent.ID, eventData)
 			return execErr
 		}
 		return nil
@@ -262,7 +274,11 @@ func (adapter *PostgresCleanupStore) Requeue(ctx context.Context, authorization 
 
 // Events returns the append-only typed cleanup journal.
 func (adapter *PostgresCleanupStore) Events(ctx context.Context, id string) ([]cleanup.Event, error) {
-	rows, err := adapter.store.pool.Query(ctx, `SELECT event FROM cleanup_events WHERE cleanup_id=$1 ORDER BY sequence`, id)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, cleanupFailure(cleanup.CategoryUnauthorized, "events")
+	}
+	rows, err := adapter.store.pool.Query(ctx, `SELECT event FROM cleanup_events WHERE organization_id=$1 AND project_id=$2 AND cleanup_id=$3 ORDER BY sequence`, coordinate.OrganizationID, coordinate.ProjectID, id)
 	if err != nil {
 		return nil, cleanupFailure(cleanup.CategoryTransient, "events")
 	}
@@ -290,7 +306,8 @@ func (adapter *PostgresCleanupStore) Status(ctx context.Context, id string) (cle
 	}
 	updated := item.CreatedAt
 	var eventData []byte
-	if scanErr := adapter.store.pool.QueryRow(ctx, `SELECT event FROM cleanup_events WHERE cleanup_id=$1 ORDER BY sequence DESC LIMIT 1`, id).Scan(&eventData); scanErr == nil {
+	coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
+	if scanErr := adapter.store.pool.QueryRow(ctx, `SELECT event FROM cleanup_events WHERE organization_id=$1 AND project_id=$2 AND cleanup_id=$3 ORDER BY sequence DESC LIMIT 1`, coordinate.OrganizationID, coordinate.ProjectID, id).Scan(&eventData); scanErr == nil {
 		var event cleanup.Event
 		if json.Unmarshal(eventData, &event) == nil && event.At.After(updated) {
 			updated = event.At
@@ -319,8 +336,12 @@ func (adapter *PostgresCleanupStore) SaveCursor(ctx context.Context, source, exp
 
 // LoadCursorPass returns one restartable scan epoch.
 func (adapter *PostgresCleanupStore) LoadCursorPass(ctx context.Context, source string) (cleanup.CursorPass, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return cleanup.CursorPass{}, cleanupFailure(cleanup.CategoryUnauthorized, "cursor_scope")
+	}
 	var value cleanup.CursorPass
-	err := adapter.store.pool.QueryRow(ctx, `SELECT epoch,cursor FROM cleanup_cursors WHERE source=$1`, source).Scan(&value.Epoch, &value.Value)
+	err := adapter.store.pool.QueryRow(ctx, `SELECT epoch,cursor FROM cleanup_cursors WHERE organization_id=$1 AND project_id=$2 AND source=$3`, coordinate.OrganizationID, coordinate.ProjectID, source).Scan(&value.Epoch, &value.Value)
 	if err == pgx.ErrNoRows {
 		return cleanup.CursorPass{Epoch: 1}, nil
 	}
@@ -342,8 +363,12 @@ func (adapter *PostgresCleanupStore) SaveCursorPass(ctx context.Context, source 
 
 // saveCursorCAS commits one exact cursor observation without replacing caller authority with a fresh read.
 func (adapter *PostgresCleanupStore) saveCursorCAS(ctx context.Context, source string, expected, next cleanup.CursorPass) error {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return cleanupFailure(cleanup.CategoryUnauthorized, "cursor_scope")
+	}
 	err := retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "cleanup.cursor_save", adapter.store.observer, func(tx pgx.Tx) error {
-		tag, execErr := tx.Exec(ctx, `INSERT INTO cleanup_cursors(source,epoch,cursor) VALUES($1,$2,$3) ON CONFLICT(source) DO UPDATE SET epoch=EXCLUDED.epoch,cursor=EXCLUDED.cursor,revision=cleanup_cursors.revision+1 WHERE cleanup_cursors.epoch=$4 AND cleanup_cursors.cursor=$5`, source, next.Epoch, next.Value, expected.Epoch, expected.Value)
+		tag, execErr := tx.Exec(ctx, `INSERT INTO cleanup_cursors(organization_id,project_id,source,epoch,cursor) VALUES($1,$2,$3,$4,$5) ON CONFLICT(organization_id,project_id,source) DO UPDATE SET epoch=EXCLUDED.epoch,cursor=EXCLUDED.cursor,revision=cleanup_cursors.revision+1 WHERE cleanup_cursors.epoch=$6 AND cleanup_cursors.cursor=$7`, coordinate.OrganizationID, coordinate.ProjectID, source, next.Epoch, next.Value, expected.Epoch, expected.Value)
 		if execErr != nil {
 			return execErr
 		}
@@ -363,8 +388,12 @@ func (adapter *PostgresCleanupStore) saveCursorCAS(ctx context.Context, source s
 
 // loadItem strictly decodes one sealed cleanup record.
 func (adapter *PostgresCleanupStore) loadItem(ctx context.Context, id string) (cleanup.Item, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return cleanup.Item{}, cleanupFailure(cleanup.CategoryConflict, "load_scope")
+	}
 	var data []byte
-	if err := adapter.store.pool.QueryRow(ctx, `SELECT item FROM cleanup_items WHERE cleanup_id=$1`, id).Scan(&data); err != nil {
+	if err := adapter.store.pool.QueryRow(ctx, `SELECT item FROM cleanup_items WHERE organization_id=$1 AND project_id=$2 AND cleanup_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, id).Scan(&data); err != nil {
 		return cleanup.Item{}, cleanupFailure(cleanup.CategoryInvalid, "load")
 	}
 	return cleanup.DecodeItem(data)
@@ -374,10 +403,11 @@ func (adapter *PostgresCleanupStore) loadItem(ctx context.Context, id string) (c
 func (adapter *PostgresCleanupStore) updateCleanup(ctx context.Context, item cleanup.Item, owner string, fence, expectedVersion uint64, now time.Time) error {
 	data, _ := canonical(item)
 	err := retryTransactionObserved(ctx, adapter.store.pool, adapter.store.maxTxAttempts, "cleanup.update", adapter.store.observer, func(tx pgx.Tx) error {
-		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, item.RunID); verifyErr != nil {
+		head, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, item.RunID)
+		if verifyErr != nil {
 			return cleanupFailure(cleanup.CategoryConflict, "update_backend")
 		}
-		tag, execErr := tx.Exec(ctx, `UPDATE cleanup_items SET state=$1,version=$2,owner=$3,lease_until=$4,fence=$5,next_attempt_at=$6,item=$7,digest=$8 WHERE cleanup_id=$9 AND owner=$10 AND fence=$11 AND version=$12 AND lease_until>$13`, item.State, item.VersionNumber, nullString(item.LeaseOwner), nullTime(item.LeaseUntil), item.FencingVersion, nullTime(item.NextAttemptAt), data, item.Digest, item.CleanupID, owner, fence, expectedVersion, now)
+		tag, execErr := tx.Exec(ctx, `UPDATE cleanup_items SET state=$1,version=$2,owner=$3,lease_until=$4,fence=$5,next_attempt_at=$6,item=$7,digest=$8 WHERE organization_id=$9 AND project_id=$10 AND cleanup_id=$11 AND owner=$12 AND fence=$13 AND version=$14 AND lease_until>$15`, item.State, item.VersionNumber, nullString(item.LeaseOwner), nullTime(item.LeaseUntil), item.FencingVersion, nullTime(item.NextAttemptAt), data, item.Digest, head.OrganizationID, head.ProjectID, item.CleanupID, owner, fence, expectedVersion, now)
 		if execErr != nil {
 			return execErr
 		}
@@ -397,8 +427,12 @@ func (adapter *PostgresCleanupStore) updateCleanup(ctx context.Context, item cle
 
 // updateCleanupTx writes a claimed item inside the claim transaction.
 func (adapter *PostgresCleanupStore) updateCleanupTx(ctx context.Context, tx pgx.Tx, item cleanup.Item, id, owner string, fence uint64) error {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return cleanupFailure(cleanup.CategoryConflict, "claim_scope")
+	}
 	data, _ := canonical(item)
-	tag, err := tx.Exec(ctx, `UPDATE cleanup_items SET state=$1,version=$2,owner=$3,lease_until=$4,fence=$5,next_attempt_at=$6,item=$7,digest=$8 WHERE cleanup_id=$9`, item.State, item.VersionNumber, nullString(item.LeaseOwner), nullTime(item.LeaseUntil), item.FencingVersion, nullTime(item.NextAttemptAt), data, item.Digest, id)
+	tag, err := tx.Exec(ctx, `UPDATE cleanup_items SET state=$1,version=$2,owner=$3,lease_until=$4,fence=$5,next_attempt_at=$6,item=$7,digest=$8 WHERE organization_id=$9 AND project_id=$10 AND cleanup_id=$11`, item.State, item.VersionNumber, nullString(item.LeaseOwner), nullTime(item.LeaseUntil), item.FencingVersion, nullTime(item.NextAttemptAt), data, item.Digest, coordinate.OrganizationID, coordinate.ProjectID, id)
 	if err != nil || tag.RowsAffected() != 1 {
 		return cleanupFailure(cleanup.CategoryConflict, "claim")
 	}

@@ -67,17 +67,20 @@ func TestOperationalControlPlaneCommandsUseAuthorizedPostgres(t *testing.T) {
 	}
 	project := "cmd-operations-" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	for name, value := range map[string]string{
-		"FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN":          dsn,
-		"FEATUREPROOF_CONTROL_PLANE_IDENTITY":              "cmd-operations",
-		"FEATUREPROOF_CONTROL_PLANE_OPERATOR_UID":          operator.Uid,
-		"FEATUREPROOF_CONTROL_PLANE_CURSOR_SECRET":         strings.Repeat("c", 32),
-		"FEATUREPROOF_CONTROL_PLANE_QUERY_PROJECT_ID":      project,
-		"FEATUREPROOF_CONTROL_PLANE_QUERY_STATE":           "",
-		"FEATUREPROOF_CONTROL_PLANE_QUERY_CURSOR":          "",
-		"FEATUREPROOF_CONTROL_PLANE_QUERY_LIMIT":           "10",
-		"FEATUREPROOF_CONTROL_PLANE_RETENTION_PROJECT_ID":  project,
-		"FEATUREPROOF_CONTROL_PLANE_RETENTION_BEFORE_UNIX": strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10),
-		"FEATUREPROOF_CONTROL_PLANE_RETENTION_BATCH_SIZE":  "10",
+		"FEATUREPROOF_ORGANIZATION_ID":                         "organization",
+		"FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN":              dsn,
+		"FEATUREPROOF_CONTROL_PLANE_IDENTITY":                  "cmd-operations",
+		"FEATUREPROOF_CONTROL_PLANE_OPERATOR_UID":              operator.Uid,
+		"FEATUREPROOF_CONTROL_PLANE_CURSOR_SECRET":             strings.Repeat("c", 32),
+		"FEATUREPROOF_CONTROL_PLANE_QUERY_ORGANIZATION_ID":     "organization",
+		"FEATUREPROOF_CONTROL_PLANE_QUERY_PROJECT_ID":          project,
+		"FEATUREPROOF_CONTROL_PLANE_QUERY_STATE":               "",
+		"FEATUREPROOF_CONTROL_PLANE_QUERY_CURSOR":              "",
+		"FEATUREPROOF_CONTROL_PLANE_QUERY_LIMIT":               "10",
+		"FEATUREPROOF_CONTROL_PLANE_RETENTION_PROJECT_ID":      project,
+		"FEATUREPROOF_CONTROL_PLANE_RETENTION_ORGANIZATION_ID": "organization",
+		"FEATUREPROOF_CONTROL_PLANE_RETENTION_BEFORE_UNIX":     strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10),
+		"FEATUREPROOF_CONTROL_PLANE_RETENTION_BATCH_SIZE":      "10",
 	} {
 		t.Setenv(name, value)
 	}
@@ -116,15 +119,16 @@ func TestOperationalControlPlaneCommandsUseAuthorizedPostgres(t *testing.T) {
 		t.Fatalf("unauthorized operator returned %d", code)
 	}
 	t.Setenv("FEATUREPROOF_CONTROL_PLANE_OPERATOR_UID", operator.Uid)
-	store, err := controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: dsn, BackendIdentity: "cmd-operations", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+	store, err := controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: dsn, BackendIdentity: "cmd-operations", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	runID := "cmd-import-" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: runID, ProjectID: project, Epoch: 1, Mode: controlplane.BackendLocal, BackendIdentity: "cmd-local", SchemaVersion: 1, CreatedAt: time.Now().UTC()})
+	epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: runID, ProjectID: project, Epoch: 1, Mode: controlplane.BackendLocal, BackendIdentity: "cmd-local", SchemaVersion: 1, CreatedAt: time.Now().UTC()})
 	if err != nil {
 		t.Fatal(err)
 	}
+	registerCommandTenant(t, dsn, epoch.OrganizationID, epoch.ProjectID)
 	head, err := store.ReserveInitial(context.Background(), epoch)
 	store.Close()
 	if err != nil {
@@ -135,14 +139,15 @@ func TestOperationalControlPlaneCommandsUseAuthorizedPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, value := range map[string]string{
-		"FEATUREPROOF_CONTROL_PLANE_IMPORT_EXPECTED_EPOCH": "1",
-		"FEATUREPROOF_CONTROL_PLANE_IMPORT_PAGE_SIZE":      "1",
-		"FEATUREPROOF_CONTROL_PLANE_IMPORT_ID":             runID + "-import",
-		"FEATUREPROOF_CONTROL_PLANE_IMPORT_RUN_ID":         runID,
-		"FEATUREPROOF_CONTROL_PLANE_IMPORT_PROJECT_ID":     project,
-		"FEATUREPROOF_CONTROL_PLANE_IMPORT_EXPECTED_HEAD":  head.Digest,
-		"FEATUREPROOF_CONTROL_PLANE_LOCAL_ROOT":            localRoot,
-		"FEATUREPROOF_CONTROL_PLANE_LOCAL_IDENTITY":        "cmd-local",
+		"FEATUREPROOF_CONTROL_PLANE_IMPORT_ORGANIZATION_ID": "organization",
+		"FEATUREPROOF_CONTROL_PLANE_IMPORT_EXPECTED_EPOCH":  "1",
+		"FEATUREPROOF_CONTROL_PLANE_IMPORT_PAGE_SIZE":       "1",
+		"FEATUREPROOF_CONTROL_PLANE_IMPORT_ID":              runID + "-import",
+		"FEATUREPROOF_CONTROL_PLANE_IMPORT_RUN_ID":          runID,
+		"FEATUREPROOF_CONTROL_PLANE_IMPORT_PROJECT_ID":      project,
+		"FEATUREPROOF_CONTROL_PLANE_IMPORT_EXPECTED_HEAD":   head.Digest,
+		"FEATUREPROOF_CONTROL_PLANE_LOCAL_ROOT":             localRoot,
+		"FEATUREPROOF_CONTROL_PLANE_LOCAL_IDENTITY":         "cmd-local",
 	} {
 		t.Setenv(name, value)
 	}
@@ -165,8 +170,9 @@ func TestGitHubControlPlanePostgresComposition(t *testing.T) {
 	t.Setenv("FEATUREPROOF_CONTROL_PLANE_BACKEND", string(controlplane.BackendPostgres))
 	t.Setenv("FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN", dsn)
 	t.Setenv("FEATUREPROOF_CONTROL_PLANE_IDENTITY", "cmd-integration")
+	t.Setenv("FEATUREPROOF_ORGANIZATION_ID", "organization")
 	ctx := context.Background()
-	ingress, build, err := composeGitHubControlPlane(ctx, githubpr.WallClock{}, time.Minute)
+	ingress, build, err := composeGitHubControlPlane(ctx, githubpr.WallClock{}, time.Minute, "")
 	if err != nil || ingress == nil || build == nil {
 		t.Fatal("compose", err)
 	}
@@ -181,6 +187,7 @@ func TestGitHubControlPlanePostgresComposition(t *testing.T) {
 	if err != nil {
 		t.Fatal("build", err)
 	}
+	registerCommandTenant(t, dsn, admission.Epoch.OrganizationID, admission.Epoch.ProjectID)
 	created, err := ingress.Admit(ctx, admission)
 	if err != nil || !created {
 		t.Fatal("admit", created, err)
@@ -189,7 +196,7 @@ func TestGitHubControlPlanePostgresComposition(t *testing.T) {
 	if err != nil || created {
 		t.Fatal("redelivery", created, err)
 	}
-	loaded, err := store.LoadIngress(ctx, admission.Epoch.RunID)
+	loaded, err := store.LoadIngress(ctx, controlplane.ProjectScope{OrganizationID: admission.Epoch.OrganizationID, ProjectID: admission.Epoch.ProjectID}, admission.Epoch.RunID)
 	if err != nil || loaded.Envelope.ExternalID != command.DeliveryID {
 		t.Fatal("reload", err)
 	}
@@ -203,6 +210,7 @@ func TestGitHubRuntimePostgresCompositionOwnsLifecycle(t *testing.T) {
 		t.Fatal("FEATUREPROOF_POSTGRES_TEST_DSN is required")
 	}
 	for name, value := range map[string]string{
+		"FEATUREPROOF_ORGANIZATION_ID":            "organization",
 		"FEATUREPROOF_CONTROL_PLANE_BACKEND":      string(controlplane.BackendPostgres),
 		"FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN": dsn,
 		"FEATUREPROOF_CONTROL_PLANE_IDENTITY":     "github-runtime-postgres",
@@ -288,7 +296,7 @@ func TestPostgresWorkflowHistoricalReadNeverRepopulatesMissingArtifact(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstStore, err := controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: dsn, BackendIdentity: "artifact-admission", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute})
+	firstStore, err := controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: dsn, BackendIdentity: "artifact-admission", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +321,7 @@ func TestPostgresWorkflowHistoricalReadNeverRepopulatesMissingArtifact(t *testin
 	if err = os.WriteFile(contractPath, []byte(`{"openapi":"3.0.0","paths":{"/current-valid-and-distinct":{}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: dsn, BackendIdentity: "artifact-restart", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute})
+	restarted, err := controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: dsn, BackendIdentity: "artifact-restart", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +404,7 @@ func preparePostgresVerticalWorkflow(t *testing.T, root, targetURL, dsn string) 
 func seedPostgresProjectConfiguration(t *testing.T, dsn, configPath string) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: dsn, BackendIdentity: "project-config-fixture", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+	store, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: dsn, BackendIdentity: "project-config-fixture", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +417,11 @@ func seedPostgresProjectConfiguration(t *testing.T, dsn, configPath string) {
 		t.Fatal(err)
 	}
 	repositoryID := readWorkflowRepositoryID(t, configPath)
-	key, _ := projectconfig.NewProjectKey(os.Getenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID"), repositoryID)
+	key, _ := projectconfig.NewProjectKey(os.Getenv("FEATUREPROOF_ORGANIZATION_ID"), os.Getenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID"), repositoryID)
+	registerCommandTenant(t, dsn, key.OrganizationID, key.ProjectID)
+	if key.RepositoryID != key.ProjectID {
+		registerCommandTenant(t, dsn, key.OrganizationID, key.RepositoryID)
+	}
 	localStore, err := localprojectconfig.New(os.Getenv("FEATUREPROOF_PROJECT_CONFIG_ROOT"))
 	if err != nil {
 		t.Fatal(err)
@@ -458,6 +470,7 @@ func TestPostgresExternalAgentProductCompositionOwnsCausalAdmission(t *testing.T
 	writeWorkflowProjectConfigurationFixture(t, root, configPath)
 	seedPostgresProjectConfiguration(t, dsn, configPath)
 	for name, value := range map[string]string{
+		"FEATUREPROOF_ORGANIZATION_ID":            "organization",
 		"FEATUREPROOF_CONTROL_PLANE_BACKEND":      string(controlplane.BackendPostgres),
 		"FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN": dsn,
 		"FEATUREPROOF_CONTROL_PLANE_IDENTITY":     "external-product-postgres",
@@ -631,13 +644,13 @@ func (barrier *postgresVerticalBarrier) waitWorkflow(t *testing.T, key string, p
 
 // waitConfirmedEffect observes the exact outbox receipt that atomically closes
 // one delivery job and never infers completion from project-wide counts.
-func (barrier *postgresVerticalBarrier) waitConfirmedEffect(t *testing.T, operationID string) {
+func (barrier *postgresVerticalBarrier) waitConfirmedEffect(t *testing.T, projectID, operationID string) {
 	t.Helper()
 	waitContext, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	for {
 		var state string
-		err := barrier.conn.QueryRow(waitContext, `SELECT state FROM effect_intents WHERE operation_id=$1`, operationID).Scan(&state)
+		err := barrier.conn.QueryRow(waitContext, `SELECT state FROM effect_intents WHERE organization_id='organization' AND project_id=$1 AND operation_id=$2`, projectID, operationID).Scan(&state)
 		if err == nil && state == "confirmed" {
 			return
 		}
@@ -651,7 +664,7 @@ func (barrier *postgresVerticalBarrier) waitConfirmedEffect(t *testing.T, operat
 func (barrier *postgresVerticalBarrier) diagnostics(projectID, workflowKey string) string {
 	diagnosticContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	jobs, err := barrier.conn.Query(diagnosticContext, `SELECT j.job_id,j.state,j.phase,j.attempt,COALESCE(convert_from(j.document,'UTF8')::jsonb->>'last_category',''),COALESCE(string_agg(e.kind,',' ORDER BY e.sequence),'') FROM jobs j LEFT JOIN job_events e ON e.job_id=j.job_id WHERE j.project_id=$1 GROUP BY j.job_id,j.state,j.phase,j.attempt,j.document ORDER BY j.job_id`, projectID)
+	jobs, err := barrier.conn.Query(diagnosticContext, `SELECT j.job_id,j.state,j.phase,j.attempt,COALESCE(convert_from(j.document,'UTF8')::jsonb->>'last_category',''),COALESCE(string_agg(e.kind,',' ORDER BY e.sequence),'') FROM jobs j LEFT JOIN job_events e ON e.organization_id=j.organization_id AND e.project_id=j.project_id AND e.job_id=j.job_id WHERE j.organization_id='organization' AND j.project_id=$1 GROUP BY j.job_id,j.state,j.phase,j.attempt,j.document ORDER BY j.job_id`, projectID)
 	if err != nil {
 		return "jobs_query=" + err.Error()
 	}
@@ -744,7 +757,7 @@ func TestPostgresProductRuntimeContinuesOnlyThroughDurableWorker(t *testing.T) {
 	jobID := "ingress-" + hex.EncodeToString(hash[:])
 	workflowKey := "github:" + jobID
 	pending := barrier.waitWorkflow(t, workflowKey, validationworkflow.PhaseAwaitingApproval)
-	barrier.waitConfirmedEffect(t, jobID+"-dispatch")
+	barrier.waitConfirmedEffect(t, "202", jobID+"-dispatch")
 	if err = first.Close(context.Background()); err != nil {
 		t.Fatal("close process N", err)
 	}
@@ -765,14 +778,14 @@ func TestPostgresProductRuntimeContinuesOnlyThroughDurableWorker(t *testing.T) {
 	select {
 	case <-readStarted:
 	case <-time.After(90 * time.Second):
-		t.Fatalf("productive execution did not reach target effect: %s", barrier.diagnostics("repository-202", workflowKey))
+		t.Fatalf("productive execution did not reach target effect: %s", barrier.diagnostics("202", workflowKey))
 	}
 	activePool, poolErr := pgxpool.New(context.Background(), dsn)
 	if poolErr != nil {
 		t.Fatal(poolErr)
 	}
 	var activeKinds []string
-	if poolErr = activePool.QueryRow(context.Background(), `SELECT array_agg(DISTINCT reference_kind ORDER BY reference_kind) FROM retention_references WHERE job_id=$1 AND live`, jobID).Scan(&activeKinds); poolErr != nil {
+	if poolErr = activePool.QueryRow(context.Background(), `SELECT array_agg(DISTINCT reference_kind ORDER BY reference_kind) FROM retention_references WHERE organization_id='organization' AND project_id='202' AND job_id=$1 AND live`, jobID).Scan(&activeKinds); poolErr != nil {
 		activePool.Close()
 		t.Fatal(poolErr)
 	}
@@ -784,7 +797,7 @@ func TestPostgresProductRuntimeContinuesOnlyThroughDurableWorker(t *testing.T) {
 		t.Fatalf("active causal references=%v", activeKinds)
 	}
 	terminal := barrier.waitWorkflow(t, workflowKey, validationworkflow.PhaseTerminal)
-	barrier.waitConfirmedEffect(t, approvalJobID+"-dispatch")
+	barrier.waitConfirmedEffect(t, "202", approvalJobID+"-dispatch")
 	if err = second.Close(context.Background()); err != nil {
 		t.Fatal("close process N+1", err)
 	}
@@ -808,16 +821,16 @@ func TestPostgresProductRuntimeContinuesOnlyThroughDurableWorker(t *testing.T) {
 	defer pool.Close()
 	var packages, confirmed, activeReferences int
 	var referenceKinds []string
-	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM packages WHERE run_id=$1`, pending.Handle).Scan(&packages); err != nil {
+	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM packages WHERE organization_id='organization' AND project_id='202' AND run_id=$1`, pending.Handle).Scan(&packages); err != nil {
 		t.Fatal(err)
 	}
-	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM effect_intents WHERE state='confirmed' AND project_id='repository-202'`).Scan(&confirmed); err != nil {
+	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM effect_intents WHERE organization_id='organization' AND state='confirmed' AND project_id='202'`).Scan(&confirmed); err != nil {
 		t.Fatal(err)
 	}
-	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM retention_references WHERE job_id=$1 AND live`, jobID).Scan(&activeReferences); err != nil {
+	if err = pool.QueryRow(context.Background(), `SELECT count(*) FROM retention_references WHERE organization_id='organization' AND project_id='202' AND job_id=$1 AND live`, jobID).Scan(&activeReferences); err != nil {
 		t.Fatal(err)
 	}
-	if err = pool.QueryRow(context.Background(), `SELECT array_agg(DISTINCT reference_kind ORDER BY reference_kind) FROM retention_references WHERE job_id=$1`, jobID).Scan(&referenceKinds); err != nil {
+	if err = pool.QueryRow(context.Background(), `SELECT array_agg(DISTINCT reference_kind ORDER BY reference_kind) FROM retention_references WHERE organization_id='organization' AND project_id='202' AND job_id=$1`, jobID).Scan(&referenceKinds); err != nil {
 		t.Fatal(err)
 	}
 	wantReferences := []string{"cleanup", "environment", "fixture", "package", "workflow"}
@@ -842,7 +855,7 @@ func TestPostgresWorkflowCompositionSurvivesFilesystemRemoval(t *testing.T) {
 	t.Setenv("FEATUREPROOF_TEST_PROJECT_ID", "filesystem-"+hex.EncodeToString(fixtureIdentity[:8]))
 	configPath, _, _ := writeWorkflowCompositionFixture(t, root, workflowContractFixture(), "/pets", workflowProjectionFixture())
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)
-	store, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: dsn, BackendIdentity: "cmd-vertical", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+	store, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: dsn, BackendIdentity: "cmd-vertical", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -863,6 +876,7 @@ func TestPostgresWorkflowCompositionSurvivesFilesystemRemoval(t *testing.T) {
 	runID := "cmd-vertical-" + strconv.FormatInt(now.UnixNano(), 10)
 	correctionID := runID + "-correction"
 	record := validationworkflow.Record{Version: 1, Handle: runID, Principal: "cmd-vertical-principal", IdempotencyKey: runID + "-key", RequestDigest: integrationCommandDigest(runID + "-request"), RepositoryID: "repo", Revision: strings.Repeat("a", 40), Phase: validationworkflow.PhaseAdmitted}
+	ctx = controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: "organization", ProjectID: record.RepositoryID, RunID: record.Handle})
 	if _, created, boundContext, reserveErr := domains.Workflow.ReserveBound(ctx, record, "cmd-vertical-worker", now, time.Minute); reserveErr != nil || !created {
 		t.Fatal("postgres workflow seed", created, reserveErr)
 	} else {
@@ -893,7 +907,7 @@ func TestPostgresWorkflowCompositionSurvivesFilesystemRemoval(t *testing.T) {
 	if err = contracttest.RunCleanupStore(ctx, func() (contracttest.CleanupStore, error) { return domains.Cleanup, nil }, record.Handle, "repo", now); err != nil {
 		t.Fatal("postgres cleanup", err)
 	}
-	head, epoch, err := store.Load(ctx, record.Handle)
+	head, epoch, err := store.Load(ctx, controlplane.ProjectScope{OrganizationID: "organization", ProjectID: "repo"}, record.Handle)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -915,7 +929,7 @@ func TestPostgresWorkflowCompositionSurvivesFilesystemRemoval(t *testing.T) {
 	if err = os.RemoveAll(stateRoot); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: dsn, BackendIdentity: "cmd-vertical", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+	restarted, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: dsn, BackendIdentity: "cmd-vertical", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -961,4 +975,23 @@ func TestPostgresWorkflowCompositionSurvivesFilesystemRemoval(t *testing.T) {
 func integrationCommandDigest(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+// registerCommandTenant explicitly seeds test-owned organization and project
+// ownership; productive composition is intentionally forbidden from doing so.
+func registerCommandTenant(t *testing.T, dsn, organizationID, projectID string) {
+	t.Helper()
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	digest := integrationCommandDigest(organizationID + ":" + projectID)
+	if _, err = pool.Exec(ctx, `INSERT INTO tenant_organizations(organization_id,state,version,security_revision,policy_digest,payload,payload_digest) VALUES($1,'active',1,1,$2,'{}',$2) ON CONFLICT(organization_id) DO NOTHING`, organizationID, digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = pool.Exec(ctx, `INSERT INTO tenant_projects(organization_id,project_id,repository_id,state,version,payload,payload_digest) VALUES($1,$2,$2,'active',1,'{}',$3) ON CONFLICT(organization_id,project_id) DO NOTHING`, organizationID, projectID, digest); err != nil {
+		t.Fatal(err)
+	}
 }

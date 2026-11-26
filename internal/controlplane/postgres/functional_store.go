@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	"github.com/asierhr/featureProof/internal/functionalflow"
 	"github.com/jackc/pgx/v5"
 )
@@ -57,14 +58,15 @@ func (adapter *PostgresFunctionalStore) Claim(ctx context.Context, runID string,
 		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, runID); verifyErr != nil {
 			return functionalError(functionalflow.CategoryAuthority, "store.backend", verifyErr)
 		}
+		coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
 		var terminal bool
-		if scanErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM functional_terminals WHERE run_id=$1 AND revision=$2 AND step_id=$3)`, runID, revision, stepID).Scan(&terminal); scanErr != nil {
+		if scanErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM functional_terminals WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5)`, coordinate.OrganizationID, coordinate.ProjectID, runID, revision, stepID).Scan(&terminal); scanErr != nil {
 			return scanErr
 		}
 		if terminal {
 			return nil
 		}
-		tag, execErr := tx.Exec(ctx, `INSERT INTO functional_claims(run_id,revision,step_id,owner,token,expires_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(run_id,revision,step_id) DO UPDATE SET owner=EXCLUDED.owner,token=EXCLUDED.token,expires_at=EXCLUDED.expires_at WHERE functional_claims.expires_at<=$7`, runID, revision, stepID, owner, token, expires, now)
+		tag, execErr := tx.Exec(ctx, `INSERT INTO functional_claims(organization_id,project_id,run_id,revision,step_id,owner,token,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(organization_id,project_id,run_id,revision,step_id) DO UPDATE SET owner=EXCLUDED.owner,token=EXCLUDED.token,expires_at=EXCLUDED.expires_at WHERE functional_claims.expires_at<=$9`, coordinate.OrganizationID, coordinate.ProjectID, runID, revision, stepID, owner, token, expires, now)
 		if execErr != nil {
 			return execErr
 		}
@@ -88,7 +90,8 @@ func (adapter *PostgresFunctionalStore) RenewClaim(ctx context.Context, runID st
 		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, runID); verifyErr != nil {
 			return functionalError(functionalflow.CategoryAuthority, "store.backend", verifyErr)
 		}
-		tag, execErr := tx.Exec(ctx, `UPDATE functional_claims SET expires_at=$1 WHERE run_id=$2 AND revision=$3 AND step_id=$4 AND owner=$5 AND token=$6 AND expires_at>$7`, expires, runID, revision, stepID, claim.Owner, claim.Token, now)
+		coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
+		tag, execErr := tx.Exec(ctx, `UPDATE functional_claims SET expires_at=$1 WHERE organization_id=$2 AND project_id=$3 AND run_id=$4 AND revision=$5 AND step_id=$6 AND owner=$7 AND token=$8 AND expires_at>$9`, expires, coordinate.OrganizationID, coordinate.ProjectID, runID, revision, stepID, claim.Owner, claim.Token, now)
 		if execErr != nil {
 			return execErr
 		}
@@ -117,15 +120,16 @@ func (adapter *PostgresFunctionalStore) ConfirmIntent(ctx context.Context, inten
 		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, intent.RunID); verifyErr != nil {
 			return functionalError(functionalflow.CategoryAuthority, "store.backend", verifyErr)
 		}
+		coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
 		var valid bool
-		if scanErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM functional_claims WHERE run_id=$1 AND revision=$2 AND step_id=$3 AND token=$4 AND expires_at>$5)`, intent.RunID, intent.Revision, intent.StepID, intent.ClaimToken, adapter.clock.Now().UTC()).Scan(&valid); scanErr != nil {
+		if scanErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM functional_claims WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5 AND token=$6 AND expires_at>$7)`, coordinate.OrganizationID, coordinate.ProjectID, intent.RunID, intent.Revision, intent.StepID, intent.ClaimToken, adapter.clock.Now().UTC()).Scan(&valid); scanErr != nil {
 			return scanErr
 		} else if !valid {
 			return functionalError(functionalflow.CategoryAuthority, "store.claim", nil)
 		}
 		var priorData []byte
 		var priorDigest string
-		scanErr := tx.QueryRow(ctx, `SELECT intent,digest FROM functional_intents WHERE run_id=$1 AND revision=$2 AND step_id=$3 FOR UPDATE`, intent.RunID, intent.Revision, intent.StepID).Scan(&priorData, &priorDigest)
+		scanErr := tx.QueryRow(ctx, `SELECT intent,digest FROM functional_intents WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, intent.RunID, intent.Revision, intent.StepID).Scan(&priorData, &priorDigest)
 		if scanErr == nil {
 			if priorDigest == digest {
 				return nil
@@ -134,13 +138,13 @@ func (adapter *PostgresFunctionalStore) ConfirmIntent(ctx context.Context, inten
 			if json.Unmarshal(priorData, &prior) != nil || prior.BindingDigest != safe.BindingDigest || prior.KeyDigest != safe.KeyDigest || prior.EffectStarted && !safe.EffectStarted || prior.EvidenceID != "" && prior.EvidenceID != safe.EvidenceID {
 				return functionalError(functionalflow.CategoryIntegrity, "store.intent", nil)
 			}
-			_, scanErr = tx.Exec(ctx, `UPDATE functional_intents SET intent=$1,digest=$2 WHERE run_id=$3 AND revision=$4 AND step_id=$5`, data, digest, intent.RunID, intent.Revision, intent.StepID)
+			_, scanErr = tx.Exec(ctx, `UPDATE functional_intents SET intent=$1,digest=$2 WHERE organization_id=$3 AND project_id=$4 AND run_id=$5 AND revision=$6 AND step_id=$7`, data, digest, coordinate.OrganizationID, coordinate.ProjectID, intent.RunID, intent.Revision, intent.StepID)
 			return scanErr
 		}
 		if scanErr != pgx.ErrNoRows {
 			return scanErr
 		}
-		_, scanErr = tx.Exec(ctx, `INSERT INTO functional_intents(run_id,revision,step_id,intent,digest) VALUES($1,$2,$3,$4,$5)`, intent.RunID, intent.Revision, intent.StepID, data, digest)
+		_, scanErr = tx.Exec(ctx, `INSERT INTO functional_intents(organization_id,project_id,run_id,revision,step_id,intent,digest) VALUES($1,$2,$3,$4,$5,$6,$7)`, coordinate.OrganizationID, coordinate.ProjectID, intent.RunID, intent.Revision, intent.StepID, data, digest)
 		return scanErr
 	})
 	return functionalError(functionalflow.CategoryInternal, "store.intent", err)
@@ -148,8 +152,12 @@ func (adapter *PostgresFunctionalStore) ConfirmIntent(ctx context.Context, inten
 
 // Intent returns one detached safe action intent.
 func (adapter *PostgresFunctionalStore) Intent(ctx context.Context, runID string, revision uint64, stepID string) (functionalflow.Intent, bool, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != runID {
+		return functionalflow.Intent{}, false, nil
+	}
 	var data []byte
-	err := adapter.store.pool.QueryRow(ctx, `SELECT intent FROM functional_intents WHERE run_id=$1 AND revision=$2 AND step_id=$3`, runID, revision, stepID).Scan(&data)
+	err := adapter.store.pool.QueryRow(ctx, `SELECT intent FROM functional_intents WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5`, coordinate.OrganizationID, coordinate.ProjectID, runID, revision, stepID).Scan(&data)
 	if err == pgx.ErrNoRows {
 		return functionalflow.Intent{}, false, nil
 	}
@@ -186,32 +194,33 @@ func (adapter *PostgresFunctionalStore) confirmTerminal(ctx context.Context, rec
 		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, record.RunID); verifyErr != nil {
 			return functionalError(functionalflow.CategoryAuthority, "store.backend", verifyErr)
 		}
+		coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
 		if requireClaim && record.ClaimToken == "" {
 			var prior string
-			if scanErr := tx.QueryRow(ctx, `SELECT digest FROM functional_terminals WHERE run_id=$1 AND revision=$2 AND step_id=$3`, record.RunID, record.Revision, record.StepID).Scan(&prior); scanErr == nil && prior == digest {
+			if scanErr := tx.QueryRow(ctx, `SELECT digest FROM functional_terminals WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5`, coordinate.OrganizationID, coordinate.ProjectID, record.RunID, record.Revision, record.StepID).Scan(&prior); scanErr == nil && prior == digest {
 				return nil
 			}
 			return functionalError(functionalflow.CategoryAuthority, "store.claim", nil)
 		}
 		if requireClaim {
 			var valid bool
-			if scanErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM functional_claims WHERE run_id=$1 AND revision=$2 AND step_id=$3 AND token=$4 AND expires_at>$5)`, record.RunID, record.Revision, record.StepID, record.ClaimToken, adapter.clock.Now().UTC()).Scan(&valid); scanErr != nil {
+			if scanErr := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM functional_claims WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5 AND token=$6 AND expires_at>$7)`, coordinate.OrganizationID, coordinate.ProjectID, record.RunID, record.Revision, record.StepID, record.ClaimToken, adapter.clock.Now().UTC()).Scan(&valid); scanErr != nil {
 				return scanErr
 			} else if !valid {
 				return functionalError(functionalflow.CategoryAuthority, "store.claim", nil)
 			}
 		}
-		tag, execErr := tx.Exec(ctx, `INSERT INTO functional_terminals(run_id,revision,step_id,terminal,digest) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, record.RunID, record.Revision, record.StepID, data, digest)
+		tag, execErr := tx.Exec(ctx, `INSERT INTO functional_terminals(organization_id,project_id,run_id,revision,step_id,terminal,digest) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, record.RunID, record.Revision, record.StepID, data, digest)
 		if execErr != nil {
 			return execErr
 		}
 		if tag.RowsAffected() == 0 {
 			var prior string
-			if scanErr := tx.QueryRow(ctx, `SELECT digest FROM functional_terminals WHERE run_id=$1 AND revision=$2 AND step_id=$3`, record.RunID, record.Revision, record.StepID).Scan(&prior); scanErr != nil || prior != digest {
+			if scanErr := tx.QueryRow(ctx, `SELECT digest FROM functional_terminals WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5`, coordinate.OrganizationID, coordinate.ProjectID, record.RunID, record.Revision, record.StepID).Scan(&prior); scanErr != nil || prior != digest {
 				return functionalError(functionalflow.CategoryIntegrity, "store.terminal", scanErr)
 			}
 		}
-		_, execErr = tx.Exec(ctx, `DELETE FROM functional_claims WHERE run_id=$1 AND revision=$2 AND step_id=$3`, record.RunID, record.Revision, record.StepID)
+		_, execErr = tx.Exec(ctx, `DELETE FROM functional_claims WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5`, coordinate.OrganizationID, coordinate.ProjectID, record.RunID, record.Revision, record.StepID)
 		return execErr
 	})
 	return functionalError(functionalflow.CategoryInternal, "store.terminal", err)
@@ -219,8 +228,12 @@ func (adapter *PostgresFunctionalStore) confirmTerminal(ctx context.Context, rec
 
 // Terminal returns one detached terminal projection.
 func (adapter *PostgresFunctionalStore) Terminal(ctx context.Context, runID string, revision uint64, stepID string) (functionalflow.StepRecord, bool, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != runID {
+		return functionalflow.StepRecord{}, false, nil
+	}
 	var data []byte
-	err := adapter.store.pool.QueryRow(ctx, `SELECT terminal FROM functional_terminals WHERE run_id=$1 AND revision=$2 AND step_id=$3`, runID, revision, stepID).Scan(&data)
+	err := adapter.store.pool.QueryRow(ctx, `SELECT terminal FROM functional_terminals WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5`, coordinate.OrganizationID, coordinate.ProjectID, runID, revision, stepID).Scan(&data)
 	if err == pgx.ErrNoRows {
 		return functionalflow.StepRecord{}, false, nil
 	}
@@ -242,9 +255,10 @@ func (adapter *PostgresFunctionalStore) AppendEvent(ctx context.Context, event f
 		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, base.RunID); verifyErr != nil {
 			return functionalError(functionalflow.CategoryAuthority, "store.backend", verifyErr)
 		}
+		coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
 		var sequence uint64
 		var previous string
-		scanErr := tx.QueryRow(ctx, `SELECT sequence,digest FROM functional_events WHERE run_id=$1 ORDER BY sequence DESC LIMIT 1 FOR UPDATE`, base.RunID).Scan(&sequence, &previous)
+		scanErr := tx.QueryRow(ctx, `SELECT sequence,digest FROM functional_events WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 ORDER BY sequence DESC LIMIT 1 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, base.RunID).Scan(&sequence, &previous)
 		if scanErr != nil && scanErr != pgx.ErrNoRows {
 			return scanErr
 		}
@@ -257,7 +271,7 @@ func (adapter *PostgresFunctionalStore) AppendEvent(ctx context.Context, event f
 		unsigned, _ := canonical(result)
 		result.Digest = digestBytes(unsigned)
 		data, _ := canonical(result)
-		_, execErr := tx.Exec(ctx, `INSERT INTO functional_events(run_id,sequence,flow_id,revision,artifact_digest,event,digest) VALUES($1,$2,$3,$4,$5,$6,$7)`, result.RunID, result.Sequence, result.FlowID, result.Revision, result.ArtifactDigest, data, result.Digest)
+		_, execErr := tx.Exec(ctx, `INSERT INTO functional_events(organization_id,project_id,run_id,sequence,flow_id,revision,artifact_digest,event,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, coordinate.OrganizationID, coordinate.ProjectID, result.RunID, result.Sequence, result.FlowID, result.Revision, result.ArtifactDigest, data, result.Digest)
 		return execErr
 	})
 	if err != nil {
@@ -268,7 +282,11 @@ func (adapter *PostgresFunctionalStore) AppendEvent(ctx context.Context, event f
 
 // Events returns and verifies one complete append-only journal.
 func (adapter *PostgresFunctionalStore) Events(ctx context.Context, runID string) ([]functionalflow.Event, error) {
-	rows, err := adapter.store.pool.Query(ctx, `SELECT event FROM functional_events WHERE run_id=$1 ORDER BY sequence`, runID)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != runID {
+		return nil, nil
+	}
+	rows, err := adapter.store.pool.Query(ctx, `SELECT event FROM functional_events WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 ORDER BY sequence`, coordinate.OrganizationID, coordinate.ProjectID, runID)
 	if err != nil {
 		return nil, functionalError(functionalflow.CategoryInternal, "store.events", err)
 	}

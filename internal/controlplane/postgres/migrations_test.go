@@ -130,7 +130,7 @@ func TestFunctionalRuntimeClosedHelpers(t *testing.T) {
 	if records[0].Handle != "a-run" {
 		t.Fatal("workflow records not sorted")
 	}
-	if _, err := (*Store)(nil).DeleteProjectTerminalBefore(context.Background(), "unsafe project", 1, 1); !errors.Is(err, controlplane.ErrInvalid) {
+	if _, err := (*Store)(nil).DeleteProjectTerminalBefore(context.Background(), controlplane.ProjectScope{}, 1, 1); !errors.Is(err, controlplane.ErrInvalid) {
 		t.Fatal("unsafe retention project accepted")
 	}
 	if _, err := (*Store)(nil).DeleteTerminalBefore(context.Background(), 0, 1); !errors.Is(err, controlplane.ErrInvalid) {

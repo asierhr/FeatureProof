@@ -16,30 +16,81 @@ import (
 )
 
 // runtimeApplication records calls so production transport routing is tested independently of service fixtures.
-type runtimeApplication struct{ calls []string }
+type runtimeApplication struct {
+	calls      []string
+	principals []string
+}
 
 // Create records productive create routing and returns one safe view.
-func (a *runtimeApplication) Create(context.Context, CreateCommand) (ReviewView, error) {
+func (a *runtimeApplication) Create(_ context.Context, command CreateCommand) (ReviewView, error) {
 	a.calls = append(a.calls, "create")
+	a.principals = append(a.principals, command.PrincipalID)
 	return ReviewView{ID: strings.Repeat("a", 24)}, nil
 }
 
 // Get records productive show routing and returns one safe view.
-func (a *runtimeApplication) Get(context.Context, string, string) (ReviewView, error) {
+func (a *runtimeApplication) Get(_ context.Context, principalID, _ string) (ReviewView, error) {
 	a.calls = append(a.calls, "show")
+	a.principals = append(a.principals, principalID)
 	return ReviewView{ID: strings.Repeat("a", 24)}, nil
 }
 
 // Decide records productive decision routing and returns one safe view.
-func (a *runtimeApplication) Decide(context.Context, DecisionCommand) (ReviewView, error) {
+func (a *runtimeApplication) Decide(_ context.Context, command DecisionCommand) (ReviewView, error) {
 	a.calls = append(a.calls, "decide")
+	a.principals = append(a.principals, command.PrincipalID)
 	return ReviewView{ID: strings.Repeat("a", 24)}, nil
 }
 
 // Export records productive export routing and returns one safe receipt.
-func (a *runtimeApplication) Export(context.Context, ExportCommand) (ExportReceipt, error) {
+func (a *runtimeApplication) Export(_ context.Context, command ExportCommand) (ExportReceipt, error) {
 	a.calls = append(a.calls, "export")
+	a.principals = append(a.principals, command.PrincipalID)
 	return ExportReceipt{ReviewID: strings.Repeat("a", 24)}, nil
+}
+
+// mappedMCPPrincipal authenticates independent transport credentials without
+// accepting a principal from the MCP arguments.
+type mappedMCPPrincipal map[string]string
+
+// AuthenticateMCP resolves only credentials provisioned by the transport.
+func (authenticator mappedMCPPrincipal) AuthenticateMCP(_ context.Context, credential string) (string, error) {
+	principal, ok := authenticator[credential]
+	if !ok {
+		return "", typedError(CategoryUnauthorized, "mcp.authentication", nil)
+	}
+	return principal, nil
+}
+
+// TestMCPAuthenticatesEachToolCallIndependently proves two tenants sharing one
+// server cannot inherit a process-wide principal and a spoofed credential has
+// no application effect.
+func TestMCPAuthenticatesEachToolCallIndependently(t *testing.T) {
+	application := &runtimeApplication{}
+	api := APIAdapter{Service: application, Config: SurfaceConfig{PrincipalID: "placeholder", PolicyDigest: strings.Repeat("d", 64), Limits: reviewLimits()}}
+	request := func(id int, credential, key string) string {
+		return `{"jsonrpc":"2.0","id":` + strconv.Itoa(id) + `,"method":"tools/call","params":{"name":"contract_review_create_v1","credential":"` + credential + `","arguments":{"version":"1","candidate_ref":"candidate","baseline_ref":"baseline","idempotency_key":"` + key + `"}}}` + "\n"
+	}
+	input := strings.NewReader(request(1, "credential-a", "a") + request(2, "credential-b", "b") + request(3, "credential-spoof", "spoof"))
+	var output bytes.Buffer
+	server := MCPServer{Adapter: MCPAdapter{API: api}, MaxLine: 4096, Auth: mappedMCPPrincipal{"credential-a": "tenant-a", "credential-b": "tenant-b"}}
+	if err := server.Serve(context.Background(), input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(application.principals, ",") != "tenant-a,tenant-b" || len(application.calls) != 2 {
+		t.Fatalf("principals=%v calls=%v output=%s", application.principals, application.calls, output.String())
+	}
+	if !strings.Contains(output.String(), string(CategoryUnauthorized)) {
+		t.Fatalf("spoofed credential was not rejected: %s", output.String())
+	}
+	token := []byte("0123456789abcdef")
+	bearer := MCPBearerAuthenticator{Token: token, Principal: "tenant-a"}
+	if principal, err := bearer.AuthenticateMCP(context.Background(), "Bearer 0123456789abcdef"); err != nil || principal != "tenant-a" {
+		t.Fatalf("valid bearer principal=%q err=%v", principal, err)
+	}
+	if _, err := bearer.AuthenticateMCP(context.Background(), "Bearer 0123456789abcdeg"); errorCategoryOf(err) != CategoryUnauthorized {
+		t.Fatalf("spoofed bearer=%v", err)
+	}
 }
 
 // TestProductiveHTTPAndMCPRegisterCompleteLifecycle proves both servers route every shared operation.

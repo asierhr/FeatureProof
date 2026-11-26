@@ -282,7 +282,7 @@ func TestCapacityLedgerCoordinatesIndependentInstances(t *testing.T) {
 	if scanErr != nil || len(remaining) != 2 {
 		t.Fatalf("receipt cursor lost durable entries: %#v %v", remaining, scanErr)
 	}
-	snapshot, _ := reopened.Snapshot(policy.ProjectID)
+	snapshot, _ := reopened.Snapshot(context.Background(), policy.ProjectID)
 	events, eventErr := reopened.Events(policy.ProjectID)
 	if snapshot.Reserved.Environments != 0 || eventErr != nil || len(events) != 4 {
 		t.Fatalf("ledger lost quota/events: snapshot=%#v events=%#v err=%v", snapshot, events, eventErr)
@@ -334,7 +334,7 @@ func TestDurableHeadsDefineCrashOutcomes(t *testing.T) {
 			if _, _, err = ledger.Reserve(context.Background(), request); err == nil {
 				t.Fatal("ledger fault was hidden")
 			}
-			liveSnapshot, liveErr := ledger.Snapshot("project")
+			liveSnapshot, liveErr := ledger.Snapshot(context.Background(), "project")
 			if liveErr != nil {
 				t.Fatalf("live ledger could not recover publication boundary: %v", liveErr)
 			}
@@ -342,7 +342,7 @@ func TestDurableHeadsDefineCrashOutcomes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			snapshot, _ := reopenedLedger.Snapshot("project")
+			snapshot, _ := reopenedLedger.Snapshot(context.Background(), "project")
 			if int(snapshot.Reserved.Environments) != want {
 				t.Fatalf("boundary %s capacity=%d want=%d", boundary, snapshot.Reserved.Environments, want)
 			}

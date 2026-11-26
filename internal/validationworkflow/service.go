@@ -52,6 +52,7 @@ type Dependencies struct {
 	FlowAuthority    FunctionalFlowAuthorityLifecyclePort
 	ProjectConfig    ProjectConfigurationResolver
 	ProjectResources ProjectResourceMaterializer
+	TenantAdmission  TenantRunAdmission
 }
 
 // ProjectBoundResources contains only run-scoped consumers rebuilt from one immutable configuration binding.
@@ -95,6 +96,38 @@ func (materializer StaticProjectResourceMaterializer) Materialize(_ context.Cont
 // ProjectConfigurationResolver binds a generated workflow ID to one trusted repository configuration.
 type ProjectConfigurationResolver interface {
 	BindForWorkflow(context.Context, string, string) (projectconfig.RunConfigurationBinding, error)
+}
+
+// TenantRunAdmission seals the authenticated tenant/configuration authority
+// against the actual workflow handle before the workflow becomes runnable.
+type TenantRunAdmission interface {
+	Prepare(context.Context, string, projectconfig.RunConfigurationBinding) error
+	Confirm(context.Context, string) error
+}
+
+// RecoverableTenantRunAdmission exposes only pending run identities so crash
+// recovery can confirm records that committed or cancel orphan intents that
+// never crossed the workflow reserve boundary.
+type RecoverableTenantRunAdmission interface {
+	TenantRunAdmission
+	Pending(context.Context) ([]string, error)
+	Abort(context.Context, string) error
+}
+
+// TenantAdmissionIntent carries the opaque historical authority that created a
+// pending tenant intent; workflow never parses or broadens this authority.
+type TenantAdmissionIntent struct {
+	RunID     string
+	Authority string
+}
+
+// HistoricalTenantRunAdmission preserves the exact request authority across
+// workflow persistence and process restart without exposing tenant internals.
+type HistoricalTenantRunAdmission interface {
+	PrepareHistorical(context.Context, string, projectconfig.RunConfigurationBinding) (string, error)
+	ConfirmHistorical(context.Context, string, string) error
+	PendingHistorical(context.Context) ([]TenantAdmissionIntent, error)
+	AbortHistorical(context.Context, string, string) error
 }
 
 // PreparedProjectConfigurationResolver leaves binding persistence to an atomic workflow store transaction.
@@ -248,9 +281,32 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 	}
 	now := s.deps.Clock.Now().UTC()
 	record := Record{Version: 1, Handle: handle, Principal: command.Principal, IdempotencyKey: command.IdempotencyKey, RequestDigest: digest, RepositoryID: command.RepositoryID, Revision: command.Revision, Command: command, Phase: PhaseAdmitted, UpdatedAt: now, RetainUntil: now.Add(time.Duration(binding.Effective.Constraints.RetentionDays) * 24 * time.Hour), ProjectConfigurationBinding: configurationBinding}
+	if s.deps.TenantAdmission != nil {
+		if record.ProjectConfigurationBinding == nil {
+			return WorkflowView{}, &Error{Code: CodeInternal, Operation: "tenant_admission_binding"}
+		}
+		if historical, ok := s.deps.TenantAdmission.(HistoricalTenantRunAdmission); ok {
+			record.TenantAdmissionAuthority, err = historical.PrepareHistorical(ctx, record.Handle, *record.ProjectConfigurationBinding)
+		} else {
+			err = s.deps.TenantAdmission.Prepare(ctx, record.Handle, *record.ProjectConfigurationBinding)
+		}
+		if err != nil {
+			return WorkflowView{}, mapBoundaryError(ctx, "tenant_admission", err)
+		}
+	}
 	record, created, ctx, err := s.reserveOperation(ctx, record, now)
 	if err != nil {
 		return WorkflowView{}, err
+	}
+	if s.deps.TenantAdmission != nil {
+		if historical, ok := s.deps.TenantAdmission.(HistoricalTenantRunAdmission); ok {
+			err = historical.ConfirmHistorical(ctx, record.Handle, record.TenantAdmissionAuthority)
+		} else {
+			err = s.deps.TenantAdmission.Confirm(ctx, record.Handle)
+		}
+		if err != nil {
+			return WorkflowView{}, mapBoundaryError(ctx, "tenant_admission_confirm", err)
+		}
 	}
 	if !created {
 		if err := s.validateRecordProjectConfiguration(record); err != nil {
@@ -346,7 +402,7 @@ func (s *Service) Start(ctx context.Context, command StartCommand) (WorkflowView
 			}
 		}
 	} else {
-		result, usage, generationErr = s.deps.Generation.Generate(workCtx, snapshot.Clone())
+		result, usage, generationErr = s.deps.Generation.Generate(WithGenerationQuotaIdentity(workCtx, handle), snapshot.Clone())
 	}
 	if generationErr != nil {
 		outcome := OutcomeInconclusive
@@ -842,14 +898,61 @@ func (s *Service) Result(ctx context.Context, handle string) (WorkflowResult, er
 
 // Recover applies the phase matrix to expired leases without repeating uncertain model or tool calls.
 func (s *Service) Recover(ctx context.Context) error {
+	if admission, ok := s.deps.TenantAdmission.(HistoricalTenantRunAdmission); ok {
+		intents, pendingErr := admission.PendingHistorical(ctx)
+		if pendingErr != nil {
+			return pendingErr
+		}
+		for _, intent := range intents {
+			record, loadErr := s.deps.Store.Load(ctx, intent.RunID)
+			if errors.Is(loadErr, ErrNotFound) {
+				if abortErr := admission.AbortHistorical(ctx, intent.RunID, intent.Authority); abortErr != nil {
+					return abortErr
+				}
+				continue
+			}
+			if loadErr != nil {
+				return loadErr
+			}
+			if record.TenantAdmissionAuthority == "" || record.TenantAdmissionAuthority != intent.Authority {
+				return &Error{Code: CodeConflict, Operation: "tenant_admission_authority"}
+			}
+			if reconcileErr := s.reconcileTenantAdmission(ctx, record); reconcileErr != nil {
+				return reconcileErr
+			}
+		}
+	} else if admission, ok := s.deps.TenantAdmission.(RecoverableTenantRunAdmission); ok {
+		intents, pendingErr := admission.Pending(ctx)
+		if pendingErr != nil {
+			return pendingErr
+		}
+		for _, runID := range intents {
+			record, loadErr := s.deps.Store.Load(ctx, runID)
+			if errors.Is(loadErr, ErrNotFound) {
+				if abortErr := admission.Abort(ctx, runID); abortErr != nil {
+					return abortErr
+				}
+				continue
+			}
+			if loadErr != nil {
+				return loadErr
+			}
+			if reconcileErr := s.reconcileTenantAdmission(ctx, record); reconcileErr != nil {
+				return reconcileErr
+			}
+		}
+	}
 	records, err := s.deps.Store.Pending(ctx, s.deps.Clock.Now())
 	if err != nil {
 		return err
 	}
 	for _, candidate := range records {
-		_, operationCtx, loadErr := s.loadOperation(ctx, candidate.Handle)
+		loaded, operationCtx, loadErr := s.loadOperation(ctx, candidate.Handle)
 		if loadErr != nil {
 			return loadErr
+		}
+		if reconcileErr := s.reconcileTenantAdmission(operationCtx, loaded); reconcileErr != nil {
+			return reconcileErr
 		}
 		record, claimed, claimErr := s.deps.Store.Claim(operationCtx, candidate.Handle, s.deps.Owner, s.deps.Clock.Now(), s.config.LeaseTTL)
 		if claimErr != nil {
@@ -968,6 +1071,33 @@ func (s *Service) Recover(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// reconcileTenantAdmission idempotently recreates or confirms the exact
+// historical tenant intent before recovery may claim workflow work.
+func (s *Service) reconcileTenantAdmission(ctx context.Context, record Record) error {
+	if s.deps.TenantAdmission == nil {
+		return nil
+	}
+	if err := s.validateRecordProjectConfiguration(record); err != nil {
+		return err
+	}
+	if historical, ok := s.deps.TenantAdmission.(HistoricalTenantRunAdmission); ok {
+		if record.TenantAdmissionAuthority == "" {
+			return &Error{Code: CodeConflict, Operation: "tenant_admission_authority"}
+		}
+		if err := historical.ConfirmHistorical(ctx, record.Handle, record.TenantAdmissionAuthority); err != nil {
+			return mapBoundaryError(ctx, "tenant_admission_recover_confirm", err)
+		}
+		return nil
+	}
+	if err := s.deps.TenantAdmission.Prepare(ctx, record.Handle, *record.ProjectConfigurationBinding); err != nil {
+		return mapBoundaryError(ctx, "tenant_admission_recover", err)
+	}
+	if err := s.deps.TenantAdmission.Confirm(ctx, record.Handle); err != nil {
+		return mapBoundaryError(ctx, "tenant_admission_recover_confirm", err)
 	}
 	return nil
 }

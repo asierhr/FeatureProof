@@ -363,8 +363,7 @@ func TestServiceConcurrentIdenticalExportsReturnOneReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	ownerReady := make(chan struct{})
 	followerWaiting := make(chan struct{})
 	releaseOwner := make(chan struct{})

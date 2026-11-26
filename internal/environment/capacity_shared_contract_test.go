@@ -104,7 +104,7 @@ func TestExportedStoreAndCleanupContractsFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = importer.Freeze(context.Background(), "environment-import", "environment-run", "project", strings.Repeat("a", 64), 1, time.Now().UTC()); err != nil {
+	if _, err = importer.Freeze(context.Background(), "organization", "environment-import", "environment-run", "project", strings.Repeat("a", 64), 1, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err = lifecycle.Reserve(context.Background(), environment.Record{RunID: "frozen-run"}); !environment.IsCategory(err, environment.CategoryConflict) {

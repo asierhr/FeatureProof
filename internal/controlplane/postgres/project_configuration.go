@@ -64,7 +64,7 @@ func (store *ProjectConfigurationStore) Publish(ctx context.Context, command pc.
 		if err = store.owner.injectFault("project_config.publish.before_version"); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO project_configuration_versions(project_id,repository_id,version,schema_name,canonical,document_digest,policy_digest,catalog_digest,actor,created_at,effective) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, key.ProjectID, key.RepositoryID, version, command.Document.Document.Schema, command.Document.Bytes, command.Document.Digest, command.Effective.PolicyDigest, command.Effective.CatalogDigest, command.Actor, command.CreatedAt, effective)
+		_, err = tx.Exec(ctx, `INSERT INTO project_configuration_versions(project_id,repository_id,version,schema_name,canonical,document_digest,policy_digest,catalog_digest,actor,created_at,effective,organization_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, key.ProjectID, key.RepositoryID, version, command.Document.Document.Schema, command.Document.Bytes, command.Document.Digest, command.Effective.PolicyDigest, command.Effective.CatalogDigest, command.Actor, command.CreatedAt, effective, key.OrganizationID)
 		if err != nil {
 			return err
 		}
@@ -84,7 +84,7 @@ func (store *ProjectConfigurationStore) Publish(ctx context.Context, command pc.
 		if err = store.owner.injectFault("project_config.publish.before_head"); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO project_configuration_heads(project_id,repository_id,generation) VALUES($1,$2,$3) ON CONFLICT(project_id,repository_id) DO UPDATE SET generation=EXCLUDED.generation`, key.ProjectID, key.RepositoryID, generation)
+		_, err = tx.Exec(ctx, `INSERT INTO project_configuration_heads(project_id,repository_id,generation,organization_id) VALUES($1,$2,$3,$4) ON CONFLICT(organization_id,project_id,repository_id) DO UPDATE SET generation=EXCLUDED.generation`, key.ProjectID, key.RepositoryID, generation, key.OrganizationID)
 		if err != nil {
 			return err
 		}
@@ -98,7 +98,7 @@ func (store *ProjectConfigurationStore) Publish(ctx context.Context, command pc.
 		if err = store.owner.injectFault("project_config.publish.before_counters"); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE project_configuration_projects SET next_version=$3,next_generation=$4,next_sequence=$5 WHERE project_id=$1 AND repository_id=$2`, key.ProjectID, key.RepositoryID, version, generation, sequence)
+		_, err = tx.Exec(ctx, `UPDATE project_configuration_projects SET next_version=$3,next_generation=$4,next_sequence=$5 WHERE project_id=$1 AND repository_id=$2 AND organization_id=$6`, key.ProjectID, key.RepositoryID, version, generation, sequence, key.OrganizationID)
 		return err
 	})
 	if err != nil {
@@ -138,7 +138,7 @@ func (store *ProjectConfigurationStore) Rollback(ctx context.Context, command pc
 			return pcErr(pc.CategoryStaleHead, "project_config.rollback")
 		}
 		var versionDigest string
-		if err = tx.QueryRow(ctx, `SELECT document_digest FROM project_configuration_versions WHERE project_id=$1 AND repository_id=$2 AND version=$3`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, command.Version).Scan(&versionDigest); errors.Is(err, pgx.ErrNoRows) {
+		if err = tx.QueryRow(ctx, `SELECT document_digest FROM project_configuration_versions WHERE project_id=$1 AND repository_id=$2 AND version=$3 AND organization_id=$4`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, command.Version, command.ProjectKey.OrganizationID).Scan(&versionDigest); errors.Is(err, pgx.ErrNoRows) {
 			return pcErr(pc.CategoryNotFound, "project_config.rollback.version")
 		}
 		if err != nil {
@@ -169,7 +169,7 @@ func (store *ProjectConfigurationStore) Rollback(ctx context.Context, command pc
 		if err = store.owner.injectFault("project_config.rollback.before_head"); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE project_configuration_heads SET generation=$3 WHERE project_id=$1 AND repository_id=$2`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, generation)
+		_, err = tx.Exec(ctx, `UPDATE project_configuration_heads SET generation=$3 WHERE project_id=$1 AND repository_id=$2 AND organization_id=$4`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, generation, command.ProjectKey.OrganizationID)
 		if err != nil {
 			return err
 		}
@@ -180,7 +180,7 @@ func (store *ProjectConfigurationStore) Rollback(ctx context.Context, command pc
 		if err = insertReceiptEvent(ctx, tx, command.ProjectKey, receipt, sequence, "activated", command.Actor, "rollback", command.CreatedAt); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE project_configuration_projects SET next_generation=$3,next_sequence=$4 WHERE project_id=$1 AND repository_id=$2`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, generation, sequence)
+		_, err = tx.Exec(ctx, `UPDATE project_configuration_projects SET next_generation=$3,next_sequence=$4 WHERE project_id=$1 AND repository_id=$2 AND organization_id=$5`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, generation, sequence, command.ProjectKey.OrganizationID)
 		return err
 	})
 	if err != nil {
@@ -195,7 +195,7 @@ func (store *ProjectConfigurationStore) Rollback(ctx context.Context, command pc
 // resolveReceipt determines the outcome of an unknown commit without repeating mutation.
 func (store *ProjectConfigurationStore) resolveReceipt(ctx context.Context, key pc.ProjectKey, operationID, commandDigest string) (pc.PublishReceipt, error) {
 	var receipt pc.PublishReceipt
-	err := store.owner.pool.QueryRow(ctx, `SELECT command_digest,version,generation,head_digest FROM project_configuration_receipts WHERE project_id=$1 AND repository_id=$2 AND operation_id=$3`, key.ProjectID, key.RepositoryID, operationID).Scan(&receipt.CommandDigest, &receipt.Version, &receipt.Generation, &receipt.HeadDigest)
+	err := store.owner.pool.QueryRow(ctx, `SELECT command_digest,version,generation,head_digest FROM project_configuration_receipts WHERE project_id=$1 AND repository_id=$2 AND operation_id=$3 AND organization_id=$4`, key.ProjectID, key.RepositoryID, operationID, key.OrganizationID).Scan(&receipt.CommandDigest, &receipt.Version, &receipt.Generation, &receipt.HeadDigest)
 	if err != nil {
 		return pc.PublishReceipt{}, mapProjectError(err, "project_config.receipt")
 	}
@@ -210,7 +210,7 @@ func (store *ProjectConfigurationStore) resolveReceipt(ctx context.Context, key 
 func (store *ProjectConfigurationStore) Effective(ctx context.Context, key pc.ProjectKey, generation uint64) (pc.EffectiveConfiguration, error) {
 	var raw []byte
 	var expected string
-	err := store.owner.pool.QueryRow(ctx, `SELECT effective,effective_digest FROM project_configuration_effective_snapshots WHERE project_id=$1 AND repository_id=$2 AND generation=$3`, key.ProjectID, key.RepositoryID, generation).Scan(&raw, &expected)
+	err := store.owner.pool.QueryRow(ctx, `SELECT effective,effective_digest FROM project_configuration_effective_snapshots WHERE project_id=$1 AND repository_id=$2 AND generation=$3 AND organization_id=$4`, key.ProjectID, key.RepositoryID, generation, key.OrganizationID).Scan(&raw, &expected)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pc.EffectiveConfiguration{}, pcErr(pc.CategoryNotFound, "project_config.effective")
 	}
@@ -226,11 +226,11 @@ func (store *ProjectConfigurationStore) Effective(ctx context.Context, key pc.Pr
 
 // Head reads the current activation without consulting mutable bootstrap configuration.
 func (store *ProjectConfigurationStore) Head(ctx context.Context, key pc.ProjectKey) (pc.ConfigurationHead, error) {
-	row := store.owner.pool.QueryRow(ctx, `SELECT a.generation,a.version,a.version_digest,a.previous_generation,a.reason,a.actor,a.created_at,a.digest,v.document_digest FROM project_configuration_heads h JOIN project_configuration_activations a USING(project_id,repository_id,generation) JOIN project_configuration_versions v ON v.project_id=a.project_id AND v.repository_id=a.repository_id AND v.version=a.version WHERE h.project_id=$1 AND h.repository_id=$2`, key.ProjectID, key.RepositoryID)
+	row := store.owner.pool.QueryRow(ctx, `SELECT a.generation,a.version,a.version_digest,a.previous_generation,a.reason,a.actor,a.created_at,a.digest,v.document_digest FROM project_configuration_heads h JOIN project_configuration_activations a USING(organization_id,project_id,repository_id,generation) JOIN project_configuration_versions v ON v.organization_id=a.organization_id AND v.project_id=a.project_id AND v.repository_id=a.repository_id AND v.version=a.version WHERE h.project_id=$1 AND h.repository_id=$2 AND h.organization_id=$3`, key.ProjectID, key.RepositoryID, key.OrganizationID)
 	activation, err := scanActivationWithVersion(row, key)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var exists bool
-		if existsErr := store.owner.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM project_configuration_heads WHERE project_id=$1 AND repository_id=$2)`, key.ProjectID, key.RepositoryID).Scan(&exists); existsErr != nil {
+		if existsErr := store.owner.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM project_configuration_heads WHERE project_id=$1 AND repository_id=$2 AND organization_id=$3)`, key.ProjectID, key.RepositoryID, key.OrganizationID).Scan(&exists); existsErr != nil {
 			return pc.ConfigurationHead{}, mapProjectError(existsErr, "project_config.head")
 		}
 		if exists {
@@ -248,7 +248,7 @@ func (store *ProjectConfigurationStore) Head(ctx context.Context, key pc.Project
 func (store *ProjectConfigurationStore) Version(ctx context.Context, key pc.ProjectKey, number uint64) (pc.ConfigurationVersion, pc.EffectiveConfiguration, error) {
 	var value pc.ConfigurationVersion
 	var effectiveRaw []byte
-	err := store.owner.pool.QueryRow(ctx, `SELECT schema_name,canonical,document_digest,policy_digest,catalog_digest,actor,created_at,effective FROM project_configuration_versions WHERE project_id=$1 AND repository_id=$2 AND version=$3`, key.ProjectID, key.RepositoryID, number).Scan(&value.Schema, &value.Canonical, &value.DocumentDigest, &value.PolicyDigest, &value.CatalogDigest, &value.Actor, &value.CreatedAt, &effectiveRaw)
+	err := store.owner.pool.QueryRow(ctx, `SELECT schema_name,canonical,document_digest,policy_digest,catalog_digest,actor,created_at,effective FROM project_configuration_versions WHERE project_id=$1 AND repository_id=$2 AND version=$3 AND organization_id=$4`, key.ProjectID, key.RepositoryID, number, key.OrganizationID).Scan(&value.Schema, &value.Canonical, &value.DocumentDigest, &value.PolicyDigest, &value.CatalogDigest, &value.Actor, &value.CreatedAt, &effectiveRaw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return value, pc.EffectiveConfiguration{}, pcErr(pc.CategoryNotFound, "project_config.version")
 	}
@@ -270,7 +270,7 @@ func (store *ProjectConfigurationStore) History(ctx context.Context, key pc.Proj
 	if limit < 1 || limit > 100 {
 		return pc.HistoryPage{}, pcErr(pc.CategoryInvalid, "project_config.history")
 	}
-	rows, err := store.owner.pool.Query(ctx, `SELECT sequence,action,version,generation,digest FROM project_configuration_events WHERE project_id=$1 AND repository_id=$2 AND ($3::bigint=0 OR sequence<$3) ORDER BY sequence DESC LIMIT $4`, key.ProjectID, key.RepositoryID, before, limit+1)
+	rows, err := store.owner.pool.Query(ctx, `SELECT sequence,action,version,generation,digest FROM project_configuration_events WHERE project_id=$1 AND repository_id=$2 AND ($3::bigint=0 OR sequence<$3) AND organization_id=$5 ORDER BY sequence DESC LIMIT $4`, key.ProjectID, key.RepositoryID, before, limit+1, key.OrganizationID)
 	if err != nil {
 		return pc.HistoryPage{}, mapProjectError(err, "project_config.history")
 	}
@@ -299,7 +299,7 @@ func (store *ProjectConfigurationStore) Bind(ctx context.Context, command pc.Bin
 	err := store.transaction(ctx, "project_config.bind", func(tx pgx.Tx) error {
 		var raw []byte
 		var durableBindingDigest string
-		err := tx.QueryRow(ctx, `SELECT binding,binding_digest FROM project_configuration_run_bindings WHERE project_id=$1 AND repository_id=$2 AND run_id=$3`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, command.RunID).Scan(&raw, &durableBindingDigest)
+		err := tx.QueryRow(ctx, `SELECT binding,binding_digest FROM project_configuration_run_bindings WHERE project_id=$1 AND repository_id=$2 AND run_id=$3 AND organization_id=$4`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, command.RunID, command.ProjectKey.OrganizationID).Scan(&raw, &durableBindingDigest)
 		if err == nil {
 			if json.Unmarshal(raw, &binding) != nil {
 				return pcErr(pc.CategoryIntegrity, "project_config.bind")
@@ -316,7 +316,7 @@ func (store *ProjectConfigurationStore) Bind(ctx context.Context, command pc.Bin
 			return err
 		}
 		var activation pc.Activation
-		row := tx.QueryRow(ctx, `SELECT a.generation,a.version,a.version_digest,a.previous_generation,a.reason,a.actor,a.created_at,a.digest,v.document_digest FROM project_configuration_heads h JOIN project_configuration_activations a USING(project_id,repository_id,generation) JOIN project_configuration_versions v ON v.project_id=a.project_id AND v.repository_id=a.repository_id AND v.version=a.version WHERE h.project_id=$1 AND h.repository_id=$2 FOR SHARE`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID)
+		row := tx.QueryRow(ctx, `SELECT a.generation,a.version,a.version_digest,a.previous_generation,a.reason,a.actor,a.created_at,a.digest,v.document_digest FROM project_configuration_heads h JOIN project_configuration_activations a USING(organization_id,project_id,repository_id,generation) JOIN project_configuration_versions v ON v.organization_id=a.organization_id AND v.project_id=a.project_id AND v.repository_id=a.repository_id AND v.version=a.version WHERE h.project_id=$1 AND h.repository_id=$2 AND h.organization_id=$3 FOR SHARE`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, command.ProjectKey.OrganizationID)
 		activation, err = scanActivationWithVersion(row, command.ProjectKey)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return pcErr(pc.CategoryNotFound, "project_config.bind.head")
@@ -326,7 +326,7 @@ func (store *ProjectConfigurationStore) Bind(ctx context.Context, command pc.Bin
 		}
 		var effectiveRaw []byte
 		var durableEffectiveDigest string
-		if err = tx.QueryRow(ctx, `SELECT effective,effective_digest FROM project_configuration_effective_snapshots WHERE project_id=$1 AND repository_id=$2 AND generation=$3`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, activation.Generation).Scan(&effectiveRaw, &durableEffectiveDigest); err != nil {
+		if err = tx.QueryRow(ctx, `SELECT effective,effective_digest FROM project_configuration_effective_snapshots WHERE project_id=$1 AND repository_id=$2 AND generation=$3 AND organization_id=$4`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, activation.Generation, command.ProjectKey.OrganizationID).Scan(&effectiveRaw, &durableEffectiveDigest); err != nil {
 			return err
 		}
 		var effective pc.EffectiveConfiguration
@@ -349,7 +349,7 @@ func (store *ProjectConfigurationStore) Bind(ctx context.Context, command pc.Bin
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO project_configuration_run_bindings(project_id,repository_id,run_id,binding,binding_digest,created_at) VALUES($1,$2,$3,$4,$5,$6)`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, command.RunID, raw, binding.BindingDigest, command.CreatedAt)
+		_, err = tx.Exec(ctx, `INSERT INTO project_configuration_run_bindings(project_id,repository_id,run_id,binding,binding_digest,created_at,organization_id) VALUES($1,$2,$3,$4,$5,$6,$7)`, command.ProjectKey.ProjectID, command.ProjectKey.RepositoryID, command.RunID, raw, binding.BindingDigest, command.CreatedAt, command.ProjectKey.OrganizationID)
 		return err
 	})
 	return binding.Clone(), err
@@ -359,7 +359,7 @@ func (store *ProjectConfigurationStore) Bind(ctx context.Context, command pc.Bin
 func (store *ProjectConfigurationStore) Binding(ctx context.Context, key pc.ProjectKey, runID string) (pc.RunConfigurationBinding, error) {
 	var raw []byte
 	var expected string
-	err := store.owner.pool.QueryRow(ctx, `SELECT binding,binding_digest FROM project_configuration_run_bindings WHERE project_id=$1 AND repository_id=$2 AND run_id=$3`, key.ProjectID, key.RepositoryID, runID).Scan(&raw, &expected)
+	err := store.owner.pool.QueryRow(ctx, `SELECT binding,binding_digest FROM project_configuration_run_bindings WHERE project_id=$1 AND repository_id=$2 AND run_id=$3 AND organization_id=$4`, key.ProjectID, key.RepositoryID, runID, key.OrganizationID).Scan(&raw, &expected)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pc.RunConfigurationBinding{}, pcErr(pc.CategoryNotFound, "project_config.binding")
 	}
@@ -401,18 +401,18 @@ func (store *ProjectConfigurationStore) transaction(ctx context.Context, operati
 
 // lockProject creates and locks the monotonic counters for one project authority.
 func lockProject(ctx context.Context, tx pgx.Tx, key pc.ProjectKey) (uint64, uint64, uint64, error) {
-	_, err := tx.Exec(ctx, `INSERT INTO project_configuration_projects(project_id,repository_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, key.ProjectID, key.RepositoryID)
+	_, err := tx.Exec(ctx, `INSERT INTO project_configuration_projects(project_id,repository_id,organization_id) VALUES($1,$2,$3) ON CONFLICT(organization_id,project_id,repository_id) DO NOTHING`, key.ProjectID, key.RepositoryID, key.OrganizationID)
 	if err != nil {
 		return 0, 0, 0, err
 	}
 	var version, generation, sequence uint64
-	err = tx.QueryRow(ctx, `SELECT next_version,next_generation,next_sequence FROM project_configuration_projects WHERE project_id=$1 AND repository_id=$2 FOR UPDATE`, key.ProjectID, key.RepositoryID).Scan(&version, &generation, &sequence)
+	err = tx.QueryRow(ctx, `SELECT next_version,next_generation,next_sequence FROM project_configuration_projects WHERE project_id=$1 AND repository_id=$2 AND organization_id=$3 FOR UPDATE`, key.ProjectID, key.RepositoryID, key.OrganizationID).Scan(&version, &generation, &sequence)
 	return version, generation, sequence, err
 }
 
 // loadReceipt resolves retry and unknown-commit outcomes before new writes.
 func loadReceipt(ctx context.Context, tx pgx.Tx, key pc.ProjectKey, operation string, result *pc.PublishReceipt) (bool, error) {
-	err := tx.QueryRow(ctx, `SELECT command_digest,version,generation,head_digest FROM project_configuration_receipts WHERE project_id=$1 AND repository_id=$2 AND operation_id=$3`, key.ProjectID, key.RepositoryID, operation).Scan(&result.CommandDigest, &result.Version, &result.Generation, &result.HeadDigest)
+	err := tx.QueryRow(ctx, `SELECT command_digest,version,generation,head_digest FROM project_configuration_receipts WHERE project_id=$1 AND repository_id=$2 AND operation_id=$3 AND organization_id=$4`, key.ProjectID, key.RepositoryID, operation, key.OrganizationID).Scan(&result.CommandDigest, &result.Version, &result.Generation, &result.HeadDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -422,23 +422,23 @@ func loadReceipt(ctx context.Context, tx pgx.Tx, key pc.ProjectKey, operation st
 
 // insertActivation appends one immutable causal head transition.
 func insertActivation(ctx context.Context, tx pgx.Tx, a pc.Activation) error {
-	_, err := tx.Exec(ctx, `INSERT INTO project_configuration_activations(project_id,repository_id,generation,version,version_digest,previous_generation,reason,actor,created_at,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, a.ProjectKey.ProjectID, a.ProjectKey.RepositoryID, a.Generation, a.Version, a.VersionDigest, a.PreviousGeneration, a.Reason, a.Actor, a.CreatedAt, a.Digest)
+	_, err := tx.Exec(ctx, `INSERT INTO project_configuration_activations(project_id,repository_id,generation,version,version_digest,previous_generation,reason,actor,created_at,digest,organization_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, a.ProjectKey.ProjectID, a.ProjectKey.RepositoryID, a.Generation, a.Version, a.VersionDigest, a.PreviousGeneration, a.Reason, a.Actor, a.CreatedAt, a.Digest, a.ProjectKey.OrganizationID)
 	return err
 }
 
 // insertEffective persists one activation-specific immutable effective snapshot.
 func insertEffective(ctx context.Context, tx pgx.Tx, key pc.ProjectKey, generation uint64, effective []byte, digest string) error {
-	_, err := tx.Exec(ctx, `INSERT INTO project_configuration_effective_snapshots(project_id,repository_id,generation,effective,effective_digest) VALUES($1,$2,$3,$4,$5)`, key.ProjectID, key.RepositoryID, generation, effective, digest)
+	_, err := tx.Exec(ctx, `INSERT INTO project_configuration_effective_snapshots(project_id,repository_id,generation,effective,effective_digest,organization_id) VALUES($1,$2,$3,$4,$5,$6)`, key.ProjectID, key.RepositoryID, generation, effective, digest, key.OrganizationID)
 	return err
 }
 
 // insertReceiptEvent commits retry resolution and audit history in the state transaction.
 func insertReceiptEvent(ctx context.Context, tx pgx.Tx, key pc.ProjectKey, r pc.PublishReceipt, sequence uint64, action, actor, reason string, at time.Time) error {
-	_, err := tx.Exec(ctx, `INSERT INTO project_configuration_receipts(project_id,repository_id,operation_id,command_digest,version,generation,head_digest) VALUES($1,$2,$3,$4,$5,$6,$7)`, key.ProjectID, key.RepositoryID, r.OperationID, r.CommandDigest, r.Version, r.Generation, r.HeadDigest)
+	_, err := tx.Exec(ctx, `INSERT INTO project_configuration_receipts(project_id,repository_id,operation_id,command_digest,version,generation,head_digest,organization_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, key.ProjectID, key.RepositoryID, r.OperationID, r.CommandDigest, r.Version, r.Generation, r.HeadDigest, key.OrganizationID)
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO project_configuration_events(project_id,repository_id,sequence,action,actor,version,generation,digest,reason,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, key.ProjectID, key.RepositoryID, sequence, action, actor, r.Version, r.Generation, r.HeadDigest, reason, at)
+	_, err = tx.Exec(ctx, `INSERT INTO project_configuration_events(project_id,repository_id,sequence,action,actor,version,generation,digest,reason,created_at,organization_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, key.ProjectID, key.RepositoryID, sequence, action, actor, r.Version, r.Generation, r.HeadDigest, reason, at, key.OrganizationID)
 	return err
 }
 

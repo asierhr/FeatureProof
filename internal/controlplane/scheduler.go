@@ -22,7 +22,7 @@ type Scheduler struct {
 
 // NewScheduler validates and composes a bounded worker without starting it.
 func NewScheduler(queue JobQueue, clock Clock, waiter Waiter, handler JobHandler, classifier ErrorClassifier, config SchedulerConfig) (*Scheduler, error) {
-	if queue == nil || clock == nil || waiter == nil || handler == nil || classifier == nil || !safeID.MatchString(config.ProjectID) || !safeID.MatchString(config.WorkerID) || config.Lease <= 0 || config.BatchSize <= 0 || config.IdleWait < 0 {
+	if queue == nil || clock == nil || waiter == nil || handler == nil || classifier == nil || config.Scope.Validate() != nil || !safeID.MatchString(config.WorkerID) || config.Lease <= 0 || config.BatchSize <= 0 || config.IdleWait < 0 {
 		return nil, ErrInvalid
 	}
 	if config.HeartbeatInterval == 0 {
@@ -39,17 +39,17 @@ func NewScheduler(queue JobQueue, clock Clock, waiter Waiter, handler JobHandler
 // RunOnce recovers expired work, claims one bounded page and persists every outcome.
 func (scheduler *Scheduler) RunOnce(ctx context.Context) (int, error) {
 	now := scheduler.clock.Now().UTC()
-	if _, err := scheduler.queue.Recover(ctx, now, scheduler.config.BatchSize); err != nil {
+	if _, err := scheduler.queue.Recover(ctx, scheduler.config.Scope, now, scheduler.config.BatchSize); err != nil {
 		return 0, err
 	}
-	jobs, err := scheduler.queue.Claim(ctx, ClaimRequest{ProjectID: scheduler.config.ProjectID, WorkerID: scheduler.config.WorkerID, Now: now, Lease: scheduler.config.Lease, Limit: scheduler.config.BatchSize})
+	jobs, err := scheduler.queue.Claim(ctx, ClaimRequest{Scope: scheduler.config.Scope, WorkerID: scheduler.config.WorkerID, Now: now, Lease: scheduler.config.Lease, Limit: scheduler.config.BatchSize})
 	if err != nil {
 		return 0, err
 	}
 	for _, job := range jobs {
 		handleErr := scheduler.handleWithHeartbeat(ctx, job)
 		if handleErr == nil {
-			if _, err := scheduler.queue.Complete(ctx, job.JobID, scheduler.config.WorkerID, job.Fence, job.CancelRevision, scheduler.clock.Now(), JobSucceeded, ""); err != nil {
+			if _, err := scheduler.queue.Complete(ctx, scheduler.config.Scope, job.JobID, scheduler.config.WorkerID, job.Fence, job.CancelRevision, scheduler.clock.Now(), JobSucceeded, ""); err != nil {
 				return len(jobs), err
 			}
 			continue
@@ -59,7 +59,7 @@ func (scheduler *Scheduler) RunOnce(ctx context.Context) (int, error) {
 		}
 		decision := scheduler.classifier.Classify(handleErr)
 		available := scheduler.clock.Now().UTC().Add(decision.Backoff)
-		if _, err := scheduler.queue.Retry(ctx, job.JobID, scheduler.config.WorkerID, job.Fence, job.CancelRevision, now, decision, available); err != nil {
+		if _, err := scheduler.queue.Retry(ctx, scheduler.config.Scope, job.JobID, scheduler.config.WorkerID, job.Fence, job.CancelRevision, now, decision, available); err != nil {
 			return len(jobs), err
 		}
 	}
@@ -85,7 +85,7 @@ func (scheduler *Scheduler) handleWithHeartbeat(ctx context.Context, job Job) er
 			return err
 		case <-ticker.C:
 			now := scheduler.clock.Now().UTC()
-			updated, err := scheduler.queue.Heartbeat(ctx, job.JobID, scheduler.config.WorkerID, job.Fence, job.CancelRevision, now, scheduler.config.Lease)
+			updated, err := scheduler.queue.Heartbeat(ctx, scheduler.config.Scope, job.JobID, scheduler.config.WorkerID, job.Fence, job.CancelRevision, now, scheduler.config.Lease)
 			if err != nil {
 				cancel()
 				return err

@@ -19,9 +19,13 @@ func (store *Store) FixtureStore() *PostgresFixtureStore { return &PostgresFixtu
 
 // Load returns one detached sealed fixture lifecycle projection.
 func (adapter *PostgresFixtureStore) Load(ctx context.Context, runID string) (fixture.FixtureState, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != runID {
+		return fixture.FixtureState{}, fixture.ErrNotFound
+	}
 	var data []byte
 	var digest string
-	if err := adapter.store.pool.QueryRow(ctx, `SELECT document,digest FROM fixture_states WHERE run_id=$1`, runID).Scan(&data, &digest); err == pgx.ErrNoRows {
+	if err := adapter.store.pool.QueryRow(ctx, `SELECT document,digest FROM fixture_states WHERE organization_id=$1 AND project_id=$2 AND run_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, runID).Scan(&data, &digest); err == pgx.ErrNoRows {
 		return fixture.FixtureState{}, fixture.ErrNotFound
 	} else if err != nil {
 		return fixture.FixtureState{}, err
@@ -45,8 +49,9 @@ func (adapter *PostgresFixtureStore) Save(ctx context.Context, runID string, exp
 		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, runID); verifyErr != nil {
 			return verifyErr
 		}
+		coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
 		if expected == 0 {
-			tag, execErr := tx.Exec(ctx, `INSERT INTO fixture_states(run_id,version,document,digest) VALUES($1,1,$2,$3) ON CONFLICT DO NOTHING`, runID, data, digestBytes(data))
+			tag, execErr := tx.Exec(ctx, `INSERT INTO fixture_states(organization_id,project_id,run_id,version,document,digest) VALUES($1,$2,$3,1,$4,$5) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, runID, data, digestBytes(data))
 			if execErr != nil {
 				return execErr
 			}
@@ -58,7 +63,7 @@ func (adapter *PostgresFixtureStore) Save(ctx context.Context, runID string, exp
 			}
 			return syncRunRetentionReferenceTx(ctx, tx, runID, "cleanup", runID, true)
 		}
-		tag, execErr := tx.Exec(ctx, `UPDATE fixture_states SET version=$1,document=$2,digest=$3 WHERE run_id=$4 AND version=$5`, sealed.Version, data, digestBytes(data), runID, expected)
+		tag, execErr := tx.Exec(ctx, `UPDATE fixture_states SET version=$1,document=$2,digest=$3 WHERE organization_id=$4 AND project_id=$5 AND run_id=$6 AND version=$7`, sealed.Version, data, digestBytes(data), coordinate.OrganizationID, coordinate.ProjectID, runID, expected)
 		if execErr != nil {
 			return execErr
 		}
@@ -88,7 +93,8 @@ func (adapter *PostgresFixtureStore) Confirm(ctx context.Context, runID, evidenc
 		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, runID); verifyErr != nil {
 			return verifyErr
 		}
-		tag, execErr := tx.Exec(ctx, `INSERT INTO fixture_evidence(run_id,evidence_id,document,digest) VALUES($1,$2,$3,$4) ON CONFLICT(run_id,evidence_id) DO UPDATE SET document=EXCLUDED.document,digest=EXCLUDED.digest WHERE fixture_evidence.digest=EXCLUDED.digest`, runID, evidenceID, data, digest)
+		coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
+		tag, execErr := tx.Exec(ctx, `INSERT INTO fixture_evidence(organization_id,project_id,run_id,evidence_id,document,digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(organization_id,project_id,run_id,evidence_id) DO UPDATE SET document=EXCLUDED.document,digest=EXCLUDED.digest WHERE fixture_evidence.digest=EXCLUDED.digest`, coordinate.OrganizationID, coordinate.ProjectID, runID, evidenceID, data, digest)
 		if execErr != nil {
 			return execErr
 		}
@@ -115,7 +121,8 @@ func (adapter *PostgresFixtureStore) Record(ctx context.Context, event fixture.E
 		if _, _, verifyErr := adapter.store.verifyWorkflowBackendTx(ctx, tx, event.RunID); verifyErr != nil {
 			return verifyErr
 		}
-		_, execErr := tx.Exec(ctx, `INSERT INTO fixture_events(run_id,event,digest) VALUES($1,$2,$3)`, event.RunID, data, digestBytes(data))
+		coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
+		_, execErr := tx.Exec(ctx, `INSERT INTO fixture_events(organization_id,project_id,run_id,event,digest) VALUES($1,$2,$3,$4,$5)`, coordinate.OrganizationID, coordinate.ProjectID, event.RunID, data, digestBytes(data))
 		return execErr
 	})
 }

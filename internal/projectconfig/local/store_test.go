@@ -26,12 +26,12 @@ func localCatalogLimits() pc.CatalogLimits {
 // publishCommand creates canonical store input without external dependencies.
 func publishCommand(t *testing.T, operation string, generation uint64) pc.PublishCommand {
 	t.Helper()
-	document := pc.Document{Schema: pc.SchemaV1, ProjectID: "project", RepositoryID: "repo", References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digestA}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
+	document := pc.Document{Schema: pc.SchemaV1, OrganizationID: "organization", ProjectID: "project", RepositoryID: "repo", References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digestA}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
 	canonical, err := pc.Canonicalize(document)
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, _ := pc.NewProjectKey("project", "repo")
+	key, _ := pc.NewProjectKey("organization", "project", "repo")
 	effective, err := pc.ValidateAndMerge(canonical, pc.OrganizationPolicySnapshot{Version: 1, Digest: digestA}, pc.ResourceCatalogSnapshot{Limits: localCatalogLimits(), ProjectKey: key, Digest: digestA, Descriptors: []pc.ResourceDescriptor{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digestA, ProjectKey: key}}})
 	if err != nil {
 		t.Fatal(err)
@@ -248,7 +248,7 @@ func TestStoreContract(t *testing.T) {
 	if receipt.Version != 1 || receipt.Generation != 1 {
 		t.Fatalf("unexpected receipt %+v", receipt)
 	}
-	key, _ := pc.NewProjectKey("project", "repo")
+	key, _ := pc.NewProjectKey("organization", "project", "repo")
 	head, err := store.Head(ctx, key)
 	if err != nil || head.Activation.Digest != receipt.HeadDigest {
 		t.Fatalf("head: %v", err)
@@ -302,7 +302,7 @@ func TestStoreRejectsCorruption(t *testing.T) {
 	if _, err := store.Publish(context.Background(), publishCommand(t, "op-1", 0)); err != nil {
 		t.Fatal(err)
 	}
-	key, _ := pc.NewProjectKey("project", "repo")
+	key, _ := pc.NewProjectKey("organization", "project", "repo")
 	if err := overwriteForTest(store.dataPath(key), []byte(`{"payload":{},"checksum":"bad"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -316,7 +316,7 @@ func TestStoreCancellationAndBoundaries(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	store, _ := New(root)
-	key, _ := pc.NewProjectKey("project", "repo")
+	key, _ := pc.NewProjectKey("organization", "project", "repo")
 	unlock, err := acquireLock(context.Background(), store.lockPath(key))
 	if err != nil {
 		t.Fatal(err)
@@ -351,7 +351,7 @@ func TestStoreRejectsOverflowAndDivergentBinding(t *testing.T) {
 	for _, field := range []string{"version", "generation", "sequence"} {
 		t.Run("publish_"+field, func(t *testing.T) {
 			store, _ := New(t.TempDir())
-			key, _ := pc.NewProjectKey("project", "repo")
+			key, _ := pc.NewProjectKey("organization", "project", "repo")
 			current := newState()
 			switch field {
 			case "version":
@@ -372,7 +372,7 @@ func TestStoreRejectsOverflowAndDivergentBinding(t *testing.T) {
 	for _, field := range []string{"generation", "sequence"} {
 		t.Run("rollback_"+field, func(t *testing.T) {
 			store, _ := New(t.TempDir())
-			key, _ := pc.NewProjectKey("project", "repo")
+			key, _ := pc.NewProjectKey("organization", "project", "repo")
 			published := publishCommand(t, "seed", 0)
 			if _, err := store.Publish(context.Background(), published); err != nil {
 				t.Fatal(err)
@@ -396,7 +396,7 @@ func TestStoreRejectsOverflowAndDivergentBinding(t *testing.T) {
 		})
 	}
 	store, _ := New(t.TempDir())
-	key, _ := pc.NewProjectKey("project", "repo")
+	key, _ := pc.NewProjectKey("organization", "project", "repo")
 	store, _ = New(t.TempDir())
 	if _, err := store.Publish(context.Background(), publishCommand(t, "publish", 0)); err != nil {
 		t.Fatal(err)

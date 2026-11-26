@@ -5,13 +5,133 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/asierhr/featureProof/internal/localvalidation"
 )
+
+// mutableMCPAuthenticator models a trusted transport verifier whose live
+// revocation state changes without reconstructing the MCP server.
+type mutableMCPAuthenticator struct {
+	mu       sync.Mutex
+	profiles map[string]Principal
+	revoked  map[string]bool
+}
+
+// AuthenticateMCP resolves a fresh principal for each credential and rejects
+// one revoked after an earlier successful request.
+func (auth *mutableMCPAuthenticator) AuthenticateMCP(ctx context.Context, credential, _ string) (context.Context, Principal, error) {
+	auth.mu.Lock()
+	defer auth.mu.Unlock()
+	principal, ok := auth.profiles[credential]
+	if !ok || auth.revoked[credential] {
+		return ctx, Principal{}, &AppError{Code: CodeUnauthorized}
+	}
+	return ctx, clonePrincipal(principal), nil
+}
+
+// TestAuthenticatedMCPResolvesEveryRequestPrincipal proves one long-lived MCP
+// process cannot reuse the first caller, observes revocation immediately, and
+// never accepts an actor field in operation arguments as authority.
+func TestAuthenticatedMCPResolvesEveryRequestPrincipal(t *testing.T) {
+	registry, err := NewLocalRegistry(filepath.Join(t.TempDir(), "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := RequestIdentity{}
+	service, err := NewService(ServiceDependencies{Identity: identity, Catalog: fixedCatalog{allowed: map[string]map[string]bool{"alice": {"safe": true}, "bob": {"safe": true}}}, Registry: registry, Executor: &fakeExecutor{}, Packages: fakePackages{}, Clock: fixedClock{now: time.Unix(1000, 0).UTC()}, IDs: &sequenceIDs{}, Owner: "mcp-owner", Retention: time.Hour, RunTimeout: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = service.Close(context.Background()) })
+	auth := &mutableMCPAuthenticator{profiles: map[string]Principal{
+		"credential-alice":  {ID: "alice", Scopes: allScopes()},
+		"credential-bob-00": {ID: "bob", Scopes: allScopes()},
+	}, revoked: map[string]bool{}}
+	server, err := NewAuthenticatedMCPServer(service, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(id int, credential string, arguments map[string]any) Envelope {
+		t.Helper()
+		raw, marshalErr := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": map[string]any{"protocolVersion": MCPVersion, "credential": credential, "name": "featureproof.submit", "arguments": arguments}})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return mcpEnvelope(t, server.Handle(context.Background(), raw))
+	}
+	alice := call(1, "credential-alice", map[string]any{"selection_alias": "safe", "idempotency_key": "alice-request-key"})
+	bob := call(2, "credential-bob-00", map[string]any{"selection_alias": "safe", "idempotency_key": "bob-request-key"})
+	for principal, envelope := range map[string]Envelope{"alice": alice, "bob": bob} {
+		view, ok := envelope.Data.(RunView)
+		if !ok || envelope.Error != nil {
+			t.Fatalf("%s response=%#v", principal, envelope)
+		}
+		record, getErr := registry.Get(context.Background(), view.RunHandle)
+		if getErr != nil || record.PrincipalID != principal {
+			t.Fatalf("%s durable principal=%q err=%v", principal, record.PrincipalID, getErr)
+		}
+	}
+	spoof := call(3, "credential-alice", map[string]any{"selection_alias": "safe", "idempotency_key": "spoof-request-key", "principal_id": "bob"})
+	if spoof.Error == nil || spoof.Error.Code != CodeInvalidRequest {
+		t.Fatalf("actor spoof accepted: %#v", spoof)
+	}
+	auth.mu.Lock()
+	auth.revoked["credential-alice"] = true
+	auth.mu.Unlock()
+	revoked := call(4, "credential-alice", map[string]any{"selection_alias": "safe", "idempotency_key": "revoked-request-key"})
+	if revoked.Error == nil || revoked.Error.Code != CodeUnauthorized {
+		t.Fatalf("live revocation ignored: %#v", revoked)
+	}
+	missing := call(5, "", map[string]any{"selection_alias": "safe", "idempotency_key": "missing-credential-key"})
+	if missing.Error == nil || missing.Error.Code != CodeUnauthorized {
+		t.Fatalf("missing credential accepted: %#v", missing)
+	}
+	listed := server.Handle(context.Background(), []byte(`{"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"protocolVersion":"2026-07-28","credential":"missing-credential"}}`))
+	if envelope := mcpEnvelope(t, listed); envelope.Error == nil || envelope.Error.Code != CodeUnauthorized {
+		t.Fatalf("unauthenticated discovery accepted: %#v", listed)
+	}
+	if _, constructorErr := NewAuthenticatedMCPServer(service, nil); constructorErr == nil {
+		t.Fatal("authenticated MCP server accepted nil verifier")
+	}
+}
+
+// TestRequestIdentityFallbackAndDenial covers local host fallback separately
+// from remote context identity and denies composition with neither source.
+func TestRequestIdentityFallbackAndDenial(t *testing.T) {
+	fallback, err := NewLocalIdentity(Principal{ID: "local", Scopes: map[string]bool{ScopeRead: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := (RequestIdentity{Fallback: fallback}).Resolve(context.Background())
+	if err != nil || principal.ID != "local" {
+		t.Fatalf("fallback principal=%+v err=%v", principal, err)
+	}
+	if _, err = (RequestIdentity{}).Resolve(context.Background()); err == nil {
+		t.Fatal("request identity without transport or fallback accepted")
+	}
+}
+
+// TestRecoverTerminalRejectsCorruptDurableState proves recovery never invents
+// terminal identities when its authoritative registry cannot be verified.
+func TestRecoverTerminalRejectsCorruptDurableState(t *testing.T) {
+	registry, err := NewLocalRegistry(filepath.Join(t.TempDir(), "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(registry.path, []byte(`{`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = registry.RecoverTerminal(context.Background(), "owner", time.Now().UTC()); err == nil {
+		t.Fatal("corrupt registry recovered terminal resources")
+	}
+}
 
 // decodeEnvelope parses one CLI object for transport contract assertions.
 func decodeEnvelope(t *testing.T, raw []byte) Envelope {

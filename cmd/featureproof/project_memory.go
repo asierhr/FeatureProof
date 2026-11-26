@@ -19,6 +19,7 @@ import (
 	"github.com/asierhr/featureProof/internal/functionalflow"
 	"github.com/asierhr/featureProof/internal/githubpr"
 	"github.com/asierhr/featureProof/internal/projectmemory"
+	"github.com/asierhr/featureProof/internal/tenantsecurity"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 )
 
@@ -71,9 +72,18 @@ func projectMemoryGitHubHandler(composition projectMemoryComposition) func(conte
 
 // runProjectMemoryMCP composes the shared durable service and owns the productive MCP stream.
 func runProjectMemoryMCP(ctx context.Context, input io.Reader, output io.Writer) int {
+	return runProjectMemoryMCPWithTenantSecurity(ctx, input, output, nil)
+}
+
+// runProjectMemoryMCPWithTenantSecurity authorizes the principal only after
+// the MCP credential resolver authenticates each individual request.
+func runProjectMemoryMCPWithTenantSecurity(ctx context.Context, input io.Reader, output io.Writer, security *tenantSecurityComposition) int {
 	composition, err := composeProjectMemory()
 	if err != nil {
 		return 3
+	}
+	if security != nil {
+		composition.MCP.Auth = tenantMemoryPrincipalResolver{next: composition.MCP.Auth, security: security, surface: tenantsecurity.SurfaceMCP}
 	}
 	if err = (projectmemory.MCPServer{Adapter: composition.MCP, MaxLine: projectmemory.DefaultLimits().MaxDocumentBytes}).Serve(ctx, input, output); err != nil {
 		return 3
@@ -83,9 +93,18 @@ func runProjectMemoryMCP(ctx context.Context, input io.Reader, output io.Writer)
 
 // runProjectMemoryAPI binds only a configured loopback address and joins shutdown.
 func runProjectMemoryAPI(ctx context.Context) int {
+	return runProjectMemoryAPIWithTenantSecurity(ctx, nil)
+}
+
+// runProjectMemoryAPIWithTenantSecurity derives tenant authority from the
+// bearer principal authenticated on each HTTP request.
+func runProjectMemoryAPIWithTenantSecurity(ctx context.Context, security *tenantSecurityComposition) int {
 	composition, err := composeProjectMemory()
 	if err != nil {
 		return 3
+	}
+	if security != nil {
+		composition.API.Auth = tenantMemoryPrincipalResolver{next: composition.API.Auth, security: security, surface: tenantsecurity.SurfaceAPI}
 	}
 	address := os.Getenv("FEATUREPROOF_MEMORY_ADDRESS")
 	if address == "" {
@@ -101,6 +120,31 @@ func runProjectMemoryAPI(ctx context.Context) int {
 		return 3
 	}
 	return serveProjectMemoryAPI(ctx, composition.API, listener)
+}
+
+// tenantMemoryPrincipalResolver composes product authentication with the
+// shared tenant gateway without accepting principal claims from memory DTOs.
+type tenantMemoryPrincipalResolver struct {
+	next     projectmemory.CredentialPrincipalResolver
+	security *tenantSecurityComposition
+	surface  tenantsecurity.Surface
+}
+
+// ResolvePrincipal reauthorizes the exact principal returned by the product's
+// credential verifier for the current API or MCP request.
+func (resolver tenantMemoryPrincipalResolver) ResolvePrincipal(ctx context.Context, credential string) (string, error) {
+	principal, err := resolver.next.ResolvePrincipal(ctx, credential)
+	if err != nil {
+		return "", err
+	}
+	authenticated, err := resolver.security.AuthenticateSurface(ctx, resolver.surface, principal)
+	if err != nil {
+		return "", err
+	}
+	if _, err = resolver.security.Gateway.Authorize(authenticated, resolver.surface, tenantsecurity.ActionConfigRead, tenantsecurity.ResourceConfig); err != nil {
+		return "", err
+	}
+	return principal, nil
 }
 
 // serveProjectMemoryAPI serves the composed adapter on an already-bound loopback listener.

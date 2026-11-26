@@ -21,9 +21,9 @@ func catalogLimits() pc.CatalogLimits {
 // serviceFixture composes the real service and local durable adapter with deterministic snapshots.
 func serviceFixture(t *testing.T) (*pc.Service, pc.ProjectKey, []byte, pc.ConfigurationAuthority) {
 	t.Helper()
-	key, _ := pc.NewProjectKey("service-project", "service-repo")
+	key, _ := pc.NewProjectKey("service-organization", "service-project", "service-repo")
 	digest := digestFixture()
-	document := pc.Document{Schema: pc.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digest}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 5, ToolCalls: 2, ModelTokens: 50, Replans: 1}, Approval: "required", RetentionDays: 7, Capabilities: []string{"read"}}}
+	document := pc.Document{Schema: pc.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digest}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 5, ToolCalls: 2, ModelTokens: 50, Replans: 1}, Approval: "required", RetentionDays: 7, Capabilities: []string{"read"}}}
 	raw, err := json.Marshal(document)
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +118,7 @@ func TestServiceRejectsStaleScopeAndMalformedOperations(t *testing.T) {
 	if _, err := service.PublishAndActivate(ctx, authority, key, "publish", 1, raw); !pc.IsCategory(err, pc.CategoryStaleHead) {
 		t.Fatalf("stale got %v", err)
 	}
-	other, _ := pc.NewProjectKey("other", "service-repo")
+	other, _ := pc.NewProjectKey("other-organization", "other", "service-repo")
 	if _, err := service.Validate(ctx, authority, other, raw); !pc.IsCategory(err, pc.CategoryUnauthorized) {
 		t.Fatalf("scope got %v", err)
 	}
@@ -230,7 +230,7 @@ func TestObserverCoversRejectionAndCannotChangeResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, _ := pc.NewProjectKey("other", "repo")
+	other, _ := pc.NewProjectKey("other-organization", "other", "repo")
 	if _, err = service.Validate(context.Background(), authority, other, []byte(`{"secret_value":"CANARY"}`)); !pc.IsCategory(err, pc.CategoryUnauthorized) {
 		t.Fatalf("authorization result changed: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestObserverCoversEveryServiceBoundary(t *testing.T) {
 func TestEveryServiceBoundaryRejectsWrongAuthorityBeforeState(t *testing.T) {
 	t.Parallel()
 	service, key, raw, _ := serviceFixture(t)
-	other, _ := pc.NewProjectKey("other-project", key.RepositoryID)
+	other, _ := pc.NewProjectKey("other-organization", "other-project", key.RepositoryID)
 	wrong, _ := pc.IssueAuthority("actor", other, pc.ActionValidate, pc.ActionPublish, pc.ActionRollback, pc.ActionRead, pc.ActionExport, pc.ActionAdmit)
 	ctx := context.Background()
 	assertUnauthorized := func(err error) {
@@ -344,7 +344,7 @@ func TestEveryServiceBoundaryRejectsWrongAuthorityBeforeState(t *testing.T) {
 func TestServiceRejectsAuthorizedCrossDocumentScopeAndMalformedWrite(t *testing.T) {
 	t.Parallel()
 	service, key, raw, _ := serviceFixture(t)
-	other, _ := pc.NewProjectKey("other-project", key.RepositoryID)
+	other, _ := pc.NewProjectKey("other-organization", "other-project", key.RepositoryID)
 	authority, _ := pc.IssueAuthority("actor", other, pc.ActionValidate, pc.ActionPublish)
 	if _, err := service.Validate(context.Background(), authority, other, raw); !pc.IsCategory(err, pc.CategoryUnauthorized) {
 		t.Fatalf("validate scope: %v", err)
@@ -472,8 +472,8 @@ func (*boundaryStore) Binding(context.Context, pc.ProjectKey, string) (pc.RunCon
 // boundaryService creates a complete service around one scripted store.
 func boundaryService(t *testing.T, store *boundaryStore) (*pc.Service, pc.ProjectKey, pc.ConfigurationAuthority) {
 	t.Helper()
-	key, _ := pc.NewProjectKey("boundary-project", "boundary-repo")
-	rawDocument := pc.Document{Schema: pc.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digestFixture()}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
+	key, _ := pc.NewProjectKey("boundary-organization", "boundary-project", "boundary-repo")
+	rawDocument := pc.Document{Schema: pc.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digestFixture()}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
 	canonical, err := pc.Canonicalize(rawDocument)
 	if err != nil {
 		t.Fatal(err)
@@ -568,8 +568,8 @@ func (failingCatalogSource) Snapshot(context.Context, pc.ProjectKey) (pc.Resourc
 // TestServiceClassifiesSnapshotFailures proves raw collaborator errors never cross the boundary.
 func TestServiceClassifiesSnapshotFailures(t *testing.T) {
 	t.Parallel()
-	key, _ := pc.NewProjectKey("snapshot-project", "snapshot-repo")
-	document := pc.Document{Schema: pc.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digestFixture()}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
+	key, _ := pc.NewProjectKey("snapshot-organization", "snapshot-project", "snapshot-repo")
+	document := pc.Document{Schema: pc.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digestFixture()}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
 	raw, _ := json.Marshal(document)
 	store := &boundaryStore{}
 	authority, _ := pc.IssueAuthority("actor", key, pc.ActionValidate)

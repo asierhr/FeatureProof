@@ -65,6 +65,7 @@ func (p deadlineProducer) Produce(ctx context.Context, _ Request) (Projection, e
 type deadlinePhaseProbe struct {
 	phase    string
 	deadline time.Time
+	entered  chan struct{}
 	calls    int
 	records  []Record
 	store    *MemoryStore
@@ -77,6 +78,7 @@ func (p *deadlinePhaseProbe) block(ctx context.Context, phase string) error {
 		return nil
 	}
 	p.deadline, _ = ctx.Deadline()
+	close(p.entered)
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -373,24 +375,36 @@ func TestEffectiveDeadlinePropagatesAcrossEveryCollaboratorBoundary(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			probe := &deadlinePhaseProbe{phase: phase, store: NewMemoryStore(), gate: NewCanaryGate(nil)}
+			probe := &deadlinePhaseProbe{phase: phase, entered: make(chan struct{}), store: NewMemoryStore(), gate: NewCanaryGate(nil)}
 			constraint := testProducer(t, SourceConstraints, testItem("constraint", SourceConstraints, "x"))
 			contract := testProducer(t, SourceContract, testItem("contract", SourceContract, "x"))
 			configItem := testItem("config", SourceConfig, "x")
 			configItem.Authority, configItem.State = AuthorityApproved, "approved"
 			config := testProducer(t, SourceConfig, configItem)
 			producers := []Producer{deadlineProbeProducer{Producer: constraint, probe: probe}, contract, config}
-			assembler, err := NewAssembler(Config{ObserverTimeout: time.Second}, Dependencies{Profiles: profiles, Producers: producers, Secrets: probe, Ranker: probe, Tokens: probe, Store: probe, Observer: probe, Clock: &testClock{now: time.Unix(1, 0)}})
+			assembler, err := NewAssembler(Config{ObserverTimeout: 50 * time.Millisecond}, Dependencies{Profiles: profiles, Producers: producers, Secrets: probe, Ranker: probe, Tokens: probe, Store: probe, Observer: probe, Clock: &testClock{now: time.Unix(1, 0)}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			callerDeadline, _ := ctx.Deadline()
 			defer cancel()
+			go func() {
+				select {
+				case <-probe.entered:
+					cancel()
+				case <-ctx.Done():
+				}
+			}()
 			request := testRequest(SourceConstraints, SourceContract, SourceConfig)
 			request.IdempotencyKey = "deadline-" + phase
 			request.Limits.MaxDurationMS = 500
-			if _, err = assembler.Assemble(ctx, request); !IsCategory(err, CategoryTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+			_, err = assembler.Assemble(ctx, request)
+			if phase == "observer" {
+				if !IsCategory(err, CategoryTimeout) || !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("phase %s did not fail closed on reserved observer deadline: %v", phase, err)
+				}
+			} else if !IsCategory(err, CategoryCancelled) || !errors.Is(err, context.Canceled) {
 				t.Fatalf("phase %s did not fail closed on deadline: %v", phase, err)
 			}
 			if probe.calls != 1 || len(probe.records) != 1 {
@@ -404,8 +418,8 @@ func TestEffectiveDeadlinePropagatesAcrossEveryCollaboratorBoundary(t *testing.T
 				t.Fatalf("phase %s terminal outcome=%s want=%s", phase, probe.records[0].Outcome, expectedOutcome)
 			}
 			if phase == "observer" {
-				if probe.deadline.IsZero() || !probe.deadline.After(callerDeadline) {
-					t.Fatalf("observer did not receive detached reserved deadline: caller=%s received=%s", callerDeadline, probe.deadline)
+				if probe.deadline.IsZero() || !probe.deadline.Before(callerDeadline) {
+					t.Fatalf("observer did not receive independent reserved deadline: caller=%s received=%s", callerDeadline, probe.deadline)
 				}
 			} else if probe.deadline.IsZero() || probe.deadline.After(callerDeadline.Add(time.Millisecond)) {
 				t.Fatalf("phase %s received widened work deadline: caller=%s received=%s", phase, callerDeadline, probe.deadline)

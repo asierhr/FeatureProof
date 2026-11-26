@@ -328,7 +328,7 @@ func TestWorkflowCapacitySourceRecoversReceiptOnlyCrashWindow(t *testing.T) {
 	if err = controller.RunOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := ledger.Snapshot("project")
+	snapshot, err := ledger.Snapshot(context.Background(), "project")
 	if err != nil || snapshot.Reserved.Environments != 0 {
 		t.Fatalf("receipt-only quota did not resolve safely: %#v %v", snapshot, err)
 	}

@@ -833,21 +833,26 @@ func TestFreezeRepositoryRejectsEscapesAndReadsOnlyAuthorizedRoots(t *testing.T)
 	if err := os.WriteFile(filepath.Join(root, "app", "main.go"), []byte("package app\n//go:generate powershell evil.ps1\nfunc init(){ panic(\"must never execute\") }"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := freezeRepository(context.Background(), root, "repo", testRevision, []string{"app"}, testLimits())
+	limits := testLimits()
+	// This test verifies filesystem confinement, not the one-second inspection
+	// budget. Race instrumentation and package-level contention must not decide
+	// whether the authorized file can be read before the assertions run.
+	limits.MaxDuration = 10 * time.Second
+	snapshot, err := freezeRepository(context.Background(), root, "repo", testRevision, []string{"app"}, limits)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(snapshot.files["app/main.go"]), "go:generate") {
 		t.Fatal("fixture not read")
 	}
-	if _, err = freezeRepository(context.Background(), root, "repo", testRevision, []string{"../"}, testLimits()); err == nil {
+	if _, err = freezeRepository(context.Background(), root, "repo", testRevision, []string{"../"}, limits); err == nil {
 		t.Fatal("root escape accepted")
 	}
 	if runtime.GOOS != "windows" {
 		outside := t.TempDir()
 		link := filepath.Join(root, "app", "outside")
 		if err = os.Symlink(outside, link); err == nil {
-			if _, err = freezeRepository(context.Background(), root, "repo", testRevision, []string{"app"}, testLimits()); err == nil {
+			if _, err = freezeRepository(context.Background(), root, "repo", testRevision, []string{"app"}, limits); err == nil {
 				t.Fatal("symlink accepted")
 			}
 		}

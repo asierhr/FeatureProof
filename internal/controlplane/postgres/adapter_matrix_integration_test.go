@@ -35,7 +35,8 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		integrationReserveBackend(t, store, "matrix-run-two", "matrix-project", now)
 		integrationReserveBackend(t, store, "matrix-orphan-run", "matrix-orphan-project", now)
 		integrationReserveBackend(t, store, "matrix-unbound-run", "matrix-unbound-project", now)
-		ctx := integrationBoundContext(t, store, "matrix-run")
+		integrationReserveBackend(t, store, "matrix-block-run", "matrix-block-project", now)
+		ctx := integrationBoundContext(t, store, "matrix-run", "matrix-project")
 		policy, err := cleanup.SealCapacityPolicy(cleanup.CapacityPolicy{ProjectID: "matrix-project", MaxEnvironments: 2, MaxCPUMilli: 2000, MaxMemoryBytes: 4096, MaxObjectCount: 20, MaxTTL: 2 * time.Hour})
 		if err != nil {
 			t.Fatal(err)
@@ -50,7 +51,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		}
 		conflicting := request
 		conflicting.RunID = "matrix-other-run"
-		if _, _, conflictErr := ledger.Reserve(integrationBoundContext(t, store, conflicting.RunID), conflicting); !cleanup.IsCategory(conflictErr, cleanup.CategoryConflict) {
+		if _, _, conflictErr := ledger.Reserve(integrationBoundContext(t, store, conflicting.RunID, "matrix-project"), conflicting); !cleanup.IsCategory(conflictErr, cleanup.CategoryConflict) {
 			t.Fatal("conflicting reserve", conflictErr)
 		}
 		loaded, err := ledger.Receipt(ctx, receipt.ID)
@@ -93,7 +94,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		secondRequest := request
 		secondRequest.RunID = "matrix-run-two"
 		secondRequest.AcquisitionKey = "matrix-acquisition-two"
-		if _, created, err = ledger.Reserve(integrationBoundContext(t, store, secondRequest.RunID), secondRequest); err != nil || !created {
+		if _, created, err = ledger.Reserve(integrationBoundContext(t, store, secondRequest.RunID, "matrix-project"), secondRequest); err != nil || !created {
 			t.Fatal("second reserve", created, err)
 		}
 		if values, next, err = ledger.ScanReceipts(ctx, "", 1); err != nil || len(values) != 1 || next == "" {
@@ -113,7 +114,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		if _, _, err = ledger.AdoptUnknown(ctx, "", "run", "acquisition", integrationDigest("authority"), cleanup.ResourceDemand{Environments: 1}, time.Hour); !cleanup.IsCategory(err, cleanup.CategoryInvalid) {
 			t.Fatal("invalid orphan accepted", err)
 		}
-		orphanContext := integrationBoundContext(t, store, "matrix-orphan-run")
+		orphanContext := integrationBoundContext(t, store, "matrix-orphan-run", "matrix-orphan-project")
 		orphan, adopted, err := ledger.AdoptUnknown(orphanContext, "matrix-orphan-project", "matrix-orphan-run", "matrix-orphan-acquisition", integrationDigest("orphan-authority"), cleanup.ResourceDemand{Environments: 1, CPUMilli: 10, MemoryBytes: 10, ObjectCount: 1}, time.Hour)
 		if err != nil || !adopted || !orphan.Unknown {
 			t.Fatal("adopt orphan", adopted, err)
@@ -124,14 +125,15 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		if _, _, err = ledger.BlockUnknown(ctx, "", integrationDigest("identity")); !cleanup.IsCategory(err, cleanup.CategoryInvalid) {
 			t.Fatal("invalid unknown block accepted", err)
 		}
-		blocked, changed, err := ledger.BlockUnknown(ctx, "matrix-block-project", integrationDigest("inventory-identity"))
+		blockContext := integrationBoundContext(t, store, "matrix-block-run", "matrix-block-project")
+		blocked, changed, err := ledger.BlockUnknown(blockContext, "matrix-block-project", integrationDigest("inventory-identity"))
 		if err != nil || !changed || !blocked.Unknown {
 			t.Fatal("block unknown", changed, err)
 		}
-		if replayed, replayChanged, replayErr := ledger.BlockUnknown(ctx, blocked.ProjectID, integrationDigest("inventory-identity")); replayErr != nil || replayChanged || replayed.ID != blocked.ID {
+		if replayed, replayChanged, replayErr := ledger.BlockUnknown(blockContext, blocked.ProjectID, integrationDigest("inventory-identity")); replayErr != nil || replayChanged || replayed.ID != blocked.ID {
 			t.Fatal("block replay", replayChanged, replayErr)
 		}
-		snapshot, err := ledger.Snapshot(orphan.ProjectID)
+		snapshot, err := ledger.Snapshot(orphanContext, orphan.ProjectID)
 		if err != nil || !snapshot.Unknown || snapshot.Reserved.Environments != 1 {
 			t.Fatal("orphan snapshot", snapshot, err)
 		}
@@ -141,7 +143,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		unboundContext := integrationBoundContext(t, store, unboundRequest.RunID)
+		unboundContext := integrationBoundContext(t, store, unboundRequest.RunID, "matrix-unbound-project")
 		unbound, _, err := ledger.Reserve(unboundContext, unboundRequest)
 		if err != nil {
 			t.Fatal(err)
@@ -153,67 +155,68 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		if freed, changed, releaseErr := ledger.ReleaseUnbound(unboundContext, unbound, resolution); releaseErr != nil || !changed || !freed.Released {
 			t.Fatal("unbound release", changed, releaseErr)
 		}
-		if _, _, err = ledger.ReleaseConfirmed(ctx, "missing", "missing", integrationDigest("missing"), "cleanup", integrationDigest("confirmation")); !cleanup.IsCategory(err, cleanup.CategoryConflict) {
+		missingContext := controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: "organization", ProjectID: "missing"})
+		if _, _, err = ledger.ReleaseConfirmed(missingContext, "missing", "missing", integrationDigest("missing"), "cleanup", integrationDigest("confirmation")); !cleanup.IsCategory(err, cleanup.CategoryConflict) {
 			t.Fatal("missing release binding", err)
 		}
 		if _, err = store.pool.Exec(ctx, `UPDATE cleanup_capacity_receipts SET receipt='not-json' WHERE receipt_id=$1`, blocked.ID); err != nil {
 			t.Fatal(err)
 		}
-		if _, err = ledger.Receipt(ctx, blocked.ID); !cleanup.IsCategory(err, cleanup.CategoryIntegrity) {
+		if _, err = ledger.Receipt(blockContext, blocked.ID); !cleanup.IsCategory(err, cleanup.CategoryIntegrity) {
 			t.Fatal("corrupt capacity receipt accepted", err)
 		}
-		if _, err = ledger.Snapshot(blocked.ProjectID); !cleanup.IsCategory(err, cleanup.CategoryIntegrity) {
+		if _, err = ledger.Snapshot(blockContext, blocked.ProjectID); !cleanup.IsCategory(err, cleanup.CategoryIntegrity) {
 			t.Fatal("corrupt capacity snapshot accepted", err)
 		}
 	})
 
 	t.Run("queue deadline exhaustion and cancellation", func(t *testing.T) {
-		epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: "matrix-queue-run", ProjectID: "matrix-project", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
+		epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: "matrix-queue-run", ProjectID: "matrix-project", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
 		if err != nil {
 			t.Fatal(err)
 		}
-		head, err := store.ReserveInitial(ctx, epoch)
+		head, err := integrationReserveInitial(ctx, store, epoch)
 		if err != nil {
 			t.Fatal(err)
 		}
-		short, _ := controlplane.SealJob(controlplane.Job{JobID: "matrix-short-job", ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: 1, BindingDigest: head.EpochDigest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest("short"), CreatedAt: now, AvailableAt: now, Deadline: now.Add(10 * time.Second)})
+		short, _ := controlplane.SealJob(controlplane.Job{OrganizationID: "organization", JobID: "matrix-short-job", ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: 1, BindingDigest: head.EpochDigest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest("short"), CreatedAt: now, AvailableAt: now, Deadline: now.Add(10 * time.Second)})
 		if _, err = store.Enqueue(ctx, short); err != nil {
 			t.Fatal(err)
 		}
-		claimed, err := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: epoch.ProjectID, WorkerID: "matrix-queue-worker", Now: now, Lease: time.Minute, Limit: 1})
+		claimed, err := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope(epoch.ProjectID), WorkerID: "matrix-queue-worker", Now: now, Lease: time.Minute, Limit: 1})
 		if err != nil || len(claimed) != 1 || !claimed[0].LeaseUntil.Equal(short.Deadline) {
 			t.Fatal("bounded lease", err)
 		}
 		leased := claimed[0]
-		if _, err = store.Heartbeat(ctx, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now.Add(time.Second), 5*time.Minute); err != nil {
+		if _, err = store.Heartbeat(ctx, integrationScope(leased.ProjectID), leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now.Add(time.Second), 5*time.Minute); err != nil {
 			t.Fatal("bounded heartbeat", err)
 		}
-		dead, err := store.Retry(ctx, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now.Add(time.Second), controlplane.RetryDecision{Category: "exhausted", Backoff: time.Second, MaxAttempts: 1}, now.Add(2*time.Second))
+		dead, err := store.Retry(ctx, integrationScope(leased.ProjectID), leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now.Add(time.Second), controlplane.RetryDecision{Category: "exhausted", Backoff: time.Second, MaxAttempts: 1}, now.Add(2*time.Second))
 		if err != nil || dead.State != controlplane.JobDead {
 			t.Fatal("retry exhaustion", err)
 		}
-		cancelJob, _ := controlplane.SealJob(controlplane.Job{JobID: "matrix-cancel-job", ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: 1, BindingDigest: head.EpochDigest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest("cancel"), CreatedAt: now.Add(time.Second), AvailableAt: now.Add(time.Second), Deadline: now.Add(time.Hour)})
+		cancelJob, _ := controlplane.SealJob(controlplane.Job{OrganizationID: "organization", JobID: "matrix-cancel-job", ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: 1, BindingDigest: head.EpochDigest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest("cancel"), CreatedAt: now.Add(time.Second), AvailableAt: now.Add(time.Second), Deadline: now.Add(time.Hour)})
 		if _, err = store.Enqueue(ctx, cancelJob); err != nil {
 			t.Fatal(err)
 		}
-		claimed, err = store.Claim(ctx, controlplane.ClaimRequest{ProjectID: epoch.ProjectID, WorkerID: "matrix-cancel-worker", Now: now.Add(time.Second), Lease: time.Minute, Limit: 1})
+		claimed, err = store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope(epoch.ProjectID), WorkerID: "matrix-cancel-worker", Now: now.Add(time.Second), Lease: time.Minute, Limit: 1})
 		if err != nil || len(claimed) != 1 {
 			t.Fatal("cancel claim", err)
 		}
-		cancelled, err := store.Cancel(ctx, claimed[0].JobID, 2)
+		cancelled, err := store.Cancel(ctx, integrationScope(claimed[0].ProjectID), claimed[0].JobID, 2)
 		if err != nil || cancelled.State != controlplane.JobCancelled || cancelled.Fence <= claimed[0].Fence {
 			t.Fatal("cancel", err)
 		}
-		if replay, replayErr := store.Cancel(ctx, cancelled.JobID, 2); replayErr != nil || replay.CancelRevision != 2 {
+		if replay, replayErr := store.Cancel(ctx, integrationScope(cancelled.ProjectID), cancelled.JobID, 2); replayErr != nil || replay.CancelRevision != 2 {
 			t.Fatal("cancel replay", replayErr)
 		}
-		if _, err = store.Cancel(ctx, cancelled.JobID, 1); !errors.Is(err, controlplane.ErrConflict) {
+		if _, err = store.Cancel(ctx, integrationScope(cancelled.ProjectID), cancelled.JobID, 1); !errors.Is(err, controlplane.ErrConflict) {
 			t.Fatal("stale cancel", err)
 		}
-		if _, err = store.Complete(ctx, claimed[0].JobID, claimed[0].Owner, claimed[0].Fence, claimed[0].CancelRevision, now, controlplane.JobSucceeded, ""); !errors.Is(err, controlplane.ErrConflict) {
+		if _, err = store.Complete(ctx, integrationScope(claimed[0].ProjectID), claimed[0].JobID, claimed[0].Owner, claimed[0].Fence, claimed[0].CancelRevision, now, controlplane.JobSucceeded, ""); !errors.Is(err, controlplane.ErrConflict) {
 			t.Fatal("cancelled completion", err)
 		}
-		if _, err = store.Heartbeat(ctx, claimed[0].JobID, claimed[0].Owner, claimed[0].Fence, claimed[0].CancelRevision, now, 0); !errors.Is(err, controlplane.ErrInvalid) {
+		if _, err = store.Heartbeat(ctx, integrationScope(claimed[0].ProjectID), claimed[0].JobID, claimed[0].Owner, claimed[0].Fence, claimed[0].CancelRevision, now, 0); !errors.Is(err, controlplane.ErrInvalid) {
 			t.Fatal("invalid lease", err)
 		}
 	})
@@ -223,10 +226,11 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		manifest, err := controlplane.SealImportManifest(controlplane.ImportManifest{ImportID: "matrix-import", RunID: "matrix-import-run", ProjectID: "matrix-project", SourceIdentity: "matrix-local", ExpectedHeadDigest: integrationDigest("head"), ExpectedEpoch: 1, Counts: map[string]uint64{"packages": 1}, StreamDigests: map[string]string{"packages": postgresImportDigest([]controlplane.ImportDocument{document}, false)}, RelationDigests: map[string]string{"packages": postgresImportDigest([]controlplane.ImportDocument{document}, true)}, State: controlplane.ImportFrozen, CreatedAt: now})
+		manifest, err := controlplane.SealImportManifest(controlplane.ImportManifest{OrganizationID: "organization", ImportID: "matrix-import", RunID: "matrix-import-run", ProjectID: "matrix-project", SourceIdentity: "matrix-local", ExpectedHeadDigest: integrationDigest("head"), ExpectedEpoch: 1, Counts: map[string]uint64{"packages": 1}, StreamDigests: map[string]string{"packages": postgresImportDigest([]controlplane.ImportDocument{document}, false)}, RelationDigests: map[string]string{"packages": postgresImportDigest([]controlplane.ImportDocument{document}, true)}, State: controlplane.ImportFrozen, CreatedAt: now})
 		if err != nil {
 			t.Fatal(err)
 		}
+		ctx := controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: manifest.OrganizationID, ProjectID: manifest.ProjectID, RunID: manifest.RunID})
 		manifest, err = store.SaveImport(ctx, manifest, "")
 		if err != nil {
 			t.Fatal(err)
@@ -277,18 +281,19 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		if _, err = store.AbandonImport(ctx, manifest.ImportID); !errors.Is(err, controlplane.ErrConflict) {
 			t.Fatal("verified abandon accepted", err)
 		}
-		abandonCandidate, err := controlplane.SealImportManifest(controlplane.ImportManifest{ImportID: "matrix-abandon", RunID: "matrix-abandon-run", ProjectID: "matrix-project", SourceIdentity: "matrix-local", ExpectedHeadDigest: integrationDigest("abandon-head"), ExpectedEpoch: 1, Counts: map[string]uint64{}, StreamDigests: map[string]string{}, RelationDigests: map[string]string{}, State: controlplane.ImportFrozen, CreatedAt: now})
+		abandonCandidate, err := controlplane.SealImportManifest(controlplane.ImportManifest{OrganizationID: "organization", ImportID: "matrix-abandon", RunID: "matrix-abandon-run", ProjectID: "matrix-project", SourceIdentity: "matrix-local", ExpectedHeadDigest: integrationDigest("abandon-head"), ExpectedEpoch: 1, Counts: map[string]uint64{}, StreamDigests: map[string]string{}, RelationDigests: map[string]string{}, State: controlplane.ImportFrozen, CreatedAt: now})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err = store.SaveImport(ctx, abandonCandidate, ""); err != nil {
+		abandonContext := controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: abandonCandidate.OrganizationID, ProjectID: abandonCandidate.ProjectID, RunID: abandonCandidate.RunID})
+		if _, err = store.SaveImport(abandonContext, abandonCandidate, ""); err != nil {
 			t.Fatal(err)
 		}
-		abandoned, err := store.AbandonImport(ctx, abandonCandidate.ImportID)
+		abandoned, err := store.AbandonImport(abandonContext, abandonCandidate.ImportID)
 		if err != nil || abandoned.State != controlplane.ImportAbandoned {
 			t.Fatal("abandon", err)
 		}
-		if replay, replayErr := store.AbandonImport(ctx, abandonCandidate.ImportID); replayErr != nil || replay.Digest != abandoned.Digest {
+		if replay, replayErr := store.AbandonImport(abandonContext, abandonCandidate.ImportID); replayErr != nil || replay.Digest != abandoned.Digest {
 			t.Fatal("abandon replay", replayErr)
 		}
 		if _, err = store.CutoverImport(ctx, "", now); !errors.Is(err, controlplane.ErrInvalid) {
@@ -300,11 +305,11 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 	})
 
 	t.Run("outbox and authority reject unowned work", func(t *testing.T) {
-		claim := OutboxClaim{OperationID: "missing-operation", ProjectID: "matrix-project", Owner: "matrix-dispatcher", LeaseUntil: now.Add(time.Minute), Fence: 1, Attempts: 1}
-		if _, err := store.ClaimEffect(ctx, "", claim.Owner, now, time.Minute); !errors.Is(err, controlplane.ErrInvalid) {
+		claim := OutboxClaim{OperationID: "missing-operation", Scope: integrationScope("matrix-project"), Owner: "matrix-dispatcher", LeaseUntil: now.Add(time.Minute), Fence: 1, Attempts: 1}
+		if _, err := store.ClaimEffect(ctx, claim.Scope, "", claim.Owner, now, time.Minute); !errors.Is(err, controlplane.ErrInvalid) {
 			t.Fatal("invalid effect claim accepted", err)
 		}
-		if _, err := store.ClaimEffect(ctx, claim.OperationID, claim.Owner, now, time.Minute); !errors.Is(err, controlplane.ErrConflict) {
+		if _, err := store.ClaimEffect(ctx, claim.Scope, claim.OperationID, claim.Owner, now, time.Minute); !errors.Is(err, controlplane.ErrConflict) {
 			t.Fatal("missing effect claimed", err)
 		}
 		if _, err := store.LoadEffect(ctx, OutboxClaim{}); !errors.Is(err, controlplane.ErrNotFound) {
@@ -331,7 +336,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		if err := store.SaveAuthorityGrant(ctx, controlplane.AuthorityGrant{}); err == nil {
 			t.Fatal("invalid authority grant accepted")
 		}
-		if _, err := store.LoadAuthorityGrant(ctx, "missing-run", controlplane.PhaseExecute); !errors.Is(err, controlplane.ErrNotFound) {
+		if _, err := store.LoadAuthorityGrant(ctx, controlplane.ProjectScope{OrganizationID: "organization", ProjectID: "matrix-project"}, "missing-run", controlplane.PhaseExecute); !errors.Is(err, controlplane.ErrNotFound) {
 			t.Fatal("missing authority grant", err)
 		}
 		if err := store.VerifyLiveAuthority(ctx, controlplane.AuthorityEnvelope{JobID: "missing-job"}, "worker", now); !errors.Is(err, controlplane.ErrNotFound) {
@@ -341,7 +346,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 
 	t.Run("cleanup scheduling and cursors", func(t *testing.T) {
 		integrationReserveBackend(t, store, "matrix-cleanup-run", "matrix-project", now)
-		ctx := integrationBoundContext(t, store, "matrix-cleanup-run")
+		ctx := integrationBoundContext(t, store, "matrix-cleanup-run", "matrix-project")
 		adapter := store.CleanupStore()
 		binding, err := cleanup.SealLifecycleCleanupBinding(cleanup.LifecycleCleanupBinding{Version: cleanup.BindingVersion, ProjectID: "matrix-project", RunID: "matrix-cleanup-run", ProviderID: "provider", ProviderVersion: "v1", SelectionDigest: integrationDigest("selection"), AcquisitionKey: "matrix-acquisition-2", AcquisitionDigest: integrationDigest("acquisition"), EnvironmentDigest: integrationDigest("environment"), ResourceIdentityDigest: integrationDigest("resource"), LifecycleDigest: integrationDigest("lifecycle"), CleanupKey: "matrix-cleanup-key", CapacityReceiptDigest: integrationDigest("capacity"), LifecycleRecordDigest: integrationDigest("record")})
 		if err != nil {
@@ -442,7 +447,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 
 	t.Run("functional intent and journal", func(t *testing.T) {
 		integrationReserveBackend(t, store, "matrix-flow-run", "matrix-project", now)
-		ctx := integrationBoundContext(t, store, "matrix-flow-run")
+		ctx := integrationBoundContext(t, store, "matrix-flow-run", "matrix-project")
 		if _, err := store.FunctionalStore(nil, 0); err == nil {
 			t.Fatal("invalid functional store accepted")
 		}
@@ -537,6 +542,10 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		adapter := store.WorkflowStore()
 		record := validationworkflow.Record{Version: 1, Handle: "matrix-workflow", Principal: "matrix-principal", IdempotencyKey: "matrix-workflow-key", RequestDigest: integrationDigest("request"), RepositoryID: "matrix-repository", Revision: strings.Repeat("c", 40), Phase: validationworkflow.PhaseAdmitted}
 		proposed := record
+		ctx := controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: "organization", ProjectID: record.RepositoryID, RunID: record.Handle})
+		if err := integrationRegisterProject(ctx, store, "organization", record.RepositoryID); err != nil {
+			t.Fatal(err)
+		}
 		record, created, ctx, err := adapter.ReserveBound(ctx, record, "matrix-workflow-worker", now, time.Minute)
 		if err != nil || !created {
 			t.Fatal("reserve", created, err)
@@ -657,7 +666,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 
 	t.Run("environment lifecycle and capacity conflicts", func(t *testing.T) {
 		integrationReserveBackend(t, store, "matrix-environment", "matrix-project", now)
-		ctx := integrationBoundContext(t, store, "matrix-environment")
+		ctx := integrationBoundContext(t, store, "matrix-environment", "matrix-project")
 		adapter := store.EnvironmentStore()
 		if _, _, err := adapter.Reserve(ctx, environment.Record{}); err == nil {
 			t.Fatal("invalid environment reserve accepted")
@@ -690,7 +699,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 			t.Fatal("stale save accepted")
 		}
 		job := integrationJob(now, "matrix-environment-job", 1, integrationDigest("binding"))
-		effect := controlplane.EffectIntent{OperationID: "matrix-environment-effect", IdempotencyKey: "matrix-environment-key", ProjectID: record.ProjectID, RunID: record.RunID, Phase: controlplane.PhaseCleanup, BindingDigest: integrationDigest("binding"), InputDigest: integrationDigest("input")}
+		effect := controlplane.EffectIntent{OrganizationID: "organization", OperationID: "matrix-environment-effect", IdempotencyKey: "matrix-environment-key", ProjectID: record.ProjectID, RunID: record.RunID, Phase: controlplane.PhaseCleanup, BindingDigest: integrationDigest("binding"), InputDigest: integrationDigest("input")}
 		if _, err = adapter.SaveCausal(ctx, record, record.Revision, integrationEnvironmentEvent(record, "matrix-environment-two-outputs", now), &job, &effect); err == nil {
 			t.Fatal("two causal outputs accepted")
 		}
@@ -744,7 +753,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 
 	t.Run("correction lineage budget and recovery", func(t *testing.T) {
 		integrationReserveBackend(t, store, "matrix-parent", "matrix-project", now)
-		ctx := integrationBoundContext(t, store, "matrix-parent")
+		ctx := integrationBoundContext(t, store, "matrix-parent", "matrix-project")
 		adapter := store.CorrectionStore()
 		if _, err := adapter.Reserve(ctx, correction.Reservation{}); err == nil {
 			t.Fatal("invalid correction reserve accepted")
@@ -813,7 +822,7 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		if err != nil || terminal.Phase != correction.PhaseTerminal {
 			t.Fatal("terminal recovery", err)
 		}
-		adapter.ReleaseOwner(loaded.Link.Handle)
+		adapter.ReleaseOwner(ctx, loaded.Link.Handle)
 		if _, err = adapter.Get(ctx, "missing-correction"); err == nil {
 			t.Fatal("missing correction")
 		}
@@ -840,32 +849,32 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		if err != nil || len(claimedComparisons) != 1 || claimedComparisons[0].Owner != "matrix-finalizer" {
 			t.Fatal("pending comparisons", len(claimedComparisons), err)
 		}
-		adapter.ReleaseOwner(pendingRecord.Link.Handle)
+		adapter.ReleaseOwner(ctx, pendingRecord.Link.Handle)
 		if _, err = store.WorkflowStore().Load(ctx, "missing-workflow"); !errors.Is(err, validationworkflow.ErrNotFound) {
 			t.Fatal("missing workflow", err)
 		}
 	})
 
 	t.Run("durable corruption rejection", func(t *testing.T) {
-		queueHead, queueEpoch, err := store.Load(ctx, "matrix-queue-run")
+		queueHead, queueEpoch, err := store.Load(ctx, integrationScope("matrix-project"), "matrix-queue-run")
 		if err != nil {
 			t.Fatal(err)
 		}
-		grant, _ := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{ProjectID: queueHead.ProjectID, RunID: queueHead.RunID, BackendEpoch: queueHead.Epoch, BindingDigest: queueHead.EpochDigest, Phase: controlplane.PhaseExecute, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "matrix-target", TargetBindingDigest: integrationDigest("target")})
+		grant, _ := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{OrganizationID: "organization", ProjectID: queueHead.ProjectID, RunID: queueHead.RunID, BackendEpoch: queueHead.Epoch, BindingDigest: queueHead.EpochDigest, Phase: controlplane.PhaseExecute, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "matrix-target", TargetBindingDigest: integrationDigest("target")})
 		if err = store.SaveAuthorityGrant(ctx, grant); err != nil {
 			t.Fatal(err)
 		}
 		if _, err = store.pool.Exec(ctx, `UPDATE authority_grants SET document='not-json'::bytea WHERE run_id='matrix-queue-run'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err = store.LoadAuthorityGrant(ctx, queueHead.RunID, controlplane.PhaseExecute); !errors.Is(err, controlplane.ErrIntegrity) {
+		if _, err = store.LoadAuthorityGrant(ctx, controlplane.ProjectScope{OrganizationID: queueHead.OrganizationID, ProjectID: queueHead.ProjectID}, queueHead.RunID, controlplane.PhaseExecute); !errors.Is(err, controlplane.ErrIntegrity) {
 			t.Fatal("corrupt authority grant accepted", err)
 		}
-		effect := controlplane.EffectIntent{OperationID: "matrix-corrupt-effect", IdempotencyKey: "matrix-corrupt-effect-key", ProjectID: queueHead.ProjectID, RunID: queueHead.RunID, Phase: controlplane.PhasePublish, BindingDigest: queueHead.EpochDigest, InputDigest: integrationDigest("effect-input"), ReconcileMethod: "poll"}
+		effect := controlplane.EffectIntent{OrganizationID: "organization", OperationID: "matrix-corrupt-effect", IdempotencyKey: "matrix-corrupt-effect-key", ProjectID: queueHead.ProjectID, RunID: queueHead.RunID, Phase: controlplane.PhasePublish, BindingDigest: queueHead.EpochDigest, InputDigest: integrationDigest("effect-input"), ReconcileMethod: "poll"}
 		if _, err = store.Prepare(ctx, effect); err != nil {
 			t.Fatal(err)
 		}
-		claims, err := store.ClaimOutbox(ctx, "matrix-corrupt-dispatcher", time.Now().UTC(), time.Minute, 100)
+		claims, err := store.ClaimOutbox(ctx, integrationScope(effect.ProjectID), "matrix-corrupt-dispatcher", time.Now().UTC(), time.Minute, 100)
 		if err != nil {
 			t.Fatal("corrupt effect claim", err)
 		}
@@ -885,37 +894,38 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 			t.Fatal("corrupt effect accepted", err)
 		}
 		admission := integrationAdmission(now, "matrix-corrupt")
-		if _, err = store.Admit(ctx, admission); err != nil {
+		if _, err = integrationAdmit(ctx, store, admission); err != nil {
 			t.Fatal(err)
 		}
 		if _, err = store.pool.Exec(ctx, `UPDATE ingress_inbox SET envelope='not-json'::bytea WHERE source=$1 AND idempotency_key=$2`, admission.Envelope.Source, admission.Envelope.IdempotencyKey); err != nil {
 			t.Fatal(err)
 		}
-		if _, err = store.LoadIngress(ctx, admission.Epoch.RunID); !errors.Is(err, controlplane.ErrIntegrity) {
+		if _, err = store.LoadIngress(ctx, integrationScope(admission.Epoch.ProjectID), admission.Epoch.RunID); !errors.Is(err, controlplane.ErrIntegrity) {
 			t.Fatal("corrupt ingress accepted", err)
 		}
 		if _, err = store.pool.Exec(ctx, `UPDATE jobs SET document='not-json'::bytea WHERE job_id='matrix-cancel-job'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err = store.Cancel(ctx, "matrix-cancel-job", 3); !errors.Is(err, controlplane.ErrIntegrity) {
+		if _, err = store.Cancel(ctx, integrationScope("matrix-project"), "matrix-cancel-job", 3); !errors.Is(err, controlplane.ErrIntegrity) {
 			t.Fatal("corrupt queue job accepted", err)
 		}
 		if _, err = store.pool.Exec(ctx, `UPDATE backend_binding_heads SET document='not-json'::bytea WHERE run_id='matrix-queue-run'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err = store.Load(ctx, queueEpoch.RunID); !errors.Is(err, controlplane.ErrIntegrity) {
+		if _, _, err = store.Load(ctx, integrationScope(queueEpoch.ProjectID), queueEpoch.RunID); !errors.Is(err, controlplane.ErrIntegrity) {
 			t.Fatal("corrupt binding head accepted", err)
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE workflow_events SET event='{}'::bytea WHERE handle='matrix-workflow' AND sequence=1`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.WorkflowStore().Events(ctx, "matrix-workflow"); err == nil {
+		workflowContext := integrationBoundContext(t, store, "matrix-workflow", "matrix-repository")
+		if _, err := store.WorkflowStore().Events(workflowContext, "matrix-workflow"); err == nil {
 			t.Fatal("corrupt workflow event accepted")
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE workflow_artifacts SET artifact='not-json'::bytea WHERE workflow_id='matrix-workflow'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.PlanArtifactStore().Load(ctx, "matrix-workflow"); err == nil {
+		if _, err := store.PlanArtifactStore().Load(workflowContext, "matrix-workflow"); err == nil {
 			t.Fatal("corrupt workflow artifact accepted")
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE functional_intents SET intent='not-json'::bytea WHERE run_id='matrix-flow-run'`); err != nil {
@@ -925,60 +935,64 @@ func TestPostgresConsumerAdapterMatrix(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := functionalAdapter.Intent(ctx, "matrix-flow-run", 1, "step-1"); err == nil {
+		functionalContext := integrationBoundContext(t, store, "matrix-flow-run", "matrix-project")
+		if _, _, err := functionalAdapter.Intent(functionalContext, "matrix-flow-run", 1, "step-1"); err == nil {
 			t.Fatal("corrupt functional intent accepted")
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE functional_terminals SET terminal='not-json'::bytea WHERE run_id='matrix-flow-run' AND step_id='step-1'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := functionalAdapter.Terminal(ctx, "matrix-flow-run", 1, "step-1"); err == nil {
+		if _, _, err := functionalAdapter.Terminal(functionalContext, "matrix-flow-run", 1, "step-1"); err == nil {
 			t.Fatal("corrupt functional terminal accepted")
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE functional_events SET event='not-json'::bytea WHERE run_id='matrix-flow-run' AND sequence=1`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := functionalAdapter.Events(ctx, "matrix-flow-run"); err == nil {
+		if _, err := functionalAdapter.Events(functionalContext, "matrix-flow-run"); err == nil {
 			t.Fatal("corrupt functional event accepted")
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE environment_records SET record='not-json'::bytea WHERE run_id='matrix-environment'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.EnvironmentStore().Load(ctx, "matrix-environment"); err == nil {
+		environmentContext := integrationBoundContext(t, store, "matrix-environment", "matrix-project")
+		if _, err := store.EnvironmentStore().Load(environmentContext, "matrix-environment"); err == nil {
 			t.Fatal("corrupt environment record accepted")
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE environment_events SET event='not-json'::bytea WHERE run_id='matrix-environment'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.EnvironmentStore().Events(ctx, "matrix-environment"); err == nil {
+		if _, err := store.EnvironmentStore().Events(environmentContext, "matrix-environment"); err == nil {
 			t.Fatal("corrupt environment event accepted")
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE cleanup_items SET item='not-json'::bytea WHERE cleanup_id='matrix-cleanup-item'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.CleanupStore().Scan(ctx, "", 100); err == nil {
+		cleanupContext := integrationBoundContext(t, store, "matrix-cleanup-run", "matrix-project")
+		if _, err := store.CleanupStore().Scan(cleanupContext, "", 100); err == nil {
 			t.Fatal("corrupt cleanup item accepted")
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE cleanup_events SET event='not-json'::bytea WHERE cleanup_id='matrix-cleanup-item'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.CleanupStore().Events(ctx, "matrix-cleanup-item"); err == nil {
+		if _, err := store.CleanupStore().Events(cleanupContext, "matrix-cleanup-item"); err == nil {
 			t.Fatal("corrupt cleanup event accepted")
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE correction_records SET record='not-json'::bytea WHERE run_id='matrix-correction'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.CorrectionStore().Get(ctx, "matrix-correction"); err == nil {
+		correctionContext := integrationBoundContext(t, store, "matrix-parent", "matrix-project")
+		if _, err := store.CorrectionStore().Get(correctionContext, "matrix-correction"); err == nil {
 			t.Fatal("corrupt correction record accepted")
 		}
 		if _, err := store.pool.Exec(ctx, `UPDATE correction_events SET event='not-json'::bytea WHERE run_id='matrix-pending'`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.CorrectionStore().Events(ctx, "matrix-pending"); err == nil {
+		if _, err := store.CorrectionStore().Events(correctionContext, "matrix-pending"); err == nil {
 			t.Fatal("corrupt correction event accepted")
 		}
 	})
 
-	if _, _, err := store.Load(ctx, "matrix-missing-binding"); !errors.Is(err, controlplane.ErrNotFound) {
+	if _, _, err := store.Load(ctx, integrationScope("matrix-project"), "matrix-missing-binding"); !errors.Is(err, controlplane.ErrNotFound) {
 		t.Fatal("missing binding", err)
 	}
 }
@@ -1001,47 +1015,48 @@ func TestPostgresConsumerAdaptersFailClosedOnDatabaseLoss(t *testing.T) {
 
 	requireFailure("ready", store.Ready(ctx))
 	requireFailure("migrate", store.Migrate(ctx))
-	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: "loss-run", ProjectID: "loss-project", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
-	_, err := store.ReserveInitial(ctx, epoch)
+	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: "loss-run", ProjectID: "loss-project", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
+	_, err := integrationReserveInitial(ctx, store, epoch)
 	requireFailure("reserve binding", err)
-	_, _, err = store.Load(ctx, epoch.RunID)
+	_, _, err = store.Load(ctx, integrationScope(epoch.ProjectID), epoch.RunID)
 	requireFailure("load binding", err)
 	_, err = store.Cutover(ctx, controlplane.BindingHead{RunID: epoch.RunID}, epoch)
 	requireFailure("cutover", err)
 	job := integrationJob(now, "loss-job", 1, integrationDigest("binding"))
 	_, err = store.Enqueue(ctx, job)
 	requireFailure("enqueue", err)
-	_, err = store.Claim(ctx, controlplane.ClaimRequest{ProjectID: job.ProjectID, WorkerID: "loss-worker", Now: now, Lease: time.Minute, Limit: 1})
+	_, err = store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope(job.ProjectID), WorkerID: "loss-worker", Now: now, Lease: time.Minute, Limit: 1})
 	requireFailure("claim", err)
-	_, err = store.Heartbeat(ctx, job.JobID, "loss-worker", 1, 0, now, time.Minute)
+	_, err = store.Heartbeat(ctx, integrationScope(job.ProjectID), job.JobID, "loss-worker", 1, 0, now, time.Minute)
 	requireFailure("heartbeat", err)
-	_, err = store.Complete(ctx, job.JobID, "loss-worker", 1, 0, now, controlplane.JobSucceeded, "")
+	_, err = store.Complete(ctx, integrationScope(job.ProjectID), job.JobID, "loss-worker", 1, 0, now, controlplane.JobSucceeded, "")
 	requireFailure("complete", err)
-	_, err = store.Retry(ctx, job.JobID, "loss-worker", 1, 0, now, controlplane.RetryDecision{Category: "transient", Backoff: time.Second, MaxAttempts: 2}, now.Add(time.Second))
+	_, err = store.Retry(ctx, integrationScope(job.ProjectID), job.JobID, "loss-worker", 1, 0, now, controlplane.RetryDecision{Category: "transient", Backoff: time.Second, MaxAttempts: 2}, now.Add(time.Second))
 	requireFailure("retry", err)
-	_, err = store.Cancel(ctx, job.JobID, 1)
+	_, err = store.Cancel(ctx, integrationScope(job.ProjectID), job.JobID, 1)
 	requireFailure("cancel", err)
-	_, err = store.Recover(ctx, now, 1)
+	_, err = store.Recover(ctx, integrationScope(job.ProjectID), now, 1)
 	requireFailure("recover", err)
 
 	admission := integrationAdmission(now, "loss")
-	_, err = store.Admit(ctx, admission)
+	_, err = integrationAdmit(ctx, store, admission)
 	requireFailure("admit", err)
 	_, err = store.Accept(ctx, admission.Envelope, admission.Job)
 	requireFailure("accept", err)
-	_, err = store.LoadIngress(ctx, admission.Epoch.RunID)
+	_, err = store.LoadIngress(ctx, integrationScope(admission.Epoch.ProjectID), admission.Epoch.RunID)
 	requireFailure("load ingress", err)
-	intent := controlplane.EffectIntent{OperationID: "loss-operation", IdempotencyKey: "loss-effect", ProjectID: "loss-project", RunID: epoch.RunID, Phase: controlplane.PhasePublish, BindingDigest: integrationDigest("binding"), InputDigest: integrationDigest("input"), ReconcileMethod: "poll"}
+	intent := controlplane.EffectIntent{OrganizationID: "organization", OperationID: "loss-operation", IdempotencyKey: "loss-effect", ProjectID: "loss-project", RunID: epoch.RunID, Phase: controlplane.PhasePublish, BindingDigest: integrationDigest("binding"), InputDigest: integrationDigest("input"), ReconcileMethod: "poll"}
 	_, err = store.Prepare(ctx, intent)
 	requireFailure("prepare", err)
-	requireFailure("confirm", store.Confirm(ctx, intent.OperationID, integrationDigest("receipt")))
-	_, err = store.ClaimOutbox(ctx, "loss-dispatcher", now, time.Minute, 1)
+	requireFailure("confirm", store.Confirm(ctx, integrationScope(intent.ProjectID), intent.OperationID, integrationDigest("receipt")))
+	_, err = store.ClaimOutbox(ctx, integrationScope(intent.ProjectID), "loss-dispatcher", now, time.Minute, 1)
 	requireFailure("claim outbox", err)
-	_, err = store.RecoverOutbox(ctx, now, 1)
+	_, err = store.RecoverOutbox(ctx, integrationScope(intent.ProjectID), now, 1)
 	requireFailure("recover outbox", err)
 
 	workflowAdapter := store.WorkflowStore()
 	workflow := validationworkflow.Record{Version: 1, Handle: "loss-workflow", Principal: "loss-principal", IdempotencyKey: "loss-key", RequestDigest: integrationDigest("request"), RepositoryID: "loss-repository", Revision: strings.Repeat("d", 40), Phase: validationworkflow.PhaseAdmitted}
+	ctx = controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: "organization", ProjectID: workflow.RepositoryID, RunID: workflow.Handle})
 	_, _, err = workflowAdapter.Reserve(ctx, workflow, "loss-worker", now, time.Minute)
 	requireFailure("workflow reserve", err)
 	_, err = workflowAdapter.Load(ctx, workflow.Handle)
@@ -1064,6 +1079,7 @@ func TestPostgresConsumerAdaptersFailClosedOnDatabaseLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx = controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: "organization", ProjectID: "loss-project", RunID: "loss-flow"})
 	_, _, err = functionalAdapter.Claim(ctx, "loss-flow", 1, "step", "worker")
 	requireFailure("functional claim", err)
 	_, err = functionalAdapter.RenewClaim(ctx, "loss-flow", 1, "step", functionalflow.Claim{Owner: "worker", Token: "token", ExpiresAt: now.Add(time.Minute)})
@@ -1080,6 +1096,7 @@ func TestPostgresConsumerAdaptersFailClosedOnDatabaseLoss(t *testing.T) {
 	requireFailure("functional events", err)
 
 	cleanupAdapter := store.CleanupStore()
+	ctx = controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: "organization", ProjectID: "loss-project", RunID: "loss-flow"})
 	_, err = cleanupAdapter.Scan(ctx, "", 1)
 	requireFailure("cleanup scan", err)
 	_, _, err = cleanupAdapter.Claim(ctx, "loss-cleanup", "worker", now, time.Minute)
@@ -1107,7 +1124,7 @@ func TestPostgresConsumerAdaptersFailClosedOnDatabaseLoss(t *testing.T) {
 	requireFailure("correction recover", store.CorrectionStore().Recover(ctx, "loss-worker", now))
 	_, err = store.CorrectionStore().ClaimPendingComparisons(ctx, "loss-worker", now)
 	requireFailure("correction claims", err)
-	manifest, sealErr := controlplane.SealImportManifest(controlplane.ImportManifest{ImportID: "loss-import", RunID: epoch.RunID, ProjectID: epoch.ProjectID, SourceIdentity: "loss-source", ExpectedHeadDigest: integrationDigest("head"), ExpectedEpoch: 1, Counts: map[string]uint64{"runs": 1}, StreamDigests: map[string]string{"runs": integrationDigest("stream")}, RelationDigests: map[string]string{"runs": integrationDigest("relation")}, State: controlplane.ImportFrozen, CreatedAt: now})
+	manifest, sealErr := controlplane.SealImportManifest(controlplane.ImportManifest{OrganizationID: "organization", ImportID: "loss-import", RunID: epoch.RunID, ProjectID: epoch.ProjectID, SourceIdentity: "loss-source", ExpectedHeadDigest: integrationDigest("head"), ExpectedEpoch: 1, Counts: map[string]uint64{"runs": 1}, StreamDigests: map[string]string{"runs": integrationDigest("stream")}, RelationDigests: map[string]string{"runs": integrationDigest("relation")}, State: controlplane.ImportFrozen, CreatedAt: now})
 	if sealErr != nil {
 		t.Fatal(sealErr)
 	}
@@ -1130,11 +1147,11 @@ func TestPostgresConsumerAdaptersFailClosedOnDatabaseLoss(t *testing.T) {
 	if codecErr != nil {
 		t.Fatal(codecErr)
 	}
-	_, err = store.ListJobs(ctx, controlplane.JobQuery{ProjectID: epoch.ProjectID, Limit: 1, Now: now, CursorTTL: time.Minute}, codec)
+	_, err = store.ListJobs(ctx, controlplane.JobQuery{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID, Limit: 1, Now: now, CursorTTL: time.Minute}, codec)
 	requireFailure("job query", err)
-	grant, _ := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: epoch.Epoch, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "target", TargetBindingDigest: integrationDigest("target")})
+	grant, _ := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{OrganizationID: "organization", ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: epoch.Epoch, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "target", TargetBindingDigest: integrationDigest("target")})
 	requireFailure("authority grant save", store.SaveAuthorityGrant(ctx, grant))
-	_, err = store.LoadAuthorityGrant(ctx, epoch.RunID, controlplane.PhaseExecute)
+	_, err = store.LoadAuthorityGrant(ctx, controlplane.ProjectScope{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID}, epoch.RunID, controlplane.PhaseExecute)
 	requireFailure("authority grant load", err)
 	_, err = store.CommitPackage(ctx, validationworkflow.PackageDocument{ProjectID: "loss-project", PackageID: "loss-package", Document: []byte(`{}`)})
 	requireFailure("package commit", err)

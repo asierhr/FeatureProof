@@ -15,7 +15,7 @@ func (store *Store) ReserveInitial(ctx context.Context, epoch controlplane.Backe
 		return controlplane.BindingHead{}, controlplane.ErrInvalid
 	}
 	document, _ := canonical(sealed)
-	head, _ := controlplane.SealBindingHead(controlplane.BindingHead{RunID: sealed.RunID, ProjectID: sealed.ProjectID, Epoch: 1, EpochDigest: sealed.Digest, Revision: 1})
+	head, _ := controlplane.SealBindingHead(controlplane.BindingHead{OrganizationID: sealed.OrganizationID, RunID: sealed.RunID, ProjectID: sealed.ProjectID, Epoch: 1, EpochDigest: sealed.Digest, Revision: 1})
 	headDocument, _ := canonical(head)
 	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -23,7 +23,7 @@ func (store *Store) ReserveInitial(ctx context.Context, epoch controlplane.Backe
 	}
 	defer tx.Rollback(ctx)
 	var currentDigest string
-	scanErr := tx.QueryRow(ctx, `SELECT digest FROM backend_binding_heads WHERE run_id=$1`, sealed.RunID).Scan(&currentDigest)
+	scanErr := tx.QueryRow(ctx, `SELECT digest FROM backend_binding_heads WHERE organization_id=$1 AND project_id=$2 AND run_id=$3`, sealed.OrganizationID, sealed.ProjectID, sealed.RunID).Scan(&currentDigest)
 	if scanErr == nil {
 		if currentDigest == head.Digest {
 			return head, nil
@@ -33,13 +33,13 @@ func (store *Store) ReserveInitial(ctx context.Context, epoch controlplane.Backe
 	if scanErr != pgx.ErrNoRows {
 		return controlplane.BindingHead{}, mapError(scanErr)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_epochs(run_id,project_id,epoch,document,digest) VALUES($1,$2,$3,$4,$5)`, sealed.RunID, sealed.ProjectID, sealed.Epoch, document, sealed.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_epochs(organization_id,run_id,project_id,epoch,document,digest) VALUES($1,$2,$3,$4,$5,$6)`, sealed.OrganizationID, sealed.RunID, sealed.ProjectID, sealed.Epoch, document, sealed.Digest); err != nil {
 		return controlplane.BindingHead{}, mapError(err)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_heads(run_id,project_id,epoch,epoch_digest,revision,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7)`, head.RunID, head.ProjectID, head.Epoch, head.EpochDigest, head.Revision, headDocument, head.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_heads(organization_id,run_id,project_id,epoch,epoch_digest,revision,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, head.OrganizationID, head.RunID, head.ProjectID, head.Epoch, head.EpochDigest, head.Revision, headDocument, head.Digest); err != nil {
 		return controlplane.BindingHead{}, mapError(err)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_events(run_id,sequence,kind,epoch,occurred_at) VALUES($1,1,'admitted',$2,$3)`, sealed.RunID, sealed.Epoch, sealed.CreatedAt); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_events(organization_id,project_id,run_id,sequence,kind,epoch,occurred_at) VALUES($1,$2,$3,1,'admitted',$4,$5)`, sealed.OrganizationID, sealed.ProjectID, sealed.RunID, sealed.Epoch, sealed.CreatedAt); err != nil {
 		return controlplane.BindingHead{}, mapError(err)
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -49,9 +49,9 @@ func (store *Store) ReserveInitial(ctx context.Context, epoch controlplane.Backe
 }
 
 // Load reads and verifies the sole active head and its immutable epoch.
-func (store *Store) Load(ctx context.Context, runID string) (controlplane.BindingHead, controlplane.BackendEpoch, error) {
+func (store *Store) Load(ctx context.Context, scope controlplane.ProjectScope, runID string) (controlplane.BindingHead, controlplane.BackendEpoch, error) {
 	var headBytes, epochBytes []byte
-	err := store.pool.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.run_id=$1`, runID).Scan(&headBytes, &epochBytes)
+	err := store.pool.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.organization_id=$1 AND h.project_id=$2 AND h.run_id=$3`, scope.OrganizationID, scope.ProjectID, runID).Scan(&headBytes, &epochBytes)
 	if err == pgx.ErrNoRows {
 		return controlplane.BindingHead{}, controlplane.BackendEpoch{}, controlplane.ErrNotFound
 	}
@@ -69,7 +69,7 @@ func (store *Store) Load(ctx context.Context, runID string) (controlplane.Bindin
 // verifyActiveJobTx proves that a queue mutation still belongs to this adapter and the sole active PostgreSQL epoch.
 func (store *Store) verifyActiveJobTx(ctx context.Context, tx pgx.Tx, job controlplane.Job) error {
 	var headBytes, epochBytes []byte
-	err := tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.run_id=$1 FOR UPDATE OF h`, job.RunID).Scan(&headBytes, &epochBytes)
+	err := tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.organization_id=$1 AND h.project_id=$2 AND h.run_id=$3 FOR UPDATE OF h`, job.OrganizationID, job.ProjectID, job.RunID).Scan(&headBytes, &epochBytes)
 	if err == pgx.ErrNoRows {
 		return controlplane.ErrConflict
 	}
@@ -94,7 +94,7 @@ func (store *Store) Cutover(ctx context.Context, expected controlplane.BindingHe
 		return controlplane.BindingHead{}, controlplane.ErrInvalid
 	}
 	document, _ := canonical(sealed)
-	head, _ := controlplane.SealBindingHead(controlplane.BindingHead{RunID: sealed.RunID, ProjectID: sealed.ProjectID, Epoch: sealed.Epoch, EpochDigest: sealed.Digest, Revision: expected.Revision + 2})
+	head, _ := controlplane.SealBindingHead(controlplane.BindingHead{OrganizationID: sealed.OrganizationID, RunID: sealed.RunID, ProjectID: sealed.ProjectID, Epoch: sealed.Epoch, EpochDigest: sealed.Digest, Revision: expected.Revision + 2})
 	headDocument, _ := canonical(head)
 	tx, err := store.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -102,21 +102,21 @@ func (store *Store) Cutover(ctx context.Context, expected controlplane.BindingHe
 	}
 	defer tx.Rollback(ctx)
 	var currentDigest string
-	if err = tx.QueryRow(ctx, `SELECT digest FROM backend_binding_heads WHERE run_id=$1 FOR UPDATE`, expected.RunID).Scan(&currentDigest); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT digest FROM backend_binding_heads WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 FOR UPDATE`, expected.OrganizationID, expected.ProjectID, expected.RunID).Scan(&currentDigest); err != nil {
 		return controlplane.BindingHead{}, mapError(err)
 	}
 	if currentDigest != expected.Digest {
 		return controlplane.BindingHead{}, controlplane.ErrConflict
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_epochs(run_id,project_id,epoch,document,digest) VALUES($1,$2,$3,$4,$5)`, sealed.RunID, sealed.ProjectID, sealed.Epoch, document, sealed.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_epochs(organization_id,run_id,project_id,epoch,document,digest) VALUES($1,$2,$3,$4,$5,$6)`, sealed.OrganizationID, sealed.RunID, sealed.ProjectID, sealed.Epoch, document, sealed.Digest); err != nil {
 		return controlplane.BindingHead{}, mapError(err)
 	}
-	result, err := tx.Exec(ctx, `UPDATE backend_binding_heads SET epoch=$1,epoch_digest=$2,revision=$3,document=$4,digest=$5 WHERE run_id=$6 AND digest=$7`, head.Epoch, head.EpochDigest, head.Revision, headDocument, head.Digest, head.RunID, expected.Digest)
+	result, err := tx.Exec(ctx, `UPDATE backend_binding_heads SET epoch=$1,epoch_digest=$2,revision=$3,document=$4,digest=$5 WHERE organization_id=$6 AND project_id=$7 AND run_id=$8 AND digest=$9`, head.Epoch, head.EpochDigest, head.Revision, headDocument, head.Digest, head.OrganizationID, head.ProjectID, head.RunID, expected.Digest)
 	if err != nil || result.RowsAffected() != 1 {
 		return controlplane.BindingHead{}, controlplane.ErrConflict
 	}
 	now := time.Now().UTC()
-	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_events(run_id,sequence,kind,epoch,occurred_at) VALUES($1,$2,'archived',$3,$4),($1,$5,'cutover',$6,$4)`, head.RunID, expected.Revision+1, expected.Epoch, now, head.Revision, head.Epoch); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_events(organization_id,project_id,run_id,sequence,kind,epoch,occurred_at) VALUES($1,$2,$3,$4,'archived',$5,$6),($1,$2,$3,$7,'cutover',$8,$6)`, head.OrganizationID, head.ProjectID, head.RunID, expected.Revision+1, expected.Epoch, now, head.Revision, head.Epoch); err != nil {
 		return controlplane.BindingHead{}, mapError(err)
 	}
 	if err = tx.Commit(ctx); err != nil {

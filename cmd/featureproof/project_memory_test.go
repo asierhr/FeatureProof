@@ -24,6 +24,19 @@ import (
 // memoryWebhookStore keeps only the current delivery receipt for productive webhook routing tests.
 type memoryWebhookStore struct{}
 
+// mappedMemoryCredential models a transport verifier that owns the mapping
+// from opaque credentials to product principals.
+type mappedMemoryCredential map[string]string
+
+// ResolvePrincipal returns no identity claim from request payload fields.
+func (resolver mappedMemoryCredential) ResolvePrincipal(_ context.Context, credential string) (string, error) {
+	principal, ok := resolver[credential]
+	if !ok {
+		return "", fmt.Errorf("credential rejected")
+	}
+	return principal, nil
+}
+
 // ReserveDelivery returns a fresh authenticated delivery so service idempotency remains observable.
 func (memoryWebhookStore) ReserveDelivery(_ context.Context, receipt githubpr.DeliveryReceipt, _ string, _ time.Time, _ time.Duration) (githubpr.DeliveryReceipt, bool, error) {
 	return receipt, true, nil
@@ -113,6 +126,7 @@ func installProjectMemoryWitness(t *testing.T) {
 // setProjectMemoryEnvironment installs one complete isolated production composition for entrypoint tests.
 func setProjectMemoryEnvironment(t *testing.T, base, principal, repository string) {
 	t.Helper()
+	writeTenantSecurityCompositionFixture(t, base)
 	t.Setenv("FEATUREPROOF_MEMORY_ROOT", filepath.Join(base, "memory"))
 	t.Setenv("FEATUREPROOF_MEMORY_TRUST_ROOT", filepath.Join(base, "registry"))
 	installProjectMemoryWitness(t)
@@ -127,16 +141,7 @@ func setProjectMemoryEnvironment(t *testing.T, base, principal, repository strin
 
 // TestProjectMemoryCommandComposesDurableVertical exercises the executable composition through proposal, review query, transition, and operational query.
 func TestProjectMemoryCommandComposesDurableVertical(t *testing.T) {
-	t.Setenv("FEATUREPROOF_MEMORY_ROOT", filepath.Join(t.TempDir(), "memory"))
-	t.Setenv("FEATUREPROOF_MEMORY_TRUST_ROOT", filepath.Join(t.TempDir(), "trust"))
-	installProjectMemoryWitness(t)
-	t.Setenv("FEATUREPROOF_MEMORY_INTEGRITY_KEY", "0123456789abcdef0123456789abcdef")
-	t.Setenv("FEATUREPROOF_MEMORY_PRINCIPAL", "principal")
-	t.Setenv("FEATUREPROOF_MEMORY_CREDENTIAL", "Bearer credential")
-	t.Setenv("FEATUREPROOF_MEMORY_PROJECT", "project-1")
-	t.Setenv("FEATUREPROOF_MEMORY_REPOSITORY", "repo-1")
-	t.Setenv("FEATUREPROOF_MEMORY_COMMIT", strings.Repeat("a", 40))
-	t.Setenv("FEATUREPROOF_MEMORY_CONFIGURATION_DIGEST", strings.Repeat("b", 64))
+	setProjectMemoryEnvironment(t, t.TempDir(), "principal", "repo-1")
 	now := time.Now().UTC().Add(-time.Second)
 	candidate := projectmemory.Candidate{ContractVersion: projectmemory.ContractVersion, ProjectID: "project-1", Scope: projectmemory.Scope{Kind: projectmemory.ScopeRevision, RepositoryID: "repo-1", CommitOID: strings.Repeat("a", 40)}, Class: projectmemory.ClassFact, Subject: "api.pet", Predicate: "supports", Value: projectmemory.TypedValue{Kind: projectmemory.ValueBoolean, Data: true}, Provenance: projectmemory.Provenance{Source: "forged", Reference: "forged", Actor: projectmemory.Actor{Kind: "human", ID: "admin"}, Producer: "forged", ProducerVersion: "forged", ObservedAt: now, RepositoryID: "repo-1", CommitOID: strings.Repeat("a", 40)}, Confidence: projectmemory.ConfidenceHigh, Sensitivity: projectmemory.SensitivityPublic, ValidFrom: now}
 	proposalRaw, _ := json.Marshal(projectmemory.ProposalCommand{IdempotencyKey: "product-proposal", Candidate: candidate})
@@ -212,6 +217,31 @@ func TestProjectMemoryCompositionAuthorityRejectsUntrustedCoordinates(t *testing
 	t.Setenv("FEATUREPROOF_MEMORY_INTEGRITY_KEY", "")
 	if _, err := composeProjectMemory(); err == nil {
 		t.Fatal("incomplete composition accepted")
+	}
+}
+
+// TestProjectMemoryTenantResolverAuthenticatesEveryRequest proves API and MCP
+// credentials are reauthorized independently and never inherit a prior
+// request's principal.
+func TestProjectMemoryTenantResolverAuthenticatesEveryRequest(t *testing.T) {
+	root := t.TempDir()
+	writeTenantSecurityCompositionFixture(t, root)
+	security, err := composeTenantSecurity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer security.Close()
+	resolver := tenantMemoryPrincipalResolver{next: mappedMemoryCredential{"credential-a": "actor", "credential-b": "operator", "credential-empty": "", "credential-spoof": "attacker"}, security: security, surface: "api"}
+	for credential, expected := range map[string]string{"credential-a": "actor", "credential-b": "operator"} {
+		principal, resolveErr := resolver.ResolvePrincipal(context.Background(), credential)
+		if resolveErr != nil || principal != expected {
+			t.Fatalf("credential=%s principal=%q err=%v", credential, principal, resolveErr)
+		}
+	}
+	for _, credential := range []string{"missing", "credential-empty", "credential-spoof"} {
+		if _, resolveErr := resolver.ResolvePrincipal(context.Background(), credential); resolveErr == nil {
+			t.Fatalf("credential %s inherited a principal", credential)
+		}
 	}
 }
 

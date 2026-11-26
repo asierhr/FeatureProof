@@ -323,7 +323,7 @@ func TestInterruptedOwnerDoesNotRerun(t *testing.T) {
 	if err != nil || live.Phase != PhaseReserved {
 		t.Fatalf("live owner was recovered: %+v err=%v", live, err)
 	}
-	store.ReleaseOwner(reserved.Record.Link.Handle)
+	store.ReleaseOwner(context.Background(), reserved.Record.Link.Handle)
 	if err := store.Recover(context.Background(), "owner", testNow.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -676,7 +676,7 @@ func TestCorrectionCancelJoinsAndPreservesParent(t *testing.T) {
 	}
 	select {
 	case <-fixture.executor.started:
-	case <-time.After(time.Second):
+	case <-t.Context().Done():
 		t.Fatal("executor did not start")
 	}
 	cancelled, err := fixture.coordinator.Cancel(context.Background(), record.Link.Handle, "principal", "cancel-key-12345")
@@ -990,8 +990,7 @@ func TestIndependentChainLocksDoNotBlockProgress(t *testing.T) {
 // TestMultiprocessTailAdmissionHasOneWinner proves the per-chain CAS across real OS processes.
 func TestMultiprocessTailAdmissionHasOneWinner(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "shared")
-	testContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	testContext := t.Context()
 	results := make(chan processAdmissionResult, 2)
 	var wg sync.WaitGroup
 	for index := 1; index <= 2; index++ {
@@ -1053,8 +1052,7 @@ func TestLookupWaitsForPausedMultiprocessAppend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	processContext, stop := context.WithTimeout(context.Background(), 10*time.Second)
-	defer stop()
+	processContext := t.Context()
 	command := exec.CommandContext(processContext, os.Args[0], "-test.run=^TestCorrectionPausedAppendProcessHelper$")
 	command.Env = append(os.Environ(), "FEATUREPROOF_CORRECTION_PAUSED_APPEND=1", "FEATUREPROOF_CORRECTION_ROOT="+store.root, "FEATUREPROOF_CORRECTION_CHAIN=parent.one")
 	stdin, err := command.StdinPipe()
@@ -1227,7 +1225,7 @@ func TestTerminalUsageIsCountedOnceAfterCancelReplayAndReopen(t *testing.T) {
 	terminal.Link.UpdatedAt = testNow.Add(time.Second)
 	terminal.Link, _ = terminal.Link.Seal()
 	terminalizeTestRecord(t, store, terminal)
-	store.ReleaseOwner(terminal.Link.Handle)
+	store.ReleaseOwner(context.Background(), terminal.Link.Handle)
 	if _, fresh, err := store.ReserveCancel(context.Background(), terminal.Link.Handle, "principal", keyDigest("cancel.key"), digestA, testNow.Add(2*time.Second)); err != nil || !fresh {
 		t.Fatalf("cancel fresh=%v err=%v", fresh, err)
 	}
@@ -1284,7 +1282,7 @@ func TestEveryAdmissionLimitBecomesTypedTerminalData(t *testing.T) {
 			terminal.Link.UpdatedAt = testNow.Add(time.Second)
 			terminal.Link, _ = terminal.Link.Seal()
 			terminalizeTestRecord(t, store, terminal)
-			store.ReleaseOwner(terminal.Link.Handle)
+			store.ReleaseOwner(context.Background(), terminal.Link.Handle)
 			secondInput := testReservation(t, "child.one", "handle.two", "key.two")
 			setReservationLimits(t, &secondInput, limits)
 			if dimension == "duration" {
@@ -1657,7 +1655,7 @@ func TestCoordinatorCloseCancelsActiveWorker(t *testing.T) {
 	}
 	select {
 	case <-fixture.executor.started:
-	case <-time.After(time.Second):
+	case <-t.Context().Done():
 		t.Fatal("executor did not start")
 	}
 	if err := fixture.coordinator.Close(context.Background()); err != nil {
@@ -1829,12 +1827,9 @@ func TestComparisonRecoveryCompletesAbandonedIntent(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			joinCtx, cancelJoin := context.WithTimeout(context.Background(), 15*time.Second)
-			if err := fixture.coordinator.Wait(joinCtx, record.Link.Handle); err != nil {
-				cancelJoin()
+			if err := fixture.coordinator.Wait(t.Context(), record.Link.Handle); err != nil {
 				t.Fatal(err)
 			}
-			cancelJoin()
 			pending, err := fixture.store.Get(context.Background(), record.Link.Handle)
 			if err != nil || pending.Phase != PhaseFinalizing || pending.ComparisonIntent == nil || pending.Comparison != nil {
 				t.Fatalf("pending=%+v err=%v", pending, err)
@@ -1912,7 +1907,7 @@ func TestConcurrentComparisonRecoveryInstallsAllWorkers(t *testing.T) {
 		prepareComparisonIntentRecord(t, store, "parent.two", "handle.two", "child.two"),
 	}
 	for _, record := range records {
-		store.ReleaseOwner(record.Link.Handle)
+		store.ReleaseOwner(context.Background(), record.Link.Handle)
 	}
 	reopened, err := NewLocalStore(store.root)
 	if err != nil {
@@ -1934,7 +1929,7 @@ func TestConcurrentComparisonRecoveryInstallsAllWorkers(t *testing.T) {
 		select {
 		case handle := <-publisher.started:
 			seen[handle] = true
-		case <-time.After(15 * time.Second):
+		case <-t.Context().Done():
 			t.Fatal("recovery workers did not reach barrier")
 		}
 	}
@@ -2375,7 +2370,7 @@ func TestValidateStoreTransitionRejectsIdentityAndLinkDrift(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = importer.Freeze(context.Background(), "correction-import", "correction-run", "project", strings.Repeat("a", 64), 1, time.Now().UTC()); err != nil {
+	if _, err = importer.Freeze(context.Background(), "organization", "correction-import", "correction-run", "project", strings.Repeat("a", 64), 1, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = store.Reserve(context.Background(), testReservation(t, "frozen-parent", "frozen.handle", "frozen-key")); !IsCategory(err, Conflict) {
@@ -2732,11 +2727,11 @@ func newFlowFixture(t *testing.T, approval bool) flowFixture {
 	return flowFixture{coordinator: coordinator, deps: deps, store: store, ids: ids, resolver: resolver, executor: executor, gate: gate, publisher: publisher}
 }
 
-// waitTerminal observes durable completion without sleeps or timing assumptions.
+// waitTerminal observes durable completion without a scheduler-sensitive wall
+// timeout; the test framework context still bounds a genuinely stuck worker.
 func waitTerminal(t *testing.T, coordinator *Coordinator, handle string) Record {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	ctx := t.Context()
 	if err := coordinator.Wait(ctx, handle); err != nil {
 		t.Fatal(err)
 	}

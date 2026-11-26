@@ -22,15 +22,15 @@ func (store *Store) Admit(ctx context.Context, admission controlplane.IngressAdm
 		return false, controlplane.ErrInvalid
 	}
 	job, err := controlplane.SealJob(admission.Job)
-	if err != nil || job.RunID != epoch.RunID || job.ProjectID != epoch.ProjectID || job.BackendEpoch != epoch.Epoch || job.BindingDigest != epoch.Digest || admission.Envelope.ProjectID != epoch.ProjectID {
+	if err != nil || job.RunID != epoch.RunID || job.OrganizationID != epoch.OrganizationID || job.ProjectID != epoch.ProjectID || job.BackendEpoch != epoch.Epoch || job.BindingDigest != epoch.Digest || admission.Envelope.OrganizationID != epoch.OrganizationID || admission.Envelope.ProjectID != epoch.ProjectID {
 		return false, controlplane.ErrInvalid
 	}
 	grant, err := controlplane.SealAuthorityGrant(admission.Grant)
-	if err != nil || grant.ProjectID != job.ProjectID || grant.RunID != job.RunID || grant.BackendEpoch != job.BackendEpoch || grant.BindingDigest != job.BindingDigest || grant.Phase != job.Phase {
+	if err != nil || grant.OrganizationID != job.OrganizationID || grant.ProjectID != job.ProjectID || grant.RunID != job.RunID || grant.BackendEpoch != job.BackendEpoch || grant.BindingDigest != job.BindingDigest || grant.Phase != job.Phase {
 		return false, controlplane.ErrInvalid
 	}
 	intent := admission.Intent
-	if intent.OperationID == "" || intent.OperationID != job.JobID+"-dispatch" || intent.IdempotencyKey != job.JobID || intent.ProjectID != job.ProjectID || intent.RunID != job.RunID || intent.Phase != job.Phase || intent.BindingDigest != job.BindingDigest || intent.InputDigest != job.InputDigest {
+	if intent.OperationID == "" || intent.OperationID != job.JobID+"-dispatch" || intent.IdempotencyKey != job.JobID || intent.OrganizationID != job.OrganizationID || intent.ProjectID != job.ProjectID || intent.RunID != job.RunID || intent.Phase != job.Phase || intent.BindingDigest != job.BindingDigest || intent.InputDigest != job.InputDigest {
 		return false, controlplane.ErrInvalid
 	}
 	envelopeBytes, err := canonical(admission.Envelope)
@@ -38,7 +38,7 @@ func (store *Store) Admit(ctx context.Context, admission controlplane.IngressAdm
 		return false, err
 	}
 	epochBytes, _ := canonical(epoch)
-	head, _ := controlplane.SealBindingHead(controlplane.BindingHead{RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 1, EpochDigest: epoch.Digest, Revision: 1})
+	head, _ := controlplane.SealBindingHead(controlplane.BindingHead{OrganizationID: epoch.OrganizationID, RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 1, EpochDigest: epoch.Digest, Revision: 1})
 	headBytes, _ := canonical(head)
 	jobBytes, _ := canonical(job)
 	grantBytes, _ := canonical(grant)
@@ -48,7 +48,7 @@ func (store *Store) Admit(ctx context.Context, admission controlplane.IngressAdm
 	}
 	defer tx.Rollback(ctx)
 	var existing string
-	scanErr := tx.QueryRow(ctx, `SELECT request_digest FROM ingress_inbox WHERE source=$1 AND idempotency_key=$2`, admission.Envelope.Source, admission.Envelope.IdempotencyKey).Scan(&existing)
+	scanErr := tx.QueryRow(ctx, `SELECT request_digest FROM ingress_inbox WHERE organization_id=$1 AND project_id=$2 AND source=$3 AND idempotency_key=$4`, admission.Envelope.OrganizationID, admission.Envelope.ProjectID, admission.Envelope.Source, admission.Envelope.IdempotencyKey).Scan(&existing)
 	if scanErr == nil {
 		if existing != admission.Envelope.RequestDigest {
 			return false, controlplane.ErrConflict
@@ -58,40 +58,40 @@ func (store *Store) Admit(ctx context.Context, admission controlplane.IngressAdm
 	if scanErr != pgx.ErrNoRows {
 		return false, mapError(scanErr)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO ingress_inbox(source,idempotency_key,request_digest,project_id,envelope,committed_at,run_id,job_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, admission.Envelope.Source, admission.Envelope.IdempotencyKey, admission.Envelope.RequestDigest, admission.Envelope.ProjectID, envelopeBytes, epoch.CreatedAt, epoch.RunID, job.JobID); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO ingress_inbox(organization_id,source,idempotency_key,request_digest,project_id,envelope,committed_at,run_id,job_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, admission.Envelope.OrganizationID, admission.Envelope.Source, admission.Envelope.IdempotencyKey, admission.Envelope.RequestDigest, admission.Envelope.ProjectID, envelopeBytes, epoch.CreatedAt, epoch.RunID, job.JobID); err != nil {
 		return false, mapError(err)
 	}
 	if err = store.injectFault("ingress.after_inbox"); err != nil {
 		return false, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_epochs(run_id,project_id,epoch,document,digest) VALUES($1,$2,1,$3,$4)`, epoch.RunID, epoch.ProjectID, epochBytes, epoch.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_epochs(organization_id,run_id,project_id,epoch,document,digest) VALUES($1,$2,$3,1,$4,$5)`, epoch.OrganizationID, epoch.RunID, epoch.ProjectID, epochBytes, epoch.Digest); err != nil {
 		return false, mapError(err)
 	}
 	if err = store.injectFault("ingress.after_epoch"); err != nil {
 		return false, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_heads(run_id,project_id,epoch,epoch_digest,revision,document,digest) VALUES($1,$2,1,$3,1,$4,$5)`, head.RunID, head.ProjectID, head.EpochDigest, headBytes, head.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_heads(organization_id,run_id,project_id,epoch,epoch_digest,revision,document,digest) VALUES($1,$2,$3,1,$4,1,$5,$6)`, head.OrganizationID, head.RunID, head.ProjectID, head.EpochDigest, headBytes, head.Digest); err != nil {
 		return false, mapError(err)
 	}
 	if err = store.injectFault("ingress.after_head"); err != nil {
 		return false, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_events(run_id,sequence,kind,epoch,occurred_at) VALUES($1,1,'admitted',1,$2)`, epoch.RunID, epoch.CreatedAt); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_events(organization_id,project_id,run_id,sequence,kind,epoch,occurred_at) VALUES($1,$2,$3,1,'admitted',1,$4)`, epoch.OrganizationID, epoch.ProjectID, epoch.RunID, epoch.CreatedAt); err != nil {
 		return false, mapError(err)
 	}
 	if err = store.injectFault("ingress.after_event"); err != nil {
 		return false, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO jobs(job_id,project_id,run_id,state,phase,created_at,available_at,deadline,backend_epoch,binding_digest,owner,lease_until,fence,attempt,cancel_revision,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,NULL,$11,$12,$13,$14,$15)`, job.JobID, job.ProjectID, job.RunID, job.State, job.Phase, job.CreatedAt, job.AvailableAt, job.Deadline, job.BackendEpoch, job.BindingDigest, job.Fence, job.Attempt, job.CancelRevision, jobBytes, job.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO jobs(organization_id,job_id,project_id,run_id,state,phase,created_at,available_at,deadline,backend_epoch,binding_digest,owner,lease_until,fence,attempt,cancel_revision,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,NULL,$12,$13,$14,$15,$16)`, job.OrganizationID, job.JobID, job.ProjectID, job.RunID, job.State, job.Phase, job.CreatedAt, job.AvailableAt, job.Deadline, job.BackendEpoch, job.BindingDigest, job.Fence, job.Attempt, job.CancelRevision, jobBytes, job.Digest); err != nil {
 		return false, mapError(err)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO job_events(job_id,kind,fence,occurred_at) VALUES($1,'admitted',$2,$3)`, job.JobID, job.Fence, epoch.CreatedAt); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO job_events(organization_id,project_id,job_id,kind,fence,occurred_at) VALUES($1,$2,$3,'admitted',$4,$5)`, job.OrganizationID, job.ProjectID, job.JobID, job.Fence, epoch.CreatedAt); err != nil {
 		return false, mapError(err)
 	}
 	if err = store.injectFault("ingress.after_job"); err != nil {
 		return false, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO authority_grants(run_id,phase,project_id,document,digest) VALUES($1,$2,$3,$4,$5)`, grant.RunID, grant.Phase, grant.ProjectID, grantBytes, grant.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO authority_grants(organization_id,run_id,phase,project_id,document,digest) VALUES($1,$2,$3,$4,$5,$6)`, grant.OrganizationID, grant.RunID, grant.Phase, grant.ProjectID, grantBytes, grant.Digest); err != nil {
 		return false, mapError(err)
 	}
 	if err = store.injectFault("ingress.after_grant"); err != nil {
@@ -119,7 +119,7 @@ func (store *Store) Accept(ctx context.Context, envelope controlplane.InboxEnvel
 		return false, err
 	}
 	sealed, err := controlplane.SealJob(job)
-	if err != nil || envelope.ProjectID != sealed.ProjectID {
+	if err != nil || envelope.OrganizationID != sealed.OrganizationID || envelope.ProjectID != sealed.ProjectID {
 		return false, controlplane.ErrInvalid
 	}
 	envelopeBytes, err := canonical(envelope)
@@ -136,7 +136,7 @@ func (store *Store) Accept(ctx context.Context, envelope controlplane.InboxEnvel
 		return false, err
 	}
 	var existing string
-	scanErr := tx.QueryRow(ctx, `SELECT request_digest FROM ingress_inbox WHERE source=$1 AND idempotency_key=$2`, envelope.Source, envelope.IdempotencyKey).Scan(&existing)
+	scanErr := tx.QueryRow(ctx, `SELECT request_digest FROM ingress_inbox WHERE organization_id=$1 AND project_id=$2 AND source=$3 AND idempotency_key=$4`, envelope.OrganizationID, envelope.ProjectID, envelope.Source, envelope.IdempotencyKey).Scan(&existing)
 	if scanErr == nil {
 		if existing != envelope.RequestDigest {
 			return false, controlplane.ErrConflict
@@ -146,10 +146,10 @@ func (store *Store) Accept(ctx context.Context, envelope controlplane.InboxEnvel
 	if scanErr != pgx.ErrNoRows {
 		return false, mapError(scanErr)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO ingress_inbox(source,idempotency_key,request_digest,project_id,envelope,committed_at,run_id,job_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, envelope.Source, envelope.IdempotencyKey, envelope.RequestDigest, envelope.ProjectID, envelopeBytes, time.Now().UTC(), sealed.RunID, sealed.JobID); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO ingress_inbox(organization_id,source,idempotency_key,request_digest,project_id,envelope,committed_at,run_id,job_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, envelope.OrganizationID, envelope.Source, envelope.IdempotencyKey, envelope.RequestDigest, envelope.ProjectID, envelopeBytes, time.Now().UTC(), sealed.RunID, sealed.JobID); err != nil {
 		return false, mapError(err)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO jobs(job_id,project_id,run_id,state,phase,created_at,available_at,deadline,backend_epoch,binding_digest,owner,lease_until,fence,attempt,cancel_revision,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,NULL,$11,$12,$13,$14,$15)`, sealed.JobID, sealed.ProjectID, sealed.RunID, sealed.State, sealed.Phase, sealed.CreatedAt, sealed.AvailableAt, sealed.Deadline, sealed.BackendEpoch, sealed.BindingDigest, sealed.Fence, sealed.Attempt, sealed.CancelRevision, jobBytes, sealed.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO jobs(organization_id,job_id,project_id,run_id,state,phase,created_at,available_at,deadline,backend_epoch,binding_digest,owner,lease_until,fence,attempt,cancel_revision,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,NULL,$12,$13,$14,$15,$16)`, sealed.OrganizationID, sealed.JobID, sealed.ProjectID, sealed.RunID, sealed.State, sealed.Phase, sealed.CreatedAt, sealed.AvailableAt, sealed.Deadline, sealed.BackendEpoch, sealed.BindingDigest, sealed.Fence, sealed.Attempt, sealed.CancelRevision, jobBytes, sealed.Digest); err != nil {
 		return false, mapError(err)
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -159,9 +159,9 @@ func (store *Store) Accept(ctx context.Context, envelope controlplane.InboxEnvel
 }
 
 // LoadIngress reconstructs one allowlisted command with its verified current PostgreSQL epoch and initial job.
-func (store *Store) LoadIngress(ctx context.Context, runID string) (controlplane.IngressAdmission, error) {
+func (store *Store) LoadIngress(ctx context.Context, scope controlplane.ProjectScope, runID string) (controlplane.IngressAdmission, error) {
 	var envelopeBytes, epochBytes, jobBytes, grantBytes []byte
-	err := store.pool.QueryRow(ctx, `SELECT i.envelope,e.document,j.document,g.document FROM ingress_inbox i JOIN backend_binding_heads h ON h.run_id=i.run_id JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch JOIN jobs j ON j.job_id=i.job_id JOIN authority_grants g ON g.run_id=j.run_id AND g.phase=j.phase WHERE i.run_id=$1 AND h.epoch=j.backend_epoch AND h.epoch_digest=j.binding_digest`, runID).Scan(&envelopeBytes, &epochBytes, &jobBytes, &grantBytes)
+	err := store.pool.QueryRow(ctx, `SELECT i.envelope,e.document,j.document,g.document FROM ingress_inbox i JOIN backend_binding_heads h ON h.organization_id=i.organization_id AND h.project_id=i.project_id AND h.run_id=i.run_id JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch JOIN jobs j ON j.organization_id=i.organization_id AND j.project_id=i.project_id AND j.job_id=i.job_id JOIN authority_grants g ON g.organization_id=j.organization_id AND g.project_id=j.project_id AND g.run_id=j.run_id AND g.phase=j.phase WHERE i.organization_id=$1 AND i.project_id=$2 AND i.run_id=$3 AND h.epoch=j.backend_epoch AND h.epoch_digest=j.binding_digest`, scope.OrganizationID, scope.ProjectID, runID).Scan(&envelopeBytes, &epochBytes, &jobBytes, &grantBytes)
 	if err == pgx.ErrNoRows {
 		return controlplane.IngressAdmission{}, controlplane.ErrNotFound
 	}
@@ -169,7 +169,7 @@ func (store *Store) LoadIngress(ctx context.Context, runID string) (controlplane
 		return controlplane.IngressAdmission{}, mapError(err)
 	}
 	var admission controlplane.IngressAdmission
-	if controlplane.StrictDecode(envelopeBytes, &admission.Envelope) != nil || controlplane.StrictDecode(epochBytes, &admission.Epoch) != nil || controlplane.StrictDecode(jobBytes, &admission.Job) != nil || controlplane.StrictDecode(grantBytes, &admission.Grant) != nil || controlplane.VerifyBackendEpoch(admission.Epoch) != nil || controlplane.VerifyJob(admission.Job) != nil || controlplane.VerifyAuthorityGrant(admission.Grant) != nil || admission.Grant.BackendEpoch != admission.Epoch.Epoch || admission.Grant.BindingDigest != admission.Epoch.Digest || admission.Epoch.Mode != controlplane.BackendPostgres || admission.Epoch.BackendIdentity != store.backendIdentity {
+	if controlplane.StrictDecode(envelopeBytes, &admission.Envelope) != nil || controlplane.StrictDecode(epochBytes, &admission.Epoch) != nil || controlplane.StrictDecode(jobBytes, &admission.Job) != nil || controlplane.StrictDecode(grantBytes, &admission.Grant) != nil || controlplane.VerifyBackendEpoch(admission.Epoch) != nil || controlplane.VerifyJob(admission.Job) != nil || controlplane.VerifyAuthorityGrant(admission.Grant) != nil || admission.Grant.BackendEpoch != admission.Epoch.Epoch || admission.Grant.BindingDigest != admission.Epoch.Digest || admission.Envelope.OrganizationID != scope.OrganizationID || admission.Envelope.ProjectID != scope.ProjectID || admission.Epoch.OrganizationID != scope.OrganizationID || admission.Epoch.ProjectID != scope.ProjectID || admission.Job.OrganizationID != scope.OrganizationID || admission.Job.ProjectID != scope.ProjectID || admission.Grant.OrganizationID != scope.OrganizationID || admission.Grant.ProjectID != scope.ProjectID || admission.Epoch.Mode != controlplane.BackendPostgres || admission.Epoch.BackendIdentity != store.backendIdentity {
 		return controlplane.IngressAdmission{}, controlplane.ErrIntegrity
 	}
 	return admission, nil
@@ -177,6 +177,9 @@ func (store *Store) LoadIngress(ctx context.Context, runID string) (controlplane
 
 // Prepare inserts one immutable intent before any external side effect.
 func (store *Store) Prepare(ctx context.Context, intent controlplane.EffectIntent) (controlplane.EffectIntent, error) {
+	if (controlplane.ProjectScope{OrganizationID: intent.OrganizationID, ProjectID: intent.ProjectID}).Validate() != nil {
+		return controlplane.EffectIntent{}, controlplane.ErrInvalid
+	}
 	data, err := canonical(intent)
 	if err != nil {
 		return controlplane.EffectIntent{}, err
@@ -192,12 +195,12 @@ func (store *Store) Prepare(ctx context.Context, intent controlplane.EffectInten
 		return controlplane.EffectIntent{}, err
 	}
 	now := time.Now().UTC()
-	result, err := tx.Exec(ctx, `INSERT INTO effect_intents(operation_id,idempotency_key,project_id,run_id,phase,document,digest,state,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,'prepared',$8) ON CONFLICT DO NOTHING`, intent.OperationID, intent.IdempotencyKey, intent.ProjectID, intent.RunID, intent.Phase, data, digest, now)
+	result, err := tx.Exec(ctx, `INSERT INTO effect_intents(organization_id,operation_id,idempotency_key,project_id,run_id,phase,document,digest,state,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'prepared',$9) ON CONFLICT DO NOTHING`, intent.OrganizationID, intent.OperationID, intent.IdempotencyKey, intent.ProjectID, intent.RunID, intent.Phase, data, digest, now)
 	if err != nil {
 		return controlplane.EffectIntent{}, mapError(err)
 	}
 	if result.RowsAffected() == 1 {
-		if _, err = tx.Exec(ctx, `INSERT INTO outbox(operation_id,project_id,state,available_at) VALUES($1,$2,'pending',$3)`, intent.OperationID, intent.ProjectID, now); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO outbox(organization_id,operation_id,project_id,state,available_at) VALUES($1,$2,$3,'pending',$4)`, intent.OrganizationID, intent.OperationID, intent.ProjectID, now); err != nil {
 			return controlplane.EffectIntent{}, mapError(err)
 		}
 		if err = tx.Commit(ctx); err != nil {
@@ -207,7 +210,7 @@ func (store *Store) Prepare(ctx context.Context, intent controlplane.EffectInten
 	}
 	var currentData []byte
 	var currentDigest string
-	if err = tx.QueryRow(ctx, `SELECT document,digest FROM effect_intents WHERE operation_id=$1`, intent.OperationID).Scan(&currentData, &currentDigest); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT document,digest FROM effect_intents WHERE organization_id=$1 AND project_id=$2 AND operation_id=$3`, intent.OrganizationID, intent.ProjectID, intent.OperationID).Scan(&currentData, &currentDigest); err != nil {
 		return controlplane.EffectIntent{}, mapError(err)
 	}
 	if currentDigest != digest {
@@ -224,7 +227,7 @@ func (store *Store) Prepare(ctx context.Context, intent controlplane.EffectInten
 }
 
 // Confirm records a digest-only reconciliation receipt exactly once.
-func (store *Store) Confirm(ctx context.Context, operationID, receiptDigest string) error {
+func (store *Store) Confirm(ctx context.Context, scope controlplane.ProjectScope, operationID, receiptDigest string) error {
 	if len(receiptDigest) != 64 {
 		return controlplane.ErrInvalid
 	}
@@ -233,21 +236,21 @@ func (store *Store) Confirm(ctx context.Context, operationID, receiptDigest stri
 		return mapError(err)
 	}
 	defer tx.Rollback(ctx)
-	intent, err := loadEffectTx(ctx, tx, operationID)
+	intent, err := loadEffectTx(ctx, tx, scope, operationID)
 	if err != nil {
 		return err
 	}
 	if err = store.verifyEffectActiveTx(ctx, tx, intent); err != nil {
 		return err
 	}
-	result, err := tx.Exec(ctx, `UPDATE effect_intents SET state='confirmed',receipt_digest=$1,updated_at=$2 WHERE operation_id=$3 AND (state='prepared' OR receipt_digest=$1)`, receiptDigest, time.Now().UTC(), operationID)
+	result, err := tx.Exec(ctx, `UPDATE effect_intents SET state='confirmed',receipt_digest=$1,updated_at=$2 WHERE organization_id=$3 AND project_id=$4 AND operation_id=$5 AND (state='prepared' OR receipt_digest=$1)`, receiptDigest, time.Now().UTC(), scope.OrganizationID, scope.ProjectID, operationID)
 	if err != nil {
 		return mapError(err)
 	}
 	if result.RowsAffected() != 1 {
 		return controlplane.ErrConflict
 	}
-	if _, err = tx.Exec(ctx, `UPDATE outbox SET state='confirmed',owner=NULL,lease_until=NULL WHERE operation_id=$1`, operationID); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE outbox SET state='confirmed',owner=NULL,lease_until=NULL WHERE organization_id=$1 AND project_id=$2 AND operation_id=$3`, scope.OrganizationID, scope.ProjectID, operationID); err != nil {
 		return mapError(err)
 	}
 	return mapError(tx.Commit(ctx))

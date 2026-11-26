@@ -4899,3 +4899,170 @@ completas; feature sigue `in_progress` y `feature_list.json` no cambia.
 - El usuario aprobó explícitamente la spec; aprobación registrada como `user` a `2026-11-20T08:52:19+01:00`.
 - El leader cambia la feature 37 de `spec_ready` a `in_progress` y autoriza al implementer a ejecutar T1–T24 en orden.
 
+## Feature 37 — T1–T3 implementadas (2026-11-20)
+
+- Nuevo paquete `internal/tenantsecurity` con modelos tenant, relaciones, límites, catálogo cerrado RBAC, resolución de subject confiable y capabilities scopeadas/expirables con security revision.
+- Matrices herméticas cubren defensive copies, acciones desconocidas, acceso cross-tenant, revocación y cancelación. Se inicia persistencia local/PostgreSQL y servicios de secretos/audit/quota/retention sin marcar todavía sus tasks completas.
+
+## Feature 37 — T4–T5 implementadas (2026-11-20)
+
+- Store local transaccional cerrado con lock real entre procesos, snapshot y receipts checksummed, CAS monotónico, idempotencia exacta/conflictiva, temp+fsync+rename, resolución de commit desconocido y reload fail-closed.
+- Contract suite compartida valida restart, IDs iguales en tenants distintos, cancelación, overflow, corrupción y concurrencia; local normal `count=3` y race UCRT `count=3` pasan.
+- Migración PostgreSQL `0021` añade catálogo tenant, snapshot/receipts inmutables, columnas y FKs/índices compuestos, triggers N/N+1, backfill verificable, security epoch y RLS defensiva sin sustituir predicates de aplicación.
+- Adapter PostgreSQL usa transacciones serializables con retry completo, scope compuesto en lookups, checksum, CAS/fencing y receipts para unknown commit; no existe fallback ni dual write.
+- Gate aislado Alpine/PostgreSQL 16 terminal PASS: artifacts N/N+1 migrate/ready, normal, Linux y race UCRT; cleanup sin distros ni roots temporales. Global serial, vet, compile y diff-check pasan.
+- T4 y T5 quedan `[x]`; T6–T24 siguen pendientes y la feature permanece `in_progress`.
+
+## Feature 37 — T6–T8 implementadas (2026-11-20)
+
+- Administration durable para project, membership, role y service identity confirma CAS, security revision, audit causal y receipt en una sola transacción; replay divergente, fault rollback y unknown commit quedan cubiertos.
+- Capability incluye policy digest vigente y la admisión fija binding tenant/config/run/fase/fence junto a run inicial, primer job, audit y receipt de forma atómica.
+- `projectconfig` obtiene policy, catálogo y authority desde una capability tenant actual; rechaza project/repository, descriptor, policy o security revision fuera de scope.
+- Contratos locales repetidos y race UCRT pasan; PostgreSQL 16 normal, N/N+1 y Linux pasan con proyecciones compuestas y detección de corrupción.
+- T6–T8 quedan `[x]`. T9–T10 siguen abiertas hasta eliminar operaciones productivas legacy sin organization scope; no se mantiene fallback u overload unscoped.
+
+## Feature 37 — T9–T10 en progreso (2026-11-20)
+
+- `ProjectKey`, configuración y artifacts de proyecto ya usan `organization/project/repository`; control-plane binding, queue, inbox y efectos usan scope compuesto y los fixtures registran ownership explícitamente sin bootstrap productivo.
+- `BackendCoordinate` transporta organización/proyecto además de run/epoch/digest, y las mutaciones PostgreSQL de environment, capacity y cleanup presentan ese scope al verificar el head y al escribir predicates/columnas tenant.
+- Se corrigió `retention_references` para insertar y actualizar con organización/proyecto y FK compuesta; el focal PG16 real de cleanup-capacity, cleanup scheduling y environment-capacity pasa en host.
+- Gate completa todavía roja: quedan workflow/materials, functional/context, correction, retention/delete y lecturas/cursors/imports sin contrato explícitamente scoped; Linux detecta además rutas administrativas que aún invocan loaders sin coordinate. T9/T10 no se marcan.
+- Verificación parcial verde: focales locales, compile global y compile con `postgres_integration`; migraciones N/N+1 pasan. No se usa la gate roja como evidencia de cierre y el cleanup aislado terminó.
+- Handoff: correction mutation/contract queda focal verde, pero sus scans/cursors y fixture evidence aún requieren cambiar interfaces para recibir scope explícito; el siguiente implementer debe continuar ahí antes de workflow/material/functional/context/import/retention. Árbol compilable, sin edición simultánea.
+
+## Feature 37 — T9–T10 implementadas (2026-11-20)
+
+- Todos los stores productivos inventariados presentan `organization_id` + `project_id`: workflow/materials/packages, correction/fixtures, functional/context, imports/retention, environment/capacity/cleanup, external-agent y approval. Keys, FKs, backfill, cursors y predicates PostgreSQL son compuestos; no queda fallback ni overload productivo unscoped.
+- Queue, inbox/outbox, effect intents, authority grants/envelopes y job events validan el mismo tenant, run, epoch, fence y lease. El durable worker presenta al producto la capability derivada del envelope vivo; redelivery/restart N/N+1 no reutiliza autoridad de otro scope.
+- Se corrigieron dos defectos sistémicos descubiertos por la vertical real: `ClaimOutbox` vinculaba la identidad al parámetro de `LIMIT`, y `BuildAuthority` hardcodeaba la organización. Ambos quedan ligados a autoridad de composición.
+- El runtime GitHub usa el `ProjectKey.RepositoryID` inmutable para admission, scheduler y workflow, y la vertical PostgreSQL sobrevive cierre N, pérdida del filesystem y continuación N+1 hasta evidencia/cleanup terminal.
+- Verificación terminal: focales exactos `TestPostgresConsumerAdapterMatrix`, `TestPostgresGate` y `TestPostgresProductRuntimeContinuesOnlyThroughDurableWorker`; gate PG16 normal (`cmd 30.286s`, `postgres 102.903s`, `planapproval 0.508s`) y Linux/N-N+1; gate race UCRT (`cmd 46.077s`, `postgres 106.826s`, `planapproval 3.165s`), cleanup exit 0.
+- Global serial `go test -p=1 ./... -count=1 -timeout=12m`, `go vet ./...` y `git diff --check` pasan. T9–T10 quedan `[x]`; T11–T24 permanecen pendientes, sin editar `feature_list.json`, commit ni push.
+
+## Feature 37 — T11–T16 implementadas (2026-11-20)
+
+- Secrets usan envelope encryption provider-neutral con AAD tenant-scoped y randomness consumer-owned; persistencia local/PG contiene sólo ciphertext y metadata versionada.
+- Leases JIT durables ligan run/phase/consumer/purpose/fence/expiry y confirman single-use+audit antes del callback privado; rotación/revocación CAS invalida leases sin fallback.
+- Transporte productivo exige TLS+peer auth+server name; loopback inseguro sólo existe bajo autorización explícita del gate y no permite endpoint remoto ni downgrade.
+- Audit encadena sequence/previous digest con head CAS independiente, queries scoped/cursor sellado; `SensitiveExecutor` confirma mutation+audit+receipt y resuelve unknown commit sin duplicados.
+- Migración `0022` y proyección PG verifican secret versions/leases/audit events/heads; snapshot consistente usa repeatable-read ante writers concurrentes.
+- Gate aislado PG16 normal/N-N+1/Linux/race UCRT exit 0; cleanup sin distro/root/proceso. Global serial, vet y diff-check pasan. T11–T16 `[x]`; T17–T24 pendientes, sin tocar feature list, commit o push.
+
+## Feature 37 — T17–T20 implementadas (2026-11-20)
+
+- Retention policy/eligibility queda cerrada por clase, floors, protected records, límites y boundary versionado/digestado; active/live refs/pending work/secret activo fallan cerrado.
+- Deletion controller persiste intent+audit antes del deleter consumer-owned, usa fencing/digests, reconcilia unknown/restart, respeta dependency graph y preserva tombstones; project deletion bloquea admisión y revoca identities/leases.
+- Quota durable evalúa tenant+project con window/burst/outstanding/TTL, gana el último slot por CAS multiproceso, conserva uncertainty y libera ambos counters exactamente una vez.
+- Guards productivos preceden queue claim, generación/model usage, environment provider e object/storage repository; sin guard la composición falla y denial no invoca consumers.
+- Migration `0023` y contract local/PG verifican proyección/checksums. Gate PG16 normal/N-N+1/Linux/race exit 0 y cleanup limpio; global serial, vet, comentarios y diff-check verdes.
+- T17–T20 `[x]`; T21–T24 pendientes, sin editar `feature_list.json`, commit ni push.
+
+## 2026-11-20 — Feature 37 T21–T24 en verificación
+
+- Se auditó T20 y se confirmó que los wrappers de quota existían pero no estaban
+  inyectados productivamente; se conectaron a workflow, environments, GitHub
+  PostgreSQL y external-agent.
+- Se añadió autoridad durable común y providers obligatorios para
+  CLI/API/MCP/GitHub/external-agent/worker, con revalidación live y sin
+  auto-provision ni fallback permisivo.
+- Se añadió mapping SQLSTATE tipado/redactado, tests de observer panic, denial
+  antes de collaborator y configuración incompleta.
+- La gate PostgreSQL 16 normal/race/N–N+1 ejecutada antes del último delta pasó;
+  la matriz terminal se repetirá sobre el árbol final.
+- El primer global race detectó una espera no causal del test MCP; se sustituyó
+  por pipe vivo, estado observable y timeout context-aware. El focal race x3
+  quedó verde.
+
+## 2026-11-25 — Feature 37 T24 preparada para review
+
+- Los verticales adversariales finales cubren drift TOCTOU de secret lease,
+  authority live, scope/cursors/objects, retention/deletion, quota y fallos de
+  stores sin inflar coverage con tests mecánicos.
+- Gate PostgreSQL 16 terminal exit 0: normal, race UCRT, Linux, N/N+1 y dos
+  databases independientes; cada una produjo dos perfiles internos estables.
+  Coverage diferencial exacta: `4008/4715 =
+  85.00530222693531283138918345705196182397%`, firmas completas iguales.
+- Pasan formato/diff, vet, compile-only, global normal/race, focal race ×20,
+  seis cross-builds Windows/Linux/Darwin amd64/arm64, módulos, comentarios AST
+  y auditoría de secrets/canaries.
+- Cleanup verificado: cero distros, roots y procesos del gate; eliminados sólo
+  perfiles/binarios/pycache/lock demostrados de Feature37. T24 queda `[x]` y el
+  informe canónico está en `progress/tenant-security/implementation.md`.
+
+## 2026-11-25 — Feature 37 remediación de review y cierre definitivo
+
+- Se cerraron REV-1–REV-7: identidad remota por request, binding productivo
+  causal/reconciliable, caller completo en secret leases, audit durable de
+  allow/deny, lifecycle quota durable tras restart, trazabilidad corregida y
+  race canónico exacto sin `-p=1`.
+- Las nuevas verticales prueban dos tenants/requests MCP/API, spoof y ausencia
+  de identidad, intent `Prepare`/`Confirm`, audit fail-closed y release de
+  environment/worker sólo tras terminalidad durable.
+- Gates finales: format/diff, vet, compile, global normal y race canónico,
+  seis builds cruzados, módulos, comments y secrets verdes.
+- Gate PostgreSQL 16 terminal exit 0. Dos ejecuciones exteriores independientes
+  produjeron `4379/5145 =
+  85.11175898931000971817298347910592808552%` con firma idéntica; inventario
+  `82 production / 47 tests / 2 zero-statement / 15 packages`.
+- Cleanup final sin distro/root/proceso/temp; T24 `[x]`. `feature_list.json`
+  intacto, sin commit ni push. Informe definitivo en
+  `progress/tenant-security/implementation.md`.
+
+
+## Feature 37 tenant-security — cierre segunda re-review (2026-11-25)
+
+Se corrigieron los cuatro blockers restantes: autenticación MCP por request con
+revocación viva y anti-spoof, admisión workflow causal Prepare/Confirm con
+reconcile durable tras crash, liberación exactly-once de quota environment del
+external-agent en terminal/cancel/error/recovery y estabilidad del race canónico
+sin `-p=1`. Global normal/race, seis builds, auditorías y gate PostgreSQL 16
+terminal pasan. Coverage diferencial determinista: `4626/5417 =
+85.39782167251246077164482185711648513938%`; inventario 87/50/3 y cleanup a
+cero. T24 está completa y se solicita nueva review independiente.
+
+## Feature 37 tenant-security — recuperación cuarta review (2026-11-26)
+
+La tercera review rechazó attribution/recovery multi-principal, liberación de
+quota con efecto unknown y un deadline de test sensible a carga. Las
+correcciones están presentes y sus focales/globales anteriores pasaron, pero
+la interrupción detuvo el gate PostgreSQL terminal antes del resultado. T24 se
+reabre hasta auditar el inventario actual, repetir gates y actualizar el
+informe con evidencia vigente.
+
+El primer gate recuperado completó PostgreSQL normal/race y las dos mediciones
+de cobertura, pero el auditor cerró en fallo porque `validationworkflow/model.go`
+solo añade un campo y comentario (ninguna sentencia Go instrumentable) y aún no
+figuraba en `zero_statement_sources`. Se corrigió el manifiesto cerrado sin
+excluir el archivo de producción ni relajar el umbral; inventario vigente:
+`89 production / 52 tests / 4 zero-statement / 16 packages`. El gate terminal
+completo se repite desde cero.
+
+## Feature 37 tenant-security — cierre tercera re-review (2026-11-26)
+
+Los blockers de attribution/recovery multi-principal, quota `EffectUnknown` y
+sincronización race quedaron cerrados con verticales conductuales. El auditor
+detectó y se corrigió la clasificación zero-statement de
+`validationworkflow/model.go`; después, dos verticales de recovery legacy y
+fallos de authority añadieron 22 statements cubiertos sin exclusiones.
+
+Verificación terminal: format/diff, vet, compile, global normal y race canónico
+sin `-p=1`, focales race repetidas, seis builds cruzados, módulos, comentarios y
+secrets pasan. Gate PostgreSQL 16 normal/race/Linux/N-N+1 exit 0. Dos auditores
+exteriores y cuatro generaciones internas produjeron exactamente `4725/5545 =
+85.21190261496844003606853020739404869252%` con firmas idénticas. Inventario
+exacto `89 production / 53 tests / 4 zero-statement / 17 packages`; cleanup sin
+distro, root, proceso ni diagnóstico owned. Informe vigente en
+`progress/tenant-security/implementation.md`; T24 queda completa, sin tocar
+`feature_list.json`, commit ni push.
+
+## Feature 37 tenant-security — cierre aprobado (2026-11-26)
+
+La review independiente final aprobó R1–R20 y confirmó el cierre de attribution
+multi-principal, recovery de capability histórica, quota `EffectUnknown` y race
+canónico. El manifest reproducido contiene `89 production / 53 tests / 4
+zero-statement / 17 packages`; la cobertura exacta es `4725/5545 =
+85.21190261496844003606853020739404869252%` con dos bases y cuatro firmas
+deterministas. PostgreSQL 16 normal/race/Linux/N→N+1, global normal/race,
+builds, módulos, comentarios, secretos y cleanup pasan. El leader cambia la
+feature a `done`; el trabajo queda listo para commit y push en
+`feature-37-tenant-security`.

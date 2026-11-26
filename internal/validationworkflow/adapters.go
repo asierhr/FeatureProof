@@ -301,10 +301,17 @@ func parseStartCLI(args []string, profiles map[string]string, direct map[string]
 type MCPServer struct {
 	Service        *Service
 	Principal      string
+	Authenticator  MCPAuthenticator
 	AuthProfiles   map[string]string
 	DirectTargets  map[string]DirectTarget
 	PreviewTargets map[string]PreviewTarget
 	FlowAliases    map[string]string
+}
+
+// MCPAuthenticator authenticates one transport credential for each request
+// and returns a context carrying current trusted authority plus its principal.
+type MCPAuthenticator interface {
+	AuthenticateWorkflowMCP(context.Context, string, string) (context.Context, string, error)
 }
 
 // MCPRequest is one bounded transport-neutral MCP workflow call.
@@ -333,6 +340,7 @@ type workflowRPCRequest struct {
 // workflowRPCParams carries protocol discovery or one workflow tool call.
 type workflowRPCParams struct {
 	ProtocolVersion string          `json:"protocolVersion"`
+	Credential      string          `json:"credential,omitempty"`
 	Name            string          `json:"name,omitempty"`
 	Arguments       json.RawMessage `json:"arguments,omitempty"`
 }
@@ -400,6 +408,11 @@ func (m MCPServer) handleRPC(ctx context.Context, raw []byte) workflowRPCRespons
 	case "server/discover":
 		return workflowRPCResponse{JSONRPC: "2.0", ID: request.ID, Result: map[string]any{"protocolVersion": MCPProtocolVersion, "applicationContractVersion": ContractVersion, "capabilities": map[string]any{"tools": map[string]any{}}}}
 	case "tools/list":
+		if m.Authenticator != nil {
+			if _, _, err := m.Authenticator.AuthenticateWorkflowMCP(ctx, params.Credential, "workflow.list"); err != nil {
+				return workflowRPCResponse{JSONRPC: "2.0", ID: request.ID, Error: &workflowRPCError{Code: -32001, Message: "Unauthorized"}}
+			}
+		}
 		return workflowRPCResponse{JSONRPC: "2.0", ID: request.ID, Result: map[string]any{"tools": workflowTools()}}
 	case "tools/call":
 		operation, ok := workflowToolOperation(params.Name)
@@ -409,7 +422,17 @@ func (m MCPServer) handleRPC(ctx context.Context, raw []byte) workflowRPCRespons
 		if len(params.Arguments) == 0 {
 			params.Arguments = json.RawMessage(`{}`)
 		}
-		response := m.Handle(ctx, MCPRequest{Version: ContractVersion, Operation: operation, Arguments: params.Arguments})
+		requestServer, requestCtx := m, ctx
+		if m.Authenticator != nil {
+			var principal string
+			var err error
+			requestCtx, principal, err = m.Authenticator.AuthenticateWorkflowMCP(ctx, params.Credential, operation)
+			if err != nil {
+				return workflowRPCResponse{JSONRPC: "2.0", ID: request.ID, Error: &workflowRPCError{Code: -32001, Message: "Unauthorized"}}
+			}
+			requestServer.Principal = principal
+		}
+		response := requestServer.Handle(requestCtx, MCPRequest{Version: ContractVersion, Operation: operation, Arguments: params.Arguments})
 		rawResponse, err := json.Marshal(response)
 		if err != nil {
 			response = MCPResponse{Version: ContractVersion, Error: CodeInternal}

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -493,6 +494,10 @@ func composeProductWorkflowWithOptionsAndPersistence(t *testing.T, root string, 
 		}
 	})
 	writeWorkflowProjectConfigurationFixture(t, root, configPath)
+	if err := os.RemoveAll(filepath.Join(root, ".featureproof", "tenant-security")); err != nil {
+		t.Fatal(err)
+	}
+	writeTenantSecurityCompositionFixture(t, root)
 	t.Setenv("FEATUREPROOF_WORKFLOW_CONFIG", configPath)
 	t.Setenv("FEATUREPROOF_PRODUCT_IDENTITY", "PRODUCT-IDENTITY-CANARY")
 	previousTransport := http.DefaultTransport
@@ -768,10 +773,20 @@ func TestProductWorkflowMCPEntrypointComposesFunctionalAliases(t *testing.T) {
 	if err := os.RemoveAll(filepath.Join(root, ".featureproof", "project-resource-artifacts")); err != nil {
 		t.Fatal(err)
 	}
-	request := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"protocolVersion":"2026-07-28"}}` + "\n"
+	current, err := user.Current()
+	if err != nil || current.Uid == "" {
+		t.Fatal("current test identity unavailable")
+	}
+	const credential = "workflow-mcp-entrypoint-credential"
+	t.Setenv("FEATUREPROOF_WORKFLOW_MCP_CREDENTIALS", `{"`+credential+`":"`+current.Uid+`"}`)
+	request := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"protocolVersion":"2026-07-28","credential":"` + credential + `"}}` + "\n"
 	var stdout, stderr bytes.Buffer
 	if code := runWithContext(context.Background(), []string{"workflow", "mcp", "serve"}, strings.NewReader(request), &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "featureproof.workflow.start") {
 		t.Fatalf("code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	t.Setenv("FEATUREPROOF_WORKFLOW_MCP_CREDENTIALS", "")
+	if code := runWithContext(context.Background(), []string{"workflow", "mcp", "serve"}, strings.NewReader(""), io.Discard, io.Discard); code != 3 {
+		t.Fatalf("workflow MCP started without transport credential verifier: %d", code)
 	}
 }
 

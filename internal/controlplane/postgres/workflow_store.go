@@ -101,9 +101,16 @@ func (adapter *PostgresWorkflowStore) ReserveBound(ctx context.Context, proposed
 		return validationworkflow.Record{}, false, ctx, workflowError(mapError(err), "reserve")
 	}
 	defer tx.Rollback(ctx)
+	scope, scopeErr := workflowAdmissionScope(ctx, proposed)
+	if scopeErr != nil {
+		return validationworkflow.Record{}, false, ctx, scopeErr
+	}
+	if coordinate, ok := controlplane.BackendCoordinateFromContext(ctx); !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		ctx = controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: scope.OrganizationID, ProjectID: scope.ProjectID, RunID: proposed.Handle})
+	}
 	var existingData []byte
 	var existingDigest string
-	scanErr := tx.QueryRow(ctx, `SELECT record,request_digest FROM workflow_runs WHERE principal=$1 AND idempotency_key=$2 FOR UPDATE`, proposed.Principal, proposed.IdempotencyKey).Scan(&existingData, &existingDigest)
+	scanErr := tx.QueryRow(ctx, `SELECT record,request_digest FROM workflow_runs WHERE organization_id=$1 AND project_id=$2 AND principal=$3 AND idempotency_key=$4 FOR UPDATE`, scope.OrganizationID, scope.ProjectID, proposed.Principal, proposed.IdempotencyKey).Scan(&existingData, &existingDigest)
 	if scanErr == nil {
 		if existingDigest != proposed.RequestDigest {
 			return validationworkflow.Record{}, false, ctx, &validationworkflow.Error{Code: validationworkflow.CodeConflict, Operation: "idempotency"}
@@ -126,14 +133,14 @@ func (adapter *PostgresWorkflowStore) ReserveBound(ctx context.Context, proposed
 	}
 	recordData, _ := canonical(proposed)
 	eventData, _ := canonical(event)
-	if _, err = tx.Exec(ctx, `INSERT INTO workflow_runs(handle,principal,idempotency_key,request_digest,version,phase,owner,lease_until,updated_at,record) VALUES($1,$2,$3,$4,1,$5,$6,$7,$8,$9)`, proposed.Handle, proposed.Principal, proposed.IdempotencyKey, proposed.RequestDigest, proposed.Phase, owner, proposed.LeaseUntil, proposed.UpdatedAt, recordData); err != nil {
+	if err = adapter.reserveBackendTx(ctx, tx, proposed, scope, now); err != nil {
+		return validationworkflow.Record{}, false, ctx, workflowError(err, "reserve_backend")
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO workflow_runs(organization_id,project_id,handle,principal,idempotency_key,request_digest,version,phase,owner,lease_until,updated_at,record) VALUES($1,$2,$3,$4,$5,$6,1,$7,$8,$9,$10,$11)`, scope.OrganizationID, scope.ProjectID, proposed.Handle, proposed.Principal, proposed.IdempotencyKey, proposed.RequestDigest, proposed.Phase, owner, proposed.LeaseUntil, proposed.UpdatedAt, recordData); err != nil {
 		return validationworkflow.Record{}, false, ctx, workflowError(mapError(err), "reserve")
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO workflow_events(handle,sequence,event_id,event) VALUES($1,1,$2,$3)`, proposed.Handle, event.ID, eventData); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO workflow_events(organization_id,project_id,handle,sequence,event_id,event) VALUES($1,$2,$3,1,$4,$5)`, scope.OrganizationID, scope.ProjectID, proposed.Handle, event.ID, eventData); err != nil {
 		return validationworkflow.Record{}, false, ctx, workflowError(mapError(err), "reserve_event")
-	}
-	if err = adapter.reserveBackendTx(ctx, tx, proposed, now); err != nil {
-		return validationworkflow.Record{}, false, ctx, workflowError(err, "reserve_backend")
 	}
 	bound, bindErr := adapter.boundContextTx(ctx, tx, proposed.Handle)
 	if bindErr != nil {
@@ -143,6 +150,26 @@ func (adapter *PostgresWorkflowStore) ReserveBound(ctx context.Context, proposed
 		return validationworkflow.Record{}, false, ctx, workflowError(mapError(err), "reserve_commit")
 	}
 	return proposed, true, bound, nil
+}
+
+// workflowAdmissionScope accepts only composition-bound tenant authority and never invents a productive owner.
+func workflowAdmissionScope(ctx context.Context, proposed validationworkflow.Record) (controlplane.ProjectScope, error) {
+	if proposed.ProjectConfigurationBinding != nil {
+		key := proposed.ProjectConfigurationBinding.ProjectKey
+		// Runtime state follows the repository project selected by the immutable
+		// ProjectKey; configuration administration remains under ProjectID.
+		scope := controlplane.ProjectScope{OrganizationID: key.OrganizationID, ProjectID: key.RepositoryID}
+		if scope.Validate() == nil {
+			return scope, nil
+		}
+	}
+	if coordinate, ok := controlplane.BackendCoordinateFromContext(ctx); ok {
+		scope := controlplane.ProjectScope{OrganizationID: coordinate.OrganizationID, ProjectID: coordinate.ProjectID}
+		if scope.Validate() == nil && (coordinate.RunID == "" || coordinate.RunID == proposed.Handle) {
+			return scope, nil
+		}
+	}
+	return controlplane.ProjectScope{}, &validationworkflow.Error{Code: validationworkflow.CodeInvalid, Operation: "tenant_scope"}
 }
 
 // AtomicConfigurationBinding marks ReserveBound as the owner of binding, run and first-event commit.
@@ -162,7 +189,7 @@ func (adapter *PostgresWorkflowStore) reserveProjectConfigurationTx(ctx context.
 	}
 	var generation uint64
 	var activationDigest, effectiveDigest string
-	err := tx.QueryRow(ctx, `SELECT a.generation,a.digest,e.effective_digest FROM project_configuration_heads h JOIN project_configuration_activations a USING(project_id,repository_id,generation) JOIN project_configuration_effective_snapshots e USING(project_id,repository_id,generation) WHERE h.project_id=$1 AND h.repository_id=$2 FOR SHARE`, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID).Scan(&generation, &activationDigest, &effectiveDigest)
+	err := tx.QueryRow(ctx, `SELECT a.generation,a.digest,e.effective_digest FROM project_configuration_heads h JOIN project_configuration_activations a USING(organization_id,project_id,repository_id,generation) JOIN project_configuration_effective_snapshots e USING(organization_id,project_id,repository_id,generation) WHERE h.organization_id=$1 AND h.project_id=$2 AND h.repository_id=$3 FOR SHARE`, binding.ProjectKey.OrganizationID, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID).Scan(&generation, &activationDigest, &effectiveDigest)
 	if err != nil {
 		return err
 	}
@@ -173,13 +200,13 @@ func (adapter *PostgresWorkflowStore) reserveProjectConfigurationTx(ctx context.
 	if err != nil {
 		return err
 	}
-	tag, err := tx.Exec(ctx, `INSERT INTO project_configuration_run_bindings(project_id,repository_id,run_id,binding,binding_digest,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID, binding.RunID, raw, binding.BindingDigest, now.UTC())
+	tag, err := tx.Exec(ctx, `INSERT INTO project_configuration_run_bindings(organization_id,project_id,repository_id,run_id,binding,binding_digest,created_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, binding.ProjectKey.OrganizationID, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID, binding.RunID, raw, binding.BindingDigest, now.UTC())
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		var existing string
-		if err = tx.QueryRow(ctx, `SELECT binding_digest FROM project_configuration_run_bindings WHERE project_id=$1 AND repository_id=$2 AND run_id=$3`, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID, binding.RunID).Scan(&existing); err != nil {
+		if err = tx.QueryRow(ctx, `SELECT binding_digest FROM project_configuration_run_bindings WHERE organization_id=$1 AND project_id=$2 AND repository_id=$3 AND run_id=$4`, binding.ProjectKey.OrganizationID, binding.ProjectKey.ProjectID, binding.ProjectKey.RepositoryID, binding.RunID).Scan(&existing); err != nil {
 			return err
 		}
 		if existing != binding.BindingDigest {
@@ -190,39 +217,39 @@ func (adapter *PostgresWorkflowStore) reserveProjectConfigurationTx(ctx context.
 }
 
 // reserveBackendTx creates the workflow's immutable PostgreSQL epoch/head in the same admission transaction, so every downstream adapter can fence by handle.
-func (adapter *PostgresWorkflowStore) reserveBackendTx(ctx context.Context, tx pgx.Tx, proposed validationworkflow.Record, now time.Time) error {
-	projectID := proposed.RepositoryID
-	if projectID == "" {
-		projectID = proposed.Principal
-	}
+func (adapter *PostgresWorkflowStore) reserveBackendTx(ctx context.Context, tx pgx.Tx, proposed validationworkflow.Record, scope controlplane.ProjectScope, now time.Time) error {
 	manifest, err := loadMigrations()
 	if err != nil {
 		return err
 	}
-	epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: proposed.Handle, ProjectID: projectID, Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: adapter.store.backendIdentity, SchemaVersion: uint64(len(manifest)), CreatedAt: now.UTC()})
+	epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: scope.OrganizationID, RunID: proposed.Handle, ProjectID: scope.ProjectID, Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: adapter.store.backendIdentity, SchemaVersion: uint64(len(manifest)), CreatedAt: now.UTC()})
 	if err != nil {
 		return err
 	}
-	head, err := controlplane.SealBindingHead(controlplane.BindingHead{RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 1, EpochDigest: epoch.Digest, Revision: 1})
+	head, err := controlplane.SealBindingHead(controlplane.BindingHead{OrganizationID: epoch.OrganizationID, RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 1, EpochDigest: epoch.Digest, Revision: 1})
 	if err != nil {
 		return err
 	}
 	epochData, _ := canonical(epoch)
 	headData, _ := canonical(head)
-	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_epochs(run_id,project_id,epoch,document,digest) VALUES($1,$2,1,$3,$4)`, epoch.RunID, epoch.ProjectID, epochData, epoch.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_epochs(organization_id,run_id,project_id,epoch,document,digest) VALUES($1,$2,$3,1,$4,$5)`, epoch.OrganizationID, epoch.RunID, epoch.ProjectID, epochData, epoch.Digest); err != nil {
 		return mapError(err)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_heads(run_id,project_id,epoch,epoch_digest,revision,document,digest) VALUES($1,$2,1,$3,1,$4,$5)`, head.RunID, head.ProjectID, head.EpochDigest, headData, head.Digest); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_heads(organization_id,run_id,project_id,epoch,epoch_digest,revision,document,digest) VALUES($1,$2,$3,1,$4,1,$5,$6)`, head.OrganizationID, head.RunID, head.ProjectID, head.EpochDigest, headData, head.Digest); err != nil {
 		return mapError(err)
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO backend_binding_events(run_id,sequence,kind,epoch,occurred_at) VALUES($1,1,'admitted',1,$2)`, epoch.RunID, now.UTC())
+	_, err = tx.Exec(ctx, `INSERT INTO backend_binding_events(organization_id,project_id,run_id,sequence,kind,epoch,occurred_at) VALUES($1,$2,$3,1,'admitted',1,$4)`, epoch.OrganizationID, epoch.ProjectID, epoch.RunID, now.UTC())
 	return mapError(err)
 }
 
 // verifyWorkflowBackendTx locks and validates the sole active PostgreSQL head before a workflow-owned adapter mutates durable state.
 func (store *Store) verifyWorkflowBackendTx(ctx context.Context, tx pgx.Tx, handle string) (controlplane.BindingHead, controlplane.BackendEpoch, error) {
+	coordinate, presented := controlplane.BackendCoordinateFromContext(ctx)
+	if !presented || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != handle {
+		return controlplane.BindingHead{}, controlplane.BackendEpoch{}, controlplane.ErrConflict
+	}
 	var headData, epochData []byte
-	if err := tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.run_id=$1 FOR UPDATE OF h`, handle).Scan(&headData, &epochData); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.organization_id=$1 AND h.project_id=$2 AND h.run_id=$3 FOR UPDATE OF h`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&headData, &epochData); err != nil {
 		return controlplane.BindingHead{}, controlplane.BackendEpoch{}, controlplane.ErrConflict
 	}
 	var head controlplane.BindingHead
@@ -230,11 +257,7 @@ func (store *Store) verifyWorkflowBackendTx(ctx context.Context, tx pgx.Tx, hand
 	if controlplane.StrictDecode(headData, &head) != nil || controlplane.StrictDecode(epochData, &epoch) != nil || controlplane.VerifyBindingHead(head, epoch) != nil || epoch.Mode != controlplane.BackendPostgres || epoch.BackendIdentity != store.backendIdentity {
 		return controlplane.BindingHead{}, controlplane.BackendEpoch{}, controlplane.ErrConflict
 	}
-	coordinate, presented := controlplane.BackendCoordinateFromContext(ctx)
-	if !presented {
-		return controlplane.BindingHead{}, controlplane.BackendEpoch{}, controlplane.ErrConflict
-	}
-	if presented && (coordinate.RunID != handle || coordinate.BackendIdentity != epoch.BackendIdentity || coordinate.Epoch != epoch.Epoch || coordinate.BindingDigest != epoch.Digest) {
+	if coordinate.OrganizationID != epoch.OrganizationID || coordinate.ProjectID != epoch.ProjectID || coordinate.BackendIdentity != epoch.BackendIdentity || coordinate.Epoch != epoch.Epoch || coordinate.BindingDigest != epoch.Digest {
 		return controlplane.BindingHead{}, controlplane.BackendEpoch{}, controlplane.ErrConflict
 	}
 	return head, epoch, nil
@@ -252,8 +275,12 @@ func (adapter *PostgresWorkflowStore) LoadBound(ctx context.Context, handle stri
 	if !workflowID.MatchString(handle) {
 		return validationworkflow.Record{}, ctx, &validationworkflow.Error{Code: validationworkflow.CodeInvalid, Operation: "load"}
 	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return validationworkflow.Record{}, ctx, validationworkflow.ErrNotFound
+	}
 	var data, headData, epochData []byte
-	err := adapter.store.pool.QueryRow(ctx, `SELECT w.record,h.document,e.document FROM workflow_runs w JOIN backend_binding_heads h ON h.run_id=w.handle JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE w.handle=$1 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2`, handle, adapter.store.backendIdentity).Scan(&data, &headData, &epochData)
+	err := adapter.store.pool.QueryRow(ctx, `SELECT w.record,h.document,e.document FROM workflow_runs w JOIN backend_binding_heads h ON h.organization_id=w.organization_id AND h.project_id=w.project_id AND h.run_id=w.handle JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE w.organization_id=$1 AND w.project_id=$2 AND w.handle=$3 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4`, coordinate.OrganizationID, coordinate.ProjectID, handle, adapter.store.backendIdentity).Scan(&data, &headData, &epochData)
 	if err == pgx.ErrNoRows {
 		return validationworkflow.Record{}, ctx, validationworkflow.ErrNotFound
 	}
@@ -270,8 +297,12 @@ func (adapter *PostgresWorkflowStore) LoadBound(ctx context.Context, handle stri
 
 // boundContextTx reads the coordinate inside an existing transaction snapshot.
 func (adapter *PostgresWorkflowStore) boundContextTx(ctx context.Context, tx pgx.Tx, handle string) (context.Context, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return ctx, workflowError(controlplane.ErrConflict, "load_bound")
+	}
 	var headData, epochData []byte
-	if err := tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.run_id=$1`, handle).Scan(&headData, &epochData); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.organization_id=$1 AND h.project_id=$2 AND h.run_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&headData, &epochData); err != nil {
 		return ctx, workflowError(mapError(err), "load_bound")
 	}
 	return adapter.boundContext(ctx, handle, headData, epochData)
@@ -285,7 +316,7 @@ func (adapter *PostgresWorkflowStore) boundContext(ctx context.Context, handle s
 	if controlplane.StrictDecode(headData, &head) != nil || controlplane.StrictDecode(epochData, &epoch) != nil || controlplane.VerifyBindingHead(head, epoch) != nil || epoch.Mode != controlplane.BackendPostgres || epoch.BackendIdentity != adapter.store.backendIdentity {
 		return ctx, workflowError(controlplane.ErrConflict, "load_bound")
 	}
-	coordinate := controlplane.BackendCoordinate{RunID: handle, BackendIdentity: epoch.BackendIdentity, Epoch: epoch.Epoch, BindingDigest: epoch.Digest}
+	coordinate := controlplane.BackendCoordinate{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID, RunID: handle, BackendIdentity: epoch.BackendIdentity, Epoch: epoch.Epoch, BindingDigest: epoch.Digest}
 	return controlplane.WithBackendCoordinate(ctx, coordinate), nil
 }
 
@@ -293,7 +324,7 @@ func (adapter *PostgresWorkflowStore) boundContext(ctx context.Context, handle s
 // identity, epoch and digest captured by ReserveBound or LoadBound.
 func requiredBackendCoordinate(ctx context.Context, handle string) (controlplane.BackendCoordinate, error) {
 	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
-	if !ok || coordinate.RunID != handle || coordinate.BackendIdentity == "" || coordinate.Epoch == 0 || coordinate.BindingDigest == "" {
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != handle || coordinate.BackendIdentity == "" || coordinate.Epoch == 0 || coordinate.BindingDigest == "" {
 		return controlplane.BackendCoordinate{}, controlplane.ErrConflict
 	}
 	return coordinate, nil
@@ -304,8 +335,12 @@ func (adapter *PostgresWorkflowStore) FindReservation(ctx context.Context, princ
 	if !workflowID.MatchString(principal) || !workflowID.MatchString(key) {
 		return validationworkflow.Record{}, false, &validationworkflow.Error{Code: validationworkflow.CodeInvalid, Operation: "find_reservation"}
 	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return validationworkflow.Record{}, false, nil
+	}
 	var data []byte
-	err := adapter.store.pool.QueryRow(ctx, `SELECT w.record FROM workflow_runs w JOIN backend_binding_heads h ON h.run_id=w.handle JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE w.principal=$1 AND w.idempotency_key=$2 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$3`, principal, key, adapter.store.backendIdentity).Scan(&data)
+	err := adapter.store.pool.QueryRow(ctx, `SELECT w.record FROM workflow_runs w JOIN backend_binding_heads h ON h.organization_id=w.organization_id AND h.project_id=w.project_id AND h.run_id=w.handle JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE w.organization_id=$1 AND w.project_id=$2 AND w.principal=$3 AND w.idempotency_key=$4 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$5`, coordinate.OrganizationID, coordinate.ProjectID, principal, key, adapter.store.backendIdentity).Scan(&data)
 	if err == pgx.ErrNoRows {
 		return validationworkflow.Record{}, false, nil
 	}
@@ -339,11 +374,12 @@ func (adapter *PostgresWorkflowStore) saveOwnedCausal(ctx context.Context, next 
 	if _, _, err = adapter.store.verifyWorkflowBackendTx(ctx, tx, next.Handle); err != nil {
 		return validationworkflow.Record{}, workflowError(err, "save_backend")
 	}
+	coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
 	var currentData []byte
 	var currentVersion uint64
 	var currentOwner *string
 	var lease *time.Time
-	if err = tx.QueryRow(ctx, `SELECT record,version,owner,lease_until FROM workflow_runs WHERE handle=$1 FOR UPDATE`, next.Handle).Scan(&currentData, &currentVersion, &currentOwner, &lease); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT record,version,owner,lease_until FROM workflow_runs WHERE organization_id=$1 AND project_id=$2 AND handle=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, next.Handle).Scan(&currentData, &currentVersion, &currentOwner, &lease); err != nil {
 		return validationworkflow.Record{}, workflowError(mapError(err), "save")
 	}
 	if currentVersion != version || currentOwner == nil || *currentOwner != owner || lease == nil || !lease.After(now) {
@@ -360,14 +396,14 @@ func (adapter *PostgresWorkflowStore) saveOwnedCausal(ctx context.Context, next 
 	}
 	recordData, _ := canonical(next)
 	eventData, _ := canonical(event)
-	tag, err := tx.Exec(ctx, `UPDATE workflow_runs SET version=$1,phase=$2,owner=$3,lease_until=$4,updated_at=$5,record=$6 WHERE handle=$7 AND version=$8`, next.VersionCAS, next.Phase, owner, next.LeaseUntil, next.UpdatedAt, recordData, next.Handle, version)
+	tag, err := tx.Exec(ctx, `UPDATE workflow_runs SET version=$1,phase=$2,owner=$3,lease_until=$4,updated_at=$5,record=$6 WHERE organization_id=$7 AND project_id=$8 AND handle=$9 AND version=$10`, next.VersionCAS, next.Phase, owner, next.LeaseUntil, next.UpdatedAt, recordData, coordinate.OrganizationID, coordinate.ProjectID, next.Handle, version)
 	if err != nil || tag.RowsAffected() != 1 {
 		return validationworkflow.Record{}, &validationworkflow.Error{Code: validationworkflow.CodeConflict, Operation: "save_cas"}
 	}
 	if err = adapter.store.injectFault("workflow.after_projection"); err != nil {
 		return validationworkflow.Record{}, workflowError(err, "save_projection")
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO workflow_events(handle,sequence,event_id,event) VALUES($1,$2,$3,$4)`, next.Handle, event.Sequence, event.ID, eventData); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO workflow_events(organization_id,project_id,handle,sequence,event_id,event) VALUES($1,$2,$3,$4,$5,$6)`, coordinate.OrganizationID, coordinate.ProjectID, next.Handle, event.Sequence, event.ID, eventData); err != nil {
 		return validationworkflow.Record{}, workflowError(mapError(err), "save_event")
 	}
 	if err = adapter.store.injectFault("workflow.after_event"); err != nil {
@@ -393,7 +429,7 @@ func (adapter *PostgresWorkflowStore) saveOwnedCausal(ctx context.Context, next 
 		return validationworkflow.Record{}, workflowError(err, "save_retention")
 	}
 	if next.Phase == validationworkflow.PhaseTerminal {
-		if _, err = tx.Exec(ctx, `UPDATE retention_references r SET live=false FROM workflow_runs w WHERE w.handle=$1 AND w.idempotency_key LIKE 'github:%' AND r.job_id=substring(w.idempotency_key from 8)`, next.Handle); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE retention_references r SET live=false FROM workflow_runs w WHERE w.organization_id=$1 AND w.project_id=$2 AND w.handle=$3 AND w.idempotency_key LIKE 'github:%' AND r.organization_id=w.organization_id AND r.project_id=w.project_id AND r.job_id=substring(w.idempotency_key from 8)`, coordinate.OrganizationID, coordinate.ProjectID, next.Handle); err != nil {
 			return validationworkflow.Record{}, workflowError(err, "close_retention")
 		}
 	}
@@ -416,9 +452,10 @@ func (adapter *PostgresWorkflowStore) RequestCancel(ctx context.Context, handle 
 	if _, _, err = adapter.store.verifyWorkflowBackendTx(ctx, tx, handle); err != nil {
 		return validationworkflow.Record{}, workflowError(err, "cancel_backend")
 	}
+	coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
 	var data []byte
 	var version uint64
-	if err = tx.QueryRow(ctx, `SELECT record,version FROM workflow_runs WHERE handle=$1 FOR UPDATE`, handle).Scan(&data, &version); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT record,version FROM workflow_runs WHERE organization_id=$1 AND project_id=$2 AND handle=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&data, &version); err != nil {
 		return validationworkflow.Record{}, workflowError(mapError(err), "cancel")
 	}
 	record, decodeErr := decodeWorkflowRecord(data)
@@ -438,10 +475,10 @@ func (adapter *PostgresWorkflowStore) RequestCancel(ctx context.Context, handle 
 	}
 	recordData, _ := canonical(record)
 	eventData, _ := canonical(event)
-	if _, err = tx.Exec(ctx, `UPDATE workflow_runs SET version=$1,updated_at=$2,record=$3 WHERE handle=$4 AND version=$5`, record.VersionCAS, record.UpdatedAt, recordData, handle, version); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE workflow_runs SET version=$1,updated_at=$2,record=$3 WHERE organization_id=$4 AND project_id=$5 AND handle=$6 AND version=$7`, record.VersionCAS, record.UpdatedAt, recordData, coordinate.OrganizationID, coordinate.ProjectID, handle, version); err != nil {
 		return validationworkflow.Record{}, workflowError(mapError(err), "cancel")
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO workflow_events(handle,sequence,event_id,event) VALUES($1,$2,$3,$4)`, handle, event.Sequence, event.ID, eventData); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO workflow_events(organization_id,project_id,handle,sequence,event_id,event) VALUES($1,$2,$3,$4,$5,$6)`, coordinate.OrganizationID, coordinate.ProjectID, handle, event.Sequence, event.ID, eventData); err != nil {
 		return validationworkflow.Record{}, workflowError(mapError(err), "cancel_event")
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -452,7 +489,11 @@ func (adapter *PostgresWorkflowStore) RequestCancel(ctx context.Context, handle 
 
 // Events returns the append-only typed workflow journal.
 func (adapter *PostgresWorkflowStore) Events(ctx context.Context, handle string) ([]validationworkflow.Event, error) {
-	rows, err := adapter.store.pool.Query(ctx, `SELECT v.event FROM workflow_events v JOIN backend_binding_heads h ON h.run_id=v.handle JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE v.handle=$1 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2 ORDER BY v.sequence`, handle, adapter.store.backendIdentity)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, validationworkflow.ErrNotFound
+	}
+	rows, err := adapter.store.pool.Query(ctx, `SELECT v.event FROM workflow_events v JOIN backend_binding_heads h ON h.organization_id=v.organization_id AND h.project_id=v.project_id AND h.run_id=v.handle JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE v.organization_id=$1 AND v.project_id=$2 AND v.handle=$3 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4 ORDER BY v.sequence`, coordinate.OrganizationID, coordinate.ProjectID, handle, adapter.store.backendIdentity)
 	if err != nil {
 		return nil, workflowError(mapError(err), "events")
 	}
@@ -471,7 +512,11 @@ func (adapter *PostgresWorkflowStore) Events(ctx context.Context, handle string)
 
 // Pending lists expired nonterminal workflows in stable handle order.
 func (adapter *PostgresWorkflowStore) Pending(ctx context.Context, now time.Time) ([]validationworkflow.Record, error) {
-	rows, err := adapter.store.pool.Query(ctx, `SELECT w.record FROM workflow_runs w JOIN backend_binding_heads h ON h.run_id=w.handle JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE w.phase<>$1 AND (w.lease_until IS NULL OR w.lease_until<=$2) AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$3 ORDER BY w.handle`, validationworkflow.PhaseTerminal, now, adapter.store.backendIdentity)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, nil
+	}
+	rows, err := adapter.store.pool.Query(ctx, `SELECT w.record FROM workflow_runs w JOIN backend_binding_heads h ON h.organization_id=w.organization_id AND h.project_id=w.project_id AND h.run_id=w.handle JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE w.organization_id=$1 AND w.project_id=$2 AND w.phase<>$3 AND (w.lease_until IS NULL OR w.lease_until<=$4) AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$5 ORDER BY w.handle`, coordinate.OrganizationID, coordinate.ProjectID, validationworkflow.PhaseTerminal, now, adapter.store.backendIdentity)
 	if err != nil {
 		return nil, workflowError(mapError(err), "pending")
 	}
@@ -506,7 +551,7 @@ func (adapter *PostgresWorkflowStore) Claim(ctx context.Context, handle, owner s
 	}
 	record.Owner, record.LeaseUntil, record.VersionCAS, record.UpdatedAt = owner, now.Add(ttl), record.VersionCAS+1, now.UTC()
 	data, _ := canonical(record)
-	tag, err := adapter.store.pool.Exec(ctx, `UPDATE workflow_runs w SET owner=$1,lease_until=$2,version=$3,updated_at=$4,record=$5 FROM backend_binding_heads h,backend_binding_epochs e WHERE w.handle=$6 AND w.version=$7 AND (w.lease_until IS NULL OR w.lease_until<=$8) AND h.run_id=w.handle AND h.epoch=$9 AND e.run_id=h.run_id AND e.epoch=h.epoch AND e.digest=$10 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$11`, owner, record.LeaseUntil, record.VersionCAS, record.UpdatedAt, data, handle, record.VersionCAS-1, now, coordinate.Epoch, coordinate.BindingDigest, coordinate.BackendIdentity)
+	tag, err := adapter.store.pool.Exec(ctx, `UPDATE workflow_runs w SET owner=$1,lease_until=$2,version=$3,updated_at=$4,record=$5 FROM backend_binding_heads h,backend_binding_epochs e WHERE w.organization_id=$6 AND w.project_id=$7 AND w.handle=$8 AND w.version=$9 AND (w.lease_until IS NULL OR w.lease_until<=$10) AND h.organization_id=w.organization_id AND h.project_id=w.project_id AND h.run_id=w.handle AND h.epoch=$11 AND e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch AND e.digest=$12 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$13`, owner, record.LeaseUntil, record.VersionCAS, record.UpdatedAt, data, coordinate.OrganizationID, coordinate.ProjectID, handle, record.VersionCAS-1, now, coordinate.Epoch, coordinate.BindingDigest, coordinate.BackendIdentity)
 	if err != nil {
 		return validationworkflow.Record{}, false, workflowError(mapError(err), "claim")
 	}
@@ -531,7 +576,7 @@ func (adapter *PostgresWorkflowStore) Renew(ctx context.Context, handle, owner s
 	}
 	record.LeaseUntil, record.UpdatedAt = now.Add(ttl), now.UTC()
 	data, _ := canonical(record)
-	tag, err := adapter.store.pool.Exec(ctx, `UPDATE workflow_runs w SET lease_until=$1,updated_at=$2,record=$3 FROM backend_binding_heads h,backend_binding_epochs e WHERE w.handle=$4 AND w.owner=$5 AND w.version=$6 AND w.lease_until>$7 AND h.run_id=w.handle AND h.epoch=$8 AND e.run_id=h.run_id AND e.epoch=h.epoch AND e.digest=$9 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$10`, record.LeaseUntil, record.UpdatedAt, data, handle, owner, record.VersionCAS, now, coordinate.Epoch, coordinate.BindingDigest, coordinate.BackendIdentity)
+	tag, err := adapter.store.pool.Exec(ctx, `UPDATE workflow_runs w SET lease_until=$1,updated_at=$2,record=$3 FROM backend_binding_heads h,backend_binding_epochs e WHERE w.organization_id=$4 AND w.project_id=$5 AND w.handle=$6 AND w.owner=$7 AND w.version=$8 AND w.lease_until>$9 AND h.organization_id=w.organization_id AND h.project_id=w.project_id AND h.run_id=w.handle AND h.epoch=$10 AND e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch AND e.digest=$11 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$12`, record.LeaseUntil, record.UpdatedAt, data, coordinate.OrganizationID, coordinate.ProjectID, handle, owner, record.VersionCAS, now, coordinate.Epoch, coordinate.BindingDigest, coordinate.BackendIdentity)
 	if err != nil || tag.RowsAffected() != 1 {
 		return validationworkflow.Record{}, &validationworkflow.Error{Code: validationworkflow.CodeConflict, Operation: "renew"}
 	}
@@ -556,7 +601,7 @@ func (adapter *PostgresWorkflowStore) ReleaseOwner(ctx context.Context, handle, 
 	record.VersionCAS++
 	record.UpdatedAt = now.UTC()
 	data, _ := canonical(record)
-	tag, err := adapter.store.pool.Exec(ctx, `UPDATE workflow_runs w SET owner=NULL,lease_until=NULL,version=$1,updated_at=$2,record=$3 FROM backend_binding_heads h,backend_binding_epochs e WHERE w.handle=$4 AND w.owner=$5 AND w.version=$6 AND h.run_id=w.handle AND h.epoch=$7 AND e.run_id=h.run_id AND e.epoch=h.epoch AND e.digest=$8 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$9`, record.VersionCAS, record.UpdatedAt, data, handle, owner, version, coordinate.Epoch, coordinate.BindingDigest, coordinate.BackendIdentity)
+	tag, err := adapter.store.pool.Exec(ctx, `UPDATE workflow_runs w SET owner=NULL,lease_until=NULL,version=$1,updated_at=$2,record=$3 FROM backend_binding_heads h,backend_binding_epochs e WHERE w.organization_id=$4 AND w.project_id=$5 AND w.handle=$6 AND w.owner=$7 AND w.version=$8 AND h.organization_id=w.organization_id AND h.project_id=w.project_id AND h.run_id=w.handle AND h.epoch=$9 AND e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch AND e.digest=$10 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$11`, record.VersionCAS, record.UpdatedAt, data, coordinate.OrganizationID, coordinate.ProjectID, handle, owner, version, coordinate.Epoch, coordinate.BindingDigest, coordinate.BackendIdentity)
 	if err != nil || tag.RowsAffected() != 1 {
 		return validationworkflow.Record{}, &validationworkflow.Error{Code: validationworkflow.CodeConflict, Operation: "release_owner"}
 	}
@@ -580,7 +625,8 @@ func (adapter *PostgresPlanArtifactStore) Commit(ctx context.Context, artifact v
 	if _, _, err = adapter.store.verifyWorkflowBackendTx(ctx, tx, artifact.WorkflowID); err != nil {
 		return workflowError(err, "artifact_backend")
 	}
-	tag, err := tx.Exec(ctx, `INSERT INTO workflow_artifacts(workflow_id,artifact_digest,media_type,artifact) VALUES($1,$2,'application/vnd.featureproof.plan+json',$3) ON CONFLICT DO NOTHING`, artifact.WorkflowID, artifact.ArtifactSHA256, data)
+	coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
+	tag, err := tx.Exec(ctx, `INSERT INTO workflow_artifacts(organization_id,project_id,workflow_id,artifact_digest,media_type,artifact) VALUES($1,$2,$3,$4,'application/vnd.featureproof.plan+json',$5) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, artifact.WorkflowID, artifact.ArtifactSHA256, data)
 	if err != nil {
 		return workflowError(mapError(err), "artifact_commit")
 	}
@@ -588,7 +634,7 @@ func (adapter *PostgresPlanArtifactStore) Commit(ctx context.Context, artifact v
 		return workflowError(mapError(tx.Commit(ctx)), "artifact_commit")
 	}
 	var digest string
-	if err = tx.QueryRow(ctx, `SELECT artifact_digest FROM workflow_artifacts WHERE workflow_id=$1`, artifact.WorkflowID).Scan(&digest); err != nil || digest != artifact.ArtifactSHA256 {
+	if err = tx.QueryRow(ctx, `SELECT artifact_digest FROM workflow_artifacts WHERE organization_id=$1 AND project_id=$2 AND workflow_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, artifact.WorkflowID).Scan(&digest); err != nil || digest != artifact.ArtifactSHA256 {
 		return &validationworkflow.Error{Code: validationworkflow.CodeConflict, Operation: "artifact_commit"}
 	}
 	return workflowError(mapError(tx.Commit(ctx)), "artifact_commit")
@@ -596,8 +642,12 @@ func (adapter *PostgresPlanArtifactStore) Commit(ctx context.Context, artifact v
 
 // Load returns one typed immutable artifact and its canonical metadata.
 func (adapter *PostgresPlanArtifactStore) Load(ctx context.Context, handle string) (validationworkflow.PlanArtifact, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return validationworkflow.PlanArtifact{}, validationworkflow.ErrNotFound
+	}
 	var data []byte
-	if err := adapter.store.pool.QueryRow(ctx, `SELECT a.artifact FROM workflow_artifacts a JOIN backend_binding_heads h ON h.run_id=a.workflow_id JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE a.workflow_id=$1 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2`, handle, adapter.store.backendIdentity).Scan(&data); err == pgx.ErrNoRows {
+	if err := adapter.store.pool.QueryRow(ctx, `SELECT a.artifact FROM workflow_artifacts a JOIN backend_binding_heads h ON h.organization_id=a.organization_id AND h.project_id=a.project_id AND h.run_id=a.workflow_id JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE a.organization_id=$1 AND a.project_id=$2 AND a.workflow_id=$3 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4`, coordinate.OrganizationID, coordinate.ProjectID, handle, adapter.store.backendIdentity).Scan(&data); err == pgx.ErrNoRows {
 		return validationworkflow.PlanArtifact{}, validationworkflow.ErrNotFound
 	} else if err != nil {
 		return validationworkflow.PlanArtifact{}, workflowError(mapError(err), "artifact_load")
@@ -626,7 +676,8 @@ func (adapter *PostgresExecutableStore) Commit(ctx context.Context, handle strin
 	if _, _, err = adapter.store.verifyWorkflowBackendTx(ctx, tx, handle); err != nil {
 		return workflowError(err, "executable_backend")
 	}
-	tag, err := tx.Exec(ctx, `INSERT INTO workflow_executables(workflow_id,artifact_digest,material) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, handle, material.ArtifactSHA256, data)
+	coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
+	tag, err := tx.Exec(ctx, `INSERT INTO workflow_executables(organization_id,project_id,workflow_id,artifact_digest,material) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, handle, material.ArtifactSHA256, data)
 	if err != nil {
 		return workflowError(mapError(err), "executable_commit")
 	}
@@ -634,7 +685,7 @@ func (adapter *PostgresExecutableStore) Commit(ctx context.Context, handle strin
 		return workflowError(mapError(tx.Commit(ctx)), "executable_commit")
 	}
 	var current []byte
-	if err = tx.QueryRow(ctx, `SELECT material FROM workflow_executables WHERE workflow_id=$1`, handle).Scan(&current); err != nil || !bytes.Equal(current, data) {
+	if err = tx.QueryRow(ctx, `SELECT material FROM workflow_executables WHERE organization_id=$1 AND project_id=$2 AND workflow_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&current); err != nil || !bytes.Equal(current, data) {
 		return &validationworkflow.Error{Code: validationworkflow.CodeConflict, Operation: "executable_commit"}
 	}
 	return workflowError(mapError(tx.Commit(ctx)), "executable_commit")
@@ -642,8 +693,12 @@ func (adapter *PostgresExecutableStore) Commit(ctx context.Context, handle strin
 
 // Load returns detached private executable material after restart.
 func (adapter *PostgresExecutableStore) Load(ctx context.Context, handle string) (validationworkflow.ExecutableMaterial, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return validationworkflow.ExecutableMaterial{}, validationworkflow.ErrNotFound
+	}
 	var data []byte
-	if err := adapter.store.pool.QueryRow(ctx, `SELECT x.material FROM workflow_executables x JOIN backend_binding_heads h ON h.run_id=x.workflow_id JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE x.workflow_id=$1 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2`, handle, adapter.store.backendIdentity).Scan(&data); err != nil {
+	if err := adapter.store.pool.QueryRow(ctx, `SELECT x.material FROM workflow_executables x JOIN backend_binding_heads h ON h.organization_id=x.organization_id AND h.project_id=x.project_id AND h.run_id=x.workflow_id JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE x.organization_id=$1 AND x.project_id=$2 AND x.workflow_id=$3 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4`, coordinate.OrganizationID, coordinate.ProjectID, handle, adapter.store.backendIdentity).Scan(&data); err != nil {
 		return validationworkflow.ExecutableMaterial{}, workflowError(mapError(err), "executable_load")
 	}
 	var value validationworkflow.ExecutableMaterial
@@ -656,7 +711,11 @@ func (adapter *PostgresExecutableStore) Load(ctx context.Context, handle string)
 
 // Delete retires private executable material idempotently.
 func (adapter *PostgresExecutableStore) Delete(ctx context.Context, handle string) error {
-	_, err := adapter.store.pool.Exec(ctx, `DELETE FROM workflow_executables x USING backend_binding_heads h,backend_binding_epochs e WHERE x.workflow_id=$1 AND h.run_id=x.workflow_id AND e.run_id=h.run_id AND e.epoch=h.epoch AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2`, handle, adapter.store.backendIdentity)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return validationworkflow.ErrNotFound
+	}
+	_, err := adapter.store.pool.Exec(ctx, `DELETE FROM workflow_executables x USING backend_binding_heads h,backend_binding_epochs e WHERE x.organization_id=$1 AND x.project_id=$2 AND x.workflow_id=$3 AND h.organization_id=x.organization_id AND h.project_id=x.project_id AND h.run_id=x.workflow_id AND e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4`, coordinate.OrganizationID, coordinate.ProjectID, handle, adapter.store.backendIdentity)
 	return workflowError(mapError(err), "executable_delete")
 }
 
@@ -673,7 +732,7 @@ func insertCausalJob(ctx context.Context, tx pgx.Tx, store *Store, job controlpl
 		return err
 	}
 	data, _ := canonical(sealed)
-	_, err = tx.Exec(ctx, `INSERT INTO jobs(job_id,project_id,run_id,state,phase,created_at,available_at,deadline,backend_epoch,binding_digest,owner,lease_until,fence,attempt,cancel_revision,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,NULL,$11,$12,$13,$14,$15)`, sealed.JobID, sealed.ProjectID, sealed.RunID, sealed.State, sealed.Phase, sealed.CreatedAt, sealed.AvailableAt, sealed.Deadline, sealed.BackendEpoch, sealed.BindingDigest, sealed.Fence, sealed.Attempt, sealed.CancelRevision, data, sealed.Digest)
+	_, err = tx.Exec(ctx, `INSERT INTO jobs(organization_id,job_id,project_id,run_id,state,phase,created_at,available_at,deadline,backend_epoch,binding_digest,owner,lease_until,fence,attempt,cancel_revision,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL,NULL,$12,$13,$14,$15,$16)`, sealed.OrganizationID, sealed.JobID, sealed.ProjectID, sealed.RunID, sealed.State, sealed.Phase, sealed.CreatedAt, sealed.AvailableAt, sealed.Deadline, sealed.BackendEpoch, sealed.BindingDigest, sealed.Fence, sealed.Attempt, sealed.CancelRevision, data, sealed.Digest)
 	return mapError(err)
 }
 
@@ -687,10 +746,10 @@ func insertCausalEffect(ctx context.Context, tx pgx.Tx, store *Store, intent con
 		return err
 	}
 	sum := digestBytes(data)
-	if _, err = tx.Exec(ctx, `INSERT INTO effect_intents(operation_id,idempotency_key,project_id,run_id,phase,document,digest,state,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,'prepared',$8)`, intent.OperationID, intent.IdempotencyKey, intent.ProjectID, intent.RunID, intent.Phase, data, sum, now); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO effect_intents(organization_id,operation_id,idempotency_key,project_id,run_id,phase,document,digest,state,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'prepared',$9)`, intent.OrganizationID, intent.OperationID, intent.IdempotencyKey, intent.ProjectID, intent.RunID, intent.Phase, data, sum, now); err != nil {
 		return mapError(err)
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO outbox(operation_id,project_id,state,available_at) VALUES($1,$2,'pending',$3)`, intent.OperationID, intent.ProjectID, now)
+	_, err = tx.Exec(ctx, `INSERT INTO outbox(organization_id,operation_id,project_id,state,available_at) VALUES($1,$2,$3,'pending',$4)`, intent.OrganizationID, intent.OperationID, intent.ProjectID, now)
 	return mapError(err)
 }
 

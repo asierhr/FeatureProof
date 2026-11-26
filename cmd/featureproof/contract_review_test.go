@@ -130,6 +130,7 @@ func TestContractReviewCLICompositionCreatesDurableReview(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.Chdir(previous)
+	writeTenantSecurityCompositionFixture(t, temporary)
 	if err = os.MkdirAll(filepath.Join(temporary, "exports"), 0700); err != nil {
 		t.Fatal(err)
 	}

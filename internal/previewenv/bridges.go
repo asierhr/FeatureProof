@@ -52,6 +52,15 @@ func (e ExternalExecutor) Execute(ctx context.Context, selected externalagent.Se
 	return externalagent.ExecutionResult{Status: externalOutcome(result.Status), PackageDir: result.PackageDir}, nil
 }
 
+// ReconcileUnknown converges durable preview intents and provider cleanup for
+// an execution whose original response could not prove whether an effect ran.
+func (e ExternalExecutor) ReconcileUnknown(ctx context.Context, _ string) error {
+	if e.Coordinator == nil {
+		return &Error{Code: CodeInvalid, Operation: "external_reconcile"}
+	}
+	return e.Coordinator.Recover(ctx)
+}
+
 // Close joins scheduled crash recovery owned by the external-agent composition.
 func (e ExternalExecutor) Close(ctx context.Context) error { return e.Recovery.Close(ctx) }
 

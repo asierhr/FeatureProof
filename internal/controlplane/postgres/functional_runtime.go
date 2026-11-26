@@ -103,13 +103,14 @@ func (adapter *PostgresFunctionalArtifactStore) Commit(ctx context.Context, hand
 	if _, _, err = adapter.store.verifyWorkflowBackendTx(ctx, tx, handle); err != nil {
 		return workflowError(err, "functional_flow_backend")
 	}
-	result, err := tx.Exec(ctx, `INSERT INTO functional_artifacts(handle,document,digest) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, handle, data, digest)
+	coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
+	result, err := tx.Exec(ctx, `INSERT INTO functional_artifacts(organization_id,project_id,handle,document,digest) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, handle, data, digest)
 	if err != nil {
 		return workflowError(mapError(err), "functional_flow_commit")
 	}
 	if result.RowsAffected() == 0 {
 		var existing string
-		if err = tx.QueryRow(ctx, `SELECT digest FROM functional_artifacts WHERE handle=$1`, handle).Scan(&existing); err != nil || existing != digest {
+		if err = tx.QueryRow(ctx, `SELECT digest FROM functional_artifacts WHERE organization_id=$1 AND project_id=$2 AND handle=$3`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&existing); err != nil || existing != digest {
 			return &validationworkflow.Error{Code: validationworkflow.CodeConflict, Operation: "functional_flow_commit"}
 		}
 	}
@@ -121,9 +122,13 @@ func (adapter *PostgresFunctionalArtifactStore) Load(ctx context.Context, handle
 	if adapter == nil || adapter.store == nil || !workflowID.MatchString(handle) {
 		return functionalflow.Artifact{}, &validationworkflow.Error{Code: validationworkflow.CodeInvalid, Operation: "functional_flow_load"}
 	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != handle {
+		return functionalflow.Artifact{}, validationworkflow.ErrNotFound
+	}
 	var data []byte
 	var digest string
-	err := adapter.store.pool.QueryRow(ctx, `SELECT a.document,a.digest FROM functional_artifacts a JOIN backend_binding_heads h ON h.run_id=a.handle JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE a.handle=$1 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2`, handle, adapter.store.backendIdentity).Scan(&data, &digest)
+	err := adapter.store.pool.QueryRow(ctx, `SELECT a.document,a.digest FROM functional_artifacts a JOIN backend_binding_heads h ON h.organization_id=a.organization_id AND h.project_id=a.project_id AND h.run_id=a.handle JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE a.organization_id=$1 AND a.project_id=$2 AND a.handle=$3 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4`, coordinate.OrganizationID, coordinate.ProjectID, handle, adapter.store.backendIdentity).Scan(&data, &digest)
 	if err == pgx.ErrNoRows {
 		return functionalflow.Artifact{}, validationworkflow.ErrNotFound
 	}
@@ -156,13 +161,14 @@ func (adapter *PostgresFunctionalEvidenceStore) Confirm(ctx context.Context, ite
 	if _, _, err = adapter.store.verifyWorkflowBackendTx(ctx, tx, item.RunID); err != nil {
 		return functionalflow.Evidence{}, err
 	}
-	result, err := tx.Exec(ctx, `INSERT INTO functional_evidence(evidence_id,handle,document,digest) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, item.ID, item.RunID, data, digest)
+	coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
+	result, err := tx.Exec(ctx, `INSERT INTO functional_evidence(organization_id,project_id,evidence_id,handle,document,digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, item.ID, item.RunID, data, digest)
 	if err != nil {
 		return functionalflow.Evidence{}, mapError(err)
 	}
 	if result.RowsAffected() == 0 {
 		var existing string
-		if err = tx.QueryRow(ctx, `SELECT digest FROM functional_evidence WHERE evidence_id=$1`, item.ID).Scan(&existing); err != nil || existing != digest {
+		if err = tx.QueryRow(ctx, `SELECT digest FROM functional_evidence WHERE organization_id=$1 AND project_id=$2 AND evidence_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, item.ID).Scan(&existing); err != nil || existing != digest {
 			return functionalflow.Evidence{}, controlplane.ErrConflict
 		}
 	}
@@ -174,9 +180,13 @@ func (adapter *PostgresFunctionalEvidenceStore) Confirm(ctx context.Context, ite
 
 // Load verifies one private evidence record and reconstructs its detached sanitized output.
 func (adapter *PostgresFunctionalEvidenceStore) Load(ctx context.Context, evidenceID string) (functionalflow.Evidence, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return functionalflow.Evidence{}, validationworkflow.ErrNotFound
+	}
 	var data []byte
 	var digest string
-	if err := adapter.store.pool.QueryRow(ctx, `SELECT f.document,f.digest FROM functional_evidence f JOIN backend_binding_heads h ON h.run_id=f.handle JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE f.evidence_id=$1 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$2`, evidenceID, adapter.store.backendIdentity).Scan(&data, &digest); err == pgx.ErrNoRows {
+	if err := adapter.store.pool.QueryRow(ctx, `SELECT f.document,f.digest FROM functional_evidence f JOIN backend_binding_heads h ON h.organization_id=f.organization_id AND h.project_id=f.project_id AND h.run_id=f.handle JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE f.organization_id=$1 AND f.project_id=$2 AND f.evidence_id=$3 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4`, coordinate.OrganizationID, coordinate.ProjectID, evidenceID, adapter.store.backendIdentity).Scan(&data, &digest); err == pgx.ErrNoRows {
 		return functionalflow.Evidence{}, validationworkflow.ErrNotFound
 	} else if err != nil {
 		return functionalflow.Evidence{}, mapError(err)
@@ -242,13 +252,14 @@ func (publisher *PostgresFunctionalPublisher) Stage(ctx context.Context, handle 
 	if _, _, err = publisher.store.verifyWorkflowBackendTx(ctx, tx, handle); err != nil {
 		return err
 	}
-	resultTag, err := tx.Exec(ctx, `INSERT INTO functional_primaries(handle,artifact_digest,document,digest) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, handle, artifact.ArtifactDigest, data, digest)
+	coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
+	resultTag, err := tx.Exec(ctx, `INSERT INTO functional_primaries(organization_id,project_id,handle,artifact_digest,document,digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, handle, artifact.ArtifactDigest, data, digest)
 	if err != nil {
 		return mapError(err)
 	}
 	if resultTag.RowsAffected() == 0 {
 		var existing string
-		if err = tx.QueryRow(ctx, `SELECT digest FROM functional_primaries WHERE handle=$1`, handle).Scan(&existing); err != nil || existing != digest {
+		if err = tx.QueryRow(ctx, `SELECT digest FROM functional_primaries WHERE organization_id=$1 AND project_id=$2 AND handle=$3`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&existing); err != nil || existing != digest {
 			return controlplane.ErrConflict
 		}
 	}
@@ -325,9 +336,13 @@ func (publisher *PostgresFunctionalPublisher) Finalize(ctx context.Context, hand
 
 // loadPrimary authenticates staged proof before package construction.
 func (publisher *PostgresFunctionalPublisher) loadPrimary(ctx context.Context, handle string) (functionalflow.Result, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != handle {
+		return functionalflow.Result{}, controlplane.ErrNotFound
+	}
 	var data []byte
 	var digest string
-	if err := publisher.store.pool.QueryRow(ctx, `SELECT document,digest FROM functional_primaries WHERE handle=$1`, handle).Scan(&data, &digest); err == pgx.ErrNoRows {
+	if err := publisher.store.pool.QueryRow(ctx, `SELECT document,digest FROM functional_primaries WHERE organization_id=$1 AND project_id=$2 AND handle=$3`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&data, &digest); err == pgx.ErrNoRows {
 		return functionalflow.Result{}, controlplane.ErrNotFound
 	} else if err != nil {
 		return functionalflow.Result{}, mapError(err)
@@ -375,7 +390,8 @@ func (sink *PostgresFunctionalAttemptSink) AppendIdentityAttempt(ctx context.Con
 	if _, _, err = sink.store.verifyWorkflowBackendTx(ctx, tx, attempt.RunID); err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO functional_identity_attempts(handle,identity_id,operation_binding_digest,attempt,outcome_category) VALUES($1,$2,$3,$4,$5)`, attempt.RunID, attempt.IdentityID, attempt.OperationBindingSHA256, attempt.Attempt, attempt.OutcomeCategory)
+	coordinate, _ := controlplane.BackendCoordinateFromContext(ctx)
+	_, err = tx.Exec(ctx, `INSERT INTO functional_identity_attempts(organization_id,project_id,handle,identity_id,operation_binding_digest,attempt,outcome_category) VALUES($1,$2,$3,$4,$5,$6,$7)`, coordinate.OrganizationID, coordinate.ProjectID, attempt.RunID, attempt.IdentityID, attempt.OperationBindingSHA256, attempt.Attempt, attempt.OutcomeCategory)
 	if err != nil {
 		return mapError(err)
 	}
@@ -387,12 +403,16 @@ func (catalog *PostgresFunctionalCatalog) Resolve(ctx context.Context, selection
 	if catalog == nil || ctx.Err() != nil || selection == "" || strings.ContainsAny(selection, `/\\`) {
 		return "", &validationworkflow.Error{Code: validationworkflow.CodeInvalid, Operation: "functional_flow_manifest"}
 	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return "", validationworkflow.ErrNotFound
+	}
 	artifactID := selection
 	if aliased := catalog.aliases[selection]; aliased != "" {
 		artifactID = aliased
 	}
 	var exists bool
-	if err := catalog.store.pool.QueryRow(ctx, `SELECT true FROM functional_catalog WHERE artifact_id=$1`, artifactID).Scan(&exists); err != nil || !exists {
+	if err := catalog.store.pool.QueryRow(ctx, `SELECT true FROM functional_catalog WHERE organization_id=$1 AND project_id=$2 AND artifact_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, artifactID).Scan(&exists); err != nil || !exists {
 		return "", validationworkflow.ErrNotFound
 	}
 	return artifactID, nil
@@ -403,13 +423,17 @@ func (catalog *PostgresFunctionalCatalog) Load(ctx context.Context, selection va
 	if catalog == nil || (selection.Alias == "") == (selection.ArtifactID == "") {
 		return nil, controlplane.ErrInvalid
 	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, validationworkflow.ErrNotFound
+	}
 	artifactID := selection.ArtifactID
 	if selection.Alias != "" {
 		artifactID = catalog.aliases[selection.Alias]
 	}
 	var data []byte
 	var digest string
-	if err := catalog.store.pool.QueryRow(ctx, `SELECT document,digest FROM functional_catalog WHERE artifact_id=$1`, artifactID).Scan(&data, &digest); err == pgx.ErrNoRows {
+	if err := catalog.store.pool.QueryRow(ctx, `SELECT document,digest FROM functional_catalog WHERE organization_id=$1 AND project_id=$2 AND artifact_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, artifactID).Scan(&data, &digest); err == pgx.ErrNoRows {
 		return nil, validationworkflow.ErrNotFound
 	} else if err != nil {
 		return nil, mapError(err)
@@ -425,6 +449,10 @@ func (catalog *PostgresFunctionalCatalog) Load(ctx context.Context, selection va
 
 // PutProvidedFlow stores one canonical provided document for later alias/ID resolution during distributed restarts.
 func (catalog *PostgresFunctionalCatalog) PutProvidedFlow(ctx context.Context, document []byte) (string, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return "", controlplane.ErrUnauthorized
+	}
 	flow, err := functionalflow.DecodeProvided(document, catalog.limits)
 	if err != nil {
 		return "", err
@@ -436,13 +464,13 @@ func (catalog *PostgresFunctionalCatalog) PutProvidedFlow(ctx context.Context, d
 	sum := sha256.Sum256(data)
 	artifactID := hex.EncodeToString(sum[:])
 	digest := digestBytes(data)
-	tag, err := catalog.store.pool.Exec(ctx, `INSERT INTO functional_catalog(artifact_id,document,digest) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, artifactID, data, digest)
+	tag, err := catalog.store.pool.Exec(ctx, `INSERT INTO functional_catalog(organization_id,project_id,artifact_id,document,digest) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, artifactID, data, digest)
 	if err != nil {
 		return "", mapError(err)
 	}
 	if tag.RowsAffected() == 0 {
 		var existing string
-		if err = catalog.store.pool.QueryRow(ctx, `SELECT digest FROM functional_catalog WHERE artifact_id=$1`, artifactID).Scan(&existing); err != nil || existing != digest {
+		if err = catalog.store.pool.QueryRow(ctx, `SELECT digest FROM functional_catalog WHERE organization_id=$1 AND project_id=$2 AND artifact_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, artifactID).Scan(&existing); err != nil || existing != digest {
 			return "", controlplane.ErrConflict
 		}
 	}

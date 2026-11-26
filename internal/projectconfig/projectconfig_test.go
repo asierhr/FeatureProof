@@ -20,7 +20,7 @@ func testCatalogLimits() CatalogLimits {
 
 // validDocumentJSON returns the smallest semantically complete v1 document.
 func validDocumentJSON() []byte {
-	return []byte(`{"schema":"featureproof.project-config/v1","project_id":"project","repository_id":"repo","references":[{"kind":"contract","id":"contract","version":1,"digest":"` + testDigest + `"}],"constraints":{"limits":{"duration_seconds":10,"tool_calls":2,"model_tokens":100,"replans":1},"approval":"required","retention_days":7,"capabilities":["read"]}}`)
+	return []byte(`{"schema":"featureproof.project-config/v1","organization_id":"organization","project_id":"project","repository_id":"repo","references":[{"kind":"contract","id":"contract","version":1,"digest":"` + testDigest + `"}],"constraints":{"limits":{"duration_seconds":10,"tool_calls":2,"model_tokens":100,"replans":1},"approval":"required","retention_days":7,"capabilities":["read"]}}`)
 }
 
 // TestLoadStrictRejectsAmbiguityAndSecrets proves the public decoder fails closed.
@@ -61,8 +61,8 @@ func TestCanonicalizeIsDeterministic(t *testing.T) {
 // TestAuthorityRejectsScopeBeforeCollaborators proves authorization is the first boundary.
 func TestAuthorityRejectsScopeBeforeCollaborators(t *testing.T) {
 	t.Parallel()
-	key, _ := NewProjectKey("project", "repo")
-	other, _ := NewProjectKey("other", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
+	other, _ := NewProjectKey("other-organization", "other", "repo")
 	authority, _ := IssueAuthority("actor", key, ActionValidate)
 	catalog := &countingCatalog{}
 	policy := &countingPolicy{}
@@ -82,7 +82,7 @@ func TestValidateAndMergeAppliesMonotonicPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, _ := NewProjectKey("project", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
 	policy := OrganizationPolicySnapshot{Version: 1, Digest: testDigest, MaximumLimits: Limits{DurationSeconds: 10, ToolCalls: 2, ModelTokens: 100, Replans: 1}, ApprovalRequired: true, MinimumRetentionDays: 1, MaximumRetentionDays: 10, AllowedCapabilities: []string{"read"}}
 	catalog := ResourceCatalogSnapshot{Limits: testCatalogLimits(), ProjectKey: key, Digest: testDigest, Descriptors: []ResourceDescriptor{{Kind: ResourceContract, ID: "contract", Version: 1, Digest: testDigest, ProjectKey: key}}}
 	effective, err := ValidateAndMerge(canonical, policy, catalog)
@@ -102,9 +102,9 @@ func TestValidateAndMergeAppliesMonotonicPolicy(t *testing.T) {
 // TestValidateAndMergeRejectsCatalogCyclesAndProviderMismatch covers cross-resource authority.
 func TestValidateAndMergeRejectsCatalogCyclesAndProviderMismatch(t *testing.T) {
 	t.Parallel()
-	key, _ := NewProjectKey("project", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
 	policy := OrganizationPolicySnapshot{Version: 1, Digest: testDigest, MaximumLimits: Limits{DurationSeconds: 10, ToolCalls: 2, ModelTokens: 100, Replans: 1}, MinimumRetentionDays: 1, MaximumRetentionDays: 10, AllowedCapabilities: []string{"read"}}
-	document := Document{Schema: SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []ResourceReference{{Kind: ResourceFixture, ID: "a", Version: 1, Digest: testDigest}, {Kind: ResourceFixture, ID: "b", Version: 1, Digest: testDigest}}, Constraints: Constraints{Limits: Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
+	document := Document{Schema: SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []ResourceReference{{Kind: ResourceFixture, ID: "a", Version: 1, Digest: testDigest}, {Kind: ResourceFixture, ID: "b", Version: 1, Digest: testDigest}}, Constraints: Constraints{Limits: Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
 	canonical, err := Canonicalize(document)
 	if err != nil {
 		t.Fatal(err)
@@ -124,7 +124,7 @@ func TestValidateAndMergeRejectsCatalogCyclesAndProviderMismatch(t *testing.T) {
 // TestCatalogStructuralBudgetsRejectEveryLimitPlusOne proves trusted snapshots cannot bypass bounded copy or graph work.
 func TestCatalogStructuralBudgetsRejectEveryLimitPlusOne(t *testing.T) {
 	t.Parallel()
-	key, _ := NewProjectKey("project", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
 	base := ResourceCatalogSnapshot{ProjectKey: key, Digest: testDigest, Limits: CatalogLimits{MaxDescriptors: 2, MaxOperationsPerDescriptor: 2, MaxCapabilitiesPerDescriptor: 2, MaxDependenciesPerDescriptor: 2, MaxDependencyEdges: 2, MaxGraphWork: 4}, Descriptors: []ResourceDescriptor{{Kind: ResourceContract, ID: "one", Version: 1, Digest: testDigest, ProjectKey: key}}}
 	values := func(prefix string, count int) []string {
 		result := make([]string, count)
@@ -200,16 +200,20 @@ func TestHistoryCursorRejectsTamperScopeAndExpiry(t *testing.T) {
 	t.Parallel()
 	now := time.Unix(100, 0).UTC()
 	service := &Service{cursorKey: []byte("01234567890123456789012345678901"), cursorTTL: time.Minute, now: func() time.Time { return now }}
-	key, _ := NewProjectKey("project", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
 	cursor := service.encodeCursor(key, 42)
 	if value, err := service.decodeCursor(key, cursor); err != nil || value != 42 {
 		t.Fatalf("round trip: %d %v", value, err)
 	}
-	other, _ := NewProjectKey("other", "repo")
+	other, _ := NewProjectKey("other-organization", "other", "repo")
 	if _, err := service.decodeCursor(other, cursor); err == nil {
 		t.Fatal("cross-project cursor accepted")
 	}
-	tampered := cursor[:len(cursor)-1] + "A"
+	tamperedByte := byte('A')
+	if cursor[len(cursor)-1] == tamperedByte {
+		tamperedByte = 'B'
+	}
+	tampered := cursor[:len(cursor)-1] + string(tamperedByte)
 	if _, err := service.decodeCursor(key, tampered); err == nil {
 		t.Fatal("tampered cursor accepted")
 	}
@@ -222,8 +226,8 @@ func TestHistoryCursorRejectsTamperScopeAndExpiry(t *testing.T) {
 // TestSnapshotSourcesAreScopedAndDefensive proves composition cannot cross project authorities.
 func TestSnapshotSourcesAreScopedAndDefensive(t *testing.T) {
 	t.Parallel()
-	key, _ := NewProjectKey("project", "repo")
-	other, _ := NewProjectKey("other", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
+	other, _ := NewProjectKey("other-organization", "other", "repo")
 	catalog, err := NewSnapshotCatalog([]ResourceCatalogSnapshot{{Limits: testCatalogLimits(), ProjectKey: key, Digest: testDigest, Descriptors: []ResourceDescriptor{{Kind: ResourceContract, ID: "contract", Version: 1, Digest: testDigest, ProjectKey: key, Operations: []string{"read"}}}}})
 	if err != nil {
 		t.Fatal(err)
@@ -255,7 +259,7 @@ func TestSnapshotSourcesAreScopedAndDefensive(t *testing.T) {
 // TestAdmissionResolverDerivesTrustedProjectScope proves surfaces cannot override project identity.
 func TestAdmissionResolverDerivesTrustedProjectScope(t *testing.T) {
 	t.Parallel()
-	key, _ := NewProjectKey("project", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
 	authority, _ := IssueAuthority("actor", key, ActionAdmit)
 	store := &bindingStore{}
 	service, _ := NewService(store, &countingCatalog{}, &countingPolicy{}, nil, ServiceConfig{CursorKey: []byte("01234567890123456789012345678901"), CursorTTL: time.Minute})
@@ -280,7 +284,7 @@ func TestClosedBoundaryErrors(t *testing.T) {
 	if _, err := LoadStrict(strings.NewReader(`{"schema":`), MaxCanonicalBytes); !IsCategory(err, CategoryInvalid) {
 		t.Fatalf("syntax %v", err)
 	}
-	key, _ := NewProjectKey("project", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
 	if _, err := IssueAuthority("bad/token", key, ActionRead); !IsCategory(err, CategoryUnauthorized) {
 		t.Fatalf("actor %v", err)
 	}
@@ -297,7 +301,7 @@ func TestClosedBoundaryErrors(t *testing.T) {
 // TestSharedActivationAndEffectiveIntegrityContract covers the adapter-neutral corruption checks used by local and PostgreSQL reads.
 func TestSharedActivationAndEffectiveIntegrityContract(t *testing.T) {
 	t.Parallel()
-	key, _ := NewProjectKey("project", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
 	activation, err := SealActivation(Activation{ProjectKey: key, Generation: 1, Version: 1, VersionDigest: testDigest, Reason: "publish", Actor: "actor", CreatedAt: time.Unix(100, 123456789)})
 	if err != nil || activation.CreatedAt.Nanosecond()%1000 != 0 || ValidateActivation(activation, testDigest) != nil {
 		t.Fatalf("valid activation: %+v %v", activation, err)
@@ -346,7 +350,7 @@ func TestStoreCommandValidationRejectsMutableCanonicalState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, _ := NewProjectKey("project", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
 	effective, err := ValidateAndMerge(canonical, OrganizationPolicySnapshot{Version: 1, Digest: testDigest, MaximumLimits: Limits{DurationSeconds: 10, ToolCalls: 2, ModelTokens: 100, Replans: 1}, MinimumRetentionDays: 1, MaximumRetentionDays: 10, AllowedCapabilities: []string{"read"}}, ResourceCatalogSnapshot{Limits: testCatalogLimits(), ProjectKey: key, Digest: testDigest, Descriptors: []ResourceDescriptor{{Kind: ResourceContract, ID: "contract", Version: 1, Digest: testDigest, ProjectKey: key}}})
 	if err != nil {
 		t.Fatal(err)
@@ -406,7 +410,7 @@ func TestValidateAndMergeRejectsMissingStaleAndPolicyExpansion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, _ := NewProjectKey("project", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
 	basePolicy := OrganizationPolicySnapshot{Version: 1, Digest: testDigest, MaximumLimits: Limits{DurationSeconds: 10, ToolCalls: 2, ModelTokens: 100, Replans: 1}, MinimumRetentionDays: 1, MaximumRetentionDays: 10, AllowedCapabilities: []string{"read"}}
 	if _, err = ValidateAndMerge(canonical, basePolicy, ResourceCatalogSnapshot{Limits: testCatalogLimits(), ProjectKey: key, Digest: testDigest}); !IsCategory(err, CategoryMissingReference) {
 		t.Fatalf("missing %v", err)
@@ -440,7 +444,7 @@ func TestValidateAndMergeRejectsMissingStaleAndPolicyExpansion(t *testing.T) {
 // TestSnapshotSourceConstructionFailures covers duplicate, corrupt, nil and cancelled sources.
 func TestSnapshotSourceConstructionFailures(t *testing.T) {
 	t.Parallel()
-	key, _ := NewProjectKey("project", "repo")
+	key, _ := NewProjectKey("organization", "project", "repo")
 	snapshot := ResourceCatalogSnapshot{Limits: testCatalogLimits(), ProjectKey: key, Digest: testDigest, Descriptors: []ResourceDescriptor{{Kind: ResourceContract, ID: "contract", Version: 1, Digest: testDigest, ProjectKey: key}}}
 	if _, err := NewSnapshotCatalog([]ResourceCatalogSnapshot{snapshot, snapshot}); err == nil {
 		t.Fatal("duplicate catalog accepted")
@@ -465,7 +469,7 @@ func TestSnapshotSourceConstructionFailures(t *testing.T) {
 	if _, err := (*SnapshotPolicies)(nil).Snapshot(context.Background(), key); !IsCategory(err, CategoryUnavailable) {
 		t.Fatalf("nil policy %v", err)
 	}
-	other, _ := NewProjectKey("other", "repo")
+	other, _ := NewProjectKey("other-organization", "other", "repo")
 	policies, _ := NewSnapshotPolicies([]PolicyForProject{policy})
 	if _, err := policies.Snapshot(context.Background(), other); !IsCategory(err, CategoryNotFound) {
 		t.Fatalf("missing policy %v", err)

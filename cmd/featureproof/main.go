@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"syscall"
 	"time"
@@ -35,6 +36,7 @@ import (
 	"github.com/asierhr/featureProof/internal/previewenv"
 	"github.com/asierhr/featureProof/internal/projectconfig"
 	"github.com/asierhr/featureProof/internal/projectmemory"
+	"github.com/asierhr/featureProof/internal/tenantsecurity"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 )
 
@@ -61,12 +63,12 @@ type operatorUIDAuthorizer struct {
 
 // Authorize compares immutable process identity before any local freeze or
 // PostgreSQL candidate access occurs.
-func (authorizer operatorUIDAuthorizer) Authorize(ctx context.Context, operation, projectID string) error {
+func (authorizer operatorUIDAuthorizer) Authorize(ctx context.Context, operation string, scope controlplane.ProjectScope) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	allowedOperation := operation == "offline_import" || operation == "query_jobs" || operation == "retention"
-	if !allowedOperation || projectID == "" || authorizer.allowed == "" || authorizer.actual != authorizer.allowed {
+	if !allowedOperation || scope.Validate() != nil || authorizer.allowed == "" || authorizer.actual != authorizer.allowed {
 		return controlplane.ErrUnauthorized
 	}
 	return nil
@@ -153,6 +155,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 // runWithContext dispatches every product entrypoint under one caller-owned lifecycle for deterministic server shutdown.
 func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) >= 2 && args[0] == "project-config" {
+		security, err := authorizeProductSurface(ctx, tenantsecurity.SurfaceCLI, tenantsecurity.ActionTenantAdmin, tenantsecurity.ResourceTenant)
+		if err != nil {
+			return 3
+		}
+		defer security.Close()
 		return runProjectConfigurationCommand(ctx, args[1:], stdin, stdout)
 	}
 	if len(args) == 2 && args[0] == "control-plane" && args[1] == "import" {
@@ -165,12 +172,27 @@ func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout,
 		return runControlPlaneRetention(ctx, stdout, stderr)
 	}
 	if len(args) == 3 && args[0] == "memory" && args[1] == "mcp" && args[2] == "serve" {
-		return runProjectMemoryMCP(ctx, stdin, stdout)
+		security, err := composeTenantSecurity(ctx)
+		if err != nil {
+			return 3
+		}
+		defer security.Close()
+		return runProjectMemoryMCPWithTenantSecurity(ctx, stdin, stdout, security)
 	}
 	if len(args) == 3 && args[0] == "memory" && args[1] == "api" && args[2] == "serve" {
-		return runProjectMemoryAPI(ctx)
+		security, err := composeTenantSecurity(ctx)
+		if err != nil {
+			return 3
+		}
+		defer security.Close()
+		return runProjectMemoryAPIWithTenantSecurity(ctx, security)
 	}
 	if len(args) >= 2 && args[0] == "memory" {
+		security, err := authorizeProductSurface(ctx, tenantsecurity.SurfaceCLI, tenantsecurity.ActionConfigRead, tenantsecurity.ResourceConfig)
+		if err != nil {
+			return 3
+		}
+		defer security.Close()
 		composition, err := composeProjectMemory()
 		if err != nil {
 			return 3
@@ -185,10 +207,33 @@ func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout,
 		return agenteval.RunCommand(ctx, args[2:], stdout, stderr, productionEvalComposer{})
 	}
 	if len(args) == 2 && args[0] == "github" && args[1] == "serve" {
-		return runGitHubServer(ctx, stderr)
+		security, err := composeTenantSecurity(ctx)
+		if err != nil {
+			return 3
+		}
+		defer security.Close()
+		return runGitHubServerWithTenantSecurity(ctx, stderr, security)
 	}
 	if len(args) > 1 && args[0] == "workflow" {
-		cli, err := composeWorkflowCLI(ctx, stdout, stderr)
+		security, err := composeTenantSecurity(ctx)
+		if err != nil {
+			return 3
+		}
+		defer security.Close()
+		surface := tenantsecurity.SurfaceCLI
+		workflowContext := ctx
+		if len(args) == 3 && args[1] == "mcp" && args[2] == "serve" {
+			surface = tenantsecurity.SurfaceMCP
+			current, currentErr := user.Current()
+			if currentErr != nil || current.Uid == "" {
+				return 3
+			}
+			workflowContext, err = security.AuthenticateSurface(ctx, surface, current.Uid)
+			if err != nil {
+				return 3
+			}
+		}
+		cli, err := composeWorkflowCLIWithTenantSecurity(workflowContext, stdout, stderr, surface, security)
 		if err != nil {
 			return 3
 		}
@@ -201,7 +246,11 @@ func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout,
 			defer func() { runtime.Cancel(); _ = runtime.Join() }()
 		}
 		if len(args) == 3 && args[1] == "mcp" && args[2] == "serve" {
-			server := validationworkflow.MCPServer{Service: cli.Service, Principal: cli.Principal, AuthProfiles: cli.AuthProfiles, DirectTargets: cli.DirectTargets, PreviewTargets: cli.PreviewTargets, FlowAliases: cli.FlowAliases}
+			authenticator, authErr := loadTenantMCPAuthenticator(security, tenantsecurity.SurfaceMCP, "FEATUREPROOF_WORKFLOW_MCP_CREDENTIALS")
+			if authErr != nil {
+				return 3
+			}
+			server := validationworkflow.MCPServer{Service: cli.Service, Authenticator: authenticator, AuthProfiles: cli.AuthProfiles, DirectTargets: cli.DirectTargets, PreviewTargets: cli.PreviewTargets, FlowAliases: cli.FlowAliases}
 			if server.Serve(ctx, stdin, stdout) != nil {
 				return 3
 			}
@@ -211,21 +260,45 @@ func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout,
 	}
 	if len(args) > 1 && args[0] == "contract-review" {
 		if len(args) == 3 && args[1] == "mcp" && args[2] == "serve" {
-			return runContractReviewMCP(ctx, stdin, stdout)
+			security, err := composeTenantSecurity(ctx)
+			if err != nil {
+				return 3
+			}
+			defer security.Close()
+			return runContractReviewMCPWithTenantSecurity(ctx, stdin, stdout, security)
 		}
 		if len(args) == 3 && args[1] == "api" && args[2] == "serve" {
-			return runContractReviewAPI(ctx)
+			security, err := composeTenantSecurity(ctx)
+			if err != nil {
+				return 3
+			}
+			defer security.Close()
+			return runContractReviewAPIWithTenantSecurity(ctx, security)
 		}
+		security, err := authorizeProductSurface(ctx, tenantsecurity.SurfaceCLI, tenantsecurity.ActionConfigRead, tenantsecurity.ResourceConfig)
+		if err != nil {
+			return 3
+		}
+		defer security.Close()
 		return runContractReviewCommand(ctx, args[1:], stdout)
 	}
 	if isExternalAgentCommand(args) {
-		service, err := composeExternalAgentService()
+		security, securityErr := composeTenantSecurity(ctx)
+		if securityErr != nil {
+			return writeExternalCompositionError(stdout)
+		}
+		defer security.Close()
+		service, err := composeExternalAgentServiceWithTenantSecurity(security)
 		if err != nil {
 			return writeExternalCompositionError(stdout)
 		}
 		defer service.Close(context.WithoutCancel(ctx))
 		if len(args) == 2 && args[0] == "mcp" && args[1] == "serve" {
-			server, err := externalagent.NewMCPServer(service)
+			authenticator, authErr := loadTenantMCPAuthenticator(security, tenantsecurity.SurfaceExternalAgent, "FEATUREPROOF_EXTERNAL_AGENT_MCP_CREDENTIALS")
+			if authErr != nil {
+				return 3
+			}
+			server, err := externalagent.NewAuthenticatedMCPServer(service, authenticator)
 			if err != nil || server.Serve(ctx, stdin, stdout) != nil {
 				return 3
 			}
@@ -233,6 +306,11 @@ func runWithContext(ctx context.Context, args []string, stdin io.Reader, stdout,
 		}
 		return externalagent.RunCLI(ctx, args, stdout, service)
 	}
+	security, err := authorizeProductSurface(ctx, tenantsecurity.SurfaceCLI, tenantsecurity.ActionRunAdmit, tenantsecurity.ResourceRun)
+	if err != nil {
+		return 3
+	}
+	defer security.Close()
 	return localvalidation.RunCommand(localvalidation.TerminalSignalContext(ctx), args, stdin, stdout, stderr)
 }
 
@@ -318,7 +396,7 @@ func currentOperatorAuthorizer() (operatorUIDAuthorizer, error) {
 // backend and completes migrate/readiness before an operator controller runs.
 func openOperationalControlPlane(ctx context.Context, stderr io.Writer) (*controlplanepg.Store, error) {
 	observer := controlPlaneObserver{logger: slog.New(slog.NewJSONHandler(stderr, nil))}
-	store, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: os.Getenv("FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN"), BackendIdentity: requiredEnv("FEATUREPROOF_CONTROL_PLANE_IDENTITY"), MaxConnections: 8, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, Observer: observer})
+	store, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: os.Getenv("FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN"), BackendIdentity: requiredEnv("FEATUREPROOF_CONTROL_PLANE_IDENTITY"), MaxConnections: 8, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, Observer: observer, IsolatedLoopbackTest: isolatedPostgresGateAuthorized()})
 	if err != nil {
 		return nil, err
 	}
@@ -353,7 +431,7 @@ func runControlPlaneJobs(ctx context.Context, stdout, stderr io.Writer) int {
 	if err != nil {
 		return 2
 	}
-	query := controlplane.JobQuery{ProjectID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_QUERY_PROJECT_ID"), State: controlplane.JobState(os.Getenv("FEATUREPROOF_CONTROL_PLANE_QUERY_STATE")), Cursor: os.Getenv("FEATUREPROOF_CONTROL_PLANE_QUERY_CURSOR"), Limit: limit, Now: time.Now().UTC(), CursorTTL: 5 * time.Minute}
+	query := controlplane.JobQuery{OrganizationID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_QUERY_ORGANIZATION_ID"), ProjectID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_QUERY_PROJECT_ID"), State: controlplane.JobState(os.Getenv("FEATUREPROOF_CONTROL_PLANE_QUERY_STATE")), Cursor: os.Getenv("FEATUREPROOF_CONTROL_PLANE_QUERY_CURSOR"), Limit: limit, Now: time.Now().UTC(), CursorTTL: 5 * time.Minute}
 	page, err := (controlplane.QueryController{Store: store, Authorizer: authorizer, Cursors: codec}).ListJobs(ctx, query)
 	if err != nil || json.NewEncoder(stdout).Encode(page) != nil {
 		return 3
@@ -378,7 +456,8 @@ func runControlPlaneRetention(ctx context.Context, stdout, stderr io.Writer) int
 	if beforeErr != nil || batchErr != nil {
 		return 2
 	}
-	count, err := (controlplane.RetentionController{Store: store, Authorizer: authorizer}).Run(ctx, os.Getenv("FEATUREPROOF_CONTROL_PLANE_RETENTION_PROJECT_ID"), &controlplane.RetentionPolicy{BeforeUnix: before, BatchSize: batch})
+	scope := controlplane.ProjectScope{OrganizationID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_RETENTION_ORGANIZATION_ID"), ProjectID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_RETENTION_PROJECT_ID")}
+	count, err := (controlplane.RetentionController{Store: store, Authorizer: authorizer}).Run(ctx, scope, &controlplane.RetentionPolicy{BeforeUnix: before, BatchSize: batch})
 	if err != nil || json.NewEncoder(stdout).Encode(map[string]int{"deleted": count}) != nil {
 		return 3
 	}
@@ -416,7 +495,7 @@ func runControlPlaneImport(ctx context.Context, stdout, stderr io.Writer) int {
 	if err = registerLocalImportExporters(source, os.Getenv("FEATUREPROOF_CONTROL_PLANE_LOCAL_ROOT")); err != nil {
 		return 3
 	}
-	request := controlplane.OfflineImportRequest{ImportID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_IMPORT_ID"), RunID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_IMPORT_RUN_ID"), ProjectID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_IMPORT_PROJECT_ID"), ExpectedHead: os.Getenv("FEATUREPROOF_CONTROL_PLANE_IMPORT_EXPECTED_HEAD"), ExpectedEpoch: epoch, PageSize: pageSize, Now: time.Now().UTC(), ReconcileTimeout: 30 * time.Second}
+	request := controlplane.OfflineImportRequest{OrganizationID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_IMPORT_ORGANIZATION_ID"), ImportID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_IMPORT_ID"), RunID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_IMPORT_RUN_ID"), ProjectID: os.Getenv("FEATUREPROOF_CONTROL_PLANE_IMPORT_PROJECT_ID"), ExpectedHead: os.Getenv("FEATUREPROOF_CONTROL_PLANE_IMPORT_EXPECTED_HEAD"), ExpectedEpoch: epoch, PageSize: pageSize, Now: time.Now().UTC(), ReconcileTimeout: 30 * time.Second}
 	controller := controlplane.OfflineImportController{Source: source, Target: target, Authorizer: authorizer}
 	receipt, err := controller.Run(ctx, request)
 	if err != nil {
@@ -498,12 +577,29 @@ func runGitHubServer(ctx context.Context, stderr io.Writer) int {
 	return runGitHubServerWithReadiness(ctx, stderr, nil)
 }
 
+// runGitHubServerWithTenantSecurity preserves the authorized composition for
+// worker quota decisions throughout the server lifecycle.
+func runGitHubServerWithTenantSecurity(ctx context.Context, stderr io.Writer, security *tenantSecurityComposition) int {
+	runtime, address, err := composeGitHubRuntimeWithTenantSecurity(ctx, security)
+	if err != nil {
+		return 3
+	}
+	return serveGitHubRuntime(ctx, stderr, nil, runtime, address)
+}
+
 // runGitHubServerWithReadiness exposes listener ownership to integration tests without changing production shutdown semantics.
 func runGitHubServerWithReadiness(ctx context.Context, stderr io.Writer, ready chan<- struct{}) int {
 	runtime, address, err := composeGitHubRuntime(ctx)
 	if err != nil {
 		return 3
 	}
+	return serveGitHubRuntime(ctx, stderr, ready, runtime, address)
+}
+
+// serveGitHubRuntime owns bounded listener startup and shutdown after all
+// security composition has completed.
+func serveGitHubRuntime(ctx context.Context, stderr io.Writer, ready chan<- struct{}, runtime *githubpr.Runtime, address string) int {
+	var err error
 	if err = runtime.Start(ctx); err != nil {
 		_ = runtime.Close(context.WithoutCancel(ctx))
 		return 3
@@ -539,6 +635,12 @@ func runGitHubServerWithReadiness(ctx context.Context, stderr io.Writer, ready c
 
 // composeGitHubRuntime resolves GitHub App secrets and exact allowlists without passing them to the harness.
 func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error) {
+	return composeGitHubRuntimeWithTenantSecurity(ctx, nil)
+}
+
+// composeGitHubRuntimeWithTenantSecurity installs worker claim quotas when the
+// productive entrypoint supplies its mandatory tenant composition.
+func composeGitHubRuntimeWithTenantSecurity(ctx context.Context, security *tenantSecurityComposition) (*githubpr.Runtime, string, error) {
 	installation, err := requiredPositiveEnv("FEATUREPROOF_GITHUB_INSTALLATION_ID")
 	if err != nil {
 		return nil, "", err
@@ -620,7 +722,13 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 				return nil, "", workflowErr
 			}
 			selection = githubpr.Selection{Alias: configuredWorkflow.TargetAlias, Secretless: configuredWorkflow.TargetKind == "preview"}
-			workflowCLI, composeErr := composeWorkflowCLIWithGitHubAuthority(ctx, io.Discard, io.Discard, authorityAdapter)
+			var workflowCLI *validationworkflow.CLI
+			var composeErr error
+			if security != nil {
+				workflowCLI, composeErr = composeWorkflowCLIWithGitHubTenantSecurity(ctx, io.Discard, io.Discard, authorityAdapter, nil, security)
+			} else {
+				workflowCLI, composeErr = composeWorkflowCLIWithGitHubAuthority(ctx, io.Discard, io.Discard, authorityAdapter)
+			}
 			if composeErr != nil {
 				return nil, "", composeErr
 			}
@@ -680,15 +788,34 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 		}
 	}
 	config := githubpr.ProductionConfig{AppID: appID, BotID: botID, Permissions: githubpr.RequiredPermissions(), APIOrigin: apiOrigin, APIVersion: "2022-11-28", EvidenceOrigin: requiredEnv("FEATUREPROOF_EVIDENCE_ORIGIN"), StoreDir: filepath.Join(root, ".featureproof", "github-pr"), MaxWebhookBytes: 1 << 20, MaxResponseBytes: 1 << 20, MaxPages: 10, MaxChangedPaths: 1000, MaxAttempts: 4, RunTimeout: 30 * time.Minute, CloseTimeout: 10 * time.Second, LeaseTTL: 32 * time.Minute, PollInterval: 2 * time.Second, RetryMaxDuration: 2 * time.Minute, RetryMaxWait: time.Minute, RetryInitialBackoff: time.Second, RetryMaxBackoff: 30 * time.Second, Authorization: githubpr.AuthorizationConfig{Installations: map[int64]map[int64]bool{installation: {repository: true}}, Actors: map[int64]bool{actor: true}, Selections: map[string]githubpr.Selection{selection.Alias: selection}, Forks: map[int64]map[int64]bool{}}}
-	controlPlane, admission, controlPlaneErr := composeGitHubControlPlane(ctx, clock, config.RunTimeout)
+	controlPlaneProject := "repository-" + strconv.FormatInt(repository, 10)
+	if configuredWorkflow != nil {
+		// Product workflow state is tenant-scoped by the immutable repository
+		// project carried by ProjectKey, not by a second GitHub-derived alias.
+		controlPlaneProject = configuredWorkflow.RepositoryID
+	}
+	controlPlane, admission, controlPlaneErr := composeGitHubControlPlane(ctx, clock, config.RunTimeout, controlPlaneProject)
 	if controlPlaneErr != nil {
 		return nil, "", controlPlaneErr
 	}
 	var controlPlaneQueue controlplane.JobQueue
 	if controlPlane != nil {
 		controlPlaneQueue, _ = controlPlane.(controlplane.JobQueue)
+		if security != nil && controlPlaneQueue != nil {
+			workerContext, bindErr := security.AuthenticateSurface(ctx, tenantsecurity.SurfaceWorker, "github-worker")
+			if bindErr != nil {
+				return nil, "", bindErr
+			}
+			gate, gateErr := newTenantQuotaGate(workerContext, security, tenantsecurity.SurfaceWorker)
+			if gateErr != nil {
+				return nil, "", gateErr
+			}
+			controlPlaneQueue, err = controlplane.NewQuotaJobQueue(controlPlaneQueue, tenantClaimQuotaGate{tenantQuotaGate: gate})
+			if err != nil {
+				return nil, "", err
+			}
+		}
 	}
-	controlPlaneProject := "repository-" + strconv.FormatInt(repository, 10)
 	var controlPlaneAuthority controlplane.AuthorityEnvelopeStore
 	var controlPlaneOutbox controlplane.EffectOutbox
 	var postgresDomains *controlplanepg.DomainStores
@@ -724,7 +851,20 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 				return nil, "", bindErr
 			}
 			selection = githubpr.Selection{Alias: configuredWorkflow.TargetAlias, Secretless: configuredWorkflow.TargetKind == "preview"}
-			workflowCLI, composeErr := composeWorkflowCLIWithPersistence(ctx, io.Discard, io.Discard, &workflowPersistence{workflows: postgresDomains.Workflow, artifacts: postgresDomains.PlanArtifacts, executables: postgresDomains.ExecutablePlan, approvals: postgresDomains.Approval, environments: postgresDomains.Environment, capacity: postgresDomains.Capacity, cleanupLedger: postgresDomains.CleanupLedger, cleanup: postgresDomains.Cleanup, functional: postgresDomains.Functional, journal: postgresDomains.Functional, packages: postgresDomains.Packages, corrections: postgresDomains.Correction, fixtures: postgresDomains.Fixtures, context: postgresDomains.Context, projectConfig: postgresDomains.ProjectConfig, resourceArtifacts: postgresDomains.ResourceArtifacts, functionalRuntime: postgresStore})
+			workflowPersistence := &workflowPersistence{workflows: postgresDomains.Workflow, artifacts: postgresDomains.PlanArtifacts, executables: postgresDomains.ExecutablePlan, approvals: postgresDomains.Approval, environments: postgresDomains.Environment, capacity: postgresDomains.Capacity, cleanupLedger: postgresDomains.CleanupLedger, cleanup: postgresDomains.Cleanup, functional: postgresDomains.Functional, journal: postgresDomains.Functional, packages: postgresDomains.Packages, corrections: postgresDomains.Correction, fixtures: postgresDomains.Fixtures, context: postgresDomains.Context, projectConfig: postgresDomains.ProjectConfig, resourceArtifacts: postgresDomains.ResourceArtifacts, functionalRuntime: postgresStore}
+			var workflowCLI *validationworkflow.CLI
+			var composeErr error
+			if security != nil {
+				subject := "installation:" + strconv.FormatInt(installation, 10) + ":actor:" + strconv.FormatInt(actor, 10)
+				workflowContext, bindErr := security.AuthenticateSurface(ctx, tenantsecurity.SurfaceGitHub, subject)
+				if bindErr != nil {
+					postgresStore.Close()
+					return nil, "", bindErr
+				}
+				workflowCLI, composeErr = composeWorkflowCLIWithGitHubTenantSecurity(workflowContext, io.Discard, io.Discard, authorityAdapter, workflowPersistence, security)
+			} else {
+				workflowCLI, composeErr = composeWorkflowCLIWithPersistence(ctx, io.Discard, io.Discard, workflowPersistence)
+			}
 			if composeErr != nil {
 				postgresStore.Close()
 				return nil, "", composeErr
@@ -738,7 +878,34 @@ func composeGitHubRuntime(ctx context.Context) (*githubpr.Runtime, string, error
 	}
 	secretResolver := controlPlaneSecretResolver{values: map[string]string{"github-app-private-key": string(privateKey)}}
 	productEffect := &githubRuntimeEffect{appID: appID, apiOrigin: apiOrigin, authorization: config.Authorization, validation: validation, http: httpClient, clock: clock}
-	runtime, err := githubpr.ComposeRuntime(ctx, config, githubpr.CompositionSecrets{WebhookSecret: secret}, githubpr.RuntimeDependencies{Credentials: tokenSource, HTTP: httpClient, Packages: externalagent.VerifiedPackageReader{}, Validation: validation, Clock: clock, Jitter: githubpr.RandomJitter{}, IDs: githubpr.RandomIDs{}, Review: reviewHandler, ReviewOwner: reviewOwner, ControlPlane: controlPlane, ControlPlaneAdmission: admission, ControlPlaneQueue: controlPlaneQueue, ControlPlaneAuthority: controlPlaneAuthority, ControlPlaneOutbox: controlPlaneOutbox, ControlPlaneSecrets: secretResolver, ControlPlaneEffect: productEffect, ControlPlaneDomains: controlPlaneDomains, ControlPlaneProjectID: controlPlaneProject, ControlPlaneWorkerID: "github-worker"})
+	var productAuthorize func(context.Context, githubpr.ProductIdentity) error
+	var productWorkerAuthorize func(context.Context, githubpr.WorkerIdentity) error
+	if security != nil {
+		productAuthorize = func(authorizeContext context.Context, identity githubpr.ProductIdentity) error {
+			subject := "installation:" + strconv.FormatInt(identity.InstallationID, 10) + ":actor:" + strconv.FormatInt(identity.ActorID, 10)
+			authenticated, bindErr := security.AuthenticateSurface(authorizeContext, tenantsecurity.SurfaceGitHub, subject)
+			if bindErr != nil {
+				return bindErr
+			}
+			_, authorizeErr := security.Gateway.Authorize(authenticated, tenantsecurity.SurfaceGitHub, tenantsecurity.ActionRunAdmit, tenantsecurity.ResourceRun)
+			return authorizeErr
+		}
+		productWorkerAuthorize = func(authorizeContext context.Context, identity githubpr.WorkerIdentity) error {
+			authenticated, bindErr := security.AuthenticateSurface(authorizeContext, tenantsecurity.SurfaceWorker, identity.WorkerID)
+			if bindErr != nil {
+				return bindErr
+			}
+			capability, authorizeErr := security.Gateway.Authorize(authenticated, tenantsecurity.SurfaceWorker, tenantsecurity.ActionRunRead, tenantsecurity.ResourceRun)
+			if authorizeErr != nil {
+				return authorizeErr
+			}
+			if capability.Scope.OrganizationID != identity.OrganizationID || capability.Scope.ProjectID != identity.ProjectID || identity.Fence == 0 {
+				return errors.New("worker tenant scope unavailable")
+			}
+			return nil
+		}
+	}
+	runtime, err := githubpr.ComposeRuntime(ctx, config, githubpr.CompositionSecrets{WebhookSecret: secret}, githubpr.RuntimeDependencies{Credentials: tokenSource, HTTP: httpClient, Packages: externalagent.VerifiedPackageReader{}, Validation: validation, Clock: clock, Jitter: githubpr.RandomJitter{}, IDs: githubpr.RandomIDs{}, ProductAuthorize: productAuthorize, ProductWorkerAuthorize: productWorkerAuthorize, Review: reviewHandler, ReviewOwner: reviewOwner, ControlPlane: controlPlane, ControlPlaneAdmission: admission, ControlPlaneQueue: controlPlaneQueue, ControlPlaneAuthority: controlPlaneAuthority, ControlPlaneOutbox: controlPlaneOutbox, ControlPlaneSecrets: secretResolver, ControlPlaneEffect: productEffect, ControlPlaneDomains: controlPlaneDomains, ControlPlaneOrganizationID: os.Getenv("FEATUREPROOF_ORGANIZATION_ID"), ControlPlaneProjectID: controlPlaneProject, ControlPlaneWorkerID: "github-worker"})
 	if err != nil {
 		if closer, ok := controlPlane.(interface{ Close() }); ok {
 			closer.Close()
@@ -820,7 +987,7 @@ func (gateway workflowGitHubGateway) Approve(ctx context.Context, command github
 }
 
 // composeGitHubControlPlane selects existing local stores explicitly or one migrated/readiness-checked PostgreSQL authority without fallback.
-func composeGitHubControlPlane(ctx context.Context, clock githubpr.Clock, runTimeout time.Duration) (controlplane.IngressStore, func(context.Context, githubpr.WebhookCommand) (controlplane.IngressAdmission, error), error) {
+func composeGitHubControlPlane(ctx context.Context, clock githubpr.Clock, runTimeout time.Duration, productProjectID string) (controlplane.IngressStore, func(context.Context, githubpr.WebhookCommand) (controlplane.IngressAdmission, error), error) {
 	mode := os.Getenv("FEATUREPROOF_CONTROL_PLANE_BACKEND")
 	if mode == "" || mode == string(controlplane.BackendLocal) {
 		return nil, nil, nil
@@ -828,12 +995,16 @@ func composeGitHubControlPlane(ctx context.Context, clock githubpr.Clock, runTim
 	if mode != string(controlplane.BackendPostgres) {
 		return nil, nil, errors.New("control plane backend unavailable")
 	}
+	organizationID := os.Getenv("FEATUREPROOF_ORGANIZATION_ID")
+	if organizationID == "" {
+		return nil, nil, errors.New("control plane organization unavailable")
+	}
 	identity := os.Getenv("FEATUREPROOF_CONTROL_PLANE_IDENTITY")
 	if identity == "" {
 		identity = "github-postgres"
 	}
 	observer := controlPlaneObserver{logger: slog.New(slog.NewJSONHandler(os.Stderr, nil))}
-	store, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: os.Getenv("FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN"), BackendIdentity: identity, MaxConnections: 16, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, Observer: observer})
+	store, err := controlplanepg.Open(ctx, controlplanepg.Config{DSN: os.Getenv("FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN"), BackendIdentity: identity, MaxConnections: 16, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, Observer: observer, IsolatedLoopbackTest: isolatedPostgresGateAuthorized()})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -850,20 +1021,23 @@ func composeGitHubControlPlane(ctx context.Context, clock githubpr.Clock, runTim
 		sum := sha256.Sum256([]byte(command.DeliveryID))
 		identityHash := hex.EncodeToString(sum[:])
 		runID, jobID := "github-"+identityHash, "ingress-"+identityHash
-		projectID := "repository-" + strconv.FormatInt(command.RepositoryID, 10)
-		epoch, sealErr := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: runID, ProjectID: projectID, Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: identity, SchemaVersion: 1, CreatedAt: now})
+		projectID := productProjectID
+		if projectID == "" {
+			projectID = "repository-" + strconv.FormatInt(command.RepositoryID, 10)
+		}
+		epoch, sealErr := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: organizationID, RunID: runID, ProjectID: projectID, Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: identity, SchemaVersion: 1, CreatedAt: now})
 		if sealErr != nil {
 			return controlplane.IngressAdmission{}, sealErr
 		}
-		job, sealErr := controlplane.SealJob(controlplane.Job{JobID: jobID, ProjectID: projectID, RunID: runID, BackendEpoch: 1, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: command.PayloadDigest, CreatedAt: now, AvailableAt: now, Deadline: now.Add(runTimeout)})
+		job, sealErr := controlplane.SealJob(controlplane.Job{OrganizationID: organizationID, JobID: jobID, ProjectID: projectID, RunID: runID, BackendEpoch: 1, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: command.PayloadDigest, CreatedAt: now, AvailableAt: now, Deadline: now.Add(runTimeout)})
 		if sealErr != nil {
 			return controlplane.IngressAdmission{}, sealErr
 		}
-		grant, sealErr := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{ProjectID: projectID, RunID: runID, BackendEpoch: epoch.Epoch, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, InputReferences: []string{"ingress"}, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: command.SelectionAlias, TargetBindingDigest: command.PayloadDigest, SecretReferenceIDs: []string{"github-app-private-key"}})
+		grant, sealErr := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{OrganizationID: organizationID, ProjectID: projectID, RunID: runID, BackendEpoch: epoch.Epoch, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, InputReferences: []string{"ingress"}, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: command.SelectionAlias, TargetBindingDigest: command.PayloadDigest, SecretReferenceIDs: []string{"github-app-private-key"}})
 		if sealErr != nil {
 			return controlplane.IngressAdmission{}, sealErr
 		}
-		intent := controlplane.EffectIntent{OperationID: jobID + "-dispatch", IdempotencyKey: jobID, ProjectID: projectID, RunID: runID, Phase: job.Phase, BindingDigest: epoch.Digest, InputDigest: command.PayloadDigest, PayloadRef: "ingress:" + runID, PayloadDigest: command.PayloadDigest, ReconcileMethod: "reload_ingress"}
+		intent := controlplane.EffectIntent{OrganizationID: organizationID, OperationID: jobID + "-dispatch", IdempotencyKey: jobID, ProjectID: projectID, RunID: runID, Phase: job.Phase, BindingDigest: epoch.Digest, InputDigest: command.PayloadDigest, PayloadRef: "ingress:" + runID, PayloadDigest: command.PayloadDigest, ReconcileMethod: "reload_ingress"}
 		fields := map[string]string{"delivery_id": command.DeliveryID, "event": command.Event, "installation_id": strconv.FormatInt(command.InstallationID, 10), "repository_id": strconv.FormatInt(command.RepositoryID, 10), "pull_request_number": strconv.FormatInt(command.PullRequestNumber, 10), "actor_id": strconv.FormatInt(command.ActorID, 10), "selection_alias": command.SelectionAlias, "payload_digest": command.PayloadDigest}
 		if command.ReviewOperation != "" {
 			fields["review_operation"] = command.ReviewOperation
@@ -886,7 +1060,7 @@ func composeGitHubControlPlane(ctx context.Context, clock githubpr.Clock, runTim
 				fields["memory_decision_id"] = command.MemoryDecisionID
 			}
 		}
-		return controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{Source: "github", ExternalID: command.DeliveryID, IdempotencyKey: command.DeliveryID, ProjectID: projectID, RequestDigest: command.PayloadDigest, CommandKind: "validate", CommandFields: fields}, Epoch: epoch, Job: job, Grant: grant, Intent: intent}, nil
+		return controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{OrganizationID: organizationID, Source: "github", ExternalID: command.DeliveryID, IdempotencyKey: command.DeliveryID, ProjectID: projectID, RequestDigest: command.PayloadDigest, CommandKind: "validate", CommandFields: fields}, Epoch: epoch, Job: job, Grant: grant, Intent: intent}, nil
 	}
 	return store, build, nil
 }
@@ -1003,23 +1177,41 @@ func requiredPositiveEnv(name string) (int64, error) {
 // requiredEnv returns one mandatory non-secret configuration value.
 func requiredEnv(name string) string { return os.Getenv(name) }
 
+// isolatedPostgresGateAuthorized exposes plaintext loopback only inside the explicit hermetic gate.
+func isolatedPostgresGateAuthorized() bool {
+	return os.Getenv("FEATUREPROOF_POSTGRES_GATE_AUTHORIZED") == "true"
+}
+
 func isExternalAgentCommand(args []string) bool {
 	return len(args) > 0 && (args[0] == "capabilities" || args[0] == "run" || args[0] == "correction" || args[0] == "mcp")
 }
 
 // externalProjectResourceMaterializer derives every external-agent admission consumer and limit from its sealed run binding.
 type externalProjectResourceMaterializer struct {
-	principalID string
-	selection   externalagent.Selection
-	executor    externalagent.ApprovedExecutor
-	artifacts   interface {
+	principalIDs []string
+	principalID  string
+	selection    externalagent.Selection
+	executor     externalagent.ApprovedExecutor
+	artifacts    interface {
 		GetArtifact(context.Context, projectconfig.ResourceDescriptor) ([]byte, error)
 	}
 }
 
+// trustedPrincipalIDs preserves the historical single-host adapter while
+// allowing per-request MCP subjects to share the same sealed resource set.
+func (materializer externalProjectResourceMaterializer) trustedPrincipalIDs() []string {
+	if len(materializer.principalIDs) > 0 {
+		return materializer.principalIDs
+	}
+	if materializer.principalID != "" {
+		return []string{materializer.principalID}
+	}
+	return nil
+}
+
 // PrepareAdmission validates current backing and builds consumers without persisting before the causal registry transaction.
 func (materializer externalProjectResourceMaterializer) PrepareAdmission(_ context.Context, binding projectconfig.RunConfigurationBinding) (externalagent.ProjectResourceSnapshot, externalagent.ProjectBoundResources, error) {
-	if projectconfig.ValidateRunBinding(binding) != nil || materializer.principalID == "" || materializer.selection.Alias == "" || materializer.executor == nil || materializer.artifacts == nil {
+	if projectconfig.ValidateRunBinding(binding) != nil || len(materializer.trustedPrincipalIDs()) == 0 || materializer.selection.Alias == "" || materializer.executor == nil || materializer.artifacts == nil {
 		return externalagent.ProjectResourceSnapshot{}, externalagent.ProjectBoundResources{}, errors.New("external project resources unavailable")
 	}
 	descriptor := externalEnvironmentDescriptor(binding)
@@ -1051,7 +1243,7 @@ func externalEnvironmentDescriptor(binding projectconfig.RunConfigurationBinding
 
 // Materialize rejects descriptor drift and returns only artifacts authorized by the historical binding without republishing backing.
 func (materializer externalProjectResourceMaterializer) Materialize(ctx context.Context, binding projectconfig.RunConfigurationBinding) (externalagent.ProjectBoundResources, error) {
-	if projectconfig.ValidateRunBinding(binding) != nil || materializer.principalID == "" || materializer.executor == nil || materializer.artifacts == nil {
+	if projectconfig.ValidateRunBinding(binding) != nil || len(materializer.trustedPrincipalIDs()) == 0 || materializer.executor == nil || materializer.artifacts == nil {
 		return externalagent.ProjectBoundResources{}, errors.New("external project resources unavailable")
 	}
 	descriptor := externalEnvironmentDescriptor(binding)
@@ -1067,12 +1259,20 @@ func (materializer externalProjectResourceMaterializer) Materialize(ctx context.
 
 // resourcesFromPayload authenticates the selected alias and derives limits before consumers can be admitted or recovered.
 func (materializer externalProjectResourceMaterializer) resourcesFromPayload(binding projectconfig.RunConfigurationBinding, descriptor projectconfig.ResourceDescriptor, payload []byte) (externalagent.ProjectBoundResources, error) {
+	if len(materializer.trustedPrincipalIDs()) == 0 {
+		return externalagent.ProjectBoundResources{}, errors.New("external project principal unavailable")
+	}
 	var request previewenv.ConsumerRequest
 	if json.Unmarshal(payload, &request) != nil || request.Selection.Alias != descriptor.Selection {
 		return externalagent.ProjectBoundResources{}, errors.New("external project artifact corrupt")
 	}
 	selection := externalagent.Selection{Alias: descriptor.Selection, Value: request}
-	catalog, err := externalagent.NewAliasCatalog(map[string]map[string]externalagent.Selection{materializer.principalID: {selection.Alias: selection}})
+	principalIDs := materializer.trustedPrincipalIDs()
+	entries := make(map[string]map[string]externalagent.Selection, len(principalIDs))
+	for _, principalID := range principalIDs {
+		entries[principalID] = map[string]externalagent.Selection{selection.Alias: selection}
+	}
+	catalog, err := externalagent.NewAliasCatalog(entries)
 	retention := time.Duration(binding.Effective.Constraints.RetentionDays) * 24 * time.Hour
 	timeout := time.Duration(binding.Effective.Constraints.Limits.DurationSeconds) * time.Second
 	if err != nil || retention <= 0 || timeout <= 0 {
@@ -1081,8 +1281,86 @@ func (materializer externalProjectResourceMaterializer) resourcesFromPayload(bin
 	return externalagent.ProjectBoundResources{Catalog: catalog, Executor: materializer.executor, Retention: retention, RunTimeout: timeout}, nil
 }
 
+// scopedExternalRegistry seals the composition-owned project capability onto
+// every durable external-agent call, including supervisor recovery contexts.
+type scopedExternalRegistry struct {
+	registry externalagent.Registry
+	scope    controlplane.ProjectScope
+}
+
+// externalContext attaches the trusted tenant scope without granting a run identity.
+func (registry scopedExternalRegistry) externalContext(ctx context.Context) context.Context {
+	return controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: registry.scope.OrganizationID, ProjectID: registry.scope.ProjectID})
+}
+
+// ClaimSubmit scopes idempotency serialization to the composed tenant project.
+func (registry scopedExternalRegistry) ClaimSubmit(ctx context.Context, principalID, keyHash, requestHash string) (*externalagent.SubmissionClaim, error) {
+	return registry.registry.(externalagent.ConfiguredAdmissionRegistry).ClaimSubmit(registry.externalContext(ctx), principalID, keyHash, requestHash)
+}
+
+// Reserve prevents an unconfigured run from escaping the composed tenant project.
+func (registry scopedExternalRegistry) Reserve(ctx context.Context, record externalagent.RunRecord) (externalagent.ReserveResult, error) {
+	return registry.registry.Reserve(registry.externalContext(ctx), record)
+}
+
+// ReserveConfigured binds the run and captured artifact to the same tenant project.
+func (registry scopedExternalRegistry) ReserveConfigured(ctx context.Context, record externalagent.RunRecord, snapshot externalagent.ProjectResourceSnapshot) (externalagent.ReserveResult, error) {
+	return registry.registry.(externalagent.ConfiguredAdmissionRegistry).ReserveConfigured(registry.externalContext(ctx), record, snapshot)
+}
+
+// Get hides equal handles owned by a different tenant project.
+func (registry scopedExternalRegistry) Get(ctx context.Context, handle string) (externalagent.RunRecord, error) {
+	return registry.registry.Get(registry.externalContext(ctx), handle)
+}
+
+// Transition applies lifecycle CAS only inside the composed tenant project.
+func (registry scopedExternalRegistry) Transition(ctx context.Context, handle string, from, to externalagent.Phase, status externalagent.Outcome, packageDir, owner string, now time.Time) (externalagent.RunRecord, error) {
+	return registry.registry.Transition(registry.externalContext(ctx), handle, from, to, status, packageDir, owner, now)
+}
+
+// ReserveCancel scopes cancellation idempotency to the composed tenant project.
+func (registry scopedExternalRegistry) ReserveCancel(ctx context.Context, handle, keyHash, requestHash string) (externalagent.RunRecord, bool, error) {
+	return registry.registry.ReserveCancel(registry.externalContext(ctx), handle, keyHash, requestHash)
+}
+
+// Recover terminalizes abandoned runs only inside the composed tenant project.
+func (registry scopedExternalRegistry) Recover(ctx context.Context, owner string, now time.Time) error {
+	return registry.registry.Recover(registry.externalContext(ctx), owner, now)
+}
+
+// RecoverTerminal returns exact terminalized records under the same trusted
+// tenant coordinate for resource reconciliation.
+func (registry scopedExternalRegistry) RecoverTerminal(ctx context.Context, owner string, now time.Time) ([]externalagent.RunRecord, error) {
+	reporter, ok := registry.registry.(externalagent.RecoveryReportingRegistry)
+	if !ok {
+		return nil, externalagent.ErrConflict
+	}
+	return reporter.RecoverTerminal(registry.externalContext(ctx), owner, now)
+}
+
+// Events reads the tenant-scoped immutable external-agent journal.
+func (registry scopedExternalRegistry) Events(ctx context.Context, handle string) ([]externalagent.RunEvent, error) {
+	return registry.registry.Events(registry.externalContext(ctx), handle)
+}
+
+// MarkPublicationFailure records the safe failure cause under the tenant fence.
+func (registry scopedExternalRegistry) MarkPublicationFailure(ctx context.Context, handle string, now time.Time) error {
+	return registry.registry.MarkPublicationFailure(registry.externalContext(ctx), handle, now)
+}
+
+// ReleaseOwner preserves the registry lifecycle boundary after scoped execution.
+func (registry scopedExternalRegistry) ReleaseOwner(handle string) {
+	registry.registry.ReleaseOwner(handle)
+}
+
 // composeExternalAgentService enables preview scopes only after complete trusted composition.
 func composeExternalAgentService() (*externalagent.Service, error) {
+	return composeExternalAgentServiceWithTenantSecurity(nil)
+}
+
+// composeExternalAgentServiceWithTenantSecurity installs pre-effect quota
+// admission for the productive external executor.
+func composeExternalAgentServiceWithTenantSecurity(security *tenantSecurityComposition) (*externalagent.Service, error) {
 	root, err := os.Getwd()
 	if err != nil {
 		return nil, err
@@ -1110,7 +1388,7 @@ func composeExternalAgentService() (*externalagent.Service, error) {
 			identity = "external-agent-postgres"
 		}
 		observer := controlPlaneObserver{logger: slog.New(slog.NewJSONHandler(os.Stderr, nil))}
-		postgresOwner, err = controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: os.Getenv("FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN"), BackendIdentity: identity, MaxConnections: 8, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, Observer: observer})
+		postgresOwner, err = controlplanepg.Open(context.Background(), controlplanepg.Config{DSN: os.Getenv("FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN"), BackendIdentity: identity, MaxConnections: 8, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, Observer: observer, IsolatedLoopbackTest: isolatedPostgresGateAuthorized()})
 		if err == nil {
 			err = postgresOwner.Migrate(context.Background())
 		}
@@ -1134,7 +1412,20 @@ func composeExternalAgentService() (*externalagent.Service, error) {
 		return nil, errors.New("external artifact registry unavailable")
 	}
 	repositoryID := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_REPOSITORY_ID")
-	projectConfiguration, err := composeWorkflowProjectConfiguration(context.Background(), root, current.Uid, repositoryID, configurationPersistence, true)
+	var projectConfiguration workflowProjectConfiguration
+	if security != nil {
+		authenticated, bindErr := security.AuthenticateSurface(context.Background(), tenantsecurity.SurfaceExternalAgent, current.Uid)
+		if bindErr != nil {
+			return nil, bindErr
+		}
+		configCapability, authorizeErr := security.Gateway.Authorize(authenticated, tenantsecurity.SurfaceExternalAgent, tenantsecurity.ActionConfigRead, tenantsecurity.ResourceConfig)
+		if authorizeErr != nil {
+			return nil, authorizeErr
+		}
+		projectConfiguration, err = composeWorkflowProjectConfigurationWithTenant(authenticated, current.Uid, repositoryID, configurationPersistence, true, security.Store, configCapability)
+	} else {
+		projectConfiguration, err = composeWorkflowProjectConfiguration(context.Background(), root, current.Uid, repositoryID, configurationPersistence, true)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1142,6 +1433,10 @@ func composeExternalAgentService() (*externalagent.Service, error) {
 	if err != nil || active.Effective == nil {
 		return nil, errors.New("active project configuration unavailable")
 	}
+	if _, ok = registry.(externalagent.ConfiguredAdmissionRegistry); !ok {
+		return nil, errors.New("external configured registry unavailable")
+	}
+	registry = scopedExternalRegistry{registry: registry, scope: controlplane.ProjectScope{OrganizationID: projectConfiguration.Key.OrganizationID, ProjectID: projectConfiguration.Key.ProjectID}}
 	preview, configured, err := composeConfiguredPreview(context.Background(), root)
 	if err != nil {
 		return nil, err
@@ -1157,11 +1452,38 @@ func composeExternalAgentService() (*externalagent.Service, error) {
 		selections[preview.Request.Selection.Alias] = externalagent.Selection{Alias: preview.Request.Selection.Alias, Value: preview.Request}
 		executor = previewenv.ExternalExecutor{Coordinator: preview.Coordinator, Recovery: preview.Recovery}
 	}
-	identity, err := externalagent.NewLocalIdentity(externalagent.Principal{ID: current.Uid, Scopes: scopes})
+	localIdentity, err := externalagent.NewLocalIdentity(externalagent.Principal{ID: current.Uid, Scopes: scopes})
 	if err != nil {
 		return nil, err
 	}
-	catalog, err := externalagent.NewAliasCatalog(map[string]map[string]externalagent.Selection{current.Uid: selections})
+	var identity externalagent.IdentitySource = localIdentity
+	principalIDs := []string{current.Uid}
+	if security != nil {
+		if authenticated, authErr := security.AuthenticateSurface(context.Background(), tenantsecurity.SurfaceExternalAgent, current.Uid); authErr == nil {
+			if capability, authorizeErr := security.Gateway.Authorize(authenticated, tenantsecurity.SurfaceExternalAgent, tenantsecurity.ActionRunRead, tenantsecurity.ResourceRun); authorizeErr == nil {
+				principalIDs = []string{capability.Scope.PrincipalID}
+			}
+		}
+		if authenticator, authErr := loadTenantMCPAuthenticator(security, tenantsecurity.SurfaceExternalAgent, "FEATUREPROOF_EXTERNAL_AGENT_MCP_CREDENTIALS"); authErr == nil {
+			for credential := range authenticator.profiles {
+				_, principalID, _, authorizeErr := authenticator.authorize(context.Background(), credential, "submit")
+				if authorizeErr != nil {
+					return nil, authorizeErr
+				}
+				if !slices.Contains(principalIDs, principalID) {
+					principalIDs = append(principalIDs, principalID)
+				}
+			}
+		}
+	}
+	if security != nil {
+		identity = tenantExternalIdentity{next: externalagent.RequestIdentity{Fallback: localIdentity}, security: security}
+	}
+	catalogEntries := make(map[string]map[string]externalagent.Selection, len(principalIDs))
+	for _, principalID := range principalIDs {
+		catalogEntries[principalID] = selections
+	}
+	catalog, err := externalagent.NewAliasCatalog(catalogEntries)
 	if err != nil {
 		return nil, err
 	}
@@ -1177,6 +1499,29 @@ func composeExternalAgentService() (*externalagent.Service, error) {
 		preview.Recovery = recovery
 		executor = previewenv.ExternalExecutor{Coordinator: preview.Coordinator, Recovery: recovery}
 	}
+	if security != nil {
+		authenticated, bindErr := security.AuthenticateSurface(context.Background(), tenantsecurity.SurfaceExternalAgent, current.Uid)
+		if bindErr != nil {
+			return nil, bindErr
+		}
+		gate, gateErr := newTenantQuotaGate(authenticated, security, tenantsecurity.SurfaceExternalAgent)
+		if gateErr != nil {
+			return nil, gateErr
+		}
+		quotaExecutor, quotaErr := newQuotaExternalExecutor(executor, gate)
+		err = quotaErr
+		if err != nil {
+			return nil, err
+		}
+		executor = quotaExecutor
+		quotaRegistry, registryErr := newQuotaExternalRegistry(registry, gate)
+		err = registryErr
+		if err != nil {
+			return nil, err
+		}
+		quotaRegistry.reconciler = quotaExecutor
+		registry = quotaRegistry
+	}
 	retention := time.Duration(active.Effective.Constraints.RetentionDays) * 24 * time.Hour
 	runTimeout := time.Duration(active.Effective.Constraints.Limits.DurationSeconds) * time.Second
 	if retention <= 0 || runTimeout <= 0 {
@@ -1186,7 +1531,7 @@ func composeExternalAgentService() (*externalagent.Service, error) {
 	if configured {
 		selection = selections[preview.Request.Selection.Alias]
 	}
-	service, serviceErr := externalagent.NewService(externalagent.ServiceDependencies{Identity: identity, Catalog: catalog, Registry: registry, Executor: executor, Packages: externalagent.VerifiedPackageReader{}, Clock: externalagent.WallClock{}, IDs: externalagent.RandomIDs{}, Owner: owner, Retention: retention, RunTimeout: runTimeout, RepositoryID: repositoryID, ProjectConfig: projectConfiguration.Resolver, ProjectResources: externalProjectResourceMaterializer{principalID: current.Uid, selection: selection, executor: executor, artifacts: artifactRegistry}})
+	service, serviceErr := externalagent.NewService(externalagent.ServiceDependencies{Identity: identity, Catalog: catalog, Registry: registry, Executor: executor, Packages: externalagent.VerifiedPackageReader{}, Clock: externalagent.WallClock{}, IDs: externalagent.RandomIDs{}, Owner: owner, Retention: retention, RunTimeout: runTimeout, RepositoryID: repositoryID, ProjectConfig: projectConfiguration.Resolver, ProjectResources: externalProjectResourceMaterializer{principalIDs: principalIDs, selection: selection, executor: executor, artifacts: artifactRegistry}})
 	if serviceErr != nil && configured {
 		_ = preview.Recovery.Close(context.Background())
 	}

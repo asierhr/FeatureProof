@@ -225,7 +225,7 @@ func (store *LocalImportStore) SnapshotLocalStores(ctx context.Context) error {
 // FreezeLocalStores acquires the source-wide writer exclusion before reading
 // any consumer-owned store and publishes the manifest in the same critical
 // section, so no writable interval exists between export and freeze.
-func (store *LocalImportStore) FreezeLocalStores(ctx context.Context, importID, runID, projectID, expectedHead string, expectedEpoch uint64, now time.Time) (ImportManifest, error) {
+func (store *LocalImportStore) FreezeLocalStores(ctx context.Context, organizationID, importID, runID, projectID, expectedHead string, expectedEpoch uint64, now time.Time) (ImportManifest, error) {
 	var result ImportManifest
 	if store == nil {
 		return result, ErrInvalid
@@ -247,7 +247,7 @@ func (store *LocalImportStore) FreezeLocalStores(ctx context.Context, importID, 
 		if err := store.snapshotLocalStoresLocked(ctx, state); err != nil {
 			return err
 		}
-		manifest, err := store.sealFrozenManifest(importID, runID, projectID, expectedHead, expectedEpoch, now, state.Streams)
+		manifest, err := store.sealFrozenManifest(organizationID, importID, runID, projectID, expectedHead, expectedEpoch, now, state.Streams)
 		if err != nil {
 			return err
 		}
@@ -446,7 +446,7 @@ func localStoreStream(path string) (string, bool) {
 }
 
 // Freeze persists a canonical immutable manifest before any candidate data is copied.
-func (store *LocalImportStore) Freeze(ctx context.Context, importID, runID, projectID, expectedHead string, expectedEpoch uint64, now time.Time) (ImportManifest, error) {
+func (store *LocalImportStore) Freeze(ctx context.Context, organizationID, importID, runID, projectID, expectedHead string, expectedEpoch uint64, now time.Time) (ImportManifest, error) {
 	var result ImportManifest
 	err := store.withLock(ctx, func(state *localImportState) error {
 		if state.Archived {
@@ -459,7 +459,7 @@ func (store *LocalImportStore) Freeze(ctx context.Context, importID, runID, proj
 			result = *state.Manifest
 			return nil
 		}
-		manifest, sealErr := store.sealFrozenManifest(importID, runID, projectID, expectedHead, expectedEpoch, now, state.Streams)
+		manifest, sealErr := store.sealFrozenManifest(organizationID, importID, runID, projectID, expectedHead, expectedEpoch, now, state.Streams)
 		if sealErr != nil {
 			return sealErr
 		}
@@ -472,7 +472,7 @@ func (store *LocalImportStore) Freeze(ctx context.Context, importID, runID, proj
 
 // sealFrozenManifest derives the immutable import inventory exclusively from
 // documents captured under the source-wide exclusion.
-func (store *LocalImportStore) sealFrozenManifest(importID, runID, projectID, expectedHead string, expectedEpoch uint64, now time.Time, documents map[string][]ImportDocument) (ImportManifest, error) {
+func (store *LocalImportStore) sealFrozenManifest(organizationID, importID, runID, projectID, expectedHead string, expectedEpoch uint64, now time.Time, documents map[string][]ImportDocument) (ImportManifest, error) {
 	counts, streams, relations, events := map[string]uint64{}, map[string]string{}, map[string]string{}, map[string]string{}
 	for name, items := range documents {
 		counts[name] = uint64(len(items))
@@ -482,7 +482,7 @@ func (store *LocalImportStore) sealFrozenManifest(importID, runID, projectID, ex
 			events[name] = streams[name]
 		}
 	}
-	return SealImportManifest(ImportManifest{ImportID: importID, RunID: runID, ProjectID: projectID, SourceIdentity: store.identity, ExpectedHeadDigest: expectedHead, ExpectedEpoch: expectedEpoch, Counts: counts, StreamDigests: streams, RelationDigests: relations, EventDigests: events, State: ImportFrozen, CreatedAt: now})
+	return SealImportManifest(ImportManifest{OrganizationID: organizationID, ImportID: importID, RunID: runID, ProjectID: projectID, SourceIdentity: store.identity, ExpectedHeadDigest: expectedHead, ExpectedEpoch: expectedEpoch, Counts: counts, StreamDigests: streams, RelationDigests: relations, EventDigests: events, State: ImportFrozen, CreatedAt: now})
 }
 
 // ReadImportPage returns detached frozen records in stable ordinal order for resumable copying.

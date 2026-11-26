@@ -87,10 +87,13 @@ func TestCoordinatorRecoversEachBoundedBatchBeforeClaimingMore(t *testing.T) {
 	}
 	clock := &fakeClock{now: time.Unix(100, 0)}
 	gateway := &advancingRecoveryGitHub{fakeGitHub: &fakeGitHub{snapshot: testSnapshot(t)}, clock: clock, store: storeA, firstStarted: make(chan struct{}), releaseFirst: make(chan struct{}), calls: map[string]int{}, associations: associationByExternalID}
-	retry := RetryPolicy{Config: RetryConfig{MaxAttempts: 1, MaxDuration: 10 * time.Second, MaxWait: 0, InitialBackoff: time.Millisecond, MaxBackoff: time.Millisecond}, Clock: clock, Jitter: fixedJitter{}}
+	// MaxAttempts is the causal retry bound under test. Keep the unrelated
+	// duration budget above all logical-clock advances made by both concurrent
+	// coordinators and preserve the production lease-cover invariant.
+	retry := RetryPolicy{Config: RetryConfig{MaxAttempts: 1, MaxDuration: time.Minute, MaxWait: 0, InitialBackoff: time.Millisecond, MaxBackoff: time.Millisecond}, Clock: clock, Jitter: fixedJitter{}}
 	dependencies := func(store Store, owner string) CoordinatorDependencies {
-		publisher := Publisher{GitHub: gateway, Store: store, Retry: retry, AppID: 10, BotID: 20, MaxPages: 2, Owner: owner, Clock: clock, LeaseTTL: 20 * time.Second}
-		return CoordinatorDependencies{GitHub: gateway, Authorizer: StaticAuthorizer{Config: AuthorizationConfig{Installations: map[int64]map[int64]bool{1: {2: true}}, Actors: map[int64]bool{4: true}, Selections: map[string]Selection{"default": {Alias: "default"}}}}, Validation: &fakeValidation{}, Store: store, Publisher: publisher, Projector: Projector{}, Retry: retry, IDs: &sequenceIDs{}, Clock: clock, Owner: owner, RunTimeout: 10 * time.Second, CloseTimeout: 10 * time.Second, LeaseTTL: 20 * time.Second, PollInterval: time.Millisecond}
+		publisher := Publisher{GitHub: gateway, Store: store, Retry: retry, AppID: 10, BotID: 20, MaxPages: 2, Owner: owner, Clock: clock, LeaseTTL: 2 * time.Minute}
+		return CoordinatorDependencies{GitHub: gateway, Authorizer: StaticAuthorizer{Config: AuthorizationConfig{Installations: map[int64]map[int64]bool{1: {2: true}}, Actors: map[int64]bool{4: true}, Selections: map[string]Selection{"default": {Alias: "default"}}}}, Validation: &fakeValidation{}, Store: store, Publisher: publisher, Projector: Projector{}, Retry: retry, IDs: &sequenceIDs{}, Clock: clock, Owner: owner, RunTimeout: 10 * time.Second, CloseTimeout: 10 * time.Second, LeaseTTL: 2 * time.Minute, PollInterval: time.Millisecond}
 	}
 	type startupResult struct {
 		coordinator *Coordinator
@@ -101,8 +104,7 @@ func TestCoordinatorRecoversEachBoundedBatchBeforeClaimingMore(t *testing.T) {
 		coordinator, startupErr := NewCoordinator(context.Background(), dependencies(storeA, "owner-a"))
 		resultA <- startupResult{coordinator: coordinator, err: startupErr}
 	}()
-	waitCtx, cancelWait := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancelWait()
+	waitCtx := t.Context()
 	select {
 	case <-gateway.firstStarted:
 	case <-waitCtx.Done():

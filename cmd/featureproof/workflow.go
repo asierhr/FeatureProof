@@ -52,6 +52,7 @@ import (
 	"github.com/asierhr/featureProof/internal/specification"
 	specyaml "github.com/asierhr/featureProof/internal/specification/yaml"
 	"github.com/asierhr/featureProof/internal/springinspector"
+	"github.com/asierhr/featureProof/internal/tenantsecurity"
 	"github.com/asierhr/featureProof/internal/testidentity"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 	kubernetesclient "k8s.io/client-go/kubernetes"
@@ -164,6 +165,11 @@ type workflowCompositionOptions struct {
 	disableResourceFactory    bool
 	boundResources            *validationworkflow.ProjectBoundResources
 	boundConfig               *workflowConfig
+	tenantGenerationQuota     validationworkflow.GenerationQuotaGate
+	tenantAcquireQuota        environment.AcquireQuotaGate
+	tenantStore               tenantsecurity.DurableStore
+	tenantConfigCapability    tenantsecurity.Capability
+	tenantAdmission           validationworkflow.TenantRunAdmission
 }
 
 // workflowProjectResourceMaterializer rebuilds and caches one exact resource graph per sealed effective digest.
@@ -363,11 +369,18 @@ type workflowProjectConfiguration struct {
 
 // composeWorkflowProjectConfiguration selects exactly one durable backend and fails before resource composition.
 func composeWorkflowProjectConfiguration(ctx context.Context, _ string, actor, repositoryID string, persistence *workflowPersistence, requireActive bool) (workflowProjectConfiguration, error) {
+	return composeWorkflowProjectConfigurationWithTenant(ctx, actor, repositoryID, persistence, requireActive, nil, tenantsecurity.Capability{})
+}
+
+// composeWorkflowProjectConfigurationWithTenant routes catalog, policy and
+// authority through the live tenant head when product security is enabled.
+func composeWorkflowProjectConfigurationWithTenant(ctx context.Context, actor, repositoryID string, persistence *workflowPersistence, requireActive bool, tenantStore tenantsecurity.DurableStore, tenantCapability tenantsecurity.Capability) (workflowProjectConfiguration, error) {
 	projectID := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID")
+	organizationID := os.Getenv("FEATUREPROOF_ORGANIZATION_ID")
 	catalogPath := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_CATALOG")
 	policyPath := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_POLICY")
 	cursorKey := []byte(os.Getenv("FEATUREPROOF_PROJECT_CONFIG_CURSOR_KEY"))
-	key, err := projectconfig.NewProjectKey(projectID, repositoryID)
+	key, err := projectconfig.NewProjectKey(organizationID, projectID, repositoryID)
 	if err != nil || len(cursorKey) < 32 || !filepath.IsAbs(catalogPath) || !filepath.IsAbs(policyPath) {
 		return workflowProjectConfiguration{}, errors.New("project configuration bootstrap unavailable")
 	}
@@ -403,11 +416,27 @@ func composeWorkflowProjectConfiguration(ctx context.Context, _ string, actor, r
 			return workflowProjectConfiguration{}, err
 		}
 	}
-	service, err := projectconfig.NewService(store, catalog, policies, nil, projectconfig.ServiceConfig{CursorKey: cursorKey, CursorTTL: time.Hour})
+	var catalogSource projectconfig.ResourceCatalog = catalog
+	var policySource projectconfig.OrganizationPolicySource = policies
+	if tenantStore != nil {
+		catalogSource, err = projectconfig.NewTenantResourceCatalog(catalog, tenantStore, tenantCapability, time.Now)
+		if err == nil {
+			policySource, err = projectconfig.NewTenantPolicySource(tenantStore, tenantCapability, time.Now)
+		}
+		if err != nil {
+			return workflowProjectConfiguration{}, err
+		}
+	}
+	service, err := projectconfig.NewService(store, catalogSource, policySource, nil, projectconfig.ServiceConfig{CursorKey: cursorKey, CursorTTL: time.Hour})
 	if err != nil {
 		return workflowProjectConfiguration{}, err
 	}
-	authority, err := projectconfig.IssueAuthority(actor, key, projectconfig.ActionValidate, projectconfig.ActionPublish, projectconfig.ActionRollback, projectconfig.ActionRead, projectconfig.ActionExport, projectconfig.ActionAdmit)
+	var authority projectconfig.ConfigurationAuthority
+	if tenantStore != nil {
+		authority, err = projectconfig.IssueTenantAuthority(tenantCapability, projectconfig.ActionValidate, projectconfig.ActionPublish, projectconfig.ActionRollback, projectconfig.ActionRead, projectconfig.ActionExport, projectconfig.ActionAdmit)
+	} else {
+		authority, err = projectconfig.IssueAuthority(actor, key, projectconfig.ActionValidate, projectconfig.ActionPublish, projectconfig.ActionRollback, projectconfig.ActionRead, projectconfig.ActionExport, projectconfig.ActionAdmit)
+	}
 	if err != nil {
 		return workflowProjectConfiguration{}, err
 	}
@@ -975,9 +1004,53 @@ func composeWorkflowCLI(ctx context.Context, stdout, stderr io.Writer) (*validat
 	return composeWorkflowCLIWithOptions(ctx, stdout, stderr, workflowCompositionOptions{credentialResolverFactory: newWorkflowEnvironmentCredentialResolver, recoverPending: true})
 }
 
+// composeWorkflowCLIWithTenantSecurity injects mandatory durable quota guards
+// after the surface identity was authorized by product composition.
+func composeWorkflowCLIWithTenantSecurity(ctx context.Context, stdout, stderr io.Writer, surface tenantsecurity.Surface, security *tenantSecurityComposition) (*validationworkflow.CLI, error) {
+	gate, err := newTenantQuotaGate(ctx, security, surface)
+	if err != nil {
+		return nil, err
+	}
+	configCapability, err := security.Gateway.Authorize(ctx, surface, tenantsecurity.ActionConfigRead, tenantsecurity.ResourceConfig)
+	if err != nil {
+		return nil, err
+	}
+	runCapability, err := security.Gateway.Authorize(ctx, surface, tenantsecurity.ActionRunAdmit, tenantsecurity.ResourceRun)
+	if err != nil {
+		return nil, err
+	}
+	admissionService, err := tenantsecurity.NewAdmission(security.Store, tenantsecurity.RealClock{})
+	if err != nil {
+		return nil, err
+	}
+	return composeWorkflowCLIWithOptions(ctx, stdout, stderr, workflowCompositionOptions{credentialResolverFactory: newWorkflowEnvironmentCredentialResolver, recoverPending: true, tenantGenerationQuota: gate, tenantAcquireQuota: gate, tenantStore: security.Store, tenantConfigCapability: configCapability, tenantAdmission: tenantWorkflowAdmission{service: admissionService, capability: runCapability, security: security, surface: surface}})
+}
+
 // composeWorkflowCLIWithGitHubAuthority additionally binds a composition-owned PR refresher for durable GitHub decisions.
 func composeWorkflowCLIWithGitHubAuthority(ctx context.Context, stdout, stderr io.Writer, githubAuthority validationworkflow.GitHubPullRequestAuthority) (*validationworkflow.CLI, error) {
 	return composeWorkflowCLIWithOptions(ctx, stdout, stderr, workflowCompositionOptions{githubAuthority: githubAuthority, credentialResolverFactory: newWorkflowEnvironmentCredentialResolver, recoverPending: true})
+}
+
+// composeWorkflowCLIWithGitHubTenantSecurity preserves GitHub PR authority
+// while installing the same pre-model/provider quota guards as CLI/MCP.
+func composeWorkflowCLIWithGitHubTenantSecurity(ctx context.Context, stdout, stderr io.Writer, githubAuthority validationworkflow.GitHubPullRequestAuthority, persistence *workflowPersistence, security *tenantSecurityComposition) (*validationworkflow.CLI, error) {
+	gate, err := newTenantQuotaGate(ctx, security, tenantsecurity.SurfaceGitHub)
+	if err != nil {
+		return nil, err
+	}
+	configCapability, err := security.Gateway.Authorize(ctx, tenantsecurity.SurfaceGitHub, tenantsecurity.ActionConfigRead, tenantsecurity.ResourceConfig)
+	if err != nil {
+		return nil, err
+	}
+	runCapability, err := security.Gateway.Authorize(ctx, tenantsecurity.SurfaceGitHub, tenantsecurity.ActionRunAdmit, tenantsecurity.ResourceRun)
+	if err != nil {
+		return nil, err
+	}
+	admissionService, err := tenantsecurity.NewAdmission(security.Store, tenantsecurity.RealClock{})
+	if err != nil {
+		return nil, err
+	}
+	return composeWorkflowCLIWithOptions(ctx, stdout, stderr, workflowCompositionOptions{githubAuthority: githubAuthority, credentialResolverFactory: newWorkflowEnvironmentCredentialResolver, recoverPending: true, persistence: persistence, tenantGenerationQuota: gate, tenantAcquireQuota: gate, tenantStore: security.Store, tenantConfigCapability: configCapability, tenantAdmission: tenantWorkflowAdmission{service: admissionService, capability: runCapability, security: security, surface: tenantsecurity.SurfaceGitHub}})
 }
 
 // composeWorkflowCLIWithPersistence builds the productive workflow exclusively from the selected PostgreSQL consumer ports.
@@ -1021,7 +1094,12 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	if err != nil || current.Uid == "" {
 		return nil, errors.New("local identity unavailable")
 	}
-	projectConfiguration, err := composeWorkflowProjectConfiguration(ctx, root, current.Uid, config.RepositoryID, options.persistence, options.boundEffective == nil)
+	var projectConfiguration workflowProjectConfiguration
+	if options.tenantStore != nil {
+		projectConfiguration, err = composeWorkflowProjectConfigurationWithTenant(ctx, current.Uid, config.RepositoryID, options.persistence, options.boundEffective == nil, options.tenantStore, options.tenantConfigCapability)
+	} else {
+		projectConfiguration, err = composeWorkflowProjectConfiguration(ctx, root, current.Uid, config.RepositoryID, options.persistence, options.boundEffective == nil)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1093,6 +1171,12 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 		provider, providerErr := composeWorkflowKubernetesProvider(options.kubernetes)
 		if providerErr != nil {
 			return nil, providerErr
+		}
+		if options.tenantAcquireQuota != nil {
+			provider, providerErr = environment.NewQuotaEnvironmentProvider(provider, options.tenantAcquireQuota)
+			if providerErr != nil {
+				return nil, providerErr
+			}
 		}
 		options.environmentProviders = map[string]environment.EnvironmentProvider{selection.ProviderID + "@" + selection.ProviderVersion: provider}
 	} else if options.kubernetes != nil {
@@ -1450,7 +1534,14 @@ func composeWorkflowCLIWithOptions(ctx context.Context, stdout, stderr io.Writer
 	}
 	contextRegistry := validationworkflow.CurrentContextProducerRegistry{Workflows: store, Admission: admission, GitHub: githubContextSource}
 	contextPort := &validationworkflow.ContextAssemblyAdapter{Profiles: contextProfiles, Registry: contextRegistry, Secrets: contextassembly.NewCanaryGate(nil), Tokens: contextassembly.ByteTokenCounter{Selections: map[string]bool{config.Provider + "/" + config.Model: true}}, Store: contextStore, Observer: validationworkflow.ContextObserver{}, Clock: wallClock, GitHub: githubContextSource}
-	serviceDependencies := validationworkflow.Dependencies{ProjectConfig: projectConfiguration.Resolver, Admission: admission, Generation: validationworkflow.GeneratorAdapter{Generator: generator}, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: effective.Constraints.Approval != "required"}, Finalizer: workflowFinalizer{}, Environment: environmentPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, FlowAuthority: flowAuthority, Memory: memoryPort, MemoryObserver: memoryObserver, Context: contextPort, TargetPlanning: workflowTargetPlanningBinder{spec: spec, manifest: manifest, deps: runtimeDeps}}
+	generationPort := validationworkflow.GenerationPort(validationworkflow.GeneratorAdapter{Generator: generator})
+	if options.tenantGenerationQuota != nil {
+		generationPort, err = validationworkflow.NewQuotaGenerationPort(generationPort, options.tenantGenerationQuota)
+		if err != nil {
+			return nil, err
+		}
+	}
+	serviceDependencies := validationworkflow.Dependencies{ProjectConfig: projectConfiguration.Resolver, Admission: admission, Generation: generationPort, Preparation: validationworkflow.PreparationAdapter{Assertions: assertions, Policy: generationPolicy}, Approval: approval, Execution: execution, Packages: validationworkflow.LocalPackageReader{Artifacts: artifacts, AuditTrust: auditTrust}, FixturePackages: validationworkflow.LocalFixturePackageWriter{AuditSigner: auditSigner}, Authorization: workflowAutoPolicy{allowed: effective.Constraints.Approval != "required"}, Finalizer: workflowFinalizer{}, Environment: environmentPort, Store: store, Artifacts: artifacts, Executables: executables, Clock: wallClock, Waiter: wallClock, IDs: externalagent.RandomIDs{}, Owner: owner, ContractReview: approvedAuthority, Fixtures: fixturePort, FunctionalFlow: functionalPort, FlowAuthority: flowAuthority, Memory: memoryPort, MemoryObserver: memoryObserver, Context: contextPort, TargetPlanning: workflowTargetPlanningBinder{spec: spec, manifest: manifest, deps: runtimeDeps}, TenantAdmission: options.tenantAdmission}
 	resources := validationworkflow.ProjectBoundResources{Admission: serviceDependencies.Admission, Generation: serviceDependencies.Generation, Preparation: serviceDependencies.Preparation, Approval: serviceDependencies.Approval, Execution: serviceDependencies.Execution, Packages: serviceDependencies.Packages, Authorization: serviceDependencies.Authorization, Environment: serviceDependencies.Environment, ContractReview: serviceDependencies.ContractReview, Fixtures: serviceDependencies.Fixtures, FixturePackages: serviceDependencies.FixturePackages, FunctionalFlow: serviceDependencies.FunctionalFlow, FlowAuthority: serviceDependencies.FlowAuthority, Context: serviceDependencies.Context, TargetPlanning: serviceDependencies.TargetPlanning}
 	if options.boundResources != nil {
 		*options.boundResources = resources

@@ -244,22 +244,20 @@ func (s *LocalStore) Create(ctx context.Context, principal, key, requestDigest s
 
 // awaitReservedReview waits boundedly for the process that won an idempotency reservation to publish its atomic checkpoint.
 func (s *LocalStore) awaitReservedReview(ctx context.Context, reviewID string) (ReviewRecord, error) {
-	deadline := time.Now().Add(s.lockTimeout)
-	for {
+	const interval = 2 * time.Millisecond
+	attempts := int(s.lockTimeout / interval)
+	if attempts < 1 {
+		attempts = 1
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
 		if record, err := s.Load(ctx, reviewID); err == nil {
 			return record, nil
 		}
-		if time.Now().After(deadline) {
-			return ReviewRecord{}, typedError(CategoryUnavailable, "store.reservation", nil)
-		}
-		timer := time.NewTimer(2 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		if err := s.waitFor(ctx, interval); err != nil {
 			return ReviewRecord{}, typedError(CategoryCancelled, "store.reservation", ctx.Err())
-		case <-timer.C:
 		}
 	}
+	return ReviewRecord{}, typedError(CategoryUnavailable, "store.reservation", nil)
 }
 
 // Load verifies checkpoint integrity, version and exact journal convergence after restart.

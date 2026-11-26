@@ -15,6 +15,7 @@ import (
 
 	"github.com/asierhr/featureProof/internal/contractcatalog"
 	"github.com/asierhr/featureProof/internal/contractreview"
+	"github.com/asierhr/featureProof/internal/tenantsecurity"
 )
 
 // contractReviewCatalogConfig binds one exact reference to trusted identity and pre-authorized neutral sources.
@@ -183,20 +184,59 @@ func runContractReviewCommand(ctx context.Context, args []string, output io.Writ
 
 // runContractReviewMCP composes the same durable service as CLI and serves all lifecycle tools over standard I/O.
 func runContractReviewMCP(ctx context.Context, input io.Reader, output io.Writer) int {
+	return runContractReviewMCPWithTenantSecurity(ctx, input, output, nil)
+}
+
+// runContractReviewMCPWithTenantSecurity authenticates every tool call before
+// tenant authorization and argument decoding.
+func runContractReviewMCPWithTenantSecurity(ctx context.Context, input io.Reader, output io.Writer, security *tenantSecurityComposition) int {
 	cli, err := composeContractReviewCLI(ctx)
 	if err != nil {
 		return 3
 	}
 	defer cli.Close()
 	server := contractreview.MCPServer{Adapter: contractreview.MCPAdapter{API: cli.API}, MaxLine: 1 << 20}
+	if security != nil {
+		token := []byte(os.Getenv("FEATUREPROOF_CONTRACT_REVIEW_MCP_TOKEN"))
+		server.Auth = tenantContractMCPAuthenticator{next: contractreview.MCPBearerAuthenticator{Token: token, Principal: cli.API.Config.PrincipalID}, security: security}
+	}
 	if err = server.Serve(ctx, input, output); err != nil {
 		return 3
 	}
 	return 0
 }
 
+// tenantContractMCPAuthenticator composes bearer authentication with the
+// request-bound MCP tenant provider.
+type tenantContractMCPAuthenticator struct {
+	next     contractreview.MCPAuthenticator
+	security *tenantSecurityComposition
+}
+
+// AuthenticateMCP authorizes only the principal resolved from the transport credential.
+func (authenticator tenantContractMCPAuthenticator) AuthenticateMCP(ctx context.Context, credential string) (string, error) {
+	principal, err := authenticator.next.AuthenticateMCP(ctx, credential)
+	if err != nil {
+		return "", err
+	}
+	authenticated, err := authenticator.security.AuthenticateSurface(ctx, tenantsecurity.SurfaceMCP, principal)
+	if err != nil {
+		return "", err
+	}
+	if _, err = authenticator.security.Gateway.Authorize(authenticated, tenantsecurity.SurfaceMCP, tenantsecurity.ActionConfigRead, tenantsecurity.ResourceConfig); err != nil {
+		return "", err
+	}
+	return principal, nil
+}
+
 // runContractReviewAPI composes the shared durable service and owns bounded HTTP shutdown.
 func runContractReviewAPI(ctx context.Context) int {
+	return runContractReviewAPIWithTenantSecurity(ctx, nil)
+}
+
+// runContractReviewAPIWithTenantSecurity authorizes the bearer-authenticated
+// principal for each HTTP request instead of at server startup.
+func runContractReviewAPIWithTenantSecurity(ctx context.Context, security *tenantSecurityComposition) int {
 	cli, err := composeContractReviewCLI(ctx)
 	if err != nil {
 		return 3
@@ -216,17 +256,26 @@ func runContractReviewAPI(ctx context.Context) int {
 	if err != nil {
 		return 3
 	}
-	return serveContractReviewAPI(ctx, cli.API, token, listener)
+	return serveContractReviewAPIWithTenantSecurity(ctx, cli.API, token, listener, security)
 }
 
 // serveContractReviewAPI serves the product HTTP adapter on an already-bound loopback listener and joins shutdown.
 func serveContractReviewAPI(ctx context.Context, api contractreview.APIAdapter, token []byte, listener net.Listener) int {
+	return serveContractReviewAPIWithTenantSecurity(ctx, api, token, listener, nil)
+}
+
+// serveContractReviewAPIWithTenantSecurity composes product bearer identity
+// with the shared request-bound API surface provider.
+func serveContractReviewAPIWithTenantSecurity(ctx context.Context, api contractreview.APIAdapter, token []byte, listener net.Listener, security *tenantSecurityComposition) int {
 	tcpAddress, ok := listener.Addr().(*net.TCPAddr)
 	if !ok || tcpAddress.IP == nil || !tcpAddress.IP.IsLoopback() {
 		_ = listener.Close()
 		return 3
 	}
-	authenticator := contractreview.BearerAuthenticator{Token: token, Principal: api.Config.PrincipalID}
+	var authenticator contractreview.HTTPAuthenticator = contractreview.BearerAuthenticator{Token: token, Principal: api.Config.PrincipalID}
+	if security != nil {
+		authenticator = tenantContractAuthenticator{next: authenticator, security: security}
+	}
 	server := &http.Server{Handler: (contractreview.HTTPHandler{API: api, MaxBody: 1 << 20, Auth: authenticator}).Handler(), ReadHeaderTimeout: 5 * time.Second}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
@@ -244,4 +293,28 @@ func serveContractReviewAPI(ctx context.Context, api contractreview.APIAdapter, 
 		}
 		return 0
 	}
+}
+
+// tenantContractAuthenticator reauthorizes only the principal returned by the
+// constant-time bearer verifier for the current HTTP request.
+type tenantContractAuthenticator struct {
+	next     contractreview.HTTPAuthenticator
+	security *tenantSecurityComposition
+}
+
+// Authenticate binds the product principal to the API surface and denies
+// before any review lookup when tenant membership changed.
+func (authenticator tenantContractAuthenticator) Authenticate(request *http.Request) (string, error) {
+	principal, err := authenticator.next.Authenticate(request)
+	if err != nil {
+		return "", err
+	}
+	ctx, err := authenticator.security.AuthenticateSurface(request.Context(), tenantsecurity.SurfaceAPI, principal)
+	if err != nil {
+		return "", err
+	}
+	if _, err = authenticator.security.Gateway.Authorize(ctx, tenantsecurity.SurfaceAPI, tenantsecurity.ActionConfigRead, tenantsecurity.ResourceConfig); err != nil {
+		return "", err
+	}
+	return principal, nil
 }

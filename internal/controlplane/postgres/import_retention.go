@@ -60,10 +60,16 @@ func syncRunRetentionReferenceTx(ctx context.Context, tx pgx.Tx, runID, kind, re
 	if runID == "" || kind == "" || referenceID == "" {
 		return controlplane.ErrInvalid
 	}
-	_, err := tx.Exec(ctx, `INSERT INTO retention_references(project_id,job_id,reference_kind,reference_id,live)
-		SELECT j.project_id,j.job_id,$2,$3,$4 FROM workflow_runs w JOIN jobs j ON j.job_id=substring(w.idempotency_key from 8)
-		WHERE w.handle=$1 AND w.idempotency_key LIKE 'github:%'
-		ON CONFLICT(project_id,job_id,reference_kind,reference_id) DO UPDATE SET live=EXCLUDED.live`, runID, kind, referenceID, live)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != runID {
+		return controlplane.ErrUnauthorized
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO retention_references(organization_id,project_id,job_id,reference_kind,reference_id,live)
+		SELECT j.organization_id,j.project_id,j.job_id,$2,$3,$4 FROM workflow_runs w
+		JOIN backend_binding_heads h ON h.organization_id=w.organization_id AND h.project_id=w.project_id AND h.run_id=w.handle
+		JOIN jobs j ON j.organization_id=h.organization_id AND j.project_id=h.project_id AND j.job_id=substring(w.idempotency_key from 8)
+		WHERE w.organization_id=$5 AND w.project_id=$6 AND w.handle=$1 AND w.idempotency_key LIKE 'github:%'
+		ON CONFLICT(organization_id,project_id,job_id,reference_kind,reference_id) DO UPDATE SET live=EXCLUDED.live`, runID, kind, referenceID, live, coordinate.OrganizationID, coordinate.ProjectID)
 	return err
 }
 
@@ -78,7 +84,7 @@ func (store *Store) SaveRetentionReference(ctx context.Context, job controlplane
 		return mapError(err)
 	}
 	defer tx.Rollback(ctx)
-	current, err := loadJobTx(ctx, tx, job.JobID, true)
+	current, err := loadJobTx(ctx, tx, controlplane.ProjectScope{OrganizationID: job.OrganizationID, ProjectID: job.ProjectID}, job.JobID, true)
 	if err != nil {
 		return err
 	}
@@ -89,10 +95,10 @@ func (store *Store) SaveRetentionReference(ctx context.Context, job controlplane
 		return controlplane.ErrConflict
 	}
 	if live {
-		_, err = tx.Exec(ctx, `INSERT INTO retention_references(project_id,job_id,reference_kind,reference_id,live) VALUES($1,$2,$3,$4,true) ON CONFLICT(project_id,job_id,reference_kind,reference_id) DO UPDATE SET live=true`, current.ProjectID, current.JobID, kind, referenceID)
+		_, err = tx.Exec(ctx, `INSERT INTO retention_references(organization_id,project_id,job_id,reference_kind,reference_id,live) VALUES($1,$2,$3,$4,$5,true) ON CONFLICT(organization_id,project_id,job_id,reference_kind,reference_id) DO UPDATE SET live=true`, current.OrganizationID, current.ProjectID, current.JobID, kind, referenceID)
 	} else {
 		var tag pgconn.CommandTag
-		tag, err = tx.Exec(ctx, `UPDATE retention_references SET live=false WHERE project_id=$1 AND job_id=$2 AND reference_kind=$3 AND reference_id=$4`, current.ProjectID, current.JobID, kind, referenceID)
+		tag, err = tx.Exec(ctx, `UPDATE retention_references SET live=false WHERE organization_id=$1 AND project_id=$2 AND job_id=$3 AND reference_kind=$4 AND reference_id=$5`, current.OrganizationID, current.ProjectID, current.JobID, kind, referenceID)
 		if err == nil && tag.RowsAffected() != 1 {
 			return controlplane.ErrConflict
 		}
@@ -109,12 +115,16 @@ func (store *Store) SaveImport(ctx context.Context, value controlplane.ImportMan
 	if err != nil {
 		return controlplane.ImportManifest{}, err
 	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID != sealed.OrganizationID || coordinate.ProjectID != sealed.ProjectID || coordinate.RunID != sealed.RunID {
+		return controlplane.ImportManifest{}, controlplane.ErrUnauthorized
+	}
 	data, _ := canonical(sealed)
 	if expected == "" {
 		if sealed.State != controlplane.ImportFrozen {
 			return controlplane.ImportManifest{}, controlplane.ErrConflict
 		}
-		result, execErr := store.pool.Exec(ctx, `INSERT INTO import_manifests(import_id,run_id,expected_head_digest,document,digest,state) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, sealed.ImportID, sealed.RunID, sealed.ExpectedHeadDigest, data, sealed.Digest, sealed.State)
+		result, execErr := store.pool.Exec(ctx, `INSERT INTO import_manifests(organization_id,project_id,import_id,run_id,expected_head_digest,document,digest,state) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, sealed.OrganizationID, sealed.ProjectID, sealed.ImportID, sealed.RunID, sealed.ExpectedHeadDigest, data, sealed.Digest, sealed.State)
 		if execErr != nil {
 			return controlplane.ImportManifest{}, mapError(execErr)
 		}
@@ -141,7 +151,7 @@ func (store *Store) SaveImport(ctx context.Context, value controlplane.ImportMan
 	if advanceErr != nil || advanced.Digest != sealed.Digest {
 		return controlplane.ImportManifest{}, controlplane.ErrConflict
 	}
-	result, err := store.pool.Exec(ctx, `UPDATE import_manifests SET document=$1,digest=$2,state=$3 WHERE import_id=$4 AND digest=$5`, data, sealed.Digest, sealed.State, sealed.ImportID, expected)
+	result, err := store.pool.Exec(ctx, `UPDATE import_manifests SET document=$1,digest=$2,state=$3 WHERE organization_id=$4 AND project_id=$5 AND import_id=$6 AND digest=$7`, data, sealed.Digest, sealed.State, sealed.OrganizationID, sealed.ProjectID, sealed.ImportID, expected)
 	if err != nil {
 		return controlplane.ImportManifest{}, mapError(err)
 	}
@@ -156,9 +166,13 @@ func (store *Store) SaveImportPage(ctx context.Context, importID string, documen
 	if importID == "" || len(documents) == 0 || len(documents) > 1000 {
 		return controlplane.ErrInvalid
 	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return controlplane.ErrUnauthorized
+	}
 	return retryTransactionObserved(ctx, store.pool, store.maxTxAttempts, "import.save_page", store.observer, func(tx pgx.Tx) error {
 		var state string
-		if err := tx.QueryRow(ctx, `SELECT state FROM import_manifests WHERE import_id=$1 FOR UPDATE`, importID).Scan(&state); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT state FROM import_manifests WHERE organization_id=$1 AND project_id=$2 AND import_id=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, importID).Scan(&state); err != nil {
 			return err
 		}
 		if state != string(controlplane.ImportFrozen) && state != string(controlplane.ImportCandidate) {
@@ -169,13 +183,13 @@ func (store *Store) SaveImportPage(ctx context.Context, importID string, documen
 			if err != nil {
 				return err
 			}
-			tag, err := tx.Exec(ctx, `INSERT INTO import_streams(import_id,stream_name,ordinal,relation_key,document,digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, importID, sealed.Stream, sealed.Ordinal, sealed.RelationKey, sealed.Document, sealed.Digest)
+			tag, err := tx.Exec(ctx, `INSERT INTO import_streams(organization_id,project_id,import_id,stream_name,ordinal,relation_key,document,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, importID, sealed.Stream, sealed.Ordinal, sealed.RelationKey, sealed.Document, sealed.Digest)
 			if err != nil {
 				return err
 			}
 			if tag.RowsAffected() == 0 {
 				var digest string
-				if err = tx.QueryRow(ctx, `SELECT digest FROM import_streams WHERE import_id=$1 AND stream_name=$2 AND ordinal=$3`, importID, sealed.Stream, sealed.Ordinal).Scan(&digest); err != nil {
+				if err = tx.QueryRow(ctx, `SELECT digest FROM import_streams WHERE organization_id=$1 AND project_id=$2 AND import_id=$3 AND stream_name=$4 AND ordinal=$5`, coordinate.OrganizationID, coordinate.ProjectID, importID, sealed.Stream, sealed.Ordinal).Scan(&digest); err != nil {
 					return err
 				}
 				if digest != sealed.Digest {
@@ -193,7 +207,7 @@ func (store *Store) SaveImportPage(ctx context.Context, importID string, documen
 				return err
 			}
 			data, _ := canonical(next)
-			_, err = tx.Exec(ctx, `UPDATE import_manifests SET document=$1,digest=$2,state=$3 WHERE import_id=$4 AND digest=$5`, data, next.Digest, next.State, importID, manifest.Digest)
+			_, err = tx.Exec(ctx, `UPDATE import_manifests SET document=$1,digest=$2,state=$3 WHERE organization_id=$4 AND project_id=$5 AND import_id=$6 AND digest=$7`, data, next.Digest, next.State, coordinate.OrganizationID, coordinate.ProjectID, importID, manifest.Digest)
 			return err
 		}
 		return nil
@@ -203,7 +217,7 @@ func (store *Store) SaveImportPage(ctx context.Context, importID string, documen
 // materializeImportDocumentTx decodes closed typed local streams into their
 // real consumer tables while the local backend remains the sole authority.
 func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document controlplane.ImportDocument, authority *importMaterializationAuthority) error {
-	if validateImportRelation(document) != nil {
+	if validateImportRelation(document) != nil || authority == nil || authority.OrganizationID == "" || authority.ProjectID == "" {
 		return controlplane.ErrIntegrity
 	}
 	path, _ := importRelationPath(document.RelationKey)
@@ -214,12 +228,12 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 			return controlplane.ErrIntegrity
 		}
 		recordData, _ := canonical(record)
-		if _, err = tx.Exec(ctx, `INSERT INTO workflow_runs(handle,principal,idempotency_key,request_digest,version,phase,owner,lease_until,updated_at,record) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT DO NOTHING`, record.Handle, record.Principal, record.IdempotencyKey, record.RequestDigest, record.VersionCAS, record.Phase, nullableImportOwner(record.Owner), nullableImportLease(record.LeaseUntil), record.UpdatedAt, recordData); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO workflow_runs(organization_id,project_id,handle,principal,idempotency_key,request_digest,version,phase,owner,lease_until,updated_at,record) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, record.Handle, record.Principal, record.IdempotencyKey, record.RequestDigest, record.VersionCAS, record.Phase, nullableImportOwner(record.Owner), nullableImportLease(record.LeaseUntil), record.UpdatedAt, recordData); err != nil {
 			return err
 		}
 		for _, event := range events {
 			eventData, _ := canonical(event)
-			if _, err = tx.Exec(ctx, `INSERT INTO workflow_events(handle,sequence,event_id,event) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, record.Handle, event.Sequence, event.ID, eventData); err != nil {
+			if _, err = tx.Exec(ctx, `INSERT INTO workflow_events(organization_id,project_id,handle,sequence,event_id,event) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, record.Handle, event.Sequence, event.ID, eventData); err != nil {
 				return err
 			}
 		}
@@ -228,7 +242,7 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 		if json.Unmarshal(document.Document, &artifact) != nil || validationworkflow.ValidatePlanArtifactForStore(artifact, artifact.WorkflowID) != nil {
 			return controlplane.ErrIntegrity
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO workflow_artifacts(workflow_id,artifact_digest,media_type,artifact) VALUES($1,$2,'application/vnd.featureproof.plan+json',$3) ON CONFLICT DO NOTHING`, artifact.WorkflowID, artifact.ArtifactSHA256, document.Document); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO workflow_artifacts(organization_id,project_id,workflow_id,artifact_digest,media_type,artifact) VALUES($1,$2,$3,$4,'application/vnd.featureproof.plan+json',$5) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, artifact.WorkflowID, artifact.ArtifactSHA256, document.Document); err != nil {
 			return err
 		}
 	case "executables":
@@ -236,7 +250,7 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 		if json.Unmarshal(document.Document, &material) != nil || !validationworkflow.ValidExecutableMaterialForStore(material.WorkflowID, material) {
 			return controlplane.ErrIntegrity
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO workflow_executables(workflow_id,artifact_digest,material) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, material.WorkflowID, material.ArtifactSHA256, document.Document); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO workflow_executables(organization_id,project_id,workflow_id,artifact_digest,material) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, material.WorkflowID, material.ArtifactSHA256, document.Document); err != nil {
 			return err
 		}
 	case "functional":
@@ -252,7 +266,7 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 				return controlplane.ErrIntegrity
 			}
 			data, _ := canonical(intent)
-			if _, err := tx.Exec(ctx, `INSERT INTO functional_intents(run_id,revision,step_id,intent,digest) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, intent.RunID, intent.Revision, intent.StepID, data, digestBytes(data)); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO functional_intents(organization_id,project_id,run_id,revision,step_id,intent,digest) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, intent.RunID, intent.Revision, intent.StepID, data, digestBytes(data)); err != nil {
 				return err
 			}
 		}
@@ -261,7 +275,7 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 				return controlplane.ErrIntegrity
 			}
 			data, _ := canonical(terminal)
-			if _, err := tx.Exec(ctx, `INSERT INTO functional_terminals(run_id,revision,step_id,terminal,digest) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, terminal.RunID, terminal.Revision, terminal.StepID, data, digestBytes(data)); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO functional_terminals(organization_id,project_id,run_id,revision,step_id,terminal,digest) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, terminal.RunID, terminal.Revision, terminal.StepID, data, digestBytes(data)); err != nil {
 				return err
 			}
 		}
@@ -270,7 +284,7 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 			if event.RunID == "" || event.Sequence == 0 || event.Digest == "" {
 				return controlplane.ErrIntegrity
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO functional_events(run_id,sequence,flow_id,revision,artifact_digest,event,digest) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, event.RunID, event.Sequence, event.FlowID, event.Revision, event.ArtifactDigest, data, event.Digest); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO functional_events(organization_id,project_id,run_id,sequence,flow_id,revision,artifact_digest,event,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, event.RunID, event.Sequence, event.FlowID, event.Revision, event.ArtifactDigest, data, event.Digest); err != nil {
 				return err
 			}
 		}
@@ -286,12 +300,12 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 			if _, err = planapproval.Project(ctx, events, 100000); err != nil {
 				return controlplane.ErrIntegrity
 			}
-			if _, err = tx.Exec(ctx, `INSERT INTO approval_runs(run_id,revision) VALUES($1,$2) ON CONFLICT(run_id) DO UPDATE SET revision=GREATEST(approval_runs.revision,EXCLUDED.revision)`, events[0].RunID, events[len(events)-1].Revision); err != nil {
+			if _, err = tx.Exec(ctx, `INSERT INTO approval_runs(organization_id,project_id,run_id,revision) VALUES($1,$2,$3,$4) ON CONFLICT(organization_id,project_id,run_id) DO UPDATE SET revision=GREATEST(approval_runs.revision,EXCLUDED.revision)`, authority.OrganizationID, authority.ProjectID, events[0].RunID, events[len(events)-1].Revision); err != nil {
 				return err
 			}
 			for _, event := range events {
 				data, _ := canonical(event)
-				if _, err = tx.Exec(ctx, `INSERT INTO approval_events(run_id,revision,event_id,event) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, event.RunID, event.Sequence, event.EventID, data); err != nil {
+				if _, err = tx.Exec(ctx, `INSERT INTO approval_events(organization_id,project_id,run_id,revision,event_id,event) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, event.RunID, event.Sequence, event.EventID, data); err != nil {
 					return err
 				}
 			}
@@ -300,7 +314,7 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 			if controlplane.StrictDecode(document.Document, &request) != nil || request.RunID == "" || request.Revision == 0 {
 				return controlplane.ErrIntegrity
 			}
-			terminal, err := approvalRevisionTerminalTx(ctx, tx, request.RunID, request.Revision)
+			terminal, err := approvalRevisionTerminalTx(ctx, tx, authority, request.RunID, request.Revision)
 			if err != nil {
 				return err
 			}
@@ -317,7 +331,10 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 				return controlplane.ErrIntegrity
 			}
 			recordData, _ := canonical(wrapper.Record)
-			if _, err := tx.Exec(ctx, `INSERT INTO environment_records(run_id,project_id,revision,state,record,digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(run_id) DO UPDATE SET project_id=EXCLUDED.project_id,revision=EXCLUDED.revision,state=EXCLUDED.state,record=EXCLUDED.record,digest=EXCLUDED.digest WHERE environment_records.revision<EXCLUDED.revision`, wrapper.Record.RunID, wrapper.Record.ProjectID, wrapper.Record.Revision, wrapper.Record.State, recordData, wrapper.Digest); err != nil {
+			if wrapper.Record.ProjectID != authority.ProjectID {
+				return controlplane.ErrIntegrity
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO environment_records(organization_id,run_id,project_id,revision,state,record,digest) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(organization_id,project_id,run_id) DO UPDATE SET revision=EXCLUDED.revision,state=EXCLUDED.state,record=EXCLUDED.record,digest=EXCLUDED.digest WHERE environment_records.revision<EXCLUDED.revision`, authority.OrganizationID, wrapper.Record.RunID, authority.ProjectID, wrapper.Record.Revision, wrapper.Record.State, recordData, wrapper.Digest); err != nil {
 				return err
 			}
 			return nil
@@ -328,7 +345,7 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 				return controlplane.ErrIntegrity
 			}
 			data, _ := canonical(event)
-			if _, err := tx.Exec(ctx, `INSERT INTO environment_events(run_id,event) VALUES($1,$2)`, event.RunID, data); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO environment_events(organization_id,project_id,run_id,event) VALUES($1,$2,$3,$4)`, authority.OrganizationID, authority.ProjectID, event.RunID, data); err != nil {
 				return err
 			}
 			return nil
@@ -344,7 +361,10 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 				return controlplane.ErrIntegrity
 			}
 			data, _ := canonical(item)
-			if _, err := tx.Exec(ctx, `INSERT INTO cleanup_items(cleanup_id,project_id,run_id,state,version,owner,lease_until,fence,next_attempt_at,item,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT DO NOTHING`, item.CleanupID, item.ProjectID, item.RunID, item.State, item.VersionNumber, nullString(item.LeaseOwner), nullTime(item.LeaseUntil), item.FencingVersion, nullTime(item.NextAttemptAt), data, item.Digest); err != nil {
+			if item.ProjectID != authority.ProjectID {
+				return controlplane.ErrIntegrity
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO cleanup_items(organization_id,cleanup_id,project_id,run_id,state,version,owner,lease_until,fence,next_attempt_at,item,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`, authority.OrganizationID, item.CleanupID, authority.ProjectID, item.RunID, item.State, item.VersionNumber, nullString(item.LeaseOwner), nullTime(item.LeaseUntil), item.FencingVersion, nullTime(item.NextAttemptAt), data, item.Digest); err != nil {
 				return err
 			}
 		}
@@ -354,7 +374,7 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 					return controlplane.ErrIntegrity
 				}
 				data, _ := canonical(event)
-				if _, err := tx.Exec(ctx, `INSERT INTO cleanup_events(cleanup_id,event_id,event) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, id, event.ID, data); err != nil {
+				if _, err := tx.Exec(ctx, `INSERT INTO cleanup_events(organization_id,project_id,cleanup_id,event_id,event) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, id, event.ID, data); err != nil {
 					return err
 				}
 			}
@@ -363,7 +383,7 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 			if source != cursor.Source || cursor.Epoch == 0 || cursor.Digest == "" {
 				return controlplane.ErrIntegrity
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO cleanup_cursors(source,epoch,cursor,revision) VALUES($1,$2,$3,1) ON CONFLICT DO NOTHING`, source, cursor.Epoch, cursor.Value); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO cleanup_cursors(organization_id,project_id,source,epoch,cursor,revision) VALUES($1,$2,$3,$4,$5,1) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, source, cursor.Epoch, cursor.Value); err != nil {
 				return err
 			}
 		}
@@ -385,7 +405,10 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 				state = "bound"
 			}
 			data, _ := canonical(receipt)
-			if _, err := tx.Exec(ctx, `INSERT INTO cleanup_capacity_receipts(receipt_id,project_id,run_id,acquisition_key,state,receipt,digest) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, receipt.ID, receipt.ProjectID, receipt.RunID, receipt.AcquisitionKey, state, data, receipt.Digest); err != nil {
+			if receipt.ProjectID != authority.ProjectID {
+				return controlplane.ErrIntegrity
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO cleanup_capacity_receipts(organization_id,receipt_id,project_id,run_id,acquisition_key,state,receipt,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, authority.OrganizationID, receipt.ID, authority.ProjectID, receipt.RunID, receipt.AcquisitionKey, state, data, receipt.Digest); err != nil {
 				return err
 			}
 		}
@@ -395,7 +418,10 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 					return controlplane.ErrIntegrity
 				}
 				data, _ := canonical(event)
-				if _, err := tx.Exec(ctx, `INSERT INTO cleanup_capacity_events(project_id,event_id,receipt_id,event) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, project, event.ID, event.ReceiptID, data); err != nil {
+				if project != authority.ProjectID {
+					return controlplane.ErrIntegrity
+				}
+				if _, err := tx.Exec(ctx, `INSERT INTO cleanup_capacity_events(organization_id,project_id,event_id,receipt_id,event) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, event.ID, event.ReceiptID, data); err != nil {
 					return err
 				}
 			}
@@ -427,19 +453,22 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 			}
 			for handle, record := range latest {
 				data, _ := canonical(record)
-				if _, err := tx.Exec(ctx, `INSERT INTO correction_records(run_id,project_id,root_run_id,parent_run_id,revision,phase,record,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, handle, record.Link.PrincipalID, root, record.Link.ParentRunID, revisions[handle], record.Phase, data, digestBytes(data)); err != nil {
+				if record.Link.PrincipalID != authority.ProjectID {
+					return controlplane.ErrIntegrity
+				}
+				if _, err := tx.Exec(ctx, `INSERT INTO correction_records(organization_id,run_id,project_id,root_run_id,parent_run_id,revision,phase,record,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`, authority.OrganizationID, handle, authority.ProjectID, root, record.Link.ParentRunID, revisions[handle], record.Phase, data, digestBytes(data)); err != nil {
 					return err
 				}
 			}
 			for handle, position := range positions {
 				record := latest[handle]
-				if _, err := tx.Exec(ctx, `INSERT INTO correction_relations(root_run_id,parent_run_id,child_run_id,position) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, root, record.Link.ParentRunID, handle, position); err != nil {
+				if _, err := tx.Exec(ctx, `INSERT INTO correction_relations(organization_id,project_id,root_run_id,parent_run_id,child_run_id,position) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, root, record.Link.ParentRunID, handle, position); err != nil {
 					return err
 				}
 			}
 			for _, event := range events {
 				data, _ := canonical(event)
-				if _, err := tx.Exec(ctx, `INSERT INTO correction_events(root_run_id,sequence,run_id,event,digest) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, root, event.Sequence, event.Record.Link.Handle, data, digestBytes(data)); err != nil {
+				if _, err := tx.Exec(ctx, `INSERT INTO correction_events(organization_id,project_id,root_run_id,sequence,run_id,event,digest) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, root, event.Sequence, event.Record.Link.Handle, data, digestBytes(data)); err != nil {
 					return err
 				}
 			}
@@ -457,12 +486,12 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 				return controlplane.ErrIntegrity
 			}
 			data, _ := canonical(event)
-			if _, err := tx.Exec(ctx, `INSERT INTO github_import_events(source_id,sequence,event,digest) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, document.RelationKey, event.Sequence, data, digestBytes(data)); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO github_import_events(organization_id,project_id,source_id,sequence,event,digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, document.RelationKey, event.Sequence, data, digestBytes(data)); err != nil {
 				return err
 			}
 			if event.Delivery != nil {
 				receipt, _ := canonical(event.Delivery)
-				if _, err := tx.Exec(ctx, `INSERT INTO ingress_inbox(source,idempotency_key,request_digest,project_id,envelope,committed_at) VALUES('github',$1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, event.Delivery.DeliveryID, event.Delivery.PayloadSHA256, authority.ProjectID, receipt, event.At.UTC()); err != nil {
+				if _, err := tx.Exec(ctx, `INSERT INTO ingress_inbox(organization_id,source,idempotency_key,request_digest,project_id,envelope,committed_at) VALUES($1,'github',$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, authority.OrganizationID, event.Delivery.DeliveryID, event.Delivery.PayloadSHA256, authority.ProjectID, receipt, event.At.UTC()); err != nil {
 					return err
 				}
 			}
@@ -479,7 +508,7 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 			if authority == nil {
 				return controlplane.ErrIntegrity
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO packages(project_id,package_id,run_id,media_type,schema_version,artifact_digest,binding_digest,backend_epoch,backend_identity,document,digest,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING`, authority.ProjectID, item.PackageID, item.RunID, item.MediaType, item.SchemaVersion, item.ArtifactDigest, authority.BindingDigest, authority.Epoch, authority.BackendIdentity, item.Document, item.Digest, authority.CreatedAt); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO packages(organization_id,project_id,package_id,run_id,media_type,schema_version,artifact_digest,binding_digest,backend_epoch,backend_identity,document,digest,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT DO NOTHING`, authority.OrganizationID, authority.ProjectID, item.PackageID, item.RunID, item.MediaType, item.SchemaVersion, item.ArtifactDigest, authority.BindingDigest, authority.Epoch, authority.BackendIdentity, item.Document, item.Digest, authority.CreatedAt); err != nil {
 				return err
 			}
 		}
@@ -492,9 +521,9 @@ func materializeImportDocumentTx(ctx context.Context, tx pgx.Tx, document contro
 // importMaterializationAuthority binds filesystem-independent packages to the
 // exact PostgreSQL epoch that becomes active in the same cutover transaction.
 type importMaterializationAuthority struct {
-	ProjectID, BindingDigest, BackendIdentity string
-	Epoch                                     uint64
-	CreatedAt                                 time.Time
+	OrganizationID, ProjectID, BindingDigest, BackendIdentity string
+	Epoch                                                     uint64
+	CreatedAt                                                 time.Time
 }
 
 // validGitHubImportEvent rechecks every optional consumer payload before its
@@ -517,8 +546,11 @@ func validGitHubImportEvent(event githubpr.StoreEvent) bool {
 
 // approvalRevisionTerminalTx evaluates sanitized confirmed events in Go because
 // their canonical bytea representation is intentionally opaque to PostgreSQL.
-func approvalRevisionTerminalTx(ctx context.Context, tx pgx.Tx, runID string, revision uint64) (bool, error) {
-	rows, err := tx.Query(ctx, `SELECT event FROM approval_events WHERE run_id=$1 ORDER BY revision`, runID)
+func approvalRevisionTerminalTx(ctx context.Context, tx pgx.Tx, authority *importMaterializationAuthority, runID string, revision uint64) (bool, error) {
+	if authority == nil || authority.OrganizationID == "" || authority.ProjectID == "" {
+		return false, controlplane.ErrUnauthorized
+	}
+	rows, err := tx.Query(ctx, `SELECT event FROM approval_events WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 ORDER BY revision`, authority.OrganizationID, authority.ProjectID, runID)
 	if err != nil {
 		return false, err
 	}
@@ -710,6 +742,10 @@ func validApprovalRequestRelation(path string) bool {
 
 // VerifyImport recomputes counts, ordered bytes, relations and event streams before marking a candidate verified.
 func (store *Store) VerifyImport(ctx context.Context, importID string) (controlplane.ImportManifest, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return controlplane.ImportManifest{}, controlplane.ErrUnauthorized
+	}
 	var verified controlplane.ImportManifest
 	err := retryTransactionObserved(ctx, store.pool, store.maxTxAttempts, "import.verify", store.observer, func(tx pgx.Tx) error {
 		manifest, err := loadImportTx(ctx, tx, importID)
@@ -723,7 +759,7 @@ func (store *Store) VerifyImport(ctx context.Context, importID string) (controlp
 		if manifest.State != controlplane.ImportCandidate {
 			return controlplane.ErrConflict
 		}
-		rows, err := tx.Query(ctx, `SELECT stream_name,ordinal,relation_key,document,digest FROM import_streams WHERE import_id=$1 ORDER BY stream_name,ordinal`, importID)
+		rows, err := tx.Query(ctx, `SELECT stream_name,ordinal,relation_key,document,digest FROM import_streams WHERE organization_id=$1 AND project_id=$2 AND import_id=$3 ORDER BY stream_name,ordinal`, coordinate.OrganizationID, coordinate.ProjectID, importID)
 		if err != nil {
 			return err
 		}
@@ -758,7 +794,7 @@ func (store *Store) VerifyImport(ctx context.Context, importID string) (controlp
 			}
 		}
 		ordered := orderImportDocuments(streams)
-		verificationAuthority := &importMaterializationAuthority{ProjectID: manifest.ProjectID, BindingDigest: manifest.ExpectedHeadDigest, BackendIdentity: store.backendIdentity, Epoch: manifest.ExpectedEpoch + 1, CreatedAt: manifest.CreatedAt}
+		verificationAuthority := &importMaterializationAuthority{OrganizationID: manifest.OrganizationID, ProjectID: manifest.ProjectID, BindingDigest: manifest.ExpectedHeadDigest, BackendIdentity: store.backendIdentity, Epoch: manifest.ExpectedEpoch + 1, CreatedAt: manifest.CreatedAt}
 		if _, err = tx.Exec(ctx, `SAVEPOINT import_candidate_validation`); err != nil {
 			return err
 		}
@@ -768,7 +804,7 @@ func (store *Store) VerifyImport(ctx context.Context, importID string) (controlp
 			}
 		}
 		for _, item := range ordered {
-			if err = verifyMaterializedImportDocumentTx(ctx, tx, item); err != nil {
+			if err = verifyMaterializedImportDocumentTx(ctx, tx, item, verificationAuthority); err != nil {
 				return err
 			}
 		}
@@ -783,7 +819,7 @@ func (store *Store) VerifyImport(ctx context.Context, importID string) (controlp
 			return err
 		}
 		data, _ := canonical(next)
-		tag, err := tx.Exec(ctx, `UPDATE import_manifests SET document=$1,digest=$2,state=$3 WHERE import_id=$4 AND digest=$5`, data, next.Digest, next.State, importID, manifest.Digest)
+		tag, err := tx.Exec(ctx, `UPDATE import_manifests SET document=$1,digest=$2,state=$3 WHERE organization_id=$4 AND project_id=$5 AND import_id=$6 AND digest=$7`, data, next.Digest, next.State, coordinate.OrganizationID, coordinate.ProjectID, importID, manifest.Digest)
 		if err != nil || tag.RowsAffected() != 1 {
 			return controlplane.ErrConflict
 		}
@@ -861,8 +897,8 @@ func orderImportDocuments(streams map[string][]controlplane.ImportDocument) []co
 
 // verifyMaterializedImportDocumentTx compares staged typed bytes with the real
 // consumer projections and journals before a candidate can become verified.
-func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document controlplane.ImportDocument) error {
-	if validateImportRelation(document) != nil {
+func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document controlplane.ImportDocument, authority *importMaterializationAuthority) error {
+	if validateImportRelation(document) != nil || authority == nil || authority.OrganizationID == "" || authority.ProjectID == "" {
 		return controlplane.ErrIntegrity
 	}
 	path, _ := importRelationPath(document.RelationKey)
@@ -873,10 +909,10 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 			return controlplane.ErrIntegrity
 		}
 		var stored []byte
-		if err = tx.QueryRow(ctx, `SELECT record FROM workflow_runs WHERE handle=$1`, record.Handle).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(record)) {
+		if err = tx.QueryRow(ctx, `SELECT record FROM workflow_runs WHERE organization_id=$1 AND project_id=$2 AND handle=$3`, authority.OrganizationID, authority.ProjectID, record.Handle).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(record)) {
 			return controlplane.ErrIntegrity
 		}
-		rows, err := tx.Query(ctx, `SELECT event FROM workflow_events WHERE handle=$1 ORDER BY sequence`, record.Handle)
+		rows, err := tx.Query(ctx, `SELECT event FROM workflow_events WHERE organization_id=$1 AND project_id=$2 AND handle=$3 ORDER BY sequence`, authority.OrganizationID, authority.ProjectID, record.Handle)
 		if err != nil {
 			return err
 		}
@@ -897,7 +933,7 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 			return controlplane.ErrIntegrity
 		}
 		var stored []byte
-		if err := tx.QueryRow(ctx, `SELECT artifact FROM workflow_artifacts WHERE workflow_id=$1`, artifact.WorkflowID).Scan(&stored); err != nil || !bytes.Equal(stored, document.Document) {
+		if err := tx.QueryRow(ctx, `SELECT artifact FROM workflow_artifacts WHERE organization_id=$1 AND project_id=$2 AND workflow_id=$3`, authority.OrganizationID, authority.ProjectID, artifact.WorkflowID).Scan(&stored); err != nil || !bytes.Equal(stored, document.Document) {
 			return controlplane.ErrIntegrity
 		}
 	case "executables":
@@ -906,7 +942,7 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 			return controlplane.ErrIntegrity
 		}
 		var stored []byte
-		if err := tx.QueryRow(ctx, `SELECT material FROM workflow_executables WHERE workflow_id=$1`, material.WorkflowID).Scan(&stored); err != nil || !bytes.Equal(stored, document.Document) {
+		if err := tx.QueryRow(ctx, `SELECT material FROM workflow_executables WHERE organization_id=$1 AND project_id=$2 AND workflow_id=$3`, authority.OrganizationID, authority.ProjectID, material.WorkflowID).Scan(&stored); err != nil || !bytes.Equal(stored, document.Document) {
 			return controlplane.ErrIntegrity
 		}
 	case "functional":
@@ -916,19 +952,19 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 		}
 		for _, intent := range snapshot.Intents {
 			var stored []byte
-			if err := tx.QueryRow(ctx, `SELECT intent FROM functional_intents WHERE run_id=$1 AND revision=$2 AND step_id=$3`, intent.RunID, intent.Revision, intent.StepID).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(intent)) {
+			if err := tx.QueryRow(ctx, `SELECT intent FROM functional_intents WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5`, authority.OrganizationID, authority.ProjectID, intent.RunID, intent.Revision, intent.StepID).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(intent)) {
 				return controlplane.ErrIntegrity
 			}
 		}
 		for _, terminal := range snapshot.Terminals {
 			var stored []byte
-			if err := tx.QueryRow(ctx, `SELECT terminal FROM functional_terminals WHERE run_id=$1 AND revision=$2 AND step_id=$3`, terminal.RunID, terminal.Revision, terminal.StepID).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(terminal)) {
+			if err := tx.QueryRow(ctx, `SELECT terminal FROM functional_terminals WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4 AND step_id=$5`, authority.OrganizationID, authority.ProjectID, terminal.RunID, terminal.Revision, terminal.StepID).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(terminal)) {
 				return controlplane.ErrIntegrity
 			}
 		}
 		for _, event := range snapshot.Events {
 			var stored []byte
-			if err := tx.QueryRow(ctx, `SELECT event FROM functional_events WHERE run_id=$1 AND sequence=$2`, event.RunID, event.Sequence).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
+			if err := tx.QueryRow(ctx, `SELECT event FROM functional_events WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND sequence=$4`, authority.OrganizationID, authority.ProjectID, event.RunID, event.Sequence).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
 				return controlplane.ErrIntegrity
 			}
 		}
@@ -940,7 +976,7 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 			}
 			for _, event := range events {
 				var stored []byte
-				if err := tx.QueryRow(ctx, `SELECT event FROM approval_events WHERE run_id=$1 AND revision=$2`, event.RunID, event.Sequence).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
+				if err := tx.QueryRow(ctx, `SELECT event FROM approval_events WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4`, authority.OrganizationID, authority.ProjectID, event.RunID, event.Sequence).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
 					return controlplane.ErrIntegrity
 				}
 			}
@@ -953,7 +989,7 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 			}
 			var revision uint64
 			var digest string
-			if err := tx.QueryRow(ctx, `SELECT revision,digest FROM environment_records WHERE run_id=$1`, wrapper.Record.RunID).Scan(&revision, &digest); err != nil || revision < wrapper.Record.Revision || revision == wrapper.Record.Revision && digest != wrapper.Digest {
+			if err := tx.QueryRow(ctx, `SELECT revision,digest FROM environment_records WHERE organization_id=$1 AND project_id=$2 AND run_id=$3`, authority.OrganizationID, authority.ProjectID, wrapper.Record.RunID).Scan(&revision, &digest); err != nil || revision < wrapper.Record.Revision || revision == wrapper.Record.Revision && digest != wrapper.Digest {
 				return controlplane.ErrIntegrity
 			}
 		}
@@ -964,14 +1000,14 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 		}
 		for id, item := range snapshot.Items {
 			var stored []byte
-			if err := tx.QueryRow(ctx, `SELECT item FROM cleanup_items WHERE cleanup_id=$1`, id).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(item)) {
+			if err := tx.QueryRow(ctx, `SELECT item FROM cleanup_items WHERE organization_id=$1 AND project_id=$2 AND cleanup_id=$3`, authority.OrganizationID, authority.ProjectID, id).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(item)) {
 				return controlplane.ErrIntegrity
 			}
 		}
 		for id, events := range snapshot.Events {
 			for _, event := range events {
 				var stored []byte
-				if err := tx.QueryRow(ctx, `SELECT event FROM cleanup_events WHERE cleanup_id=$1 AND event_id=$2`, id, event.ID).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
+				if err := tx.QueryRow(ctx, `SELECT event FROM cleanup_events WHERE organization_id=$1 AND project_id=$2 AND cleanup_id=$3 AND event_id=$4`, authority.OrganizationID, authority.ProjectID, id, event.ID).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
 					return controlplane.ErrIntegrity
 				}
 			}
@@ -979,7 +1015,7 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 		for source, cursor := range snapshot.Cursors {
 			var epoch uint64
 			var value string
-			if err := tx.QueryRow(ctx, `SELECT epoch,cursor FROM cleanup_cursors WHERE source=$1`, source).Scan(&epoch, &value); err != nil || epoch != cursor.Epoch || value != cursor.Value {
+			if err := tx.QueryRow(ctx, `SELECT epoch,cursor FROM cleanup_cursors WHERE organization_id=$1 AND project_id=$2 AND source=$3`, authority.OrganizationID, authority.ProjectID, source).Scan(&epoch, &value); err != nil || epoch != cursor.Epoch || value != cursor.Value {
 				return controlplane.ErrIntegrity
 			}
 		}
@@ -990,14 +1026,14 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 		}
 		for id, receipt := range snapshot.Receipts {
 			var stored []byte
-			if err := tx.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE receipt_id=$1`, id).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(receipt)) {
+			if err := tx.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND receipt_id=$3`, authority.OrganizationID, authority.ProjectID, id).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(receipt)) {
 				return controlplane.ErrIntegrity
 			}
 		}
 		for project, events := range snapshot.Events {
 			for _, event := range events {
 				var stored []byte
-				if err := tx.QueryRow(ctx, `SELECT event FROM cleanup_capacity_events WHERE project_id=$1 AND event_id=$2`, project, event.ID).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
+				if project != authority.ProjectID || tx.QueryRow(ctx, `SELECT event FROM cleanup_capacity_events WHERE organization_id=$1 AND project_id=$2 AND event_id=$3`, authority.OrganizationID, authority.ProjectID, event.ID).Scan(&stored) != nil || !bytes.Equal(stored, mustCanonical(event)) {
 					return controlplane.ErrIntegrity
 				}
 			}
@@ -1010,7 +1046,7 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 		for root, events := range snapshot.Chains {
 			for _, event := range events {
 				var stored []byte
-				if err := tx.QueryRow(ctx, `SELECT event FROM correction_events WHERE root_run_id=$1 AND sequence=$2`, root, event.Sequence).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
+				if err := tx.QueryRow(ctx, `SELECT event FROM correction_events WHERE organization_id=$1 AND project_id=$2 AND root_run_id=$3 AND sequence=$4`, authority.OrganizationID, authority.ProjectID, root, event.Sequence).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
 					return controlplane.ErrIntegrity
 				}
 			}
@@ -1022,13 +1058,13 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 		}
 		for _, event := range snapshot.Events {
 			var stored []byte
-			if err := tx.QueryRow(ctx, `SELECT event FROM github_import_events WHERE source_id=$1 AND sequence=$2`, document.RelationKey, event.Sequence).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
+			if err := tx.QueryRow(ctx, `SELECT event FROM github_import_events WHERE organization_id=$1 AND project_id=$2 AND source_id=$3 AND sequence=$4`, authority.OrganizationID, authority.ProjectID, document.RelationKey, event.Sequence).Scan(&stored); err != nil || !bytes.Equal(stored, mustCanonical(event)) {
 				return controlplane.ErrIntegrity
 			}
 			if event.Delivery != nil {
 				var digest string
 				var envelope []byte
-				if err := tx.QueryRow(ctx, `SELECT request_digest,envelope FROM ingress_inbox WHERE source='github' AND idempotency_key=$1`, event.Delivery.DeliveryID).Scan(&digest, &envelope); err != nil || digest != event.Delivery.PayloadSHA256 || !bytes.Equal(envelope, mustCanonical(event.Delivery)) {
+				if err := tx.QueryRow(ctx, `SELECT request_digest,envelope FROM ingress_inbox WHERE organization_id=$1 AND project_id=$2 AND source='github' AND idempotency_key=$3`, authority.OrganizationID, authority.ProjectID, event.Delivery.DeliveryID).Scan(&digest, &envelope); err != nil || digest != event.Delivery.PayloadSHA256 || !bytes.Equal(envelope, mustCanonical(event.Delivery)) {
 					return controlplane.ErrIntegrity
 				}
 			}
@@ -1041,7 +1077,7 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 		for _, item := range snapshot.Items {
 			var runID, artifactDigest, digest string
 			var stored []byte
-			if item.Digest != digestBytes(item.Document) || tx.QueryRow(ctx, `SELECT run_id,artifact_digest,document,digest FROM packages WHERE package_id=$1`, item.PackageID).Scan(&runID, &artifactDigest, &stored, &digest) != nil || runID != item.RunID || artifactDigest != item.ArtifactDigest || digest != item.Digest || !bytes.Equal(stored, item.Document) {
+			if item.Digest != digestBytes(item.Document) || tx.QueryRow(ctx, `SELECT run_id,artifact_digest,document,digest FROM packages WHERE organization_id=$1 AND project_id=$2 AND package_id=$3`, authority.OrganizationID, authority.ProjectID, item.PackageID).Scan(&runID, &artifactDigest, &stored, &digest) != nil || runID != item.RunID || artifactDigest != item.ArtifactDigest || digest != item.Digest || !bytes.Equal(stored, item.Document) {
 				return controlplane.ErrIntegrity
 			}
 		}
@@ -1051,6 +1087,10 @@ func verifyMaterializedImportDocumentTx(ctx context.Context, tx pgx.Tx, document
 
 // AbandonImport marks a pre-cutover candidate inert so composition may safely unfreeze its unchanged local source.
 func (store *Store) AbandonImport(ctx context.Context, importID string) (controlplane.ImportManifest, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return controlplane.ImportManifest{}, controlplane.ErrUnauthorized
+	}
 	var abandoned controlplane.ImportManifest
 	err := retryTransactionObserved(ctx, store.pool, store.maxTxAttempts, "import.abandon", store.observer, func(tx pgx.Tx) error {
 		manifest, err := loadImportTx(ctx, tx, importID)
@@ -1066,7 +1106,7 @@ func (store *Store) AbandonImport(ctx context.Context, importID string) (control
 			return err
 		}
 		data, _ := canonical(next)
-		tag, err := tx.Exec(ctx, `UPDATE import_manifests SET document=$1,digest=$2,state=$3 WHERE import_id=$4 AND digest=$5`, data, next.Digest, next.State, importID, manifest.Digest)
+		tag, err := tx.Exec(ctx, `UPDATE import_manifests SET document=$1,digest=$2,state=$3 WHERE organization_id=$4 AND project_id=$5 AND import_id=$6 AND digest=$7`, data, next.Digest, next.State, coordinate.OrganizationID, coordinate.ProjectID, importID, manifest.Digest)
 		if err != nil || tag.RowsAffected() != 1 {
 			return controlplane.ErrConflict
 		}
@@ -1080,6 +1120,10 @@ func (store *Store) AbandonImport(ctx context.Context, importID string) (control
 func (store *Store) CutoverImport(ctx context.Context, importID string, now time.Time) (controlplane.ImportCutoverReceipt, error) {
 	if importID == "" || now.IsZero() {
 		return controlplane.ImportCutoverReceipt{}, controlplane.ErrInvalid
+	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return controlplane.ImportCutoverReceipt{}, controlplane.ErrUnauthorized
 	}
 	var receipt controlplane.ImportCutoverReceipt
 	err := retryTransactionObserved(ctx, store.pool, store.maxTxAttempts, "import.cutover", store.observer, func(tx pgx.Tx) error {
@@ -1097,7 +1141,7 @@ func (store *Store) CutoverImport(ctx context.Context, importID string, now time
 			return controlplane.ErrConflict
 		}
 		var headBytes, epochBytes []byte
-		if err = tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.run_id=$1 FOR UPDATE OF h`, manifest.RunID).Scan(&headBytes, &epochBytes); err != nil {
+		if err = tx.QueryRow(ctx, `SELECT h.document,e.document FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch WHERE h.organization_id=$1 AND h.project_id=$2 AND h.run_id=$3 FOR UPDATE OF h`, coordinate.OrganizationID, coordinate.ProjectID, manifest.RunID).Scan(&headBytes, &epochBytes); err != nil {
 			return err
 		}
 		var head controlplane.BindingHead
@@ -1108,46 +1152,46 @@ func (store *Store) CutoverImport(ctx context.Context, importID string, now time
 		if prior.Mode != controlplane.BackendLocal {
 			return controlplane.ErrConflict
 		}
-		next, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: head.RunID, ProjectID: head.ProjectID, Epoch: head.Epoch + 1, Mode: controlplane.BackendPostgres, BackendIdentity: store.backendIdentity, SchemaVersion: prior.SchemaVersion, CreatedAt: now, PreviousDigest: prior.Digest})
+		next, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: head.OrganizationID, RunID: head.RunID, ProjectID: head.ProjectID, Epoch: head.Epoch + 1, Mode: controlplane.BackendPostgres, BackendIdentity: store.backendIdentity, SchemaVersion: prior.SchemaVersion, CreatedAt: now, PreviousDigest: prior.Digest})
 		if err != nil {
 			return err
 		}
 		nextBytes, _ := canonical(next)
-		if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_epochs(run_id,project_id,epoch,document,digest) VALUES($1,$2,$3,$4,$5)`, next.RunID, next.ProjectID, next.Epoch, nextBytes, next.Digest); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_epochs(organization_id,run_id,project_id,epoch,document,digest) VALUES($1,$2,$3,$4,$5,$6)`, next.OrganizationID, next.RunID, next.ProjectID, next.Epoch, nextBytes, next.Digest); err != nil {
 			return err
 		}
 		documents, err := loadImportDocumentsTx(ctx, tx, importID)
 		if err != nil {
 			return err
 		}
-		authority := &importMaterializationAuthority{ProjectID: next.ProjectID, BindingDigest: next.Digest, BackendIdentity: next.BackendIdentity, Epoch: next.Epoch, CreatedAt: now}
+		authority := &importMaterializationAuthority{OrganizationID: next.OrganizationID, ProjectID: next.ProjectID, BindingDigest: next.Digest, BackendIdentity: next.BackendIdentity, Epoch: next.Epoch, CreatedAt: now}
 		for _, document := range documents {
 			if err = materializeImportDocumentTx(ctx, tx, document, authority); err != nil {
 				return err
 			}
 		}
 		for _, document := range documents {
-			if err = verifyMaterializedImportDocumentTx(ctx, tx, document); err != nil {
+			if err = verifyMaterializedImportDocumentTx(ctx, tx, document, authority); err != nil {
 				return err
 			}
 		}
-		newHead, err := controlplane.SealBindingHead(controlplane.BindingHead{RunID: head.RunID, ProjectID: head.ProjectID, Epoch: next.Epoch, EpochDigest: next.Digest, Revision: head.Revision + 2})
+		newHead, err := controlplane.SealBindingHead(controlplane.BindingHead{OrganizationID: head.OrganizationID, RunID: head.RunID, ProjectID: head.ProjectID, Epoch: next.Epoch, EpochDigest: next.Digest, Revision: head.Revision + 2})
 		if err != nil {
 			return err
 		}
 		newHeadBytes, _ := canonical(newHead)
-		tag, err := tx.Exec(ctx, `UPDATE backend_binding_heads SET epoch=$1,epoch_digest=$2,revision=$3,document=$4,digest=$5 WHERE run_id=$6 AND digest=$7`, newHead.Epoch, newHead.EpochDigest, newHead.Revision, newHeadBytes, newHead.Digest, newHead.RunID, head.Digest)
+		tag, err := tx.Exec(ctx, `UPDATE backend_binding_heads SET epoch=$1,epoch_digest=$2,revision=$3,document=$4,digest=$5 WHERE organization_id=$6 AND project_id=$7 AND run_id=$8 AND digest=$9`, newHead.Epoch, newHead.EpochDigest, newHead.Revision, newHeadBytes, newHead.Digest, coordinate.OrganizationID, coordinate.ProjectID, newHead.RunID, head.Digest)
 		if err != nil || tag.RowsAffected() != 1 {
 			return controlplane.ErrConflict
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_events(run_id,sequence,kind,epoch,occurred_at) VALUES($1,$2,'archived',$3,$4),($1,$5,'cutover',$6,$4)`, head.RunID, head.Revision+1, head.Epoch, now, head.Revision+2, next.Epoch); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO backend_binding_events(organization_id,project_id,run_id,sequence,kind,epoch,occurred_at) VALUES($1,$2,$3,$4,'archived',$5,$6),($1,$2,$3,$7,'cutover',$8,$6)`, coordinate.OrganizationID, coordinate.ProjectID, head.RunID, head.Revision+1, head.Epoch, now, head.Revision+2, next.Epoch); err != nil {
 			return err
 		}
-		receipt, err = controlplane.SealImportCutoverReceipt(controlplane.ImportCutoverReceipt{ImportID: importID, RunID: head.RunID, SourceHead: head.Digest, TargetHead: newHead.Digest, ArchivedEpoch: head.Epoch, ActiveEpoch: next.Epoch, CommittedAt: now})
+		receipt, err = controlplane.SealImportCutoverReceipt(controlplane.ImportCutoverReceipt{OrganizationID: coordinate.OrganizationID, ProjectID: coordinate.ProjectID, ImportID: importID, RunID: head.RunID, SourceHead: head.Digest, TargetHead: newHead.Digest, ArchivedEpoch: head.Epoch, ActiveEpoch: next.Epoch, CommittedAt: now})
 		if err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO import_cutover_receipts(import_id,run_id,source_head_digest,target_head_digest,archived_epoch,active_epoch,committed_at,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, receipt.ImportID, receipt.RunID, receipt.SourceHead, receipt.TargetHead, receipt.ArchivedEpoch, receipt.ActiveEpoch, receipt.CommittedAt, receipt.Digest); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO import_cutover_receipts(organization_id,project_id,import_id,run_id,source_head_digest,target_head_digest,archived_epoch,active_epoch,committed_at,digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, receipt.OrganizationID, receipt.ProjectID, receipt.ImportID, receipt.RunID, receipt.SourceHead, receipt.TargetHead, receipt.ArchivedEpoch, receipt.ActiveEpoch, receipt.CommittedAt, receipt.Digest); err != nil {
 			return err
 		}
 		cutover, err := controlplane.AdvanceImport(manifest, controlplane.ImportCutover)
@@ -1155,7 +1199,7 @@ func (store *Store) CutoverImport(ctx context.Context, importID string, now time
 			return err
 		}
 		data, _ := canonical(cutover)
-		_, err = tx.Exec(ctx, `UPDATE import_manifests SET document=$1,digest=$2,state=$3 WHERE import_id=$4 AND digest=$5`, data, cutover.Digest, cutover.State, importID, manifest.Digest)
+		_, err = tx.Exec(ctx, `UPDATE import_manifests SET document=$1,digest=$2,state=$3 WHERE organization_id=$4 AND project_id=$5 AND import_id=$6 AND digest=$7`, data, cutover.Digest, cutover.State, coordinate.OrganizationID, coordinate.ProjectID, importID, manifest.Digest)
 		return err
 	})
 	if err != nil {
@@ -1170,7 +1214,11 @@ func (store *Store) CutoverImport(ctx context.Context, importID string, now time
 // loadImportDocumentsTx returns the verified candidate in deterministic
 // dependency order so cutover can materialize it before publishing authority.
 func loadImportDocumentsTx(ctx context.Context, tx pgx.Tx, importID string) ([]controlplane.ImportDocument, error) {
-	rows, err := tx.Query(ctx, `SELECT stream_name,ordinal,relation_key,document,digest FROM import_streams WHERE import_id=$1 ORDER BY stream_name,ordinal`, importID)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, controlplane.ErrUnauthorized
+	}
+	rows, err := tx.Query(ctx, `SELECT stream_name,ordinal,relation_key,document,digest FROM import_streams WHERE organization_id=$1 AND project_id=$2 AND import_id=$3 ORDER BY stream_name,ordinal`, coordinate.OrganizationID, coordinate.ProjectID, importID)
 	if err != nil {
 		return nil, err
 	}
@@ -1205,8 +1253,12 @@ func (store *Store) LoadImportCutoverReceipt(ctx context.Context, importID strin
 func loadImportTx(ctx context.Context, tx interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, importID string) (controlplane.ImportManifest, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return controlplane.ImportManifest{}, controlplane.ErrUnauthorized
+	}
 	var data []byte
-	if err := tx.QueryRow(ctx, `SELECT document FROM import_manifests WHERE import_id=$1 FOR UPDATE`, importID).Scan(&data); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT document FROM import_manifests WHERE organization_id=$1 AND project_id=$2 AND import_id=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, importID).Scan(&data); err != nil {
 		return controlplane.ImportManifest{}, err
 	}
 	var manifest controlplane.ImportManifest
@@ -1215,7 +1267,7 @@ func loadImportTx(ctx context.Context, tx interface {
 	}
 	want := manifest.Digest
 	sealed, err := controlplane.SealImportManifest(manifest)
-	if err != nil || sealed.Digest != want {
+	if err != nil || sealed.Digest != want || sealed.OrganizationID != coordinate.OrganizationID || sealed.ProjectID != coordinate.ProjectID {
 		return controlplane.ImportManifest{}, controlplane.ErrIntegrity
 	}
 	return sealed, nil
@@ -1225,9 +1277,13 @@ func loadImportTx(ctx context.Context, tx interface {
 func loadImportReceiptTx(ctx context.Context, tx interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }, importID string) (controlplane.ImportCutoverReceipt, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return controlplane.ImportCutoverReceipt{}, controlplane.ErrUnauthorized
+	}
 	var value controlplane.ImportCutoverReceipt
 	var archivedEpoch, activeEpoch int64
-	if err := tx.QueryRow(ctx, `SELECT import_id,run_id,source_head_digest,target_head_digest,archived_epoch,active_epoch,committed_at,digest FROM import_cutover_receipts WHERE import_id=$1`, importID).Scan(&value.ImportID, &value.RunID, &value.SourceHead, &value.TargetHead, &archivedEpoch, &activeEpoch, &value.CommittedAt, &value.Digest); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT organization_id,project_id,import_id,run_id,source_head_digest,target_head_digest,archived_epoch,active_epoch,committed_at,digest FROM import_cutover_receipts WHERE organization_id=$1 AND project_id=$2 AND import_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, importID).Scan(&value.OrganizationID, &value.ProjectID, &value.ImportID, &value.RunID, &value.SourceHead, &value.TargetHead, &archivedEpoch, &activeEpoch, &value.CommittedAt, &value.Digest); err != nil {
 		return controlplane.ImportCutoverReceipt{}, err
 	}
 	if archivedEpoch <= 0 || activeEpoch <= 0 {
@@ -1259,8 +1315,12 @@ func postgresImportDigest(documents []controlplane.ImportDocument, relations boo
 
 // LoadImport strictly reloads one offline candidate without granting authority.
 func (store *Store) LoadImport(ctx context.Context, id string) (controlplane.ImportManifest, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return controlplane.ImportManifest{}, controlplane.ErrNotFound
+	}
 	var data []byte
-	if err := store.pool.QueryRow(ctx, `SELECT document FROM import_manifests WHERE import_id=$1`, id).Scan(&data); err == pgx.ErrNoRows {
+	if err := store.pool.QueryRow(ctx, `SELECT document FROM import_manifests WHERE organization_id=$1 AND project_id=$2 AND import_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, id).Scan(&data); err == pgx.ErrNoRows {
 		return controlplane.ImportManifest{}, controlplane.ErrNotFound
 	} else if err != nil {
 		return controlplane.ImportManifest{}, mapError(err)
@@ -1271,7 +1331,7 @@ func (store *Store) LoadImport(ctx context.Context, id string) (controlplane.Imp
 	}
 	expected := value.Digest
 	sealed, err := controlplane.SealImportManifest(value)
-	if err != nil || expected != sealed.Digest {
+	if err != nil || expected != sealed.Digest || sealed.OrganizationID != coordinate.OrganizationID || sealed.ProjectID != coordinate.ProjectID {
 		return controlplane.ImportManifest{}, controlplane.ErrIntegrity
 	}
 	return sealed, nil
@@ -1279,27 +1339,34 @@ func (store *Store) LoadImport(ctx context.Context, id string) (controlplane.Imp
 
 // DeleteTerminalBefore summarizes and removes one locked terminal-time page while preserving live references and tombstones.
 func (store *Store) DeleteTerminalBefore(ctx context.Context, beforeUnix int64, limit int) (int, error) {
-	return store.deleteTerminalBefore(ctx, "", beforeUnix, limit)
+	if beforeUnix <= 0 || limit <= 0 || limit > 1000 {
+		return 0, controlplane.ErrInvalid
+	}
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok {
+		return 0, controlplane.ErrUnauthorized
+	}
+	return store.deleteTerminalBefore(ctx, controlplane.ProjectScope{OrganizationID: coordinate.OrganizationID, ProjectID: coordinate.ProjectID}, beforeUnix, limit)
 }
 
 // DeleteProjectTerminalBefore summarizes and removes one authenticated
 // project's locked terminal-time page without observing unrelated projects.
-func (store *Store) DeleteProjectTerminalBefore(ctx context.Context, projectID string, beforeUnix int64, limit int) (int, error) {
-	if !controlplane.SafeID(projectID) {
+func (store *Store) DeleteProjectTerminalBefore(ctx context.Context, scope controlplane.ProjectScope, beforeUnix int64, limit int) (int, error) {
+	if scope.Validate() != nil {
 		return 0, controlplane.ErrInvalid
 	}
-	return store.deleteTerminalBefore(ctx, projectID, beforeUnix, limit)
+	return store.deleteTerminalBefore(ctx, scope, beforeUnix, limit)
 }
 
-// deleteTerminalBefore implements the shared global maintenance and
-// project-scoped controller transaction while keeping the SQL parameterized.
-func (store *Store) deleteTerminalBefore(ctx context.Context, projectID string, beforeUnix int64, limit int) (int, error) {
+// deleteTerminalBefore implements the project-scoped controller transaction
+// while keeping terminal retention SQL parameterized and tenant fenced.
+func (store *Store) deleteTerminalBefore(ctx context.Context, scope controlplane.ProjectScope, beforeUnix int64, limit int) (int, error) {
 	if beforeUnix <= 0 || limit <= 0 || limit > 1000 {
 		return 0, controlplane.ErrInvalid
 	}
 	var deleted int64
 	err := retryTransactionObserved(ctx, store.pool, store.maxTxAttempts, "retention.delete_page", store.observer, func(tx pgx.Tx) error {
-		rows, queryErr := tx.Query(ctx, `SELECT j.project_id,j.job_id,j.terminal_at,j.state,j.digest FROM jobs j WHERE ($1='' OR j.project_id=$1) AND j.terminal_at<$2 AND NOT EXISTS (SELECT 1 FROM retention_references r WHERE r.project_id=j.project_id AND r.job_id=j.job_id AND r.live) AND NOT EXISTS (SELECT 1 FROM effect_intents e WHERE e.run_id=j.run_id AND e.state<>'confirmed') AND NOT EXISTS (SELECT 1 FROM authority_envelopes a WHERE a.job_id=j.job_id) ORDER BY j.terminal_at,j.job_id FOR UPDATE OF j SKIP LOCKED LIMIT $3`, projectID, time.Unix(beforeUnix, 0).UTC(), limit)
+		rows, queryErr := tx.Query(ctx, `SELECT j.project_id,j.job_id,j.terminal_at,j.state,j.digest FROM jobs j WHERE j.organization_id=$1 AND j.project_id=$2 AND j.terminal_at<$3 AND NOT EXISTS (SELECT 1 FROM retention_references r WHERE r.organization_id=j.organization_id AND r.project_id=j.project_id AND r.job_id=j.job_id AND r.live) AND NOT EXISTS (SELECT 1 FROM effect_intents e WHERE e.organization_id=j.organization_id AND e.project_id=j.project_id AND e.run_id=j.run_id AND e.state<>'confirmed') AND NOT EXISTS (SELECT 1 FROM authority_envelopes a WHERE a.organization_id=j.organization_id AND a.project_id=j.project_id AND a.job_id=j.job_id) ORDER BY j.terminal_at,j.job_id FOR UPDATE OF j SKIP LOCKED LIMIT $4`, scope.OrganizationID, scope.ProjectID, time.Unix(beforeUnix, 0).UTC(), limit)
 		if queryErr != nil {
 			return queryErr
 		}
@@ -1321,10 +1388,10 @@ func (store *Store) deleteTerminalBefore(ctx context.Context, projectID string, 
 			return rows.Err()
 		}
 		for _, item := range summaries {
-			if _, insertErr := tx.Exec(ctx, `INSERT INTO retention_summaries(project_id,job_id,terminal_at,state,digest) VALUES($1,$2,$3,$4,$5) ON CONFLICT(job_id,project_id) DO NOTHING`, item.projectID, item.jobID, item.terminalAt, item.state, item.digest); insertErr != nil {
+			if _, insertErr := tx.Exec(ctx, `INSERT INTO retention_summaries(organization_id,project_id,job_id,terminal_at,state,digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(organization_id,project_id,job_id) DO NOTHING`, scope.OrganizationID, item.projectID, item.jobID, item.terminalAt, item.state, item.digest); insertErr != nil {
 				return insertErr
 			}
-			if _, deleteErr := tx.Exec(ctx, `DELETE FROM jobs WHERE project_id=$1 AND job_id=$2 AND terminal_at=$3`, item.projectID, item.jobID, item.terminalAt); deleteErr != nil {
+			if _, deleteErr := tx.Exec(ctx, `DELETE FROM jobs WHERE organization_id=$1 AND project_id=$2 AND job_id=$3 AND terminal_at=$4`, scope.OrganizationID, item.projectID, item.jobID, item.terminalAt); deleteErr != nil {
 				return deleteErr
 			}
 		}

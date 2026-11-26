@@ -114,7 +114,7 @@ func TestRestoreDoesNotHoldBudgetMutexDuringModelSnapshot(t *testing.T) {
 	}()
 	select {
 	case <-modelBudget.entered:
-	case <-time.After(time.Second):
+	case <-t.Context().Done():
 		t.Fatal("model snapshot was not invoked")
 	}
 	stateLockFree := b.mu.TryLock()

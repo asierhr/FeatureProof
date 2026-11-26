@@ -51,6 +51,10 @@ type RuntimeDependencies struct {
 	Clock       Clock
 	Jitter      Jitter
 	IDs         IDSource
+	// ProductAuthorize revalidates tenant membership/security head for every admitted webhook command.
+	ProductAuthorize func(context.Context, ProductIdentity) error
+	// ProductWorkerAuthorize derives tenant identity only from the persisted live worker envelope.
+	ProductWorkerAuthorize func(context.Context, WorkerIdentity) error
 	// Review receives only commands authenticated and translated by the webhook boundary.
 	Review func(context.Context, WebhookCommand) (string, error)
 	// ReviewOwner transfers lifecycle ownership of the review service into the composed runtime.
@@ -72,8 +76,25 @@ type RuntimeDependencies struct {
 	ControlPlaneDomains interface {
 		Ready(context.Context) error
 	}
-	// ControlPlaneProjectID and ControlPlaneWorkerID bind scheduler claims to composition-owned identities.
-	ControlPlaneProjectID, ControlPlaneWorkerID string
+	// ControlPlaneOrganizationID, ControlPlaneProjectID and ControlPlaneWorkerID bind scheduler claims to composition-owned identities.
+	ControlPlaneOrganizationID, ControlPlaneProjectID, ControlPlaneWorkerID string
+}
+
+// ProductIdentity carries only fields authenticated by the signed webhook or
+// refreshed GitHub observation; it is never decoded from workflow arguments.
+type ProductIdentity struct {
+	InstallationID int64
+	RepositoryID   int64
+	ActorID        int64
+}
+
+// WorkerIdentity is the minimal authenticated service identity sealed by the
+// durable authority envelope before private secrets or product code.
+type WorkerIdentity struct {
+	OrganizationID string
+	ProjectID      string
+	WorkerID       string
+	Fence          uint64
 }
 
 // ControlPlaneEffectRequest carries durable operation identity and ephemeral credentials to exactly one effect boundary.
@@ -141,7 +162,11 @@ func ComposeRuntime(ctx context.Context, config ProductionConfig, secrets Compos
 		}
 		retry := RetryPolicy{Config: RetryConfig{MaxAttempts: config.MaxAttempts, MaxDuration: config.RetryMaxDuration, MaxWait: config.RetryMaxWait, InitialBackoff: config.RetryInitialBackoff, MaxBackoff: config.RetryMaxBackoff}, Clock: deps.Clock, Jitter: deps.Jitter}
 		publisher := Publisher{GitHub: adapter, Store: store, Retry: retry, AppID: config.AppID, BotID: config.BotID, MaxPages: config.MaxPages, Owner: owner, Clock: deps.Clock, LeaseTTL: config.LeaseTTL}
-		coordinator, err = NewCoordinator(ctx, CoordinatorDependencies{GitHub: adapter, Authorizer: StaticAuthorizer{Config: config.Authorization}, Validation: deps.Validation, Store: store, Publisher: publisher, Projector: Projector{Packages: deps.Packages, Links: linker, MaxItems: 50, MaxSummary: 60000}, Retry: retry, IDs: deps.IDs, Clock: deps.Clock, Owner: owner, RunTimeout: config.RunTimeout, CloseTimeout: config.CloseTimeout, LeaseTTL: config.LeaseTTL, PollInterval: config.PollInterval})
+		authorizer := Authorizer(StaticAuthorizer{Config: config.Authorization})
+		if deps.ProductAuthorize != nil {
+			authorizer = productTenantAuthorizer{next: authorizer, authorize: deps.ProductAuthorize}
+		}
+		coordinator, err = NewCoordinator(ctx, CoordinatorDependencies{GitHub: adapter, Authorizer: authorizer, Validation: deps.Validation, Store: store, Publisher: publisher, Projector: Projector{Packages: deps.Packages, Links: linker, MaxItems: 50, MaxSummary: 60000}, Retry: retry, IDs: deps.IDs, Clock: deps.Clock, Owner: owner, RunTimeout: config.RunTimeout, CloseTimeout: config.CloseTimeout, LeaseTTL: config.LeaseTTL, PollInterval: config.PollInterval})
 		if err != nil {
 			return nil, err
 		}
@@ -154,14 +179,20 @@ func ComposeRuntime(ctx context.Context, config ProductionConfig, secrets Compos
 			return nil, &Error{Code: CodeInvalid, Operation: "control_plane"}
 		}
 		admission = func(admissionContext context.Context, command WebhookCommand) (controlplane.IngressAdmission, error) {
+			if deps.ProductAuthorize != nil {
+				identity := ProductIdentity{InstallationID: command.InstallationID, RepositoryID: command.RepositoryID, ActorID: command.ActorID}
+				if authorizeErr := deps.ProductAuthorize(admissionContext, identity); authorizeErr != nil {
+					return controlplane.IngressAdmission{}, &Error{Code: CodeUnauthorized, Operation: "tenant_authorize"}
+				}
+			}
 			if !webhookCommandInScope(config.Authorization, command) {
 				return controlplane.IngressAdmission{}, &Error{Code: CodeUnauthorized, Operation: "control_plane_scope"}
 			}
 			return deps.ControlPlaneAdmission(admissionContext, command)
 		}
 		productHandler := controlPlaneJobHandler{reader: reader, outbox: deps.ControlPlaneOutbox, effect: deps.ControlPlaneEffect, clock: deps.Clock, waiter: deps.Clock, owner: deps.ControlPlaneWorkerID + "-outbox"}
-		workerHandler := authorizedControlPlaneJobHandler{authority: deps.ControlPlaneAuthority, secrets: deps.ControlPlaneSecrets, clock: deps.Clock, next: productHandler}
-		scheduler, schedulerErr := controlplane.NewScheduler(deps.ControlPlaneQueue, deps.Clock, deps.Clock, workerHandler, controlPlaneErrorClassifier{}, controlplane.SchedulerConfig{ProjectID: deps.ControlPlaneProjectID, WorkerID: deps.ControlPlaneWorkerID, Lease: 2 * time.Minute, HeartbeatInterval: 30 * time.Second, BatchSize: 8, IdleWait: config.PollInterval})
+		workerHandler := authorizedControlPlaneJobHandler{authority: deps.ControlPlaneAuthority, secrets: deps.ControlPlaneSecrets, clock: deps.Clock, authorize: deps.ProductWorkerAuthorize, next: productHandler}
+		scheduler, schedulerErr := controlplane.NewScheduler(deps.ControlPlaneQueue, deps.Clock, deps.Clock, workerHandler, controlPlaneErrorClassifier{}, controlplane.SchedulerConfig{Scope: controlplane.ProjectScope{OrganizationID: deps.ControlPlaneOrganizationID, ProjectID: deps.ControlPlaneProjectID}, WorkerID: deps.ControlPlaneWorkerID, Lease: 2 * time.Minute, HeartbeatInterval: 30 * time.Second, BatchSize: 8, IdleWait: config.PollInterval})
 		if schedulerErr != nil {
 			return nil, &Error{Code: CodeInvalid, Operation: "control_plane_worker"}
 		}
@@ -178,6 +209,21 @@ func ComposeRuntime(ctx context.Context, config ProductionConfig, secrets Compos
 	committed = true
 	controlPlane, _ := deps.ControlPlane.(interface{ Close() })
 	return &Runtime{handler: handler, coordinator: coordinator, validation: deps.Validation, reviewOwner: owned, controlPlane: controlPlane, worker: worker, closeTimeout: config.CloseTimeout}, nil
+}
+
+// productTenantAuthorizer revalidates tenant authority before GitHub's refreshed PR/actor policy.
+type productTenantAuthorizer struct {
+	next      Authorizer
+	authorize func(context.Context, ProductIdentity) error
+}
+
+// Authorize denies before selection lookup when live tenant authority changed.
+func (authorizer productTenantAuthorizer) Authorize(ctx context.Context, snapshot PullRequestSnapshot, actor int64, alias string) (Selection, error) {
+	identity := ProductIdentity{InstallationID: snapshot.InstallationID, RepositoryID: snapshot.RepositoryID, ActorID: actor}
+	if err := authorizer.authorize(ctx, identity); err != nil {
+		return Selection{}, &Error{Code: CodeUnauthorized, Operation: "tenant_authorize"}
+	}
+	return authorizer.next.Authorize(ctx, snapshot, actor, alias)
 }
 
 // Start launches optional distributed workers only when called by executable composition.
@@ -232,7 +278,8 @@ type controlPlaneJobHandler struct {
 
 // HandleAuthorized reconstructs one authenticated command and executes it only under an outbox claim using the JIT capability.
 func (handler controlPlaneJobHandler) HandleAuthorized(ctx context.Context, job controlplane.Job, secrets map[string]string) error {
-	admission, err := handler.reader.LoadIngress(ctx, job.RunID)
+	scope := controlplane.ProjectScope{OrganizationID: job.OrganizationID, ProjectID: job.ProjectID}
+	admission, err := handler.reader.LoadIngress(ctx, scope, job.RunID)
 	if err != nil {
 		return err
 	}
@@ -241,11 +288,11 @@ func (handler controlPlaneJobHandler) HandleAuthorized(ctx context.Context, job 
 		return err
 	}
 	now := handler.clock.Now().UTC()
-	if _, err = handler.outbox.RecoverOutbox(ctx, now, 8); err != nil {
+	if _, err = handler.outbox.RecoverOutbox(ctx, scope, now, 8); err != nil {
 		return err
 	}
 	operationID := job.JobID + "-dispatch"
-	claim, err := handler.outbox.ClaimEffect(ctx, operationID, handler.owner, now, time.Minute)
+	claim, err := handler.outbox.ClaimEffect(ctx, scope, operationID, handler.owner, now, time.Minute)
 	if err != nil {
 		return err
 	}
@@ -340,6 +387,7 @@ type authorizedControlPlaneJobHandler struct {
 	authority controlplane.AuthorityEnvelopeStore
 	secrets   controlplane.SecretResolver
 	clock     controlplane.Clock
+	authorize func(context.Context, WorkerIdentity) error
 	next      interface {
 		HandleAuthorized(context.Context, controlplane.Job, map[string]string) error
 	}
@@ -356,6 +404,12 @@ func (handler authorizedControlPlaneJobHandler) Handle(ctx context.Context, job 
 	if err != nil || handler.authority.SaveAuthority(ctx, envelope, job, job.Owner, now) != nil {
 		return &Error{Code: CodeUnauthorized, Operation: "worker_authority"}
 	}
+	if handler.authorize != nil {
+		identity := WorkerIdentity{OrganizationID: envelope.OrganizationID, ProjectID: envelope.ProjectID, WorkerID: envelope.WorkerID, Fence: envelope.Fence}
+		if err = handler.authorize(ctx, identity); err != nil {
+			return &Error{Code: CodeUnauthorized, Operation: "worker_tenant_authorize"}
+		}
+	}
 	resolved := map[string]string{}
 	if len(envelope.SecretReferenceIDs) > 0 {
 		if resolved, err = controlplane.ResolvePersistedSecrets(ctx, handler.authority, envelope, job.Owner, now, handler.secrets); err != nil {
@@ -363,7 +417,11 @@ func (handler authorizedControlPlaneJobHandler) Handle(ctx context.Context, job 
 		}
 	}
 	defer clearResolvedSecrets(resolved)
-	return handler.next.HandleAuthorized(ctx, job, resolved)
+	// The persisted live envelope is the sealed tenant capability presented to
+	// product stores; a consumer may replace its run coordinate only after an
+	// atomic bound read under the same organization and project.
+	productContext := controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: envelope.OrganizationID, ProjectID: envelope.ProjectID, RunID: envelope.RunID, Epoch: envelope.BackendEpoch, BindingDigest: envelope.BindingDigest, Owner: envelope.WorkerID, Fence: envelope.Fence, LeaseUntil: envelope.ExpiresAt})
+	return handler.next.HandleAuthorized(productContext, job, resolved)
 }
 
 // controlPlaneErrorClassifier maps safe GitHub categories to bounded durable retry decisions.

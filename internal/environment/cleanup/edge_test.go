@@ -637,7 +637,7 @@ func TestCleanupUsesStableIdentityAndConfirmsAbsenceIdempotently(t *testing.T) {
 	if page.Items[0].State != StateCapacityReleased || life.releaseCalls != 1 {
 		t.Fatalf("item=%#v calls=%d", page.Items[0], life.releaseCalls)
 	}
-	usage, _ := ledger.Snapshot("project")
+	usage, _ := ledger.Snapshot(context.Background(), "project")
 	if usage.Reserved.Environments != 0 {
 		t.Fatal("capacity not released")
 	}
@@ -1099,7 +1099,7 @@ func TestInventoryDiscoveryAdoptsOnlyAfterGraceAndBothAbsences(t *testing.T) {
 	if len(page.Items) != 1 || page.Items[0].State != StateCapacityReleased || inventory.calls != 1 || authority.lifecycleCalls != 1 || authority.runCalls != 1 {
 		t.Fatalf("adoption=%#v cleanup=%d checks=%d/%d", page, inventory.calls, authority.lifecycleCalls, authority.runCalls)
 	}
-	usage, _ := controller.deps.Ledger.Snapshot(item.ProjectID)
+	usage, _ := controller.deps.Ledger.Snapshot(context.Background(), item.ProjectID)
 	if usage.Reserved.Environments != 0 || usage.Unknown {
 		t.Fatalf("orphan capacity was not released after confirmed absence: %#v", usage)
 	}
@@ -1397,7 +1397,7 @@ func TestCapacityLedgerReopensImmutableReceipts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, _ := reopened.Snapshot("project")
+	snapshot, _ := reopened.Snapshot(context.Background(), "project")
 	if snapshot.Reserved.Environments != 1 {
 		t.Fatalf("snapshot=%#v", snapshot)
 	}
@@ -1406,7 +1406,7 @@ func TestCapacityLedgerReopensImmutableReceipts(t *testing.T) {
 		t.Fatalf("release=%v %v", changed, err)
 	}
 	again, _ := OpenCapacityLedger(path)
-	snapshot, _ = again.Snapshot("project")
+	snapshot, _ = again.Snapshot(context.Background(), "project")
 	if snapshot.Reserved.Environments != 0 {
 		t.Fatalf("released snapshot=%#v", snapshot)
 	}

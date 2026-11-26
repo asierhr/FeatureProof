@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,9 +36,269 @@ import (
 	"github.com/asierhr/featureProof/internal/planapproval"
 	"github.com/asierhr/featureProof/internal/planmanifest"
 	"github.com/asierhr/featureProof/internal/planning"
+	"github.com/asierhr/featureProof/internal/projectconfig"
 	"github.com/asierhr/featureProof/internal/revisionbinding"
 	"github.com/asierhr/featureProof/internal/specification"
 )
+
+// TestTenantAdmissionReceivesActualHandleAndBlocksWorkflowMutation proves the
+// productive service cannot substitute idempotency/payload IDs for the run and
+// that a tenant failure leaves only a non-runnable workflow intent which a
+// replay reconciles against the original handle before effects.
+func TestTenantAdmissionReceivesActualHandleAndBlocksWorkflowMutation(t *testing.T) {
+	service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+	recorder := &recordingTenantAdmission{}
+	service.deps.TenantAdmission = recorder
+	view, err := service.Start(context.Background(), validCommand())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorder.calls != 1 || recorder.confirms != 1 || recorder.runID != view.Handle || recorder.binding.RunID != view.Handle || recorder.binding.EffectiveDigest == "" {
+		t.Fatalf("tenant admission calls=%d run=%q view=%q binding=%+v", recorder.calls, recorder.runID, view.Handle, recorder.binding)
+	}
+
+	blocked, _, blockedExecution, blockedStore, _ := workflowFixture(t, validPlanResponse())
+	denial := errors.New("tenant admission unavailable")
+	blockedAdmission := &recordingTenantAdmission{prepareErr: denial}
+	blocked.deps.TenantAdmission = blockedAdmission
+	if _, err = blocked.Start(context.Background(), validCommand()); err == nil {
+		t.Fatal("tenant admission failure did not stop workflow")
+	}
+	if _, loadErr := blockedStore.Load(context.Background(), "workflow-1"); !errors.Is(loadErr, ErrNotFound) || blockedExecution.calls != 0 {
+		t.Fatalf("workflow crossed failed tenant prepare: execution=%d err=%v", blockedExecution.calls, loadErr)
+	}
+	blockedAdmission.prepareErr = nil
+	view, err = blocked.Start(context.Background(), validCommand())
+	if err != nil || view.Handle != "workflow-2" || blockedAdmission.runID != "workflow-2" || blockedAdmission.calls != 2 || blockedAdmission.confirms != 1 {
+		t.Fatalf("reconciliation view=%+v admission=%+v err=%v", view, blockedAdmission, err)
+	}
+}
+
+// TestTenantAdmissionCrashBoundariesReconcileOnFreshService proves an orphan
+// intent is aborted after a pre-reserve crash and a committed workflow whose
+// confirm response was lost is confirmed before recovery claims any work.
+func TestTenantAdmissionCrashBoundariesReconcileOnFreshService(t *testing.T) {
+	service, _, _, durable, clock := workflowFixture(t, validPlanResponse())
+	admission := &recoverableTenantAdmission{}
+	faults := &reserveFaultStore{WorkflowStore: durable, remaining: 1}
+	service.deps.Store = faults
+	service.deps.TenantAdmission = admission
+	if _, err := service.Start(t.Context(), validCommand()); err == nil {
+		t.Fatal("reserve interruption did not fail start")
+	}
+	if _, err := durable.Load(t.Context(), "workflow-1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("workflow committed after reserve interruption: %v", err)
+	}
+	restartedDeps := service.deps
+	restartedDeps.Store = durable
+	restartedDeps.Owner = "restarted-owner"
+	restarted, err := NewService(service.config, restartedDeps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = restarted.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !admission.aborted["workflow-1"] || admission.queued["workflow-1"] {
+		t.Fatalf("orphan intent not aborted: aborted=%v queued=%v", admission.aborted, admission.queued)
+	}
+
+	// A lost confirmation occurs after both the tenant intent and workflow
+	// record are durable. A fresh service must confirm before claiming it.
+	service, _, execution, durable, clock := workflowFixture(t, validPlanResponse())
+	admission = &recoverableTenantAdmission{confirmErr: errors.New("confirmation response lost")}
+	service.deps.TenantAdmission = admission
+	if _, err = service.Start(t.Context(), validCommand()); err == nil {
+		t.Fatal("lost confirmation did not stop start")
+	}
+	record, err := durable.Load(t.Context(), "workflow-1")
+	if err != nil || record.Phase != PhaseAdmitted || record.TenantAdmissionAuthority != "authority-second-principal-workflow-1" || execution.calls != 0 {
+		t.Fatalf("unexpected pre-recovery record=%+v calls=%d err=%v", record, execution.calls, err)
+	}
+	admission.confirmErr = nil
+	clock.advance(2 * service.config.LeaseTTL)
+	restartedDeps = service.deps
+	restartedDeps.Owner = "restarted-owner"
+	restarted, err = NewService(service.config, restartedDeps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = restarted.Recover(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !admission.queued["workflow-1"] {
+		t.Fatal("recovery claimed workflow before tenant confirmation")
+	}
+	recovered, err := durable.Load(t.Context(), "workflow-1")
+	if err != nil || recovered.Phase != PhaseTerminal {
+		t.Fatalf("workflow did not converge after tenant reconciliation: %+v err=%v", recovered, err)
+	}
+}
+
+// TestLegacyTenantAdmissionRecoveryConvergesBothCrashWindows proves adapters
+// implementing the pre-historical recovery contract still abort orphan intents
+// and confirm committed workflows before a restarted owner can claim work.
+func TestLegacyTenantAdmissionRecoveryConvergesBothCrashWindows(t *testing.T) {
+	t.Run("orphan intent", func(t *testing.T) {
+		service, _, _, durable, _ := workflowFixture(t, validPlanResponse())
+		state := &recoverableTenantAdmission{}
+		service.deps.TenantAdmission = legacyRecoverableTenantAdmission{state: state}
+		service.deps.Store = &reserveFaultStore{WorkflowStore: durable, remaining: 1}
+		if _, err := service.Start(t.Context(), validCommand()); err == nil {
+			t.Fatal("reserve interruption did not fail start")
+		}
+		restartedDeps := service.deps
+		restartedDeps.Store = durable
+		restartedDeps.Owner = "legacy-restarted-owner"
+		restarted, err := NewService(service.config, restartedDeps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = restarted.Recover(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if !state.aborted["workflow-1"] || state.queued["workflow-1"] {
+			t.Fatalf("legacy orphan was not aborted: aborted=%v queued=%v", state.aborted, state.queued)
+		}
+	})
+
+	t.Run("committed workflow", func(t *testing.T) {
+		service, _, execution, durable, clock := workflowFixture(t, validPlanResponse())
+		state := &recoverableTenantAdmission{confirmErr: errors.New("confirmation response lost")}
+		service.deps.TenantAdmission = legacyRecoverableTenantAdmission{state: state}
+		if _, err := service.Start(t.Context(), validCommand()); err == nil {
+			t.Fatal("lost confirmation did not stop start")
+		}
+		if record, err := durable.Load(t.Context(), "workflow-1"); err != nil || record.Phase != PhaseAdmitted || execution.calls != 0 {
+			t.Fatalf("unexpected committed record=%+v calls=%d err=%v", record, execution.calls, err)
+		}
+		state.confirmErr = nil
+		clock.advance(2 * service.config.LeaseTTL)
+		restartedDeps := service.deps
+		restartedDeps.Owner = "legacy-restarted-owner"
+		restarted, err := NewService(service.config, restartedDeps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = restarted.Recover(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if !state.queued["workflow-1"] {
+			t.Fatal("legacy recovery claimed workflow before confirmation")
+		}
+		if record, err := durable.Load(t.Context(), "workflow-1"); err != nil || record.Phase != PhaseTerminal {
+			t.Fatalf("legacy workflow did not converge: %+v err=%v", record, err)
+		}
+	})
+}
+
+// TestTenantAdmissionRecoveryPropagatesEveryAuthorityFailure proves restart
+// cannot skip discovery, orphan cleanup or historical/legacy confirmation when
+// the tenant boundary rejects one of those operations.
+func TestTenantAdmissionRecoveryPropagatesEveryAuthorityFailure(t *testing.T) {
+	t.Run("historical discovery", func(t *testing.T) {
+		service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+		boundaryErr := errors.New("historical discovery unavailable")
+		service.deps.TenantAdmission = &recoverableTenantAdmission{pendingErr: boundaryErr}
+		if err := service.Recover(t.Context()); !errors.Is(err, boundaryErr) {
+			t.Fatalf("historical discovery error=%v", err)
+		}
+	})
+
+	t.Run("historical orphan cleanup", func(t *testing.T) {
+		service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+		boundaryErr := errors.New("historical abort unavailable")
+		state := &recoverableTenantAdmission{
+			pending:   map[string]projectconfig.RunConfigurationBinding{"orphan": {}},
+			queued:    map[string]bool{},
+			aborted:   map[string]bool{},
+			authority: map[string]string{"orphan": "authority-orphan"},
+			abortErr:  boundaryErr,
+		}
+		service.deps.TenantAdmission = state
+		if err := service.Recover(t.Context()); !errors.Is(err, boundaryErr) {
+			t.Fatalf("historical abort error=%v", err)
+		}
+	})
+
+	t.Run("historical authority mismatch", func(t *testing.T) {
+		service, _, _, durable, _ := workflowFixture(t, validPlanResponse())
+		state := &recoverableTenantAdmission{confirmErr: errors.New("confirmation response lost")}
+		service.deps.TenantAdmission = state
+		if _, err := service.Start(t.Context(), validCommand()); err == nil {
+			t.Fatal("lost confirmation did not preserve a pending workflow")
+		}
+		state.confirmErr = nil
+		state.authority["workflow-1"] = "forged-authority"
+		if err := service.Recover(t.Context()); !IsCode(err, CodeConflict) {
+			t.Fatalf("authority mismatch error=%v", err)
+		}
+		if record, err := durable.Load(t.Context(), "workflow-1"); err != nil || record.Phase != PhaseAdmitted {
+			t.Fatalf("mismatched authority mutated workflow: %+v err=%v", record, err)
+		}
+	})
+
+	t.Run("historical confirmation", func(t *testing.T) {
+		service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+		boundaryErr := errors.New("historical confirmation unavailable")
+		state := &recoverableTenantAdmission{confirmErr: boundaryErr}
+		service.deps.TenantAdmission = state
+		if _, err := service.Start(t.Context(), validCommand()); !IsCode(err, CodeInvalid) {
+			t.Fatalf("start confirmation error=%v", err)
+		}
+		if err := service.Recover(t.Context()); !IsCode(err, CodeInvalid) {
+			t.Fatalf("historical recovery confirmation error=%v", err)
+		}
+	})
+
+	t.Run("legacy discovery", func(t *testing.T) {
+		service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+		boundaryErr := errors.New("legacy discovery unavailable")
+		service.deps.TenantAdmission = legacyRecoverableTenantAdmission{state: &recoverableTenantAdmission{pendingErr: boundaryErr}}
+		if err := service.Recover(t.Context()); !errors.Is(err, boundaryErr) {
+			t.Fatalf("legacy discovery error=%v", err)
+		}
+	})
+
+	t.Run("legacy orphan cleanup", func(t *testing.T) {
+		service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+		boundaryErr := errors.New("legacy abort unavailable")
+		state := &recoverableTenantAdmission{
+			pending:   map[string]projectconfig.RunConfigurationBinding{"orphan": {}},
+			queued:    map[string]bool{},
+			aborted:   map[string]bool{},
+			authority: map[string]string{},
+			abortErr:  boundaryErr,
+		}
+		service.deps.TenantAdmission = legacyRecoverableTenantAdmission{state: state}
+		if err := service.Recover(t.Context()); !errors.Is(err, boundaryErr) {
+			t.Fatalf("legacy abort error=%v", err)
+		}
+	})
+
+	for _, scenario := range []struct {
+		name       string
+		prepareErr error
+		confirmErr error
+	}{
+		{name: "legacy prepare", prepareErr: errors.New("legacy prepare unavailable")},
+		{name: "legacy confirmation", confirmErr: errors.New("legacy confirmation unavailable")},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+			state := &recoverableTenantAdmission{confirmErr: errors.New("confirmation response lost")}
+			service.deps.TenantAdmission = legacyRecoverableTenantAdmission{state: state}
+			if _, err := service.Start(t.Context(), validCommand()); err == nil {
+				t.Fatal("lost confirmation did not preserve a pending workflow")
+			}
+			state.prepareErr = scenario.prepareErr
+			state.confirmErr = scenario.confirmErr
+			if err := service.Recover(t.Context()); !IsCode(err, CodeInvalid) {
+				t.Fatalf("legacy recovery error=%v", err)
+			}
+		})
+	}
+}
 
 // TestMCPServeExposesDiscoveryAndSharedStatus proves the production stdio entrypoint is versioned and delegates to Service.
 func TestMCPServeExposesDiscoveryAndSharedStatus(t *testing.T) {
@@ -58,6 +319,75 @@ func TestMCPServeExposesDiscoveryAndSharedStatus(t *testing.T) {
 	}
 	if !bytes.Contains(output.Bytes(), []byte(MCPProtocolVersion)) || !bytes.Contains(output.Bytes(), []byte("featureproof.workflow.start")) || !bytes.Contains(output.Bytes(), []byte(view.Handle)) {
 		t.Fatalf("incomplete MCP output: %s", output.String())
+	}
+}
+
+// mutableWorkflowMCPAuth models a transport credential verifier whose live
+// revocation state changes without reconstructing the MCP server.
+type mutableWorkflowMCPAuth struct {
+	mu       sync.Mutex
+	profiles map[string]string
+	revoked  map[string]bool
+	seen     []string
+}
+
+// AuthenticateWorkflowMCP records the principal freshly resolved for one
+// request and denies credentials revoked after a prior call.
+func (auth *mutableWorkflowMCPAuth) AuthenticateWorkflowMCP(ctx context.Context, credential, _ string) (context.Context, string, error) {
+	auth.mu.Lock()
+	defer auth.mu.Unlock()
+	principal, ok := auth.profiles[credential]
+	if !ok || auth.revoked[credential] {
+		return ctx, "", &Error{Code: CodeUnauthorized, Operation: "mcp_authenticate"}
+	}
+	auth.seen = append(auth.seen, principal)
+	return ctx, principal, nil
+}
+
+// TestWorkflowMCPAuthenticatesEveryRequest proves a single process resolves
+// two callers independently, applies live revocation, and rejects payload
+// principal spoofing rather than treating it as authority.
+func TestWorkflowMCPAuthenticatesEveryRequest(t *testing.T) {
+	service, _, _, _, _ := workflowFixture(t, validPlanResponse())
+	view, err := service.Start(context.Background(), validCommand())
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := &mutableWorkflowMCPAuth{profiles: map[string]string{"workflow-alice-credential": "alice", "workflow-bob-credential": "bob"}, revoked: map[string]bool{}}
+	server := MCPServer{Service: service, Authenticator: auth}
+	call := func(id int, credential string, arguments map[string]any) workflowRPCResponse {
+		t.Helper()
+		raw, marshalErr := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": map[string]any{"protocolVersion": MCPProtocolVersion, "credential": credential, "name": "featureproof.workflow.status", "arguments": arguments}})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return server.handleRPC(context.Background(), raw)
+	}
+	if response := call(1, "workflow-alice-credential", map[string]any{"handle": view.Handle}); response.Error != nil {
+		t.Fatalf("alice response=%#v", response)
+	}
+	if response := call(2, "workflow-bob-credential", map[string]any{"handle": view.Handle}); response.Error != nil {
+		t.Fatalf("bob response=%#v", response)
+	}
+	auth.mu.Lock()
+	seen := slices.Clone(auth.seen)
+	auth.mu.Unlock()
+	if !reflect.DeepEqual(seen, []string{"alice", "bob"}) {
+		t.Fatalf("request principals=%v", seen)
+	}
+	spoof := call(3, "workflow-alice-credential", map[string]any{"handle": view.Handle, "principal": "bob"})
+	rawSpoof, _ := json.Marshal(spoof.Result)
+	if spoof.Error != nil || !bytes.Contains(rawSpoof, []byte(CodeInvalid)) {
+		t.Fatalf("payload principal spoof not rejected safely: %#v", spoof)
+	}
+	auth.mu.Lock()
+	auth.revoked["workflow-alice-credential"] = true
+	auth.mu.Unlock()
+	if response := call(4, "workflow-alice-credential", map[string]any{"handle": view.Handle}); response.Error == nil || response.Error.Code != -32001 {
+		t.Fatalf("live revocation ignored: %#v", response)
+	}
+	if response := call(5, "", map[string]any{"handle": view.Handle}); response.Error == nil || response.Error.Code != -32001 {
+		t.Fatalf("missing credential accepted: %#v", response)
 	}
 }
 
@@ -257,6 +587,195 @@ type fakeAdmission struct {
 	calls    int
 	snapshot AdmissionSnapshot
 	err      error
+}
+
+// recordingTenantAdmission captures the actual generated workflow handle and
+// immutable project configuration passed to the tenant security boundary.
+type recordingTenantAdmission struct {
+	runID                  string
+	binding                projectconfig.RunConfigurationBinding
+	prepareErr, confirmErr error
+	calls, confirms        int
+}
+
+// recoverableTenantAdmission models durable pending intents independently of
+// workflow persistence so crash/restart ordering can be asserted directly.
+type recoverableTenantAdmission struct {
+	mu                                           sync.Mutex
+	pending                                      map[string]projectconfig.RunConfigurationBinding
+	queued                                       map[string]bool
+	aborted                                      map[string]bool
+	authority                                    map[string]string
+	prepareErr, confirmErr, pendingErr, abortErr error
+}
+
+// legacyRecoverableTenantAdmission deliberately hides the historical methods
+// so the compatibility recovery branch is exercised through its public port.
+type legacyRecoverableTenantAdmission struct {
+	state *recoverableTenantAdmission
+}
+
+// Prepare delegates durable intent creation without exposing a historical seal.
+func (admission legacyRecoverableTenantAdmission) Prepare(ctx context.Context, runID string, binding projectconfig.RunConfigurationBinding) error {
+	return admission.state.Prepare(ctx, runID, binding)
+}
+
+// Confirm delegates publication of the prepared legacy intent.
+func (admission legacyRecoverableTenantAdmission) Confirm(ctx context.Context, runID string) error {
+	return admission.state.Confirm(ctx, runID)
+}
+
+// Pending delegates legacy recovery discovery.
+func (admission legacyRecoverableTenantAdmission) Pending(ctx context.Context) ([]string, error) {
+	return admission.state.Pending(ctx)
+}
+
+// Abort delegates convergence of an orphan legacy intent.
+func (admission legacyRecoverableTenantAdmission) Abort(ctx context.Context, runID string) error {
+	return admission.state.Abort(ctx, runID)
+}
+
+// Prepare durably records the exact binding before workflow reserve.
+func (admission *recoverableTenantAdmission) Prepare(_ context.Context, runID string, binding projectconfig.RunConfigurationBinding) error {
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	if admission.prepareErr != nil {
+		return admission.prepareErr
+	}
+	if admission.pending == nil {
+		admission.pending = map[string]projectconfig.RunConfigurationBinding{}
+		admission.queued = map[string]bool{}
+		admission.aborted = map[string]bool{}
+		admission.authority = map[string]string{}
+	}
+	if existing, ok := admission.pending[runID]; ok && existing.BindingDigest != binding.BindingDigest {
+		return errors.New("tenant binding conflict")
+	}
+	admission.pending[runID] = binding.Clone()
+	return nil
+}
+
+// PrepareHistorical returns a distinct sealed authority for the prepared run.
+func (admission *recoverableTenantAdmission) PrepareHistorical(ctx context.Context, runID string, binding projectconfig.RunConfigurationBinding) (string, error) {
+	if err := admission.Prepare(ctx, runID, binding); err != nil {
+		return "", err
+	}
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	authority := "authority-second-principal-" + runID
+	admission.authority[runID] = authority
+	return authority, nil
+}
+
+// Confirm publishes one prepared intent unless the scripted boundary fails.
+func (admission *recoverableTenantAdmission) Confirm(_ context.Context, runID string) error {
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	if admission.confirmErr != nil {
+		return admission.confirmErr
+	}
+	if _, ok := admission.pending[runID]; !ok {
+		return errors.New("tenant intent missing")
+	}
+	admission.queued[runID] = true
+	return nil
+}
+
+// ConfirmHistorical rejects recovery that substitutes another process grant.
+func (admission *recoverableTenantAdmission) ConfirmHistorical(ctx context.Context, runID, authority string) error {
+	admission.mu.Lock()
+	expected := admission.authority[runID]
+	admission.mu.Unlock()
+	if authority == "" || authority != expected {
+		return errors.New("tenant historical authority mismatch")
+	}
+	return admission.Confirm(ctx, runID)
+}
+
+// Pending lists only nonterminal tenant intents.
+func (admission *recoverableTenantAdmission) Pending(context.Context) ([]string, error) {
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	if admission.pendingErr != nil {
+		return nil, admission.pendingErr
+	}
+	var result []string
+	for runID := range admission.pending {
+		if !admission.queued[runID] && !admission.aborted[runID] {
+			result = append(result, runID)
+		}
+	}
+	slices.Sort(result)
+	return result, nil
+}
+
+// PendingHistorical returns each intent with its creating authority seal.
+func (admission *recoverableTenantAdmission) PendingHistorical(context.Context) ([]TenantAdmissionIntent, error) {
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	if admission.pendingErr != nil {
+		return nil, admission.pendingErr
+	}
+	var result []TenantAdmissionIntent
+	for runID := range admission.pending {
+		if !admission.queued[runID] && !admission.aborted[runID] {
+			result = append(result, TenantAdmissionIntent{RunID: runID, Authority: admission.authority[runID]})
+		}
+	}
+	slices.SortFunc(result, func(left, right TenantAdmissionIntent) int { return strings.Compare(left.RunID, right.RunID) })
+	return result, nil
+}
+
+// Abort terminalizes a prepared intent that has no workflow record.
+func (admission *recoverableTenantAdmission) Abort(_ context.Context, runID string) error {
+	admission.mu.Lock()
+	defer admission.mu.Unlock()
+	if admission.abortErr != nil {
+		return admission.abortErr
+	}
+	admission.aborted[runID] = true
+	return nil
+}
+
+// AbortHistorical preserves the same authority check for orphan convergence.
+func (admission *recoverableTenantAdmission) AbortHistorical(ctx context.Context, runID, authority string) error {
+	admission.mu.Lock()
+	expected := admission.authority[runID]
+	admission.mu.Unlock()
+	if authority == "" || authority != expected {
+		return errors.New("tenant historical authority mismatch")
+	}
+	return admission.Abort(ctx, runID)
+}
+
+// reserveFaultStore injects a crash-equivalent failure after tenant Prepare
+// and before the workflow record can commit.
+type reserveFaultStore struct {
+	WorkflowStore
+	remaining int
+}
+
+// Reserve fails the configured number of boundaries before delegating.
+func (store *reserveFaultStore) Reserve(ctx context.Context, record Record, owner string, now time.Time, ttl time.Duration) (Record, bool, error) {
+	if store.remaining > 0 {
+		store.remaining--
+		return Record{}, false, errors.New("workflow reserve interrupted")
+	}
+	return store.WorkflowStore.Reserve(ctx, record, owner, now, ttl)
+}
+
+// Prepare records one tenant admission intent or returns the scripted fail-closed error.
+func (admission *recordingTenantAdmission) Prepare(_ context.Context, runID string, binding projectconfig.RunConfigurationBinding) error {
+	admission.calls++
+	admission.runID, admission.binding = runID, binding.Clone()
+	return admission.prepareErr
+}
+
+// Confirm records the post-workflow durable publication boundary.
+func (admission *recordingTenantAdmission) Confirm(_ context.Context, runID string) error {
+	admission.confirms++
+	admission.runID = runID
+	return admission.confirmErr
 }
 
 // failingIDs simulates identity-source failure before durable admission.

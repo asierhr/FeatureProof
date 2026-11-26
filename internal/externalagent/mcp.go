@@ -12,6 +12,13 @@ import (
 // MCPServer serves the stateless 2026-07-28 tool surface over bounded stdio messages.
 type MCPServer struct {
 	service *Service
+	auth    MCPAuthenticator
+}
+
+// MCPAuthenticator resolves a bearer credential at the trusted transport
+// boundary for every request and returns a sealed application principal.
+type MCPAuthenticator interface {
+	AuthenticateMCP(context.Context, string, string) (context.Context, Principal, error)
 }
 
 // NewMCPServer binds MCP translation to the same application service as CLI.
@@ -20,6 +27,15 @@ func NewMCPServer(service *Service) (*MCPServer, error) {
 		return nil, &AppError{Code: CodeInternal}
 	}
 	return &MCPServer{service: service}, nil
+}
+
+// NewAuthenticatedMCPServer requires per-request transport authentication for
+// productive remote composition while preserving the legacy local constructor.
+func NewAuthenticatedMCPServer(service *Service, auth MCPAuthenticator) (*MCPServer, error) {
+	if service == nil || auth == nil {
+		return nil, &AppError{Code: CodeInternal}
+	}
+	return &MCPServer{service: service, auth: auth}, nil
 }
 
 // mcpRequest is the strict JSON-RPC request envelope accepted from stdio.
@@ -47,6 +63,7 @@ type mcpError struct {
 // mcpParams represents the shared stateless metadata and tool-call fields.
 type mcpParams struct {
 	ProtocolVersion string          `json:"protocolVersion"`
+	Credential      string          `json:"credential,omitempty"`
 	Name            string          `json:"name,omitempty"`
 	Arguments       json.RawMessage `json:"arguments,omitempty"`
 	Meta            json.RawMessage `json:"_meta,omitempty"`
@@ -106,6 +123,10 @@ func (s *MCPServer) Handle(ctx context.Context, raw []byte) mcpResponse {
 	case "server/discover":
 		return mcpResponse{JSONRPC: "2.0", ID: request.ID, Result: map[string]any{"protocolVersion": MCPVersion, "capabilities": map[string]any{"tools": map[string]any{}}, "applicationContractVersion": ContractVersion}}
 	case "tools/list":
+		ctx, authErr := s.authenticate(ctx, params.Credential, "capabilities")
+		if authErr != nil {
+			return s.applicationResponse(request.ID, Envelope{ContractVersion: ContractVersion, Error: asAppError(authErr)})
+		}
 		capabilities, err := s.service.Capabilities(ctx)
 		if err != nil {
 			return s.applicationResponse(request.ID, Envelope{ContractVersion: ContractVersion, Error: asAppError(err)})
@@ -123,10 +144,27 @@ func (s *MCPServer) Handle(ctx context.Context, raw []byte) mcpResponse {
 		if !ok {
 			return mcpResponse{JSONRPC: "2.0", ID: request.ID, Error: &mcpError{Code: -32601, Message: "Method not found"}}
 		}
+		ctx, authErr := s.authenticate(ctx, params.Credential, operation)
+		if authErr != nil {
+			return s.applicationResponse(request.ID, Envelope{ContractVersion: ContractVersion, Error: asAppError(authErr)})
+		}
 		return s.applicationResponse(request.ID, s.service.Invoke(ctx, operation, params.Arguments))
 	default:
 		return mcpResponse{JSONRPC: "2.0", ID: request.ID, Error: &mcpError{Code: -32601, Message: "Method not found"}}
 	}
+}
+
+// authenticate resolves fresh authority for each request and seals it into
+// context; legacy local servers continue to use their host identity source.
+func (s *MCPServer) authenticate(ctx context.Context, credential, operation string) (context.Context, error) {
+	if s.auth == nil {
+		return ctx, nil
+	}
+	authenticated, principal, err := s.auth.AuthenticateMCP(ctx, credential, operation)
+	if err != nil {
+		return ctx, err
+	}
+	return WithAuthenticatedPrincipal(authenticated, principal), nil
 }
 
 // applicationResponse places the identical application envelope in structured and text content.

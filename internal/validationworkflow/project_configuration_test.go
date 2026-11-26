@@ -73,10 +73,10 @@ func (materializer *rotatingWorkflowMaterializer) Materialize(_ context.Context,
 
 // rotatingWorkflowBinding constructs one valid effective epoch with a selectable contract descriptor.
 func rotatingWorkflowBinding(repositoryID, runID, contract string, version uint64) (projectconfig.RunConfigurationBinding, error) {
-	key, _ := projectconfig.NewProjectKey("project", repositoryID)
+	key, _ := projectconfig.NewProjectKey("organization", "project", repositoryID)
 	digest := strings.Repeat(string(rune('a'+version-1)), 64)
 	references := []projectconfig.ResourceReference{{Kind: projectconfig.ResourceProvider, ID: "fake", Version: version, Digest: digest}, {Kind: projectconfig.ResourceModelProfile, ID: "selected", Version: version, Digest: digest}, {Kind: projectconfig.ResourceRuntimeProfile, ID: "runtime-1", Version: version, Digest: digest}, {Kind: projectconfig.ResourceContract, ID: contract, Version: version, Digest: digest}, {Kind: projectconfig.ResourceEnvironment, ID: "target-1", Version: version, Digest: digest}}
-	document, err := projectconfig.Canonicalize(projectconfig.Document{Schema: projectconfig.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Approval: "optional", RetentionDays: 7}})
+	document, err := projectconfig.Canonicalize(projectconfig.Document{Schema: projectconfig.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Approval: "optional", RetentionDays: 7}})
 	if err != nil {
 		return projectconfig.RunConfigurationBinding{}, err
 	}
@@ -103,7 +103,7 @@ type workflowConfigurationResolver struct {
 // BindForWorkflow records the causal boundary and creates a deterministic fixture binding.
 func (resolver *workflowConfigurationResolver) BindForWorkflow(_ context.Context, repositoryID, runID string) (projectconfig.RunConfigurationBinding, error) {
 	resolver.calls.Add(1)
-	key, _ := projectconfig.NewProjectKey("project", repositoryID)
+	key, _ := projectconfig.NewProjectKey("organization", "project", repositoryID)
 	digest := strings.Repeat("a", 64)
 	references := []projectconfig.ResourceReference{{Kind: projectconfig.ResourceProvider, ID: "fake", Version: 1, Digest: digest}, {Kind: projectconfig.ResourceRuntimeProfile, ID: "runtime-1", Version: 1, Digest: digest}, {Kind: projectconfig.ResourceContract, ID: "contract-1", Version: 1, Digest: digest}, {Kind: projectconfig.ResourceEnvironment, ID: "target-1", Version: 1, Digest: digest}, {Kind: projectconfig.ResourceEnvironment, ID: "preview-1", Version: 1, Digest: digest}}
 	if !resolver.omitModel {
@@ -114,7 +114,7 @@ func (resolver *workflowConfigurationResolver) BindForWorkflow(_ context.Context
 	if approval == "" {
 		approval = "optional"
 	}
-	document, _ := projectconfig.Canonicalize(projectconfig.Document{Schema: projectconfig.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Limits: resolver.limits, Approval: approval, RetentionDays: 7}})
+	document, _ := projectconfig.Canonicalize(projectconfig.Document{Schema: projectconfig.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Limits: resolver.limits, Approval: approval, RetentionDays: 7}})
 	descriptors := make([]projectconfig.ResourceDescriptor, len(references))
 	for index, reference := range references {
 		descriptors[index] = projectconfig.ResourceDescriptor{Kind: reference.Kind, ID: reference.ID, Version: reference.Version, Digest: reference.Digest, ProjectKey: key}

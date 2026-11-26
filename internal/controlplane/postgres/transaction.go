@@ -9,6 +9,7 @@ import (
 	"github.com/asierhr/featureProof/internal/correction"
 	"github.com/asierhr/featureProof/internal/environment"
 	cleanup "github.com/asierhr/featureProof/internal/environment/cleanup"
+	"github.com/asierhr/featureProof/internal/tenantsecurity"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -78,6 +79,10 @@ func isDomainError(err error) bool {
 	}
 	var cleanupErr *cleanup.Error
 	if errors.As(err, &cleanupErr) {
+		return true
+	}
+	var tenantErr *tenantsecurity.Error
+	if errors.As(err, &tenantErr) {
 		return true
 	}
 	for _, sentinel := range []error{controlplane.ErrInvalid, controlplane.ErrNotFound, controlplane.ErrConflict, controlplane.ErrUnauthorized, controlplane.ErrIntegrity, controlplane.ErrCancelled, controlplane.ErrDeadline, controlplane.ErrTransient, controlplane.ErrUnavailable, controlplane.ErrExhausted, controlplane.ErrInternal} {

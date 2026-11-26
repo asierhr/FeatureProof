@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	"github.com/asierhr/featureProof/internal/harness"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -44,9 +45,9 @@ func postgresApprovalIntegrationPool(t *testing.T) *pgxpool.Pool {
 		admin.Close()
 		t.Fatal(err)
 	}
-	ddl := `CREATE TABLE approval_runs(run_id text PRIMARY KEY, revision bigint NOT NULL DEFAULT 0);
-CREATE TABLE approval_requests(run_id text NOT NULL REFERENCES approval_runs(run_id) ON DELETE CASCADE, revision bigint NOT NULL, snapshot bytea NOT NULL, snapshot_digest text NOT NULL, PRIMARY KEY(run_id,revision));
-CREATE TABLE approval_events(run_id text NOT NULL REFERENCES approval_runs(run_id) ON DELETE CASCADE, revision bigint NOT NULL, event_id text NOT NULL UNIQUE, event bytea NOT NULL, PRIMARY KEY(run_id,revision));`
+	ddl := `CREATE TABLE approval_runs(organization_id text NOT NULL, project_id text NOT NULL, run_id text NOT NULL, revision bigint NOT NULL DEFAULT 0, PRIMARY KEY(organization_id,project_id,run_id));
+CREATE TABLE approval_requests(organization_id text NOT NULL, project_id text NOT NULL, run_id text NOT NULL, revision bigint NOT NULL, snapshot bytea NOT NULL, snapshot_digest text NOT NULL, PRIMARY KEY(organization_id,project_id,run_id,revision));
+CREATE TABLE approval_events(organization_id text NOT NULL, project_id text NOT NULL, run_id text NOT NULL, revision bigint NOT NULL, event_id text NOT NULL, event bytea NOT NULL, PRIMARY KEY(organization_id,project_id,run_id,revision), UNIQUE(organization_id,project_id,event_id));`
 	if _, err = scoped.Exec(ctx, ddl); err != nil {
 		scoped.Close()
 		admin.Close()
@@ -60,6 +61,11 @@ CREATE TABLE approval_events(run_id text NOT NULL REFERENCES approval_runs(run_i
 		admin.Close()
 	})
 	return scoped
+}
+
+// postgresApprovalContext supplies the sealed tenant coordinate required by every durable operation.
+func postgresApprovalContext(runID string) context.Context {
+	return controlplane.WithBackendCoordinate(context.Background(), controlplane.BackendCoordinate{OrganizationID: "organization", ProjectID: "project", RunID: runID})
 }
 
 // TestPostgresApprovalSnapshotRoundTrip guards restart decoding before any database I/O.
@@ -90,14 +96,15 @@ func TestPostgresApprovalStoreContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.BindRun(context.Background(), run); err != nil {
+	ctx = postgresApprovalContext(run.ID)
+	if _, err = store.BindRun(ctx, run); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.BindRun(context.Background(), run); err != nil {
+	if _, err = store.BindRun(ctx, run); err != nil {
 		t.Fatal("bind replay", err)
 	}
 	otherRun, _ := harness.NewRun(run.ID, "different aggregate", "constraint", harness.Limits{MaxSteps: 1, MaxToolCalls: 1, MaxRetries: 1})
-	if _, err = store.BindRun(context.Background(), otherRun); err == nil {
+	if _, err = store.BindRun(ctx, otherRun); err == nil {
 		t.Fatal("different aggregate identity accepted")
 	}
 	plan, contract := approvalFixture(t)
@@ -165,7 +172,8 @@ func TestPostgresApprovalStoreRejectsCorruptAndConflictingDurableState(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.BindRun(context.Background(), run); err != nil {
+	ctx = postgresApprovalContext(run.ID)
+	if _, err = store.BindRun(ctx, run); err != nil {
 		t.Fatal(err)
 	}
 	plan, contract := approvalFixture(t)

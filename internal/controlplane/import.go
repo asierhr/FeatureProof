@@ -46,6 +46,7 @@ const (
 // ImportManifest seals expected head, stream counts and digests without secrets.
 type ImportManifest struct {
 	Version            string            `json:"version"`
+	OrganizationID     string            `json:"organization_id"`
 	ImportID           string            `json:"import_id"`
 	RunID              string            `json:"run_id"`
 	ProjectID          string            `json:"project_id"`
@@ -68,7 +69,7 @@ func SealImportManifest(value ImportManifest) (ImportManifest, error) {
 		value.Version = ModelVersion
 	}
 	valid := value.State == ImportFrozen || value.State == ImportCandidate || value.State == ImportVerified || value.State == ImportCutover || value.State == ImportAbandoned
-	if value.Version != ModelVersion || !safeID.MatchString(value.ImportID) || !safeID.MatchString(value.RunID) || !safeID.MatchString(value.ProjectID) || !safeID.MatchString(value.SourceIdentity) || !digestPattern.MatchString(value.ExpectedHeadDigest) || !valid || value.CreatedAt.IsZero() {
+	if value.Version != ModelVersion || !safeID.MatchString(value.OrganizationID) || !safeID.MatchString(value.ImportID) || !safeID.MatchString(value.RunID) || !safeID.MatchString(value.ProjectID) || !safeID.MatchString(value.SourceIdentity) || !digestPattern.MatchString(value.ExpectedHeadDigest) || !valid || value.CreatedAt.IsZero() {
 		return ImportManifest{}, ErrInvalid
 	}
 	value.Counts = cloneCounts(value.Counts)
@@ -102,14 +103,16 @@ type ImportDocument struct {
 
 // ImportCutoverReceipt proves which frozen head was atomically superseded by one verified epoch.
 type ImportCutoverReceipt struct {
-	ImportID      string    `json:"import_id"`
-	RunID         string    `json:"run_id"`
-	SourceHead    string    `json:"source_head_digest"`
-	TargetHead    string    `json:"target_head_digest"`
-	ArchivedEpoch uint64    `json:"archived_epoch"`
-	ActiveEpoch   uint64    `json:"active_epoch"`
-	CommittedAt   time.Time `json:"committed_at"`
-	Digest        string    `json:"digest"`
+	OrganizationID string    `json:"organization_id"`
+	ProjectID      string    `json:"project_id"`
+	ImportID       string    `json:"import_id"`
+	RunID          string    `json:"run_id"`
+	SourceHead     string    `json:"source_head_digest"`
+	TargetHead     string    `json:"target_head_digest"`
+	ArchivedEpoch  uint64    `json:"archived_epoch"`
+	ActiveEpoch    uint64    `json:"active_epoch"`
+	CommittedAt    time.Time `json:"committed_at"`
+	Digest         string    `json:"digest"`
 }
 
 // SealImportDocument validates byte-exact import identity without interpreting consumer-owned documents.
@@ -130,7 +133,7 @@ func SealImportDocument(value ImportDocument) (ImportDocument, error) {
 // SealImportCutoverReceipt authenticates the monotonic backend transition outcome.
 func SealImportCutoverReceipt(value ImportCutoverReceipt) (ImportCutoverReceipt, error) {
 	value.CommittedAt = value.CommittedAt.UTC().Truncate(time.Microsecond)
-	if !safeID.MatchString(value.ImportID) || !safeID.MatchString(value.RunID) || !digestPattern.MatchString(value.SourceHead) || !digestPattern.MatchString(value.TargetHead) || value.ArchivedEpoch == 0 || value.ActiveEpoch != value.ArchivedEpoch+1 || value.CommittedAt.IsZero() {
+	if !safeID.MatchString(value.OrganizationID) || !safeID.MatchString(value.ProjectID) || !safeID.MatchString(value.ImportID) || !safeID.MatchString(value.RunID) || !digestPattern.MatchString(value.SourceHead) || !digestPattern.MatchString(value.TargetHead) || value.ArchivedEpoch == 0 || value.ActiveEpoch != value.ArchivedEpoch+1 || value.CommittedAt.IsZero() {
 		return ImportCutoverReceipt{}, ErrInvalid
 	}
 	value.Digest = ""
@@ -176,7 +179,7 @@ type ImportStore interface {
 // OfflineImportSource is the frozen local authority consumed by the explicit
 // offline migration controller; it never exposes arbitrary filesystem paths.
 type OfflineImportSource interface {
-	FreezeLocalStores(context.Context, string, string, string, string, uint64, time.Time) (ImportManifest, error)
+	FreezeLocalStores(context.Context, string, string, string, string, string, uint64, time.Time) (ImportManifest, error)
 	ReadImportPage(context.Context, string, string, uint64, int) ([]ImportDocument, error)
 	Archive(context.Context, ImportCutoverReceipt) error
 }
@@ -194,17 +197,17 @@ type OfflineImportTarget interface {
 // OperatorAuthorizer authenticates one explicit operational controller call
 // before it can inspect state or mutate retention/import authority.
 type OperatorAuthorizer interface {
-	Authorize(context.Context, string, string) error
+	Authorize(context.Context, string, ProjectScope) error
 }
 
 // OfflineImportRequest contains only operator-selected identities and finite
 // pagination; it carries neither credentials nor arbitrary stream names.
 type OfflineImportRequest struct {
-	ImportID, RunID, ProjectID, ExpectedHead string
-	ExpectedEpoch                            uint64
-	PageSize                                 int
-	Now                                      time.Time
-	ReconcileTimeout                         time.Duration
+	OrganizationID, ImportID, RunID, ProjectID, ExpectedHead string
+	ExpectedEpoch                                            uint64
+	PageSize                                                 int
+	Now                                                      time.Time
+	ReconcileTimeout                                         time.Duration
 }
 
 // OfflineImportController owns freeze, resumable copy, verification, cutover
@@ -221,14 +224,16 @@ func (controller OfflineImportController) Run(ctx context.Context, request Offli
 	if controller.Source == nil || controller.Target == nil || controller.Authorizer == nil || request.PageSize <= 0 || request.PageSize > 1000 || request.Now.IsZero() || request.ReconcileTimeout <= 0 {
 		return ImportCutoverReceipt{}, ErrInvalid
 	}
-	if err := controller.Authorizer.Authorize(ctx, "offline_import", request.ProjectID); err != nil {
+	scope := ProjectScope{OrganizationID: request.OrganizationID, ProjectID: request.ProjectID}
+	if scope.Validate() != nil || controller.Authorizer.Authorize(ctx, "offline_import", scope) != nil {
 		return ImportCutoverReceipt{}, ErrUnauthorized
 	}
-	manifest, err := controller.Source.FreezeLocalStores(ctx, request.ImportID, request.RunID, request.ProjectID, request.ExpectedHead, request.ExpectedEpoch, request.Now)
+	manifest, err := controller.Source.FreezeLocalStores(ctx, request.OrganizationID, request.ImportID, request.RunID, request.ProjectID, request.ExpectedHead, request.ExpectedEpoch, request.Now)
 	if err != nil {
 		return ImportCutoverReceipt{}, err
 	}
-	if _, err = controller.Target.SaveImport(ctx, manifest, ""); err != nil {
+	targetCtx := WithBackendCoordinate(ctx, BackendCoordinate{OrganizationID: request.OrganizationID, ProjectID: request.ProjectID, RunID: request.RunID})
+	if _, err = controller.Target.SaveImport(targetCtx, manifest, ""); err != nil {
 		return ImportCutoverReceipt{}, err
 	}
 	streams := orderedImportStreams(manifest.Counts)
@@ -241,18 +246,18 @@ func (controller OfflineImportController) Run(ctx context.Context, request Offli
 				}
 				return ImportCutoverReceipt{}, ErrIntegrity
 			}
-			if pageErr = controller.Target.SaveImportPage(ctx, manifest.ImportID, page); pageErr != nil {
+			if pageErr = controller.Target.SaveImportPage(targetCtx, manifest.ImportID, page); pageErr != nil {
 				return ImportCutoverReceipt{}, pageErr
 			}
 			after += uint64(len(page))
 		}
 	}
-	if _, err = controller.Target.VerifyImport(ctx, manifest.ImportID); err != nil {
+	if _, err = controller.Target.VerifyImport(targetCtx, manifest.ImportID); err != nil {
 		return ImportCutoverReceipt{}, err
 	}
-	receipt, err := controller.Target.CutoverImport(ctx, manifest.ImportID, request.Now)
+	receipt, err := controller.Target.CutoverImport(targetCtx, manifest.ImportID, request.Now)
 	if err != nil {
-		reconcileContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), request.ReconcileTimeout)
+		reconcileContext, cancel := context.WithTimeout(context.WithoutCancel(targetCtx), request.ReconcileTimeout)
 		receipt, err = controller.Target.LoadImportCutoverReceipt(reconcileContext, manifest.ImportID)
 		cancel()
 		if err != nil {

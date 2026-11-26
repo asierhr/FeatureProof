@@ -16,9 +16,11 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -47,6 +49,8 @@ import (
 	localprojectconfig "github.com/asierhr/featureProof/internal/projectconfig/local"
 	"github.com/asierhr/featureProof/internal/specification"
 	specyaml "github.com/asierhr/featureProof/internal/specification/yaml"
+	"github.com/asierhr/featureProof/internal/tenantsecurity"
+	tenantlocal "github.com/asierhr/featureProof/internal/tenantsecurity/local"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 	"k8s.io/client-go/rest"
 )
@@ -92,25 +96,26 @@ func TestGitHubWorkflowValidationSelectsOnlyComposedTargets(t *testing.T) {
 func TestControlPlaneOperationalBoundariesFailClosed(t *testing.T) {
 	ctx := context.Background()
 	authorizer := operatorUIDAuthorizer{actual: "operator-1", allowed: "operator-1"}
+	scope := controlplane.ProjectScope{OrganizationID: "organization-1", ProjectID: "project-1"}
 	for _, operation := range []string{"offline_import", "query_jobs", "retention"} {
-		if err := authorizer.Authorize(ctx, operation, "project-1"); err != nil {
+		if err := authorizer.Authorize(ctx, operation, scope); err != nil {
 			t.Fatalf("authorized %s rejected: %v", operation, err)
 		}
 	}
 	for _, invalid := range []operatorUIDAuthorizer{{}, {actual: "operator-1", allowed: "operator-2"}} {
-		if err := invalid.Authorize(ctx, "offline_import", "project-1"); !errors.Is(err, controlplane.ErrUnauthorized) {
+		if err := invalid.Authorize(ctx, "offline_import", scope); !errors.Is(err, controlplane.ErrUnauthorized) {
 			t.Fatalf("invalid operator accepted: %v", err)
 		}
 	}
-	if err := authorizer.Authorize(ctx, "unknown", "project-1"); !errors.Is(err, controlplane.ErrUnauthorized) {
+	if err := authorizer.Authorize(ctx, "unknown", scope); !errors.Is(err, controlplane.ErrUnauthorized) {
 		t.Fatalf("unknown operation accepted: %v", err)
 	}
-	if err := authorizer.Authorize(ctx, "query_jobs", ""); !errors.Is(err, controlplane.ErrUnauthorized) {
+	if err := authorizer.Authorize(ctx, "query_jobs", controlplane.ProjectScope{}); !errors.Is(err, controlplane.ErrUnauthorized) {
 		t.Fatalf("empty project accepted: %v", err)
 	}
 	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := authorizer.Authorize(cancelled, "query_jobs", "project-1"); !errors.Is(err, context.Canceled) {
+	if err := authorizer.Authorize(cancelled, "query_jobs", scope); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled authorization=%v", err)
 	}
 	if err := (controlPlaneObserver{}).Observe(ctx, controlplane.Observation{}); err != nil {
@@ -148,7 +153,7 @@ func TestRegisterLocalImportExportersHandlesAbsentOptionalStores(t *testing.T) {
 	if err = registerLocalImportExporters(store, root); err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := store.FreezeLocalStores(ctx, "command-import-id", "command-run", "command-project", strings.Repeat("a", 64), 1, time.Now().UTC())
+	manifest, err := store.FreezeLocalStores(ctx, "organization", "command-import-id", "command-run", "command-project", strings.Repeat("a", 64), 1, time.Now().UTC())
 	if err != nil || len(manifest.Counts) != 0 || len(manifest.StreamDigests) != 0 {
 		t.Fatalf("absent optional stores produced counts=%#v digests=%#v err=%v", manifest.Counts, manifest.StreamDigests, err)
 	}
@@ -201,7 +206,7 @@ func TestRegisterLocalImportExportersFreezesEveryTypedStore(t *testing.T) {
 			if err != nil || registerLocalImportExporters(source, root) != nil {
 				t.Fatalf("register exporters: %v", err)
 			}
-			manifest, err := source.FreezeLocalStores(ctx, "command-"+test.stream+"-id", "command-"+test.stream+"-run", "command-project", strings.Repeat("b", 64), 1, now)
+			manifest, err := source.FreezeLocalStores(ctx, "organization", "command-"+test.stream+"-id", "command-"+test.stream+"-run", "command-project", strings.Repeat("b", 64), 1, now)
 			if err != nil || manifest.Counts[test.stream] != 1 || manifest.StreamDigests[test.stream] == "" {
 				t.Fatalf("typed stream %q counts=%#v err=%v", test.stream, manifest.Counts, err)
 			}
@@ -1350,7 +1355,109 @@ func writeWorkflowCompositionFixture(t *testing.T, root string, document map[str
 		}
 	}
 	writeWorkflowProjectConfigurationFixture(t, root, configPath)
+	writeTenantSecurityCompositionFixture(t, root)
 	return configPath, specPath, contractPath
+}
+
+// writeTenantSecurityCompositionFixture provisions trusted test identities via
+// the same durable aggregate consumed by productive surface composition.
+func writeTenantSecurityCompositionFixture(t *testing.T, root string) {
+	t.Helper()
+	projectID := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID")
+	if projectID == "" {
+		projectID = "project"
+	}
+	repositoryID := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_REPOSITORY_ID")
+	if repositoryID == "" {
+		repositoryID = "repo"
+	}
+	configPath := filepath.Join(root, "tenant-security.json")
+	surfaces := map[string]tenantSecuritySurfaceConfig{}
+	providers := map[tenantsecurity.Surface]string{tenantsecurity.SurfaceCLI: "cli_profile", tenantsecurity.SurfaceAPI: "api_identity", tenantsecurity.SurfaceMCP: "mcp_identity", tenantsecurity.SurfaceGitHub: "github_installation", tenantsecurity.SurfaceExternalAgent: "external_profile", tenantsecurity.SurfaceWorker: "sealed_worker_envelope"}
+	for surface, provider := range providers {
+		entry := tenantSecuritySurfaceConfig{Provider: provider, Issuer: "fixture", OrganizationID: "organization", ProjectID: projectID, RepositoryID: repositoryID}
+		if surface == tenantsecurity.SurfaceCLI {
+			entry.ProfileSubject = "operator"
+		}
+		surfaces[string(surface)] = entry
+	}
+	dimensions := []string{tenantsecurity.QuotaModelCall, tenantsecurity.QuotaEnvironment, tenantsecurity.QuotaQueueClaim, tenantsecurity.QuotaWorker, tenantsecurity.QuotaModelToken, tenantsecurity.QuotaInfrastructure, tenantsecurity.QuotaObject, tenantsecurity.QuotaStorageByte}
+	tenantLimits, projectLimits := map[string]tenantsecurity.QuotaLimit{}, map[string]tenantsecurity.QuotaLimit{}
+	for _, dimension := range dimensions {
+		limit := uint64(1000)
+		if dimension == tenantsecurity.QuotaStorageByte {
+			limit = 1 << 20
+		}
+		tenantLimits[dimension] = tenantsecurity.QuotaLimit{Limit: limit, Window: time.Hour}
+		projectLimits[dimension] = tenantsecurity.QuotaLimit{Limit: limit, Window: time.Hour}
+	}
+	config := tenantSecurityConfig{CapabilityTTLSeconds: 300, StoreRoot: filepath.Join(root, ".featureproof", "tenant-security"), Surfaces: surfaces, Quota: tenantsecurity.QuotaPolicySnapshot{Version: 1, Tenant: tenantLimits, Project: projectLimits, TenantOutstanding: 128, ProjectOutstanding: 128, ReservationTTL: time.Minute}}
+	raw, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(configPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FEATUREPROOF_TENANT_SECURITY_CONFIG", configPath)
+	store, err := tenantlocal.New(filepath.Join(root, ".featureproof", "tenant-security"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := tenantsecurity.DigestSubject(tenantsecurity.AuthenticatedSubject{Issuer: "fixture", Subject: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	memory := tenantsecurity.NewMemoryStore()
+	service, _ := tenantsecurity.NewService(memory, tenantsecurity.RealClock{}, tenantsecurity.DefaultLimits(), nil)
+	role := tenantsecurity.Role{OrganizationID: "organization", ID: "operator", Actions: []tenantsecurity.Action{tenantsecurity.ActionRunAdmit, tenantsecurity.ActionRunRead, tenantsecurity.ActionRunCancel, tenantsecurity.ActionConfigRead, tenantsecurity.ActionConfigWrite, tenantsecurity.ActionEvidenceRead, tenantsecurity.ActionEnvironmentReserve, tenantsecurity.ActionSecretResolve, tenantsecurity.ActionTenantAdmin, tenantsecurity.ActionAuditRead, tenantsecurity.ActionRetentionExecute, tenantsecurity.ActionQuotaReserve}, Resources: []tenantsecurity.ResourceClass{tenantsecurity.ResourceRun, tenantsecurity.ResourceConfig, tenantsecurity.ResourceEvidence, tenantsecurity.ResourceEnvironment, tenantsecurity.ResourceSecret, tenantsecurity.ResourceTenant, tenantsecurity.ResourceAudit, tenantsecurity.ResourceQuota}, ProjectIDs: []string{projectID}, Version: 1}
+	if err = service.Bootstrap(context.Background(), tenantsecurity.Organization{ID: "organization", State: tenantsecurity.StateActive, Version: 1, SecurityRevision: 1, PolicyDigest: strings.Repeat("a", 64)}, tenantsecurity.ProjectRegistration{OrganizationID: "organization", ProjectID: projectID, RepositoryID: repositoryID, State: tenantsecurity.StateActive, Version: 1}, tenantsecurity.Principal{ID: "operator", Kind: tenantsecurity.PrincipalHuman, SubjectDigest: digest, State: tenantsecurity.StateActive, Version: 1}, tenantsecurity.Membership{OrganizationID: "organization", PrincipalID: "operator", RoleIDs: []string{"operator"}, ProjectIDs: []string{projectID}, State: tenantsecurity.StateActive, ValidFrom: time.Now().Add(-time.Hour), Version: 1}, []tenantsecurity.Role{role}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := memory.Snapshot()
+	var projectPolicy projectconfig.OrganizationPolicySnapshot
+	if policyPath := os.Getenv("FEATUREPROOF_PROJECT_CONFIG_POLICY"); policyPath != "" && loadWorkflowProjectConfigurationJSON(policyPath, &projectPolicy) == nil {
+		allowed := make(map[string][]string, len(projectPolicy.Allowed))
+		for kind, values := range projectPolicy.Allowed {
+			allowed[string(kind)] = append([]string(nil), values...)
+		}
+		tenantPolicy, policyErr := tenantsecurity.CompileTenantPolicy(tenantsecurity.TenantPolicy{OrganizationID: "organization", Version: projectPolicy.Version, DefaultLimits: tenantsecurity.PolicyLimits{DurationSeconds: projectPolicy.DefaultLimits.DurationSeconds, ToolCalls: projectPolicy.DefaultLimits.ToolCalls, ModelTokens: projectPolicy.DefaultLimits.ModelTokens, Replans: projectPolicy.DefaultLimits.Replans}, MaximumLimits: tenantsecurity.PolicyLimits{DurationSeconds: projectPolicy.MaximumLimits.DurationSeconds, ToolCalls: projectPolicy.MaximumLimits.ToolCalls, ModelTokens: projectPolicy.MaximumLimits.ModelTokens, Replans: projectPolicy.MaximumLimits.Replans}, ApprovalRequired: projectPolicy.ApprovalRequired, MinimumRetentionDays: projectPolicy.MinimumRetentionDays, MaximumRetentionDays: projectPolicy.MaximumRetentionDays, Allowed: allowed, AllowedCapabilities: append([]string(nil), projectPolicy.AllowedCapabilities...)}, tenantsecurity.DefaultLimits())
+		if policyErr != nil {
+			t.Fatal(policyErr)
+		}
+		snapshot.Policies["organization"] = tenantPolicy
+		organization := snapshot.Organizations["organization"]
+		organization.PolicyDigest = tenantPolicy.Digest
+		snapshot.Organizations["organization"] = organization
+	}
+	addSubject := func(subject, principalID string) {
+		if subject == "" || subject == "operator" {
+			return
+		}
+		currentDigest, digestErr := tenantsecurity.DigestSubject(tenantsecurity.AuthenticatedSubject{Issuer: "fixture", Subject: subject})
+		if digestErr != nil {
+			t.Fatal(digestErr)
+		}
+		snapshot.Principals["organization/"+principalID] = tenantsecurity.Principal{ID: principalID, Kind: tenantsecurity.PrincipalHuman, SubjectDigest: currentDigest, State: tenantsecurity.StateActive, Version: 1}
+		snapshot.Subjects["organization/"+currentDigest] = principalID
+		snapshot.Memberships["organization/"+principalID] = tenantsecurity.Membership{OrganizationID: "organization", PrincipalID: principalID, RoleIDs: []string{"operator"}, ProjectIDs: []string{projectID}, State: tenantsecurity.StateActive, ValidFrom: time.Now().Add(-time.Hour), Version: 1}
+	}
+	current, currentErr := user.Current()
+	if currentErr == nil && current.Uid != "" && current.Uid != "operator" {
+		addSubject(current.Uid, "local-profile")
+	}
+	addSubject("github-worker", "github-worker")
+	addSubject(os.Getenv("FEATUREPROOF_MEMORY_PRINCIPAL"), "memory-principal")
+	addSubject("actor", "contract-actor")
+	installation, installationErr := strconv.ParseInt(os.Getenv("FEATUREPROOF_GITHUB_INSTALLATION_ID"), 10, 64)
+	actor, actorErr := strconv.ParseInt(os.Getenv("FEATUREPROOF_GITHUB_ACTOR_ID"), 10, 64)
+	if installationErr == nil && actorErr == nil && installation > 0 && actor > 0 {
+		addSubject("installation:"+strconv.FormatInt(installation, 10)+":actor:"+strconv.FormatInt(actor, 10), "github-request")
+	}
+	snapshot.Epoch = 1
+	if _, err = store.Commit(context.Background(), tenantsecurity.StoreCommand{OrganizationID: "organization", OperationID: "fixture-bootstrap", CommandDigest: strings.Repeat("b", 64), ExpectedEpoch: 0, Snapshot: snapshot}); err != nil && !tenantsecurity.IsCategory(err, tenantsecurity.CategoryConflict) {
+		t.Fatal(err)
+	}
 }
 
 // writeWorkflowProjectConfigurationFixture publishes the exact active authority used by productive composition tests.
@@ -1383,7 +1490,7 @@ func writeWorkflowProjectConfigurationFixture(t *testing.T, root, configPath str
 	if isolated := os.Getenv("FEATUREPROOF_TEST_PROJECT_ID"); isolated != "" {
 		projectID = isolated
 	}
-	key, err := projectconfig.NewProjectKey(projectID, repositoryID)
+	key, err := projectconfig.NewProjectKey("organization", projectID, repositoryID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1426,13 +1533,18 @@ func writeWorkflowProjectConfigurationFixture(t *testing.T, root, configPath str
 	if allowed, _ := config["allow_disabled_approval"].(bool); allowed {
 		approval = "optional"
 	}
-	document := projectconfig.Document{Schema: projectconfig.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Limits: projectconfig.Limits{DurationSeconds: 300, ToolCalls: 4, ModelTokens: 64000, Replans: 1}, Approval: approval, RetentionDays: 7, Capabilities: []string{"read"}}}
+	document := projectconfig.Document{Schema: projectconfig.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Limits: projectconfig.Limits{DurationSeconds: 300, ToolCalls: 4, ModelTokens: 64000, Replans: 1}, Approval: approval, RetentionDays: 7, Capabilities: []string{"read"}}}
 	canonical, err := projectconfig.Canonicalize(document)
 	if err != nil {
 		t.Fatal(err)
 	}
 	catalogSnapshot := projectconfig.ResourceCatalogSnapshot{ProjectKey: key, Digest: digest, Descriptors: descriptors, Limits: limits}
-	policySnapshot := projectconfig.OrganizationPolicySnapshot{Version: 1, Digest: digest, MaximumLimits: projectconfig.Limits{DurationSeconds: 300, ToolCalls: 4, ModelTokens: 64000, Replans: 1}, ApprovalRequired: approval == "required", MinimumRetentionDays: 1, MaximumRetentionDays: 30, AllowedCapabilities: []string{"read"}}
+	policySnapshot := projectconfig.OrganizationPolicySnapshot{Version: 1, MaximumLimits: projectconfig.Limits{DurationSeconds: 300, ToolCalls: 4, ModelTokens: 64000, Replans: 1}, ApprovalRequired: approval == "required", MinimumRetentionDays: 1, MaximumRetentionDays: 30, AllowedCapabilities: []string{"read"}}
+	tenantPolicy, policyErr := tenantsecurity.CompileTenantPolicy(tenantsecurity.TenantPolicy{OrganizationID: key.OrganizationID, Version: policySnapshot.Version, MaximumLimits: tenantsecurity.PolicyLimits{DurationSeconds: policySnapshot.MaximumLimits.DurationSeconds, ToolCalls: policySnapshot.MaximumLimits.ToolCalls, ModelTokens: policySnapshot.MaximumLimits.ModelTokens, Replans: policySnapshot.MaximumLimits.Replans}, ApprovalRequired: policySnapshot.ApprovalRequired, MinimumRetentionDays: policySnapshot.MinimumRetentionDays, MaximumRetentionDays: policySnapshot.MaximumRetentionDays, Allowed: map[string][]string{}, AllowedCapabilities: append([]string(nil), policySnapshot.AllowedCapabilities...)}, tenantsecurity.DefaultLimits())
+	if policyErr != nil {
+		t.Fatal(policyErr)
+	}
+	policySnapshot.Digest = tenantPolicy.Digest
 	catalog, err := projectconfig.NewSnapshotCatalog([]projectconfig.ResourceCatalogSnapshot{catalogSnapshot})
 	if err != nil {
 		t.Fatal(err)
@@ -1471,6 +1583,7 @@ func writeWorkflowProjectConfigurationFixture(t *testing.T, root, configPath str
 		}
 	}
 	t.Setenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID", key.ProjectID)
+	t.Setenv("FEATUREPROOF_ORGANIZATION_ID", key.OrganizationID)
 	t.Setenv("FEATUREPROOF_PROJECT_CONFIG_REPOSITORY_ID", key.RepositoryID)
 	t.Setenv("FEATUREPROOF_PROJECT_CONFIG_CATALOG", catalogPath)
 	t.Setenv("FEATUREPROOF_PROJECT_CONFIG_POLICY", policyPath)
@@ -1500,7 +1613,7 @@ func TestProjectConfigurationCLIUsesSharedGateway(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, _ := projectconfig.NewProjectKey(os.Getenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID"), os.Getenv("FEATUREPROOF_PROJECT_CONFIG_REPOSITORY_ID"))
+	key, _ := projectconfig.NewProjectKey(os.Getenv("FEATUREPROOF_ORGANIZATION_ID"), os.Getenv("FEATUREPROOF_PROJECT_CONFIG_PROJECT_ID"), os.Getenv("FEATUREPROOF_PROJECT_CONFIG_REPOSITORY_ID"))
 	head, err := localStore.Head(context.Background(), key)
 	if err != nil {
 		t.Fatal(err)
@@ -1547,7 +1660,7 @@ func (mainTestRejectWriter) Write([]byte) (int, error) { return 0, errors.New("o
 // TestApplyBoundWorkflowSelectionsRejectsMissingAndAmbiguousResources proves bootstrap values cannot fill configuration gaps.
 func TestApplyBoundWorkflowSelectionsRejectsMissingAndAmbiguousResources(t *testing.T) {
 	t.Parallel()
-	key, _ := projectconfig.NewProjectKey("project", "repo")
+	key, _ := projectconfig.NewProjectKey("organization", "project", "repo")
 	digest := strings.Repeat("a", 64)
 	required := []projectconfig.ResourceDescriptor{{Kind: projectconfig.ResourceContract, ID: "contract", Selection: "contract.json"}, {Kind: projectconfig.ResourceEnvironment, ID: "environment", Selection: "target"}, {Kind: projectconfig.ResourceProvider, ID: "provider", Selection: "openai"}, {Kind: projectconfig.ResourceRuntimeProfile, ID: "runtime", Selection: "runtime"}, {Kind: projectconfig.ResourceModelProfile, ID: "model", Selection: "model"}, {Kind: projectconfig.ResourceAuthProfile, ID: "auth", Selection: "profile"}}
 	build := func(descriptors []projectconfig.ResourceDescriptor) projectconfig.EffectiveConfiguration {
@@ -1559,7 +1672,7 @@ func TestApplyBoundWorkflowSelectionsRejectsMissingAndAmbiguousResources(t *test
 				references[index].SecretRef = "credential"
 			}
 		}
-		canonical, err := projectconfig.Canonicalize(projectconfig.Document{Schema: projectconfig.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Limits: projectconfig.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}})
+		canonical, err := projectconfig.Canonicalize(projectconfig.Document{Schema: projectconfig.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: projectconfig.Constraints{Limits: projectconfig.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1976,7 +2089,10 @@ func TestConfiguredPreviewRunsThroughExternalCLIEntrypoint(t *testing.T) {
 
 // TestConfiguredPreviewRunsThroughMCPEntrypoint verifies stdio tools/call uses the same configured preview lifecycle.
 func TestConfiguredPreviewRunsThroughMCPEntrypoint(t *testing.T) {
+	targetCalled := make(chan struct{})
+	var targetOnce sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		targetOnce.Do(func() { close(targetCalled) })
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
@@ -1990,14 +2106,38 @@ func TestConfiguredPreviewRunsThroughMCPEntrypoint(t *testing.T) {
 	})
 	writeWorkflowProjectConfigurationFixture(t, root, configPath)
 	t.Setenv("FEATUREPROOF_PREVIEW_CONFIG", writeConfiguredPreviewFixture(t, root, server.URL+"/"))
-	request := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"protocolVersion":"2026-07-28","name":"featureproof.submit","arguments":{"selection_alias":"preview","idempotency_key":"mcp-entrypoint-key"}}}` + "\n"
+	current, err := user.Current()
+	if err != nil || current.Uid == "" {
+		t.Fatal("current test identity unavailable")
+	}
+	const credential = "external-mcp-entrypoint-credential"
+	t.Setenv("FEATUREPROOF_EXTERNAL_AGENT_MCP_CREDENTIALS", `{"`+credential+`":"`+current.Uid+`"}`)
+	request := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"protocolVersion":"2026-07-28","credential":"` + credential + `","name":"featureproof.submit","arguments":{"selection_alias":"preview","idempotency_key":"mcp-entrypoint-key"}}}` + "\n"
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"mcp", "serve"}, strings.NewReader(request), &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), `"phase":"queued"`) {
-		t.Fatalf("code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	input, inputWriter := io.Pipe()
+	done := make(chan int, 1)
+	go func() { done <- run([]string{"mcp", "serve"}, input, &stdout, &stderr) }()
+	if _, err := inputWriter.Write([]byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-targetCalled:
+	case <-t.Context().Done():
+		t.Fatalf("preview target was not invoked: %v", t.Context().Err())
 	}
 	matches, err := filepath.Glob(filepath.Join(root, ".featureproof", "preview", "*.json"))
 	if err != nil || len(matches) != 1 {
 		t.Fatalf("preview records=%v err=%v", matches, err)
+	}
+	if err := inputWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-done; code != 0 || !strings.Contains(stdout.String(), `"phase":"queued"`) {
+		t.Fatalf("code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	t.Setenv("FEATUREPROOF_EXTERNAL_AGENT_MCP_CREDENTIALS", "")
+	if code := run([]string{"mcp", "serve"}, strings.NewReader(""), io.Discard, io.Discard); code != 3 {
+		t.Fatalf("external MCP started without transport credential verifier: %d", code)
 	}
 }
 
@@ -2033,17 +2173,17 @@ func TestConfiguredPreviewComposesInsideGitHubEntrypoint(t *testing.T) {
 // TestGitHubControlPlaneSelectorKeepsLocalExplicitAndPostgresFailClosed verifies no fake or fallback is installed by backend selection.
 func TestGitHubControlPlaneSelectorKeepsLocalExplicitAndPostgresFailClosed(t *testing.T) {
 	t.Setenv("FEATUREPROOF_CONTROL_PLANE_BACKEND", "local")
-	ingress, admission, err := composeGitHubControlPlane(context.Background(), githubpr.WallClock{}, time.Minute)
+	ingress, admission, err := composeGitHubControlPlane(context.Background(), githubpr.WallClock{}, time.Minute, "")
 	if err != nil || ingress != nil || admission != nil {
 		t.Fatal("local mode replaced existing stores")
 	}
 	t.Setenv("FEATUREPROOF_CONTROL_PLANE_BACKEND", "unknown")
-	if _, _, err = composeGitHubControlPlane(context.Background(), githubpr.WallClock{}, time.Minute); err == nil {
+	if _, _, err = composeGitHubControlPlane(context.Background(), githubpr.WallClock{}, time.Minute, ""); err == nil {
 		t.Fatal("unknown backend accepted")
 	}
 	t.Setenv("FEATUREPROOF_CONTROL_PLANE_BACKEND", "postgres")
 	t.Setenv("FEATUREPROOF_CONTROL_PLANE_POSTGRES_DSN", "")
-	if _, _, err = composeGitHubControlPlane(context.Background(), githubpr.WallClock{}, time.Minute); err == nil {
+	if _, _, err = composeGitHubControlPlane(context.Background(), githubpr.WallClock{}, time.Minute, ""); err == nil {
 		t.Fatal("postgres outage fell back to local")
 	}
 }

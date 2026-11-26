@@ -30,11 +30,11 @@ func RunResourceArtifacts(ctx context.Context, factory ResourceArtifactFactory, 
 	if err != nil {
 		return err
 	}
-	firstKey, err := pc.NewProjectKey("artifact-"+suffix, "repository-a")
+	firstKey, err := pc.NewProjectKey("organization-a", "artifact-"+suffix, "repository-a")
 	if err != nil {
 		return err
 	}
-	secondKey, err := pc.NewProjectKey("artifact-"+suffix, "repository-b")
+	secondKey, err := pc.NewProjectKey("organization-b", "artifact-"+suffix, "repository-b")
 	if err != nil {
 		return err
 	}
@@ -86,11 +86,11 @@ func Run(ctx context.Context, factory Factory, suffix string) error {
 	if err != nil {
 		return err
 	}
-	key, err := pc.NewProjectKey("contract-"+suffix, "repo")
+	key, err := pc.NewProjectKey("organization", "contract-"+suffix, "repo")
 	if err != nil {
 		return err
 	}
-	document := pc.Document{Schema: pc.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: fixtureDigest}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
+	document := pc.Document{Schema: pc.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: fixtureDigest}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
 	canonical, err := pc.Canonicalize(document)
 	if err != nil {
 		return err

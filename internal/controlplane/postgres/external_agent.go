@@ -6,17 +6,38 @@ import (
 	"errors"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	"github.com/asierhr/featureProof/internal/externalagent"
 	pc "github.com/asierhr/featureProof/internal/projectconfig"
 	"github.com/jackc/pgx/v5"
 )
 
 // ExternalAgentRegistry owns PostgreSQL idempotency, run lifecycle, binding and artifact admission transactions.
-type ExternalAgentRegistry struct{ owner *Store }
+type ExternalAgentRegistry struct {
+	owner *Store
+	scope controlplane.ProjectScope
+}
 
 // ExternalAgentRegistry returns the backend-homogeneous external-agent owner for productive PostgreSQL composition.
 func (store *Store) ExternalAgentRegistry() *ExternalAgentRegistry {
 	return &ExternalAgentRegistry{owner: store}
+}
+
+// ScopedExternalAgentRegistry seals one trusted composition scope onto worker
+// contexts created after request admission, without accepting tenant payloads.
+func (store *Store) ScopedExternalAgentRegistry(scope controlplane.ProjectScope) (*ExternalAgentRegistry, error) {
+	if store == nil || scope.Validate() != nil {
+		return nil, controlplane.ErrInvalid
+	}
+	return &ExternalAgentRegistry{owner: store, scope: scope}, nil
+}
+
+// scopedContext restores only an explicitly composed scope for background workers.
+func (registry *ExternalAgentRegistry) scopedContext(ctx context.Context) context.Context {
+	if registry != nil && registry.scope.Validate() == nil {
+		return controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: registry.scope.OrganizationID, ProjectID: registry.scope.ProjectID})
+	}
+	return ctx
 }
 
 // Close releases the PostgreSQL owner selected exclusively for this external-agent composition.
@@ -31,11 +52,16 @@ func (registry *ExternalAgentRegistry) ClaimSubmit(ctx context.Context, principa
 	if registry == nil || registry.owner == nil || principalID == "" || len(keyHash) != 64 || len(requestHash) != 64 {
 		return nil, externalagent.ErrConflict
 	}
+	ctx = registry.scopedContext(ctx)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, externalagent.ErrNotFound
+	}
 	connection, err := registry.owner.pool.Acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	lockIdentity := principalID + ":" + keyHash
+	lockIdentity := coordinate.OrganizationID + ":" + coordinate.ProjectID + ":" + principalID + ":" + keyHash
 	release := func() {
 		_, _ = connection.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtextextended($1,0))`, lockIdentity)
 		connection.Release()
@@ -45,7 +71,7 @@ func (registry *ExternalAgentRegistry) ClaimSubmit(ctx context.Context, principa
 		return nil, err
 	}
 	var raw []byte
-	err = connection.QueryRow(ctx, `SELECT document FROM external_agent_runs WHERE principal_id=$1 AND submit_key_hash=$2`, principalID, keyHash).Scan(&raw)
+	err = connection.QueryRow(ctx, `SELECT document FROM external_agent_runs WHERE organization_id=$1 AND project_id=$2 AND principal_id=$3 AND submit_key_hash=$4`, coordinate.OrganizationID, coordinate.ProjectID, principalID, keyHash).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return externalagent.NewSubmissionClaim(nil, release), nil
 	}
@@ -73,13 +99,18 @@ func (registry *ExternalAgentRegistry) ReserveConfigured(ctx context.Context, re
 
 // reserve implements both initial paths while preserving one idempotent transaction boundary.
 func (registry *ExternalAgentRegistry) reserve(ctx context.Context, record externalagent.RunRecord, snapshot *externalagent.ProjectResourceSnapshot) (externalagent.ReserveResult, error) {
+	ctx = registry.scopedContext(ctx)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != "" && coordinate.RunID != record.Handle {
+		return externalagent.ReserveResult{}, externalagent.ErrNotFound
+	}
 	tx, err := registry.owner.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return externalagent.ReserveResult{}, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	var existingRaw []byte
-	err = tx.QueryRow(ctx, `SELECT document FROM external_agent_runs WHERE principal_id=$1 AND submit_key_hash=$2 FOR UPDATE`, record.PrincipalID, record.SubmitKeyHash).Scan(&existingRaw)
+	err = tx.QueryRow(ctx, `SELECT document FROM external_agent_runs WHERE organization_id=$1 AND project_id=$2 AND principal_id=$3 AND submit_key_hash=$4 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, record.PrincipalID, record.SubmitKeyHash).Scan(&existingRaw)
 	if err == nil {
 		existing, decodeErr := decodeExternalRecord(existingRaw)
 		if decodeErr != nil || existing.RequestHash != record.RequestHash {
@@ -91,19 +122,19 @@ func (registry *ExternalAgentRegistry) reserve(ctx context.Context, record exter
 		return externalagent.ReserveResult{}, err
 	}
 	if snapshot != nil {
-		if record.Configuration == nil || !externalBindingContains(*record.Configuration, snapshot.Descriptor) {
+		if record.Configuration == nil || record.Configuration.ProjectKey.OrganizationID != coordinate.OrganizationID || record.Configuration.ProjectKey.ProjectID != coordinate.ProjectID || !externalBindingContains(*record.Configuration, snapshot.Descriptor) {
 			return externalagent.ReserveResult{}, externalagent.ErrConflict
 		}
 		artifact, sealErr := pc.SealResourceArtifact(snapshot.Descriptor, snapshot.Payload)
 		if sealErr != nil {
 			return externalagent.ReserveResult{}, sealErr
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO project_configuration_resource_artifacts(project_id,repository_id,reference_kind,reference_id,reference_version,descriptor_digest,payload,payload_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`, artifact.Key.ProjectKey.ProjectID, artifact.Key.ProjectKey.RepositoryID, string(artifact.Key.Kind), artifact.Key.ID, artifact.Key.Version, artifact.Key.Digest, artifact.Payload, artifact.PayloadDigest); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO project_configuration_resource_artifacts(organization_id,project_id,repository_id,reference_kind,reference_id,reference_version,descriptor_digest,payload,payload_digest) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`, artifact.Key.ProjectKey.OrganizationID, artifact.Key.ProjectKey.ProjectID, artifact.Key.ProjectKey.RepositoryID, string(artifact.Key.Kind), artifact.Key.ID, artifact.Key.Version, artifact.Key.Digest, artifact.Payload, artifact.PayloadDigest); err != nil {
 			return externalagent.ReserveResult{}, err
 		}
 		var stored pc.ResourceArtifact
 		stored.Key = artifact.Key
-		if err = tx.QueryRow(ctx, `SELECT payload,payload_digest FROM project_configuration_resource_artifacts WHERE project_id=$1 AND repository_id=$2 AND reference_kind=$3 AND reference_id=$4 AND reference_version=$5 AND descriptor_digest=$6`, artifact.Key.ProjectKey.ProjectID, artifact.Key.ProjectKey.RepositoryID, string(artifact.Key.Kind), artifact.Key.ID, artifact.Key.Version, artifact.Key.Digest).Scan(&stored.Payload, &stored.PayloadDigest); err != nil {
+		if err = tx.QueryRow(ctx, `SELECT payload,payload_digest FROM project_configuration_resource_artifacts WHERE organization_id=$1 AND project_id=$2 AND repository_id=$3 AND reference_kind=$4 AND reference_id=$5 AND reference_version=$6 AND descriptor_digest=$7`, artifact.Key.ProjectKey.OrganizationID, artifact.Key.ProjectKey.ProjectID, artifact.Key.ProjectKey.RepositoryID, string(artifact.Key.Kind), artifact.Key.ID, artifact.Key.Version, artifact.Key.Digest).Scan(&stored.Payload, &stored.PayloadDigest); err != nil {
 			return externalagent.ReserveResult{}, err
 		}
 		verified, verifyErr := pc.VerifyResourceArtifact(snapshot.Descriptor, stored)
@@ -120,10 +151,10 @@ func (registry *ExternalAgentRegistry) reserve(ctx context.Context, record exter
 	if err != nil {
 		return externalagent.ReserveResult{}, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO external_agent_runs(handle,principal_id,submit_key_hash,request_hash,phase,owner,updated_at,document) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, record.Handle, record.PrincipalID, record.SubmitKeyHash, record.RequestHash, string(record.Phase), record.Owner, record.UpdatedAt, raw); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO external_agent_runs(organization_id,project_id,handle,principal_id,submit_key_hash,request_hash,phase,owner,updated_at,document) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, coordinate.OrganizationID, coordinate.ProjectID, record.Handle, record.PrincipalID, record.SubmitKeyHash, record.RequestHash, string(record.Phase), record.Owner, record.UpdatedAt, raw); err != nil {
 		return externalagent.ReserveResult{}, externalagent.ErrConflict
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO external_agent_events(run_handle,sequence,event) VALUES($1,1,$2)`, record.Handle, eventRaw); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO external_agent_events(organization_id,project_id,run_handle,sequence,event) VALUES($1,$2,$3,1,$4)`, coordinate.OrganizationID, coordinate.ProjectID, record.Handle, eventRaw); err != nil {
 		return externalagent.ReserveResult{}, err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -134,8 +165,13 @@ func (registry *ExternalAgentRegistry) reserve(ctx context.Context, record exter
 
 // Get reads one committed run snapshot.
 func (registry *ExternalAgentRegistry) Get(ctx context.Context, handle string) (externalagent.RunRecord, error) {
+	ctx = registry.scopedContext(ctx)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return externalagent.RunRecord{}, externalagent.ErrNotFound
+	}
 	var raw []byte
-	if err := registry.owner.pool.QueryRow(ctx, `SELECT document FROM external_agent_runs WHERE handle=$1`, handle).Scan(&raw); errors.Is(err, pgx.ErrNoRows) {
+	if err := registry.owner.pool.QueryRow(ctx, `SELECT document FROM external_agent_runs WHERE organization_id=$1 AND project_id=$2 AND handle=$3`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&raw); errors.Is(err, pgx.ErrNoRows) {
 		return externalagent.RunRecord{}, externalagent.ErrNotFound
 	} else if err != nil {
 		return externalagent.RunRecord{}, err
@@ -184,22 +220,36 @@ func (registry *ExternalAgentRegistry) ReserveCancel(ctx context.Context, handle
 
 // Recover terminalizes runs owned by a prior process without re-execution.
 func (registry *ExternalAgentRegistry) Recover(ctx context.Context, owner string, now time.Time) error {
-	rows, err := registry.owner.pool.Query(ctx, `SELECT handle FROM external_agent_runs WHERE phase IN ('queued','running','finalizing') AND owner<>$1`, owner)
+	_, err := registry.RecoverTerminal(ctx, owner, now)
+	return err
+}
+
+// RecoverTerminal terminalizes abandoned runs and returns their exact durable
+// identities for resource reconciliation by outer lifecycle wrappers.
+func (registry *ExternalAgentRegistry) RecoverTerminal(ctx context.Context, owner string, now time.Time) ([]externalagent.RunRecord, error) {
+	ctx = registry.scopedContext(ctx)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, externalagent.ErrNotFound
+	}
+	rows, err := registry.owner.pool.Query(ctx, `SELECT handle FROM external_agent_runs WHERE organization_id=$1 AND project_id=$2 AND phase IN ('queued','running','finalizing') AND owner<>$3`, coordinate.OrganizationID, coordinate.ProjectID, owner)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var handles []string
 	for rows.Next() {
 		var handle string
 		if err = rows.Scan(&handle); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		handles = append(handles, handle)
 	}
 	rows.Close()
+	var recovered []externalagent.RunRecord
 	for _, handle := range handles {
-		_, err = registry.update(ctx, handle, func(record *externalagent.RunRecord) (string, error) {
+		var record externalagent.RunRecord
+		record, err = registry.update(ctx, handle, func(record *externalagent.RunRecord) (string, error) {
 			if record.Owner == owner || record.Phase == externalagent.PhaseTerminal {
 				return "", nil
 			}
@@ -207,15 +257,23 @@ func (registry *ExternalAgentRegistry) Recover(ctx context.Context, owner string
 			return "terminal", nil
 		})
 		if err != nil {
-			return err
+			return nil, err
+		}
+		if record.Phase == externalagent.PhaseTerminal {
+			recovered = append(recovered, record)
 		}
 	}
-	return nil
+	return recovered, nil
 }
 
 // Events loads the immutable ordered journal for one run.
 func (registry *ExternalAgentRegistry) Events(ctx context.Context, handle string) ([]externalagent.RunEvent, error) {
-	rows, err := registry.owner.pool.Query(ctx, `SELECT event FROM external_agent_events WHERE run_handle=$1 ORDER BY sequence`, handle)
+	ctx = registry.scopedContext(ctx)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, externalagent.ErrNotFound
+	}
+	rows, err := registry.owner.pool.Query(ctx, `SELECT event FROM external_agent_events WHERE organization_id=$1 AND project_id=$2 AND run_handle=$3 ORDER BY sequence`, coordinate.OrganizationID, coordinate.ProjectID, handle)
 	if err != nil {
 		return nil, err
 	}
@@ -254,13 +312,18 @@ func (*ExternalAgentRegistry) ReleaseOwner(string) {}
 
 // update serializes one record mutation with its optional journal append.
 func (registry *ExternalAgentRegistry) update(ctx context.Context, handle string, mutate func(*externalagent.RunRecord) (string, error)) (externalagent.RunRecord, error) {
+	ctx = registry.scopedContext(ctx)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return externalagent.RunRecord{}, externalagent.ErrNotFound
+	}
 	tx, err := registry.owner.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return externalagent.RunRecord{}, err
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
 	var raw []byte
-	if err = tx.QueryRow(ctx, `SELECT document FROM external_agent_runs WHERE handle=$1 FOR UPDATE`, handle).Scan(&raw); errors.Is(err, pgx.ErrNoRows) {
+	if err = tx.QueryRow(ctx, `SELECT document FROM external_agent_runs WHERE organization_id=$1 AND project_id=$2 AND handle=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&raw); errors.Is(err, pgx.ErrNoRows) {
 		return externalagent.RunRecord{}, externalagent.ErrNotFound
 	} else if err != nil {
 		return externalagent.RunRecord{}, err
@@ -277,12 +340,12 @@ func (registry *ExternalAgentRegistry) update(ctx context.Context, handle string
 	if err != nil {
 		return externalagent.RunRecord{}, err
 	}
-	if _, err = tx.Exec(ctx, `UPDATE external_agent_runs SET phase=$2,owner=$3,updated_at=$4,document=$5 WHERE handle=$1`, handle, string(record.Phase), record.Owner, record.UpdatedAt, raw); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE external_agent_runs SET phase=$1,owner=$2,updated_at=$3,document=$4 WHERE organization_id=$5 AND project_id=$6 AND handle=$7`, string(record.Phase), record.Owner, record.UpdatedAt, raw, coordinate.OrganizationID, coordinate.ProjectID, handle); err != nil {
 		return externalagent.RunRecord{}, err
 	}
 	if kind != "" {
 		var sequence int
-		if err = tx.QueryRow(ctx, `SELECT COALESCE(max(sequence),0)+1 FROM external_agent_events WHERE run_handle=$1`, handle).Scan(&sequence); err != nil {
+		if err = tx.QueryRow(ctx, `SELECT COALESCE(max(sequence),0)+1 FROM external_agent_events WHERE organization_id=$1 AND project_id=$2 AND run_handle=$3`, coordinate.OrganizationID, coordinate.ProjectID, handle).Scan(&sequence); err != nil {
 			return externalagent.RunRecord{}, err
 		}
 		event := externalagent.RunEvent{Sequence: sequence, Type: kind, RunHandle: handle, At: record.UpdatedAt, Phase: record.Phase, Status: record.Status, Cause: record.Cause}
@@ -290,7 +353,7 @@ func (registry *ExternalAgentRegistry) update(ctx context.Context, handle string
 		if marshalErr != nil {
 			return externalagent.RunRecord{}, marshalErr
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO external_agent_events(run_handle,sequence,event) VALUES($1,$2,$3)`, handle, sequence, eventRaw); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO external_agent_events(organization_id,project_id,run_handle,sequence,event) VALUES($1,$2,$3,$4,$5)`, coordinate.OrganizationID, coordinate.ProjectID, handle, sequence, eventRaw); err != nil {
 			return externalagent.RunRecord{}, err
 		}
 	}

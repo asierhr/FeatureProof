@@ -63,7 +63,7 @@ func TestExistingLocalStoreRejectsWritesDuringOfflineImport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := source.Freeze(context.Background(), "github-import", "run-1", "project-1", importFreezeDigest("head"), 1, time.Now().UTC())
+	manifest, err := source.Freeze(context.Background(), "organization", "github-import", "run-1", "project-1", importFreezeDigest("head"), 1, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}

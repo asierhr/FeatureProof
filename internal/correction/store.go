@@ -123,7 +123,7 @@ type Store interface {
 	Events(context.Context, string) ([]Event, error)
 	Recover(context.Context, string, time.Time) error
 	ClaimPendingComparisons(context.Context, string, time.Time) ([]Record, error)
-	ReleaseOwner(string)
+	ReleaseOwner(context.Context, string)
 }
 
 // ValidateStoreTransition exposes correction identity and phase invariants to infrastructure adapters.
@@ -569,7 +569,7 @@ func (s *LocalStore) ClaimPendingComparisons(ctx context.Context, owner string, 
 					candidateRelease()
 				}
 				for _, record := range claimed {
-					s.ReleaseOwner(record.Link.Handle)
+					s.ReleaseOwner(ctx, record.Link.Handle)
 				}
 				return nil, err
 			}
@@ -634,7 +634,10 @@ func (s *LocalStore) withChainState(ctx context.Context, root string, operation 
 }
 
 // ReleaseOwner drops the live process lease only after worker cleanup is complete.
-func (s *LocalStore) ReleaseOwner(handle string) {
+func (s *LocalStore) ReleaseOwner(ctx context.Context, handle string) {
+	if ctx == nil || ctx.Err() != nil {
+		return
+	}
 	s.leaseMu.Lock()
 	release := s.leases[handle]
 	delete(s.leases, handle)

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	"github.com/asierhr/featureProof/internal/harness"
 )
 
@@ -17,12 +18,12 @@ type approvalStoreContractFactory func() (ApprovalStore, error)
 // journal semantics against every durable backend implementation.
 func runApprovalStoreContract(t *testing.T, store ApprovalStore, reopen approvalStoreContractFactory, runID string) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := controlplane.WithBackendCoordinate(context.Background(), controlplane.BackendCoordinate{OrganizationID: "organization", ProjectID: "project", RunID: runID})
 	run, err := harness.NewRun(runID, "shared approval contract", "constraint", harness.Limits{MaxSteps: 1, MaxToolCalls: 1, MaxRetries: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.BindRun(context.Background(), run); err != nil {
+	if _, err = store.BindRun(ctx, run); err != nil {
 		t.Fatal(err)
 	}
 	plan, contract := approvalFixture(t)

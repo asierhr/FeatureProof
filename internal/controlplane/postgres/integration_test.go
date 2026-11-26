@@ -3,6 +3,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,11 +35,322 @@ import (
 	"github.com/asierhr/featureProof/internal/planning"
 	pc "github.com/asierhr/featureProof/internal/projectconfig"
 	pccontract "github.com/asierhr/featureProof/internal/projectconfig/contracttest"
+	"github.com/asierhr/featureProof/internal/tenantsecurity"
+	tenantcontract "github.com/asierhr/featureProof/internal/tenantsecurity/contracttest"
 	"github.com/asierhr/featureProof/internal/testidentity"
 	"github.com/asierhr/featureProof/internal/validationworkflow"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// postgresSecretClock fixes lease and audit timestamps in the real adapter gate.
+type postgresSecretClock struct{ now time.Time }
+
+// Now returns the deterministic integration instant.
+func (clock postgresSecretClock) Now() time.Time { return clock.now }
+
+// postgresSecretRandom supplies deterministic provider-owned test nonces.
+type postgresSecretRandom struct{}
+
+// Bytes returns a stable nonce without using a real KMS or entropy source.
+func (postgresSecretRandom) Bytes(_ context.Context, size int) ([]byte, error) {
+	return bytes.Repeat([]byte{0x3c}, size), nil
+}
+
+// postgresSecretKeys authenticates AAD in the isolated PostgreSQL contract gate.
+type postgresSecretKeys struct{}
+
+// Algorithm identifies the deterministic test envelope format.
+func (postgresSecretKeys) Algorithm() string { return "pg-fake-v1" }
+
+// Encrypt stores an AAD tag and XOR ciphertext while never returning plaintext.
+func (postgresSecretKeys) Encrypt(_ context.Context, key string, plaintext, aad, nonce []byte) (tenantsecurity.EncryptedPayload, error) {
+	tag := sha256.Sum256(append(append(append([]byte{}, key...), aad...), nonce...))
+	ciphertext := make([]byte, sha256.Size+len(plaintext))
+	copy(ciphertext, tag[:])
+	for index := range plaintext {
+		ciphertext[sha256.Size+index] = plaintext[index] ^ aad[index%len(aad)] ^ nonce[index%len(nonce)]
+	}
+	return tenantsecurity.EncryptedPayload{Algorithm: "pg-fake-v1", Nonce: append([]byte(nil), nonce...), Ciphertext: ciphertext}, nil
+}
+
+// Decrypt rejects altered AAD/key/nonce before returning the ephemeral buffer.
+func (postgresSecretKeys) Decrypt(_ context.Context, key string, payload tenantsecurity.EncryptedPayload, aad []byte) ([]byte, error) {
+	tag := sha256.Sum256(append(append(append([]byte{}, key...), aad...), payload.Nonce...))
+	if payload.Algorithm != "pg-fake-v1" || len(payload.Ciphertext) < sha256.Size || !bytes.Equal(tag[:], payload.Ciphertext[:sha256.Size]) {
+		return nil, errors.New("fake envelope authentication")
+	}
+	plaintext := make([]byte, len(payload.Ciphertext)-sha256.Size)
+	for index := range plaintext {
+		plaintext[index] = payload.Ciphertext[sha256.Size+index] ^ aad[index%len(aad)] ^ payload.Nonce[index%len(payload.Nonce)]
+	}
+	return plaintext, nil
+}
+
+// TestPostgresTenantSecurityScopesRelationshipsAndEpoch verifies migration 0021 on a real isolated database.
+func TestPostgresTenantSecurityScopesRelationshipsAndEpoch(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	org := tenantsecurity.Organization{ID: "org-a", State: tenantsecurity.StateActive, Version: 1, SecurityRevision: 1, PolicyDigest: strings.Repeat("a", 64)}
+	project := tenantsecurity.ProjectRegistration{OrganizationID: org.ID, ProjectID: "project-a", RepositoryID: "repo-a", State: tenantsecurity.StateActive, Version: 1}
+	principal := tenantsecurity.Principal{ID: "principal-a", Kind: tenantsecurity.PrincipalHuman, SubjectDigest: strings.Repeat("b", 64), State: tenantsecurity.StateActive, Version: 1}
+	membership := tenantsecurity.Membership{OrganizationID: org.ID, PrincipalID: principal.ID, State: tenantsecurity.StateActive, ValidFrom: time.Now().Add(-time.Hour), ValidUntil: time.Now().Add(time.Hour), Version: 1}
+	role, err := tenantsecurity.CompileRole(tenantsecurity.Role{OrganizationID: org.ID, ID: "reader", Actions: []tenantsecurity.Action{tenantsecurity.ActionRunRead}, Resources: []tenantsecurity.ResourceClass{tenantsecurity.ResourceRun}, ProjectIDs: []string{project.ProjectID}, Version: 1}, tenantsecurity.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = owner.TenantSecurity().Bootstrap(ctx, org, project, principal, membership, []tenantsecurity.Role{role}); err != nil {
+		t.Fatal(err)
+	}
+	secondOrg := org
+	secondOrg.ID = "org-b"
+	secondProject := project
+	secondProject.OrganizationID = secondOrg.ID
+	secondMembership := membership
+	secondMembership.OrganizationID = secondOrg.ID
+	secondRole := role
+	secondRole.OrganizationID = secondOrg.ID
+	if err = owner.TenantSecurity().Bootstrap(ctx, secondOrg, secondProject, principal, secondMembership, []tenantsecurity.Role{secondRole}); err != nil {
+		t.Fatalf("same project ID in second tenant: %v", err)
+	}
+	resolved, err := owner.TenantSecurity().ProjectOrganization(ctx, org.ID, project.ProjectID)
+	if err != nil || resolved != org.ID {
+		t.Fatalf("organization=%q err=%v", resolved, err)
+	}
+	resolved, err = owner.TenantSecurity().ProjectOrganization(ctx, secondOrg.ID, secondProject.ProjectID)
+	if err != nil || resolved != secondOrg.ID {
+		t.Fatalf("second organization=%q err=%v", resolved, err)
+	}
+	if _, err = owner.TenantSecurity().SecurityEpoch(ctx, 0, strings.Repeat("c", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = owner.pool.Exec(ctx, `INSERT INTO packages(project_id,package_id,media_type,document,digest,created_at) VALUES($1,$2,$3,$4,$5,now())`, project.ProjectID, "legacy-package", "application/json", []byte("{}"), strings.Repeat("d", 64)); err == nil {
+		t.Fatal("security epoch accepted an old writer without organization scope")
+	}
+	if err = owner.TenantSecurity().Bootstrap(ctx, org, project, principal, membership, []tenantsecurity.Role{role}); err == nil {
+		t.Fatal("cross-scope duplicate accepted")
+	}
+}
+
+// TestPostgresTenantSecurityStoreContract runs the adapter-neutral isolation and durability contract.
+func TestPostgresTenantSecurityStoreContract(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	factory := func() (tenantsecurity.DurableStore, error) {
+		return owner.TenantSecurity(), nil
+	}
+	if err := tenantcontract.Run(ctx, factory, fmt.Sprintf("tenant-%d", time.Now().UnixNano())); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPostgresTenantSecretsAuditAndLeaseRace exercises ciphertext, restart-safe single use and audit projection.
+func TestPostgresTenantSecretsAuditAndLeaseRace(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	clock := postgresSecretClock{now: time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)}
+	memory := tenantsecurity.NewMemoryStore()
+	service, err := tenantsecurity.NewService(memory, clock, tenantsecurity.DefaultLimits(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	org := tenantsecurity.Organization{ID: "secret-org", State: tenantsecurity.StateActive, Version: 1, SecurityRevision: 1, PolicyDigest: strings.Repeat("a", 64)}
+	project := tenantsecurity.ProjectRegistration{OrganizationID: org.ID, ProjectID: "secret-project", RepositoryID: "secret-repo", State: tenantsecurity.StateActive, Version: 1}
+	principal := tenantsecurity.Principal{ID: "secret-principal", Kind: tenantsecurity.PrincipalHuman, SubjectDigest: strings.Repeat("b", 64), State: tenantsecurity.StateActive, Version: 1}
+	membership := tenantsecurity.Membership{OrganizationID: org.ID, PrincipalID: principal.ID, RoleIDs: []string{"secret-role"}, ProjectIDs: []string{project.ProjectID}, State: tenantsecurity.StateActive, ValidFrom: clock.now.Add(-time.Hour), ValidUntil: clock.now.Add(time.Hour), Version: 1}
+	role := tenantsecurity.Role{OrganizationID: org.ID, ID: "secret-role", Actions: []tenantsecurity.Action{tenantsecurity.ActionTenantAdmin, tenantsecurity.ActionSecretResolve}, Resources: []tenantsecurity.ResourceClass{tenantsecurity.ResourceSecret}, ProjectIDs: []string{project.ProjectID}, Version: 1}
+	if err = service.Bootstrap(ctx, org, project, principal, membership, []tenantsecurity.Role{role}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := memory.Snapshot()
+	snapshot.Epoch = 1
+	if _, err = owner.TenantSecurity().Commit(ctx, tenantsecurity.StoreCommand{OrganizationID: org.ID, OperationID: "secret-bootstrap", CommandDigest: strings.Repeat("c", 64), ExpectedEpoch: 0, Snapshot: snapshot}); err != nil {
+		t.Fatal(err)
+	}
+	identity := tenantsecurity.TrustedResourceIdentity{OrganizationID: org.ID, ProjectID: project.ProjectID, RepositoryID: project.RepositoryID}
+	resolved, err := service.Resolve(ctx, tenantsecurity.AuthenticatedSubject{Issuer: "issuer", Subject: "subject"}, identity)
+	if err == nil {
+		t.Fatal("fixture unexpectedly resolved unmapped integration subject")
+	}
+	resolved = tenantsecurity.PrincipalContext{Principal: principal, Membership: membership, Organization: org}
+	admin, err := service.Authorize(ctx, resolved, tenantsecurity.ActionTenantAdmin, tenantsecurity.ResourceSecret, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolve, err := service.Authorize(ctx, resolved, tenantsecurity.ActionSecretResolve, tenantsecurity.ResourceSecret, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets, err := tenantsecurity.NewSecretService(owner.TenantSecurity(), postgresSecretKeys{}, postgresSecretRandom{}, clock, tenantsecurity.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	canary := []byte("POSTGRES-PLAINTEXT-CANARY")
+	if _, err = secrets.Create(ctx, admin, "pg-secret-create", "deploy-secret", "deploy", "key-a", canary); err != nil {
+		t.Fatal(err)
+	}
+	issued, err := secrets.IssueLease(ctx, resolve, "pg-lease-issue", "lease-one", "deploy-secret", "run-one", "execute", "environment", "deploy", 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var successes atomic.Int32
+	var wait sync.WaitGroup
+	for _, operationID := range []string{"pg-consume-one", "pg-consume-two"} {
+		wait.Add(1)
+		go func(operationID string) {
+			defer wait.Done()
+			caller := tenantsecurity.SecretUseIdentity{RunID: issued.Lease.RunID, Phase: issued.Lease.Phase, Consumer: issued.Lease.Consumer, Purpose: issued.Lease.Purpose, Fence: issued.Lease.Fence}
+			consumeErr := secrets.WithSecret(ctx, resolve, operationID, issued.Lease, caller, func(value []byte) error {
+				if !bytes.Equal(value, canary) {
+					return errors.New("private value mismatch")
+				}
+				successes.Add(1)
+				return nil
+			})
+			if consumeErr != nil && !tenantsecurity.IsCategory(consumeErr, tenantsecurity.CategoryStale) && !tenantsecurity.IsCategory(consumeErr, tenantsecurity.CategoryRevoked) {
+				t.Errorf("consume race=%v", consumeErr)
+			}
+		}(operationID)
+	}
+	wait.Wait()
+	if successes.Load() != 1 {
+		t.Fatalf("single-use successes=%d", successes.Load())
+	}
+	var persisted []byte
+	if err = owner.pool.QueryRow(ctx, `SELECT metadata::text::bytea || ciphertext FROM tenant_secret_versions WHERE organization_id=$1 AND project_id=$2 AND reference_id=$3 AND version=1`, org.ID, project.ProjectID, "deploy-secret").Scan(&persisted); err != nil || bytes.Contains(persisted, canary) {
+		t.Fatalf("plaintext persisted err=%v", err)
+	}
+	var auditRows int
+	if err = owner.pool.QueryRow(ctx, `SELECT count(*) FROM tenant_audit_events WHERE organization_id=$1`, org.ID).Scan(&auditRows); err != nil || auditRows != 3 {
+		t.Fatalf("audit rows=%d err=%v", auditRows, err)
+	}
+}
+
+// TestPostgresTenantScopedRuntimeContract runs T7–T10 isolation and fencing on PostgreSQL.
+func TestPostgresTenantScopedRuntimeContract(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tenantcontract.RunScopedRuntime(ctx, func() (tenantsecurity.DurableStore, error) { return owner.TenantSecurity(), nil }, fmt.Sprintf("pg-runtime-%d", time.Now().UnixNano())); err != nil {
+		t.Fatal(err)
+	}
+	for table := range map[string]struct{}{"tenant_run_bindings": {}, "tenant_scoped_records": {}, "tenant_scoped_jobs": {}} {
+		var count, organizations int
+		query := `SELECT count(*),count(DISTINCT organization_id) FROM ` + pgx.Identifier{table}.Sanitize()
+		if err := owner.pool.QueryRow(ctx, query).Scan(&count, &organizations); err != nil || count < 2 || organizations != 2 {
+			t.Fatalf("table=%s count=%d organizations=%d err=%v", table, count, organizations, err)
+		}
+	}
+	if _, err := owner.pool.Exec(ctx, `UPDATE tenant_scoped_records SET record_digest=$1 WHERE organization_id=(SELECT min(organization_id) FROM tenant_scoped_records)`, strings.Repeat("f", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.TenantSecurity().Snapshot(ctx); !tenantsecurity.IsCategory(err, tenantsecurity.CategoryIntegrity) {
+		t.Fatalf("normalized corruption=%v", err)
+	}
+}
+
+// TestPostgresTenantSecurityFaultsAndCorruption verifies rollback, unknown-commit resolution and fail-closed reload.
+func TestPostgresTenantSecurityFaultsAndCorruption(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := tenantsecurity.NewMemoryStore().Snapshot()
+	org := tenantsecurity.Organization{ID: "fault-org", State: tenantsecurity.StateActive, Version: 1, SecurityRevision: 1, PolicyDigest: strings.Repeat("a", 64)}
+	snapshot.Organizations[org.ID] = org
+	snapshot.Epoch = 1
+	command := tenantsecurity.StoreCommand{OrganizationID: org.ID, OperationID: "fault-op", CommandDigest: strings.Repeat("b", 64), ExpectedEpoch: 0, Snapshot: snapshot}
+	owner.fault = func(boundary string) error {
+		if boundary == "tenant_security.after_receipt" {
+			return errors.New("injected")
+		}
+		return nil
+	}
+	if _, err := owner.TenantSecurity().Commit(ctx, command); !tenantsecurity.IsCategory(err, tenantsecurity.CategoryUnavailable) {
+		t.Fatalf("rollback fault=%v", err)
+	}
+	owner.fault = nil
+	if _, err := owner.TenantSecurity().Receipt(ctx, org.ID, command.OperationID); !tenantsecurity.IsCategory(err, tenantsecurity.CategoryNotFoundHidden) {
+		t.Fatalf("rolled back receipt=%v", err)
+	}
+	owner.fault = func(boundary string) error {
+		if boundary == "tenant_security.after_commit" {
+			return errors.New("unknown")
+		}
+		return nil
+	}
+	if _, err := owner.TenantSecurity().Commit(ctx, command); !tenantsecurity.IsCategory(err, tenantsecurity.CategoryUnavailable) {
+		t.Fatalf("unknown fault=%v", err)
+	}
+	owner.fault = nil
+	if _, err := owner.TenantSecurity().Receipt(ctx, org.ID, command.OperationID); err != nil {
+		t.Fatalf("resolve unknown=%v", err)
+	}
+	if _, err := owner.pool.Exec(ctx, `UPDATE tenant_security_receipts SET command_digest=$1 WHERE organization_id=$2 AND operation_id=$3`, strings.Repeat("e", 64), org.ID, command.OperationID); err == nil {
+		t.Fatal("immutable receipt accepted an update")
+	}
+	if _, err := owner.pool.Exec(ctx, `UPDATE tenant_security_snapshots SET document_digest=$1 WHERE singleton=true`, strings.Repeat("f", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := owner.TenantSecurity().Snapshot(ctx); !tenantsecurity.IsCategory(err, tenantsecurity.CategoryIntegrity) {
+		t.Fatalf("corruption=%v", err)
+	}
+}
+
+// TestPostgresTenantAdministrationCommitsAuditAndReceipt verifies the T6 command boundary on PostgreSQL.
+func TestPostgresTenantAdministrationCommitsAuditAndReceipt(t *testing.T) {
+	ctx := context.Background()
+	owner := integrationStore(t)
+	if err := owner.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	clock := integrationClock{now: now}
+	memory := tenantsecurity.NewMemoryStore()
+	service, _ := tenantsecurity.NewService(memory, clock, tenantsecurity.DefaultLimits(), nil)
+	organization := tenantsecurity.Organization{ID: "pg-admin-org", State: tenantsecurity.StateActive, Version: 1, SecurityRevision: 1, PolicyDigest: strings.Repeat("a", 64)}
+	project := tenantsecurity.ProjectRegistration{OrganizationID: organization.ID, ProjectID: "pg-admin-project", RepositoryID: "pg-admin-repo", State: tenantsecurity.StateActive, Version: 1}
+	principal := tenantsecurity.Principal{ID: "pg-admin", Kind: tenantsecurity.PrincipalHuman, SubjectDigest: strings.Repeat("b", 64), State: tenantsecurity.StateActive, Version: 1}
+	membership := tenantsecurity.Membership{OrganizationID: organization.ID, PrincipalID: principal.ID, RoleIDs: []string{"admin"}, ProjectIDs: []string{project.ProjectID}, State: tenantsecurity.StateActive, ValidFrom: now.Add(-time.Hour), ValidUntil: now.Add(time.Hour), Version: 1}
+	role := tenantsecurity.Role{OrganizationID: organization.ID, ID: "admin", Actions: []tenantsecurity.Action{tenantsecurity.ActionTenantAdmin}, Resources: []tenantsecurity.ResourceClass{tenantsecurity.ResourceTenant}, ProjectIDs: []string{project.ProjectID}, Version: 1}
+	if err := service.Bootstrap(ctx, organization, project, principal, membership, []tenantsecurity.Role{role}); err != nil {
+		t.Fatal(err)
+	}
+	capability, err := service.Authorize(ctx, tenantsecurity.PrincipalContext{Principal: principal, Membership: membership, Organization: organization}, tenantsecurity.ActionTenantAdmin, tenantsecurity.ResourceTenant, tenantsecurity.TrustedResourceIdentity{OrganizationID: organization.ID, ProjectID: project.ProjectID, RepositoryID: project.RepositoryID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := memory.Snapshot()
+	snapshot.Epoch = 1
+	if _, err = owner.TenantSecurity().Commit(ctx, tenantsecurity.StoreCommand{OrganizationID: organization.ID, OperationID: "pg-admin-bootstrap", CommandDigest: strings.Repeat("c", 64), ExpectedEpoch: 0, Snapshot: snapshot}); err != nil {
+		t.Fatal(err)
+	}
+	admin, err := tenantsecurity.NewAdministration(owner.TenantSecurity(), clock, tenantsecurity.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := tenantsecurity.ProjectRegistration{OrganizationID: organization.ID, ProjectID: "pg-admin-second", RepositoryID: "pg-admin-second-repo", State: tenantsecurity.StateActive, Version: 1}
+	result, err := admin.Apply(ctx, capability, "pg-admin-project-create", 0, tenantsecurity.AdministrationMutation{Kind: tenantsecurity.AdministrationProject, Project: &candidate})
+	if err != nil || result.Audit.Sequence != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	reloaded, err := owner.TenantSecurity().Snapshot(ctx)
+	if err != nil || reloaded.Projects[organization.ID+"/"+candidate.ProjectID].RepositoryID != candidate.RepositoryID || len(reloaded.Audits[organization.ID]) != 1 {
+		t.Fatalf("reloaded=%+v err=%v", reloaded, err)
+	}
+}
 
 // integrationCatalogLimits supplies explicit finite budgets to real PostgreSQL fixtures.
 func integrationCatalogLimits() pc.CatalogLimits {
@@ -51,7 +364,7 @@ func TestPostgresResourceArtifactsSurviveRestartAndRejectCorruption(t *testing.T
 	if err := owner.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	key, _ := pc.NewProjectKey("project", "repository")
+	key, _ := pc.NewProjectKey("organization", "project", "repository")
 	descriptor := pc.ResourceDescriptor{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: strings.Repeat("a", 64), ProjectKey: key}
 	if _, err := owner.ResourceArtifacts().Get(ctx, descriptor); !pc.IsCategory(err, pc.CategoryMissingReference) {
 		t.Fatalf("missing artifact=%v", err)
@@ -73,7 +386,7 @@ func TestPostgresResourceArtifactsSurviveRestartAndRejectCorruption(t *testing.T
 	if err := owner.ResourceArtifacts().Put(ctx, descriptor, []byte("divergent")); !pc.IsCategory(err, pc.CategoryIntegrity) {
 		t.Fatalf("divergent redelivery=%v", err)
 	}
-	reopened, err := Open(ctx, Config{DSN: owner.pool.Config().ConnString(), BackendIdentity: "artifact-restart", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute})
+	reopened, err := Open(ctx, Config{DSN: owner.pool.Config().ConnString(), BackendIdentity: "artifact-restart", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,8 +427,14 @@ func TestPostgresExternalAdmissionIsCausalAtomicAndRestartable(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	registry := store.ExternalAgentRegistry()
 	binding, descriptor := integrationExternalBinding(t, "external-repository", "external-internal-1", 1)
+	if err := integrationRegisterProject(ctx, store, binding.ProjectKey.OrganizationID, binding.ProjectKey.ProjectID); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := store.ScopedExternalAgentRegistry(controlplane.ProjectScope{OrganizationID: binding.ProjectKey.OrganizationID, ProjectID: binding.ProjectKey.ProjectID})
+	if err != nil {
+		t.Fatal(err)
+	}
 	record := externalagent.RunRecord{Handle: "external-atomic-handle", InternalID: binding.RunID, PrincipalID: "external-principal", SelectionAlias: descriptor.Selection, RequestHash: integrationDigest("external-request"), SubmitKeyHash: integrationDigest("external-key"), Phase: externalagent.PhaseQueued, Owner: "external-owner", UpdatedAt: time.Unix(1000, 0).UTC(), Configuration: &binding, RetentionNS: int64(time.Hour), RunTimeoutNS: int64(time.Minute)}
 	snapshot := externalagent.ProjectResourceSnapshot{Descriptor: descriptor, Payload: []byte("external-artifact-v1")}
 	claim, err := registry.ClaimSubmit(ctx, record.PrincipalID, record.SubmitKeyHash, record.RequestHash)
@@ -129,12 +448,15 @@ func TestPostgresExternalAdmissionIsCausalAtomicAndRestartable(t *testing.T) {
 	}
 
 	// A new process and a changed current head must still converge on the committed binding without creating rows.
-	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "external-restart", MaxConnections: 8, StatementTimeout: 30 * time.Second, MaxLease: 5 * time.Minute})
+	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "external-restart", MaxConnections: 8, StatementTimeout: 30 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer restarted.Close()
-	restartedRegistry := restarted.ExternalAgentRegistry()
+	restartedRegistry, err := restarted.ScopedExternalAgentRegistry(controlplane.ProjectScope{OrganizationID: binding.ProjectKey.OrganizationID, ProjectID: binding.ProjectKey.ProjectID})
+	if err != nil {
+		t.Fatal(err)
+	}
 	replay, err := restartedRegistry.ClaimSubmit(ctx, record.PrincipalID, record.SubmitKeyHash, record.RequestHash)
 	if err != nil || replay.Existing == nil || replay.Existing.Handle != record.Handle || replay.Existing.Configuration == nil || replay.Existing.Configuration.BindingDigest != binding.BindingDigest {
 		t.Fatalf("restart replay=%+v err=%v", replay, err)
@@ -282,9 +604,15 @@ func TestPostgresExternalServiceReplayNeverConsultsChangedHead(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	registry := store.ExternalAgentRegistry()
 	first, _ := integrationExternalBinding(t, "external-service-repository", "placeholder-one", 1)
 	second, _ := integrationExternalBinding(t, "external-service-repository", "placeholder-two", 2)
+	if err := integrationRegisterProject(ctx, store, first.ProjectKey.OrganizationID, first.ProjectKey.ProjectID); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := store.ScopedExternalAgentRegistry(controlplane.ProjectScope{OrganizationID: first.ProjectKey.OrganizationID, ProjectID: first.ProjectKey.ProjectID})
+	if err != nil {
+		t.Fatal(err)
+	}
 	resolver := &integrationExternalResolver{bindings: []pc.RunConfigurationBinding{first, second}}
 	identity, err := externalagent.NewLocalIdentity(externalagent.Principal{ID: "external-principal", Scopes: map[string]bool{externalagent.ScopeCreate: true, externalagent.ScopeRead: true, externalagent.ScopeCancel: true}})
 	if err != nil {
@@ -358,7 +686,13 @@ func TestPostgresExternalRegistryLifecycleAndNegativeContract(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	registry := store.ExternalAgentRegistry()
+	if err := integrationRegisterProject(ctx, store, "external-organization", "external-project"); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := store.ScopedExternalAgentRegistry(controlplane.ProjectScope{OrganizationID: "external-organization", ProjectID: "external-project"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if claim, err := (*ExternalAgentRegistry)(nil).ClaimSubmit(ctx, "principal", integrationDigest("key"), integrationDigest("request")); claim != nil || !errors.Is(err, externalagent.ErrConflict) {
 		t.Fatalf("nil registry claim=%+v err=%v", claim, err)
 	}
@@ -526,7 +860,7 @@ func TestPostgresProjectConfigurationSharedContract(t *testing.T) {
 	dsn := owner.pool.Config().ConnString()
 	opened := []*Store{}
 	factory := func() (pc.Store, error) {
-		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: time.Minute})
+		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: time.Minute, IsolatedLoopbackTest: true})
 		if err != nil {
 			return nil, err
 		}
@@ -586,7 +920,7 @@ func TestProjectConfigurationCancellationAfterBegin(t *testing.T) {
 	if err := owner.Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	key, _ := pc.NewProjectKey(fmt.Sprintf("cancel-project-%d", time.Now().UnixNano()), fmt.Sprintf("cancel-repo-%d", time.Now().UnixNano()))
+	key, _ := pc.NewProjectKey("cancel-organization", fmt.Sprintf("cancel-project-%d", time.Now().UnixNano()), fmt.Sprintf("cancel-repo-%d", time.Now().UnixNano()))
 	command := integrationProjectPublishCommand(t, key, fmt.Sprintf("cancel-operation-%d", time.Now().UnixNano()))
 	ctx, cancel := context.WithCancel(context.Background())
 	owner.fault = func(boundary string) error {
@@ -618,7 +952,7 @@ func TestPostgresProjectConfigurationCountersExhaustWithoutMutation(t *testing.T
 	prefix := fmt.Sprintf("counter-%d-", time.Now().UnixNano())
 	for _, field := range []string{"next_version", "next_generation", "next_sequence"} {
 		t.Run("publish_"+field, func(t *testing.T) {
-			key, _ := pc.NewProjectKey(prefix+field, prefix+"repo-"+field)
+			key, _ := pc.NewProjectKey(prefix+"organization", prefix+field, prefix+"repo-"+field)
 			command := integrationProjectPublishCommand(t, key, prefix+"seed-"+field)
 			if _, err := owner.ProjectConfiguration().Publish(ctx, command); err != nil {
 				t.Fatal(err)
@@ -639,7 +973,7 @@ func TestPostgresProjectConfigurationCountersExhaustWithoutMutation(t *testing.T
 	}
 	for _, field := range []string{"next_generation", "next_sequence"} {
 		t.Run("rollback_"+field, func(t *testing.T) {
-			key, _ := pc.NewProjectKey(prefix+"rollback-"+field, prefix+"rollback-repo-"+field)
+			key, _ := pc.NewProjectKey(prefix+"organization", prefix+"rollback-"+field, prefix+"rollback-repo-"+field)
 			published := integrationProjectPublishCommand(t, key, prefix+"rollback-seed-"+field)
 			if _, err := owner.ProjectConfiguration().Publish(ctx, published); err != nil {
 				t.Fatal(err)
@@ -670,7 +1004,7 @@ func TestPostgresProjectConfigurationWorkflowCausalCommit(t *testing.T) {
 	for _, boundary := range []string{"workflow.project_configuration.before", "workflow.project_configuration.after"} {
 		t.Run(boundary, func(t *testing.T) {
 			suffix := prefix + strings.ReplaceAll(boundary, ".", "-")
-			key, _ := pc.NewProjectKey("causal-project-"+suffix, "causal-repo-"+suffix)
+			key, _ := pc.NewProjectKey("causal-organization-"+suffix, "causal-project-"+suffix, "causal-repo-"+suffix)
 			binding := integrationProjectBinding(t, ctx, owner, key, "run-"+suffix)
 			owner.fault = func(current string) error {
 				if current == boundary {
@@ -679,7 +1013,11 @@ func TestPostgresProjectConfigurationWorkflowCausalCommit(t *testing.T) {
 				return nil
 			}
 			record := validationworkflow.Record{Version: 1, Handle: binding.RunID, Principal: "principal-" + suffix, IdempotencyKey: "key-" + suffix, RequestDigest: integrationDigest("request-" + suffix), RepositoryID: key.RepositoryID, Revision: strings.Repeat("a", 40), Phase: validationworkflow.PhaseAdmitted, ProjectConfigurationBinding: &binding}
-			if _, _, _, err := owner.WorkflowStore().ReserveBound(ctx, record, "owner", time.Now().UTC(), time.Minute); err == nil {
+			if err := integrationRegisterProject(ctx, owner, key.OrganizationID, key.RepositoryID); err != nil {
+				t.Fatal(err)
+			}
+			admissionCtx := controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: key.OrganizationID, ProjectID: key.RepositoryID, RunID: record.Handle})
+			if _, _, _, err := owner.WorkflowStore().ReserveBound(admissionCtx, record, "owner", time.Now().UTC(), time.Minute); err == nil {
 				t.Fatal("fault accepted")
 			}
 			owner.fault = nil
@@ -692,10 +1030,14 @@ func TestPostgresProjectConfigurationWorkflowCausalCommit(t *testing.T) {
 			}
 		})
 	}
-	key, _ := pc.NewProjectKey(prefix+"causal-project-success", prefix+"causal-repo-success")
+	key, _ := pc.NewProjectKey(prefix+"organization", prefix+"causal-project-success", prefix+"causal-repo-success")
 	binding := integrationProjectBinding(t, ctx, owner, key, prefix+"run-causal-success")
 	record := validationworkflow.Record{Version: 1, Handle: binding.RunID, Principal: prefix + "principal-success", IdempotencyKey: prefix + "key-success", RequestDigest: integrationDigest("request-success"), RepositoryID: key.RepositoryID, Revision: strings.Repeat("a", 40), Phase: validationworkflow.PhaseAdmitted, ProjectConfigurationBinding: &binding}
-	reserved, created, _, err := owner.WorkflowStore().ReserveBound(ctx, record, "owner", time.Now().UTC(), time.Minute)
+	if err := integrationRegisterProject(ctx, owner, key.OrganizationID, key.RepositoryID); err != nil {
+		t.Fatal(err)
+	}
+	admissionCtx := controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: key.OrganizationID, ProjectID: key.RepositoryID, RunID: record.Handle})
+	reserved, created, _, err := owner.WorkflowStore().ReserveBound(admissionCtx, record, "owner", time.Now().UTC(), time.Minute)
 	if err != nil || !created || reserved.ProjectConfigurationBinding == nil {
 		t.Fatalf("causal reserve: %+v %v", reserved, err)
 	}
@@ -705,7 +1047,7 @@ func TestPostgresProjectConfigurationWorkflowCausalCommit(t *testing.T) {
 func integrationProjectBinding(t *testing.T, ctx context.Context, owner *Store, key pc.ProjectKey, runID string) pc.RunConfigurationBinding {
 	t.Helper()
 	digest := integrationDigest("project-fixture")
-	document := pc.Document{Schema: pc.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digest}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
+	document := pc.Document{Schema: pc.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digest}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
 	canonical, err := pc.Canonicalize(document)
 	if err != nil {
 		t.Fatal(err)
@@ -736,7 +1078,7 @@ func TestPostgresProjectConfigurationPublishFaultBoundaries(t *testing.T) {
 	boundaries := []string{"project_config.publish.before_lock", "project_config.publish.before_version", "project_config.publish.before_activation", "project_config.publish.before_effective", "project_config.publish.before_head", "project_config.publish.before_receipt_event", "project_config.publish.before_counters"}
 	for index, boundary := range boundaries {
 		t.Run(boundary, func(t *testing.T) {
-			key, _ := pc.NewProjectKey(fmt.Sprintf("%sfault-project-%d", prefix, index), fmt.Sprintf("%sfault-repo-%d", prefix, index))
+			key, _ := pc.NewProjectKey(prefix+"organization", fmt.Sprintf("%sfault-project-%d", prefix, index), fmt.Sprintf("%sfault-repo-%d", prefix, index))
 			command := integrationProjectPublishCommand(t, key, prefix+"fault-operation")
 			owner.fault = func(current string) error {
 				if current == boundary {
@@ -757,7 +1099,7 @@ func TestPostgresProjectConfigurationPublishFaultBoundaries(t *testing.T) {
 			}
 		})
 	}
-	key, _ := pc.NewProjectKey(prefix+"unknown-project", prefix+"unknown-repo")
+	key, _ := pc.NewProjectKey(prefix+"organization", prefix+"unknown-project", prefix+"unknown-repo")
 	command := integrationProjectPublishCommand(t, key, prefix+"unknown-operation")
 	fired := false
 	owner.fault = func(boundary string) error {
@@ -785,7 +1127,7 @@ func TestPostgresProjectConfigurationRollbackFaultBoundaries(t *testing.T) {
 	boundaries := []string{"project_config.rollback.before_lock", "project_config.rollback.before_activation", "project_config.rollback.before_effective", "project_config.rollback.before_head", "project_config.rollback.before_receipt_event"}
 	for index, boundary := range boundaries {
 		t.Run(boundary, func(t *testing.T) {
-			key, _ := pc.NewProjectKey(fmt.Sprintf("%srollback-project-%d", prefix, index), fmt.Sprintf("%srollback-repo-%d", prefix, index))
+			key, _ := pc.NewProjectKey(prefix+"organization", fmt.Sprintf("%srollback-project-%d", prefix, index), fmt.Sprintf("%srollback-repo-%d", prefix, index))
 			published := integrationProjectPublishCommand(t, key, prefix+fmt.Sprintf("rollback-seed-%d", index))
 			if _, err := owner.ProjectConfiguration().Publish(ctx, published); err != nil {
 				t.Fatal(err)
@@ -818,7 +1160,7 @@ func TestPostgresProjectConfigurationNegativeQueriesAndCorruption(t *testing.T) 
 	}
 	store := owner.ProjectConfiguration()
 	prefix := fmt.Sprintf("%d-", time.Now().UnixNano())
-	missing, _ := pc.NewProjectKey(prefix+"missing-project", prefix+"missing-repo")
+	missing, _ := pc.NewProjectKey(prefix+"organization", prefix+"missing-project", prefix+"missing-repo")
 	if _, err := store.Head(ctx, missing); !pc.IsCategory(err, pc.CategoryNotFound) {
 		t.Fatalf("head: %v", err)
 	}
@@ -835,7 +1177,7 @@ func TestPostgresProjectConfigurationNegativeQueriesAndCorruption(t *testing.T) 
 		t.Fatalf("history: %v", err)
 	}
 
-	key, _ := pc.NewProjectKey(prefix+"corrupt-project", prefix+"corrupt-repo")
+	key, _ := pc.NewProjectKey(prefix+"organization", prefix+"corrupt-project", prefix+"corrupt-repo")
 	binding := integrationProjectBinding(t, ctx, owner, key, prefix+"corrupt-run")
 	if _, err := store.Bind(ctx, pc.BindCommand{RunID: binding.RunID, ProjectKey: key, CreatedAt: time.Now().UTC(), Candidate: &pc.AdmissionCandidate{Binding: binding}}); err != nil {
 		t.Fatal(err)
@@ -903,7 +1245,7 @@ func TestPostgresProjectConfigurationNegativeQueriesAndCorruption(t *testing.T) 
 	}
 	for index, corruption := range corruptions {
 		t.Run(corruption.name, func(t *testing.T) {
-			project, _ := pc.NewProjectKey(fmt.Sprintf("%scorruption-project-%d", prefix, index), fmt.Sprintf("%scorruption-repo-%d", prefix, index))
+			project, _ := pc.NewProjectKey(prefix+"organization", fmt.Sprintf("%scorruption-project-%d", prefix, index), fmt.Sprintf("%scorruption-repo-%d", prefix, index))
 			integrationProjectBinding(t, ctx, owner, project, fmt.Sprintf("%scorruption-run-%d", prefix, index))
 			if err := corruption.mutate(project); err != nil {
 				t.Fatal(err)
@@ -935,7 +1277,7 @@ func corruptProjectConfigurationHead(ctx context.Context, owner *Store, key pc.P
 func integrationProjectPublishCommand(t *testing.T, key pc.ProjectKey, operationID string) pc.PublishCommand {
 	t.Helper()
 	digest := integrationDigest("publish-command-fixture")
-	document := pc.Document{Schema: pc.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digest}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
+	document := pc.Document{Schema: pc.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: []pc.ResourceReference{{Kind: pc.ResourceContract, ID: "contract", Version: 1, Digest: digest}}, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 1}, Approval: "required", RetentionDays: 1}}
 	canonical, err := pc.Canonicalize(document)
 	if err != nil {
 		t.Fatal(err)
@@ -952,8 +1294,8 @@ func integrationProjectPublishCommand(t *testing.T, key pc.ProjectKey, operation
 type integrationImportAuthorizer struct{}
 
 // Authorize accepts the closed offline-import operation for the tagged gate.
-func (integrationImportAuthorizer) Authorize(_ context.Context, operation, projectID string) error {
-	if operation != "offline_import" || projectID == "" {
+func (integrationImportAuthorizer) Authorize(_ context.Context, operation string, scope controlplane.ProjectScope) error {
+	if operation != "offline_import" || scope.Validate() != nil {
 		return controlplane.ErrUnauthorized
 	}
 	return nil
@@ -965,16 +1307,55 @@ func integrationDigest(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// integrationScope constructs the explicit test tenant coordinate used by PostgreSQL integration fixtures.
+func integrationScope(projectID string) controlplane.ProjectScope {
+	return controlplane.ProjectScope{OrganizationID: "organization", ProjectID: projectID}
+}
+
+// integrationAdmissionContext supplies the explicit pre-head capability used
+// only while a workflow atomically creates its first backend binding.
+func integrationAdmissionContext(runID, projectID string) context.Context {
+	return controlplane.WithBackendCoordinate(context.Background(), controlplane.BackendCoordinate{OrganizationID: "organization", ProjectID: projectID, RunID: runID})
+}
+
+// integrationRegisterProject creates the explicit ownership rows required by
+// every tenant-scoped PostgreSQL contract fixture.
+func integrationRegisterProject(ctx context.Context, store *Store, organizationID, projectID string) error {
+	digest := integrationDigest(organizationID + ":" + projectID)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO tenant_organizations(organization_id,state,version,security_revision,policy_digest,payload,payload_digest) VALUES($1,'active',1,1,$2,'{}',$2) ON CONFLICT(organization_id) DO NOTHING`, organizationID, digest); err != nil {
+		return err
+	}
+	_, err := store.pool.Exec(ctx, `INSERT INTO tenant_projects(organization_id,project_id,repository_id,state,version,payload,payload_digest) VALUES($1,$2,$2,'active',1,'{}',$3) ON CONFLICT(organization_id,project_id) DO NOTHING`, organizationID, projectID, digest)
+	return err
+}
+
+// integrationReserveInitial registers explicit tenant ownership before exercising the production admission boundary.
+func integrationReserveInitial(ctx context.Context, store *Store, epoch controlplane.BackendEpoch) (controlplane.BindingHead, error) {
+	if err := integrationRegisterProject(ctx, store, epoch.OrganizationID, epoch.ProjectID); err != nil {
+		return controlplane.BindingHead{}, err
+	}
+	return store.ReserveInitial(ctx, epoch)
+}
+
+// integrationAdmit registers the admission tenant before invoking the strict
+// production ingress boundary; production code never bootstraps ownership.
+func integrationAdmit(ctx context.Context, store *Store, admission controlplane.IngressAdmission) (bool, error) {
+	if err := integrationRegisterProject(ctx, store, admission.Epoch.OrganizationID, admission.Epoch.ProjectID); err != nil {
+		return false, err
+	}
+	return store.Admit(ctx, admission)
+}
+
 // integrationExternalBinding creates a complete immutable external-agent binding for one isolated PostgreSQL admission.
 func integrationExternalBinding(t *testing.T, repositoryID, runID string, version uint64) (pc.RunConfigurationBinding, pc.ResourceDescriptor) {
 	t.Helper()
-	key, err := pc.NewProjectKey("external-project", repositoryID)
+	key, err := pc.NewProjectKey("external-organization", "external-project", repositoryID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	digest := integrationDigest(fmt.Sprintf("external-%d", version))
 	references := []pc.ResourceReference{{Kind: pc.ResourceProvider, ID: "provider", Version: version, Digest: digest}, {Kind: pc.ResourceModelProfile, ID: "model", Version: version, Digest: digest}, {Kind: pc.ResourceRuntimeProfile, ID: "runtime", Version: version, Digest: digest}, {Kind: pc.ResourceContract, ID: "contract", Version: version, Digest: digest}, {Kind: pc.ResourceEnvironment, ID: "environment", Version: version, Digest: digest}}
-	document, err := pc.Canonicalize(pc.Document{Schema: pc.SchemaV1, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 30}, Approval: "optional", RetentionDays: 7}})
+	document, err := pc.Canonicalize(pc.Document{Schema: pc.SchemaV1, OrganizationID: key.OrganizationID, ProjectID: key.ProjectID, RepositoryID: key.RepositoryID, References: references, Constraints: pc.Constraints{Limits: pc.Limits{DurationSeconds: 30}, Approval: "optional", RetentionDays: 7}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1011,12 +1392,12 @@ func TestPostgresFunctionalStoreSharedContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	integrationReserveBackend(t, owner, "postgres-functional-contract", "contract-project", now)
-	ctx = integrationBoundContext(t, owner, "postgres-functional-contract")
+	ctx = integrationBoundContext(t, owner, "postgres-functional-contract", "contract-project")
 	clock := contracttest.FixedFunctionalClock{At: now}
 	dsn := owner.pool.Config().ConnString()
 	opened := []*Store{}
 	factory := func() (contracttest.FunctionalStore, error) {
-		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 		if err != nil {
 			return nil, err
 		}
@@ -1043,11 +1424,11 @@ func TestPostgresCleanupStoreSharedContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	integrationReserveBackend(t, owner, "postgres-cleanup-contract", "contract-project", now)
-	ctx = integrationBoundContext(t, owner, "postgres-cleanup-contract")
+	ctx = integrationBoundContext(t, owner, "postgres-cleanup-contract", "contract-project")
 	dsn := owner.pool.Config().ConnString()
 	opened := []*Store{}
 	factory := func() (contracttest.CleanupStore, error) {
-		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 		if err != nil {
 			return nil, err
 		}
@@ -1074,11 +1455,11 @@ func TestPostgresEnvironmentStoreSharedContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	integrationReserveBackend(t, owner, "postgres-environment-contract", "contract-project", now)
-	ctx = integrationBoundContext(t, owner, "postgres-environment-contract")
+	ctx = integrationBoundContext(t, owner, "postgres-environment-contract", "contract-project")
 	dsn := owner.pool.Config().ConnString()
 	opened := []*Store{}
 	factory := func() (contracttest.EnvironmentStore, error) {
-		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 		if err != nil {
 			return nil, err
 		}
@@ -1105,11 +1486,11 @@ func TestPostgresCorrectionStoreSharedContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	integrationReserveBackend(t, owner, "postgres-correction-root", "contract-project", now)
-	ctx = integrationBoundContext(t, owner, "postgres-correction-root")
+	ctx = integrationBoundContext(t, owner, "postgres-correction-root", "contract-project")
 	dsn := owner.pool.Config().ConnString()
 	opened := []*Store{}
 	factory := func() (correction.Store, error) {
-		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 		if err != nil {
 			return nil, err
 		}
@@ -1142,7 +1523,7 @@ func TestPostgresCapacityAdmissionSharedContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err = contracttest.RunCapacityAdmissionBound(ctx, admission, "contract-project", "postgres-capacity-a", "postgres-capacity-b", func(_ context.Context, runID string) context.Context {
-		return integrationBoundContext(t, store, runID)
+		return integrationBoundContext(t, store, runID, "contract-project")
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1158,6 +1539,10 @@ func TestPostgresWorkflowMaterialSharedContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflow := validationworkflow.Record{Version: 1, Handle: "postgres-material-contract", Principal: "contract-principal", IdempotencyKey: "contract-material", RequestDigest: integrationDigest("material-request"), RepositoryID: "contract-project", Revision: strings.Repeat("a", 40), Phase: validationworkflow.PhaseAdmitted}
+	ctx = integrationAdmissionContext(workflow.Handle, workflow.RepositoryID)
+	if err := integrationRegisterProject(ctx, owner, "organization", workflow.RepositoryID); err != nil {
+		t.Fatal(err)
+	}
 	if _, created, boundContext, err := owner.WorkflowStore().ReserveBound(ctx, workflow, "contract-worker", now, time.Minute); err != nil || !created {
 		t.Fatal("reserve material workflow", created, err)
 	} else {
@@ -1166,7 +1551,7 @@ func TestPostgresWorkflowMaterialSharedContract(t *testing.T) {
 	dsn := owner.pool.Config().ConnString()
 	opened := []*Store{}
 	factory := func() (validationworkflow.PlanArtifactStore, validationworkflow.ExecutablePlanStore, error) {
-		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+		store, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1194,11 +1579,11 @@ func TestPostgresOfflineImportMaterializesWorkflowConsumers(t *testing.T) {
 		t.Fatal(err)
 	}
 	runID, projectID := "typed-import-run", "typed-import-project"
-	epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: runID, ProjectID: projectID, Epoch: 1, Mode: controlplane.BackendLocal, BackendIdentity: "typed-local", SchemaVersion: 1, CreatedAt: now})
+	epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: runID, ProjectID: projectID, Epoch: 1, Mode: controlplane.BackendLocal, BackendIdentity: "typed-local", SchemaVersion: 1, CreatedAt: now})
 	if err != nil {
 		t.Fatal(err)
 	}
-	head, err := store.ReserveInitial(ctx, epoch)
+	head, err := integrationReserveInitial(ctx, store, epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1223,11 +1608,12 @@ func TestPostgresOfflineImportMaterializesWorkflowConsumers(t *testing.T) {
 		t.Fatal("local executable", err)
 	}
 	controller := controlplane.OfflineImportController{Source: source, Target: store, Authorizer: integrationImportAuthorizer{}}
-	receipt, err := controller.Run(ctx, controlplane.OfflineImportRequest{ImportID: "typed-import", RunID: runID, ProjectID: projectID, ExpectedHead: head.Digest, ExpectedEpoch: head.Epoch, PageSize: 2, Now: now.Add(time.Second), ReconcileTimeout: time.Second})
+	receipt, err := controller.Run(ctx, controlplane.OfflineImportRequest{OrganizationID: "organization", ImportID: "typed-import", RunID: runID, ProjectID: projectID, ExpectedHead: head.Digest, ExpectedEpoch: head.Epoch, PageSize: 2, Now: now.Add(time.Second), ReconcileTimeout: time.Second})
 	if err != nil || receipt.ActiveEpoch != 2 {
 		t.Fatal("typed import", receipt.ActiveEpoch, err)
 	}
-	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+	ctx = integrationBoundContext(t, store, runID, projectID)
+	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1254,11 +1640,11 @@ func TestPostgresOfflineImportMaterializesOwnedJournals(t *testing.T) {
 		t.Fatal(err)
 	}
 	runID, projectID := "journal-import-run", "journal-import-project"
-	epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: runID, ProjectID: projectID, Epoch: 1, Mode: controlplane.BackendLocal, BackendIdentity: "journal-local", SchemaVersion: 1, CreatedAt: now})
+	epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: runID, ProjectID: projectID, Epoch: 1, Mode: controlplane.BackendLocal, BackendIdentity: "journal-local", SchemaVersion: 1, CreatedAt: now})
 	if err != nil {
 		t.Fatal(err)
 	}
-	head, err := store.ReserveInitial(ctx, epoch)
+	head, err := integrationReserveInitial(ctx, store, epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1320,14 +1706,15 @@ func TestPostgresOfflineImportMaterializesOwnedJournals(t *testing.T) {
 		t.Fatal(err)
 	}
 	controller := controlplane.OfflineImportController{Source: source, Target: store, Authorizer: integrationImportAuthorizer{}}
-	receipt, err := controller.Run(ctx, controlplane.OfflineImportRequest{ImportID: "journal-import", RunID: runID, ProjectID: projectID, ExpectedHead: head.Digest, ExpectedEpoch: 1, PageSize: 2, Now: now.Add(time.Second), ReconcileTimeout: time.Second})
+	receipt, err := controller.Run(ctx, controlplane.OfflineImportRequest{OrganizationID: "organization", ImportID: "journal-import", RunID: runID, ProjectID: projectID, ExpectedHead: head.Digest, ExpectedEpoch: 1, PageSize: 2, Now: now.Add(time.Second), ReconcileTimeout: time.Second})
 	if err != nil || receipt.ActiveEpoch != 2 {
 		t.Fatal("journal cutover", receipt, err)
 	}
+	ctx = integrationBoundContext(t, store, runID, projectID)
 	if err = os.RemoveAll(root); err != nil {
 		t.Fatal(err)
 	}
-	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1356,6 +1743,10 @@ func TestPostgresFunctionalRuntimeSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	record := validationworkflow.Record{Version: 1, Handle: "functional-restart", Principal: "principal-functional", IdempotencyKey: "functional-key", RequestDigest: integrationDigest("functional-request"), RepositoryID: "functional-project", Revision: strings.Repeat("a", 40), Phase: validationworkflow.PhaseAdmitted}
+	ctx = integrationAdmissionContext(record.Handle, record.RepositoryID)
+	if err := integrationRegisterProject(ctx, store, "organization", record.RepositoryID); err != nil {
+		t.Fatal(err)
+	}
 	if _, created, boundContext, err := store.WorkflowStore().ReserveBound(ctx, record, "functional-worker", now, time.Minute); err != nil || !created {
 		t.Fatal("reserve workflow", err)
 	} else {
@@ -1462,7 +1853,7 @@ func TestPostgresFunctionalRuntimeSurvivesRestart(t *testing.T) {
 	if err = publisher.Stage(ctx, record.Handle, artifact, conflictingPrimary); !errors.Is(err, controlplane.ErrConflict) {
 		t.Fatal("conflicting primary accepted", err)
 	}
-	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "pg-test", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "pg-test", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1519,6 +1910,10 @@ func TestPostgresContextStoreEnforcesReceiptsAndBackendAuthority(t *testing.T) {
 	}
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	record := validationworkflow.Record{Version: 1, Handle: "context-store-run", Principal: "context-principal", IdempotencyKey: "context-workflow-key", RequestDigest: integrationDigest("context-request"), RepositoryID: "context-project", Revision: strings.Repeat("c", 40), Phase: validationworkflow.PhaseAdmitted}
+	ctx = integrationAdmissionContext(record.Handle, record.RepositoryID)
+	if err := integrationRegisterProject(ctx, store, "organization", record.RepositoryID); err != nil {
+		t.Fatal(err)
+	}
 	if _, created, boundContext, err := store.WorkflowStore().ReserveBound(ctx, record, "context-worker", now, time.Minute); err != nil || !created {
 		t.Fatal("reserve workflow", created, err)
 	} else {
@@ -1581,11 +1976,11 @@ func TestPostgresContextStoreEnforcesReceiptsAndBackendAuthority(t *testing.T) {
 	if _, loadErr := adapter.LoadBinding(ctx, binding.Digest); !errors.Is(loadErr, controlplane.ErrIntegrity) {
 		t.Fatal("tampered binding accepted", loadErr)
 	}
-	head, activeEpoch, err := store.Load(ctx, record.Handle)
+	head, activeEpoch, err := store.Load(ctx, integrationScope(record.RepositoryID), record.Handle)
 	if err != nil {
 		t.Fatal(err)
 	}
-	localEpoch := controlplane.BackendEpoch{RunID: record.Handle, ProjectID: head.ProjectID, Epoch: head.Epoch + 1, Mode: controlplane.BackendLocal, BackendIdentity: "archived-local", SchemaVersion: activeEpoch.SchemaVersion, CreatedAt: time.Now().UTC(), PreviousDigest: head.EpochDigest}
+	localEpoch := controlplane.BackendEpoch{OrganizationID: "organization", RunID: record.Handle, ProjectID: head.ProjectID, Epoch: head.Epoch + 1, Mode: controlplane.BackendLocal, BackendIdentity: "archived-local", SchemaVersion: activeEpoch.SchemaVersion, CreatedAt: time.Now().UTC(), PreviousDigest: head.EpochDigest}
 	if _, err = store.Cutover(ctx, head, localEpoch); err != nil {
 		t.Fatal(err)
 	}
@@ -1631,7 +2026,7 @@ func TestPostgresImportMaterializersRejectMalformedConsumerDocuments(t *testing.
 		if materializeErr := materializeImportDocumentTx(ctx, tx, document, nil); !errors.Is(materializeErr, controlplane.ErrIntegrity) {
 			t.Fatalf("materialize stream %s error=%v", document.Stream, materializeErr)
 		}
-		_ = verifyMaterializedImportDocumentTx(ctx, tx, document)
+		_ = verifyMaterializedImportDocumentTx(ctx, tx, document, nil)
 	}
 	encode := func(value any) []byte {
 		data, encodeErr := json.Marshal(value)
@@ -1672,7 +2067,11 @@ func TestPostgresImportMaterializersRejectMalformedConsumerDocuments(t *testing.
 		capacityReceipts[receipt.ID] = receipt
 	}
 	capacityDocument := controlplane.ImportDocument{Stream: "capacity", RelationKey: "typed-capacity", Document: encode(cleanup.ImportCapacitySnapshot{Receipts: capacityReceipts, Events: map[string][]cleanup.CapacityEvent{}})}
-	if err = materializeImportDocumentTx(ctx, tx, capacityDocument, nil); err != nil {
+	capacityAuthority := &importMaterializationAuthority{OrganizationID: "organization", ProjectID: "capacity-project", BindingDigest: integrationDigest("capacity-binding"), BackendIdentity: "pg-test", Epoch: 2, CreatedAt: time.Now().UTC()}
+	if err = integrationRegisterProject(ctx, store, capacityAuthority.OrganizationID, capacityAuthority.ProjectID); err != nil {
+		t.Fatal(err)
+	}
+	if err = materializeImportDocumentTx(ctx, tx, capacityDocument, capacityAuthority); err != nil {
 		t.Fatal("capacity state materialization", err)
 	}
 	for _, rejectedMetadata := range []controlplane.ImportDocument{
@@ -1694,7 +2093,7 @@ func TestPostgresImportMaterializersRejectMalformedConsumerDocuments(t *testing.
 		{Stream: "github", RelationKey: "typed-github", Document: encode(githubpr.ImportSnapshot{Events: []githubpr.StoreEvent{{Sequence: 1}}})},
 	}
 	for _, document := range missingMaterialized {
-		if verifyErr := verifyMaterializedImportDocumentTx(ctx, tx, document); !errors.Is(verifyErr, controlplane.ErrIntegrity) {
+		if verifyErr := verifyMaterializedImportDocumentTx(ctx, tx, document, nil); !errors.Is(verifyErr, controlplane.ErrIntegrity) {
 			t.Fatalf("missing materialized stream %s error=%v", document.Stream, verifyErr)
 		}
 	}
@@ -1702,7 +2101,7 @@ func TestPostgresImportMaterializersRejectMalformedConsumerDocuments(t *testing.
 	if err = materializeImportDocumentTx(ctx, tx, opaque, nil); !errors.Is(err, controlplane.ErrIntegrity) {
 		t.Fatal("opaque staging accepted", err)
 	}
-	if err = verifyMaterializedImportDocumentTx(ctx, tx, opaque); !errors.Is(err, controlplane.ErrIntegrity) {
+	if err = verifyMaterializedImportDocumentTx(ctx, tx, opaque, nil); !errors.Is(err, controlplane.ErrIntegrity) {
 		t.Fatal("opaque verification accepted", err)
 	}
 	packageBytes := []byte(`{"proof":"detached"}`)
@@ -1711,11 +2110,14 @@ func TestPostgresImportMaterializersRejectMalformedConsumerDocuments(t *testing.
 		t.Fatal(err)
 	}
 	packageDocument := controlplane.ImportDocument{Stream: "packages", RelationKey: "typed-packages", Document: packageSnapshot}
-	authority := &importMaterializationAuthority{ProjectID: "import-package-project", BindingDigest: integrationDigest("package-binding"), BackendIdentity: "pg-test", Epoch: 2, CreatedAt: time.Now().UTC()}
+	authority := &importMaterializationAuthority{OrganizationID: "organization", ProjectID: "import-package-project", BindingDigest: integrationDigest("package-binding"), BackendIdentity: "pg-test", Epoch: 2, CreatedAt: time.Now().UTC()}
+	if err = integrationRegisterProject(ctx, store, authority.OrganizationID, authority.ProjectID); err != nil {
+		t.Fatal(err)
+	}
 	if err = materializeImportDocumentTx(ctx, tx, packageDocument, authority); err != nil {
 		t.Fatal("materialize package", err)
 	}
-	if err = verifyMaterializedImportDocumentTx(ctx, tx, packageDocument); err != nil {
+	if err = verifyMaterializedImportDocumentTx(ctx, tx, packageDocument, authority); err != nil {
 		t.Fatal("verify package", err)
 	}
 	if _, err = tx.Exec(ctx, `UPDATE packages SET document='{}',digest=$1 WHERE package_id='import-package'`, integrationDigest("conflicting-package")); err != nil {
@@ -1724,19 +2126,19 @@ func TestPostgresImportMaterializersRejectMalformedConsumerDocuments(t *testing.
 	if err = materializeImportDocumentTx(ctx, tx, packageDocument, authority); err != nil {
 		t.Fatal("package conflict materialization", err)
 	}
-	if err = verifyMaterializedImportDocumentTx(ctx, tx, packageDocument); !errors.Is(err, controlplane.ErrIntegrity) {
+	if err = verifyMaterializedImportDocumentTx(ctx, tx, packageDocument, authority); !errors.Is(err, controlplane.ErrIntegrity) {
 		t.Fatal("package ON CONFLICT divergence verified", err)
 	}
 	receipt := githubpr.DeliveryReceipt{Version: githubpr.SchemaVersion, DeliveryID: "import-redelivery", Event: "issue_comment", PayloadSHA256: integrationDigest("github-payload"), State: "received", VersionCAS: 1}
 	githubEvent := githubpr.StoreEvent{Sequence: 1, Kind: "delivery_reserved", At: time.Now().UTC(), Delivery: &receipt}
 	githubDocument := controlplane.ImportDocument{Stream: "github", RelationKey: "typed-github", Document: encode(githubpr.ImportSnapshot{Events: []githubpr.StoreEvent{githubEvent}})}
-	if _, err = tx.Exec(ctx, `INSERT INTO ingress_inbox(source,idempotency_key,request_digest,project_id,envelope,committed_at) VALUES('github',$1,$2,$3,'{}',$4)`, receipt.DeliveryID, integrationDigest("other-payload"), authority.ProjectID, githubEvent.At); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO ingress_inbox(organization_id,source,idempotency_key,request_digest,project_id,envelope,committed_at) VALUES($1,'github',$2,$3,$4,'{}',$5)`, authority.OrganizationID, receipt.DeliveryID, integrationDigest("other-payload"), authority.ProjectID, githubEvent.At); err != nil {
 		t.Fatal(err)
 	}
 	if err = materializeImportDocumentTx(ctx, tx, githubDocument, authority); err != nil {
 		t.Fatal("github conflict materialization", err)
 	}
-	if err = verifyMaterializedImportDocumentTx(ctx, tx, githubDocument); !errors.Is(err, controlplane.ErrIntegrity) {
+	if err = verifyMaterializedImportDocumentTx(ctx, tx, githubDocument, authority); !errors.Is(err, controlplane.ErrIntegrity) {
 		t.Fatal("github receipt redelivery divergence verified", err)
 	}
 }
@@ -1797,7 +2199,7 @@ func TestPostgresImportUnknownRelationsNeverVerifyOrCutOver(t *testing.T) {
 		if sealErr != nil {
 			t.Fatal(sealErr)
 		}
-		manifest, sealErr := controlplane.SealImportManifest(controlplane.ImportManifest{
+		manifest, sealErr := controlplane.SealImportManifest(controlplane.ImportManifest{OrganizationID: "organization",
 			ImportID:           fmt.Sprintf("unknown-import-%d", index),
 			RunID:              runID,
 			ProjectID:          "unknown-project",
@@ -1813,16 +2215,17 @@ func TestPostgresImportUnknownRelationsNeverVerifyOrCutOver(t *testing.T) {
 		if sealErr != nil {
 			t.Fatal(sealErr)
 		}
-		if _, err := store.SaveImport(ctx, manifest, ""); err != nil {
+		importCtx := controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: manifest.OrganizationID, ProjectID: manifest.ProjectID, RunID: manifest.RunID})
+		if _, err := store.SaveImport(importCtx, manifest, ""); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.SaveImportPage(ctx, manifest.ImportID, []controlplane.ImportDocument{document}); err != nil {
+		if err := store.SaveImportPage(importCtx, manifest.ImportID, []controlplane.ImportDocument{document}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.VerifyImport(ctx, manifest.ImportID); !errors.Is(err, controlplane.ErrIntegrity) {
+		if _, err := store.VerifyImport(importCtx, manifest.ImportID); !errors.Is(err, controlplane.ErrIntegrity) {
 			t.Fatalf("%s unknown relation verified: %v", raw.Stream, err)
 		}
-		if _, err := store.CutoverImport(ctx, manifest.ImportID, now.Add(time.Second)); !errors.Is(err, controlplane.ErrConflict) {
+		if _, err := store.CutoverImport(importCtx, manifest.ImportID, now.Add(time.Second)); !errors.Is(err, controlplane.ErrConflict) {
 			t.Fatalf("%s unknown relation cut over: %v", raw.Stream, err)
 		}
 	}
@@ -1911,7 +2314,7 @@ func TestPostgresNewAdaptersMapClosedPoolFailures(t *testing.T) {
 	if _, _, err = capacity.ReleaseConfirmed(ctx, "closed-project", "closed-acquisition", integrationDigest("receipt"), "cleanup", integrationDigest("confirmation")); err == nil {
 		t.Fatal("closed confirmed release succeeded")
 	}
-	if _, err = capacity.Snapshot("closed-project"); err == nil {
+	if _, err = capacity.Snapshot(ctx, "closed-project"); err == nil {
 		t.Fatal("closed capacity snapshot succeeded")
 	}
 }
@@ -1923,7 +2326,7 @@ func integrationStore(t *testing.T) *Store {
 	if dsn == "" {
 		t.Fatal("FEATUREPROOF_POSTGRES_TEST_DSN is required for the explicit PostgreSQL gate")
 	}
-	admin, err := Open(context.Background(), Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 8, StatementTimeout: 30 * time.Second, MaxLease: 5 * time.Minute})
+	admin, err := Open(context.Background(), Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 8, StatementTimeout: 30 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1937,13 +2340,13 @@ func integrationStore(t *testing.T) *Store {
 	if strings.Contains(dsn, "?") {
 		separator = "&"
 	}
-	scoped, err := Open(context.Background(), Config{DSN: dsn + separator + "search_path=" + schema, BackendIdentity: "pg-test", MaxConnections: 16, StatementTimeout: 30 * time.Second, MaxLease: 5 * time.Minute})
+	scoped, err := Open(context.Background(), Config{DSN: dsn + separator + "search_path=" + schema, BackendIdentity: "pg-test", MaxConnections: 16, StatementTimeout: 30 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		scoped.Close()
-		cleanup, openErr := Open(context.Background(), Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 30 * time.Second, MaxLease: 5 * time.Minute})
+		cleanup, openErr := Open(context.Background(), Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 30 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 		if openErr != nil {
 			t.Errorf("cleanup open: %v", openErr)
 			return
@@ -1974,29 +2377,29 @@ func (resolver *integrationSecretResolver) Resolve(context.Context, []string) (m
 
 // integrationJob creates one valid PostgreSQL queue fixture.
 func integrationJob(now time.Time, id string, epoch uint64, bindingDigest string) controlplane.Job {
-	job, _ := controlplane.SealJob(controlplane.Job{JobID: id, ProjectID: "project-1", RunID: "run-1", BackendEpoch: epoch, BindingDigest: bindingDigest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest("input"), CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour)})
+	job, _ := controlplane.SealJob(controlplane.Job{OrganizationID: "organization", JobID: id, ProjectID: "project-1", RunID: "run-1", BackendEpoch: epoch, BindingDigest: bindingDigest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest("input"), CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour)})
 	return job
 }
 
 // integrationAdmission constructs one complete causal ingress fixture for a fresh run.
 func integrationAdmission(now time.Time, suffix string) controlplane.IngressAdmission {
 	runID := "ingress-run-" + suffix
-	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: runID, ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
-	job, _ := controlplane.SealJob(controlplane.Job{JobID: "ingress-job-" + suffix, ProjectID: "project-1", RunID: runID, BackendEpoch: 1, BindingDigest: epoch.Digest, Phase: controlplane.PhasePlan, State: controlplane.JobQueued, InputDigest: integrationDigest("input-" + suffix), CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour)})
-	grant, _ := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: epoch.Epoch, BindingDigest: epoch.Digest, Phase: controlplane.PhasePlan, InputReferences: []string{"ingress"}, AllowedCapabilities: []string{"context.read"}})
-	intent := controlplane.EffectIntent{OperationID: job.JobID + "-dispatch", IdempotencyKey: job.JobID, ProjectID: job.ProjectID, RunID: job.RunID, Phase: job.Phase, BindingDigest: job.BindingDigest, InputDigest: job.InputDigest, PayloadRef: "ingress:" + runID, PayloadDigest: job.InputDigest, ReconcileMethod: "reload_ingress"}
-	return controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{Source: "github", ExternalID: "delivery-" + suffix, IdempotencyKey: "delivery-" + suffix, ProjectID: "project-1", RequestDigest: integrationDigest("request-" + suffix), CommandKind: "validate"}, Epoch: epoch, Job: job, Grant: grant, Intent: intent}
+	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: runID, ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
+	job, _ := controlplane.SealJob(controlplane.Job{OrganizationID: "organization", JobID: "ingress-job-" + suffix, ProjectID: "project-1", RunID: runID, BackendEpoch: 1, BindingDigest: epoch.Digest, Phase: controlplane.PhasePlan, State: controlplane.JobQueued, InputDigest: integrationDigest("input-" + suffix), CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour)})
+	grant, _ := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{OrganizationID: "organization", ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: epoch.Epoch, BindingDigest: epoch.Digest, Phase: controlplane.PhasePlan, InputReferences: []string{"ingress"}, AllowedCapabilities: []string{"context.read"}})
+	intent := controlplane.EffectIntent{OrganizationID: "organization", OperationID: job.JobID + "-dispatch", IdempotencyKey: job.JobID, ProjectID: job.ProjectID, RunID: job.RunID, Phase: job.Phase, BindingDigest: job.BindingDigest, InputDigest: job.InputDigest, PayloadRef: "ingress:" + runID, PayloadDigest: job.InputDigest, ReconcileMethod: "reload_ingress"}
+	return controlplane.IngressAdmission{Envelope: controlplane.InboxEnvelope{OrganizationID: "organization", Source: "github", ExternalID: "delivery-" + suffix, IdempotencyKey: "delivery-" + suffix, ProjectID: "project-1", RequestDigest: integrationDigest("request-" + suffix), CommandKind: "validate"}, Epoch: epoch, Job: job, Grant: grant, Intent: intent}
 }
 
 // integrationReserveBackend creates the active PostgreSQL head required by
 // every domain adapter mutation in integration contracts.
 func integrationReserveBackend(t *testing.T, store *Store, runID, projectID string, now time.Time) controlplane.BindingHead {
 	t.Helper()
-	epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: runID, ProjectID: projectID, Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
+	epoch, err := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: runID, ProjectID: projectID, Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
 	if err != nil {
 		t.Fatal(err)
 	}
-	head, err := store.ReserveInitial(context.Background(), epoch)
+	head, err := integrationReserveInitial(context.Background(), store, epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2005,13 +2408,17 @@ func integrationReserveBackend(t *testing.T, store *Store, runID, projectID stri
 
 // integrationBoundContext captures the same immutable active coordinate a
 // productive read supplies before a consumer-owned adapter mutation.
-func integrationBoundContext(t *testing.T, store *Store, runID string) context.Context {
+func integrationBoundContext(t *testing.T, store *Store, runID string, projectIDs ...string) context.Context {
 	t.Helper()
-	head, epoch, err := store.Load(context.Background(), runID)
+	projectID := "project-1"
+	if len(projectIDs) == 1 {
+		projectID = projectIDs[0]
+	}
+	head, epoch, err := store.Load(context.Background(), integrationScope(projectID), runID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	coordinate := controlplane.BackendCoordinate{RunID: runID, BackendIdentity: epoch.BackendIdentity, Epoch: head.Epoch, BindingDigest: epoch.Digest}
+	coordinate := controlplane.BackendCoordinate{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID, RunID: runID, BackendIdentity: epoch.BackendIdentity, Epoch: head.Epoch, BindingDigest: epoch.Digest}
 	return controlplane.WithBackendCoordinate(context.Background(), coordinate)
 }
 
@@ -2062,31 +2469,32 @@ func TestPostgresGate(t *testing.T) {
 	if _, approvalErr = approvalAdapter.BindRun(integrationBoundContext(t, store, approvalRun.ID), approvalRun); approvalErr != nil {
 		t.Fatal("approval bind", approvalErr)
 	}
-	if approvalEvents, eventsErr := approvalAdapter.Events(ctx, approvalRun.ID); eventsErr != nil || len(approvalEvents) != 0 {
+	if approvalEvents, eventsErr := approvalAdapter.Events(integrationBoundContext(t, store, approvalRun.ID), approvalRun.ID); eventsErr != nil || len(approvalEvents) != 0 {
 		t.Fatal("approval events", eventsErr)
 	}
-	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: "run-1", ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
-	head, err := store.ReserveInitial(ctx, epoch)
+	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: "run-1", ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
+	head, err := integrationReserveInitial(ctx, store, epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sameHead, reserveErr := store.ReserveInitial(ctx, epoch); reserveErr != nil || sameHead.Digest != head.Digest {
+	ctx = integrationBoundContext(t, store, epoch.RunID, epoch.ProjectID)
+	if sameHead, reserveErr := integrationReserveInitial(ctx, store, epoch); reserveErr != nil || sameHead.Digest != head.Digest {
 		t.Fatal("binding idempotency", reserveErr)
 	}
 	conflictingEpoch := epoch
 	conflictingEpoch.BackendIdentity = "pg-other"
 	conflictingEpoch.Digest = ""
-	if _, reserveErr := store.ReserveInitial(ctx, conflictingEpoch); !errors.Is(reserveErr, controlplane.ErrConflict) {
+	if _, reserveErr := integrationReserveInitial(ctx, store, conflictingEpoch); !errors.Is(reserveErr, controlplane.ErrConflict) {
 		t.Fatal("binding conflict")
 	}
-	if _, _, loadErr := store.Load(ctx, "missing"); !errors.Is(loadErr, controlplane.ErrNotFound) {
+	if _, _, loadErr := store.Load(ctx, integrationScope(epoch.ProjectID), "missing"); !errors.Is(loadErr, controlplane.ErrNotFound) {
 		t.Fatal("missing binding")
 	}
-	loaded, _, err := store.Load(ctx, epoch.RunID)
+	loaded, _, err := store.Load(ctx, integrationScope(epoch.ProjectID), epoch.RunID)
 	if err != nil || loaded.Digest != head.Digest {
 		t.Fatal("binding reload")
 	}
-	next := controlplane.BackendEpoch{RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 2, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: epoch.SchemaVersion, CreatedAt: now.Add(time.Second), PreviousDigest: epoch.Digest}
+	next := controlplane.BackendEpoch{OrganizationID: "organization", RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 2, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: epoch.SchemaVersion, CreatedAt: now.Add(time.Second), PreviousDigest: epoch.Digest}
 	cutoverHead, cutoverErr := store.Cutover(ctx, head, next)
 	if cutoverErr != nil {
 		t.Fatal(cutoverErr)
@@ -2117,7 +2525,7 @@ func TestPostgresGate(t *testing.T) {
 		wait.Add(1)
 		go func(index int) {
 			defer wait.Done()
-			jobs, claimErr := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: "project-1", WorkerID: fmt.Sprintf("worker-%d", index), Now: now, Lease: time.Minute, Limit: 6})
+			jobs, claimErr := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope("project-1"), WorkerID: fmt.Sprintf("worker-%d", index), Now: now, Lease: time.Minute, Limit: 6})
 			if claimErr != nil {
 				t.Error(claimErr)
 				return
@@ -2149,7 +2557,7 @@ func TestPostgresGate(t *testing.T) {
 				t.Fatal("invalid retention reference accepted", err)
 			}
 		}
-		if _, err = store.Complete(ctx, job.JobID, job.Owner, job.Fence, job.CancelRevision, now, controlplane.JobSucceeded, ""); err != nil {
+		if _, err = store.Complete(ctx, integrationScope(job.ProjectID), job.JobID, job.Owner, job.Fence, job.CancelRevision, now, controlplane.JobSucceeded, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2160,25 +2568,25 @@ func TestPostgresGate(t *testing.T) {
 	if _, err = store.Enqueue(ctx, retryJob); err != nil {
 		t.Fatal(err)
 	}
-	retryClaim, _ := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: "project-1", WorkerID: "retry-worker", Now: now, Lease: time.Minute, Limit: 1})
+	retryClaim, _ := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope("project-1"), WorkerID: "retry-worker", Now: now, Lease: time.Minute, Limit: 1})
 	if len(retryClaim) != 1 {
 		t.Fatal("retry claim")
 	}
 	leased := retryClaim[0]
-	leased, err = store.Heartbeat(ctx, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now, 2*time.Minute)
+	leased, err = store.Heartbeat(ctx, integrationScope(leased.ProjectID), leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now, 2*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.Retry(ctx, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now, controlplane.RetryDecision{Category: "transient", Backoff: time.Minute, MaxAttempts: 3}, now.Add(time.Minute)); err != nil {
+	if _, err = store.Retry(ctx, integrationScope(leased.ProjectID), leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now, controlplane.RetryDecision{Category: "transient", Backoff: time.Minute, MaxAttempts: 3}, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.Heartbeat(ctx, leased.JobID, "stale-worker", leased.Fence, leased.CancelRevision, now, time.Minute); !errors.Is(err, controlplane.ErrConflict) {
+	if _, err = store.Heartbeat(ctx, integrationScope(leased.ProjectID), leased.JobID, "stale-worker", leased.Fence, leased.CancelRevision, now, time.Minute); !errors.Is(err, controlplane.ErrConflict) {
 		t.Fatal("stale heartbeat")
 	}
-	if _, err = store.Complete(ctx, leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now, controlplane.JobQueued, ""); !errors.Is(err, controlplane.ErrInvalid) {
+	if _, err = store.Complete(ctx, integrationScope(leased.ProjectID), leased.JobID, leased.Owner, leased.Fence, leased.CancelRevision, now, controlplane.JobQueued, ""); !errors.Is(err, controlplane.ErrInvalid) {
 		t.Fatal("invalid complete")
 	}
-	retryClaim, _ = store.Claim(ctx, controlplane.ClaimRequest{ProjectID: "project-1", WorkerID: "retry-worker-2", Now: now.Add(time.Minute), Lease: time.Minute, Limit: 1})
+	retryClaim, _ = store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope("project-1"), WorkerID: "retry-worker-2", Now: now.Add(time.Minute), Lease: time.Minute, Limit: 1})
 	if len(retryClaim) != 1 || retryClaim[0].Fence <= leased.Fence {
 		t.Fatal("retry fence")
 	}
@@ -2191,20 +2599,20 @@ func TestPostgresGate(t *testing.T) {
 	}
 	cancelJob := integrationJob(now, "cancel-job", cutoverHead.Epoch, cutoverHead.EpochDigest)
 	store.Enqueue(ctx, cancelJob)
-	if cancelled, cancelErr := store.Cancel(ctx, cancelJob.JobID, 1); cancelErr != nil || cancelled.State != controlplane.JobCancelled {
+	if cancelled, cancelErr := store.Cancel(ctx, integrationScope(cancelJob.ProjectID), cancelJob.JobID, 1); cancelErr != nil || cancelled.State != controlplane.JobCancelled {
 		t.Fatal("cancel", cancelErr)
 	}
 	expiredJob := integrationJob(now, "expired-job", cutoverHead.Epoch, cutoverHead.EpochDigest)
 	store.Enqueue(ctx, expiredJob)
-	expiredClaim, _ := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: "project-1", WorkerID: "expired-worker", Now: now, Lease: time.Second, Limit: 1})
+	expiredClaim, _ := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope("project-1"), WorkerID: "expired-worker", Now: now, Lease: time.Second, Limit: 1})
 	if len(expiredClaim) != 1 {
 		t.Fatal("expired claim")
 	}
-	if recovered, recoverErr := store.Recover(ctx, now.Add(time.Second), 10); recoverErr != nil || recovered < 1 {
+	if recovered, recoverErr := store.Recover(ctx, integrationScope(epoch.ProjectID), now.Add(time.Second), 10); recoverErr != nil || recovered < 1 {
 		t.Fatal("recover", recoverErr)
 	}
 	inboxJob := integrationJob(now, "inbox-job", cutoverHead.Epoch, cutoverHead.EpochDigest)
-	envelope := controlplane.InboxEnvelope{Source: "api", ExternalID: "request-1", IdempotencyKey: "key-1", ProjectID: "project-1", RequestDigest: integrationDigest("request"), CommandKind: "validate"}
+	envelope := controlplane.InboxEnvelope{OrganizationID: "organization", Source: "api", ExternalID: "request-1", IdempotencyKey: "key-1", ProjectID: "project-1", RequestDigest: integrationDigest("request"), CommandKind: "validate"}
 	created, err := store.Accept(ctx, envelope, inboxJob)
 	if err != nil || !created {
 		t.Fatal("accept", err)
@@ -2218,7 +2626,7 @@ func TestPostgresGate(t *testing.T) {
 	if err != nil || created {
 		t.Fatal("redelivery", err)
 	}
-	intent := controlplane.EffectIntent{OperationID: "operation-1", IdempotencyKey: "effect-1", ProjectID: "project-1", RunID: "run-1", Phase: controlplane.PhasePublish, BindingDigest: cutoverHead.EpochDigest, InputDigest: integrationDigest("input"), ReconcileMethod: "poll"}
+	intent := controlplane.EffectIntent{OrganizationID: "organization", OperationID: "operation-1", IdempotencyKey: "effect-1", ProjectID: "project-1", RunID: "run-1", Phase: controlplane.PhasePublish, BindingDigest: cutoverHead.EpochDigest, InputDigest: integrationDigest("input"), ReconcileMethod: "poll"}
 	if _, err = store.Prepare(ctx, intent); err != nil {
 		t.Fatal(err)
 	}
@@ -2230,10 +2638,10 @@ func TestPostgresGate(t *testing.T) {
 	if _, err = store.Prepare(ctx, conflictIntent); !errors.Is(err, controlplane.ErrConflict) {
 		t.Fatal("intent conflict")
 	}
-	if err = store.Confirm(ctx, intent.OperationID, integrationDigest("receipt")); err != nil {
+	if err = store.Confirm(ctx, integrationScope(intent.ProjectID), intent.OperationID, integrationDigest("receipt")); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.Confirm(ctx, intent.OperationID, integrationDigest("other")); !errors.Is(err, controlplane.ErrConflict) {
+	if err = store.Confirm(ctx, integrationScope(intent.ProjectID), intent.OperationID, integrationDigest("other")); !errors.Is(err, controlplane.ErrConflict) {
 		t.Fatal("receipt conflict")
 	}
 	outboxIntent := intent
@@ -2243,7 +2651,7 @@ func TestPostgresGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	dispatchNow := time.Now().UTC()
-	outboxClaims, err := store.ClaimOutbox(ctx, "dispatcher-1", dispatchNow, time.Minute, 1)
+	outboxClaims, err := store.ClaimOutbox(ctx, integrationScope(intent.ProjectID), "dispatcher-1", dispatchNow, time.Minute, 1)
 	if err != nil || len(outboxClaims) != 1 {
 		t.Fatal("outbox claim", err)
 	}
@@ -2253,7 +2661,7 @@ func TestPostgresGate(t *testing.T) {
 	if err = store.RetryOutbox(ctx, outboxClaims[0], dispatchNow.Add(time.Minute), "transient"); err != nil {
 		t.Fatal(err)
 	}
-	outboxClaims, err = store.ClaimOutbox(ctx, "dispatcher-2", dispatchNow.Add(time.Minute), time.Minute, 1)
+	outboxClaims, err = store.ClaimOutbox(ctx, integrationScope(intent.ProjectID), "dispatcher-2", dispatchNow.Add(time.Minute), time.Minute, 1)
 	if err != nil || len(outboxClaims) != 1 {
 		t.Fatal("outbox retry", err)
 	}
@@ -2273,11 +2681,11 @@ func TestPostgresGate(t *testing.T) {
 	expiringIntent.OperationID = "operation-3"
 	expiringIntent.IdempotencyKey = "effect-3"
 	store.Prepare(ctx, expiringIntent)
-	expiringClaims, _ := store.ClaimOutbox(ctx, "dispatcher-3", time.Now().UTC(), time.Second, 1)
+	expiringClaims, _ := store.ClaimOutbox(ctx, integrationScope(intent.ProjectID), "dispatcher-3", time.Now().UTC(), time.Second, 1)
 	if len(expiringClaims) != 1 {
 		t.Fatal("expiring outbox")
 	}
-	if recovered, recoverErr := store.RecoverOutbox(ctx, expiringClaims[0].LeaseUntil, 10); recoverErr != nil || recovered != 1 {
+	if recovered, recoverErr := store.RecoverOutbox(ctx, expiringClaims[0].Scope, expiringClaims[0].LeaseUntil, 10); recoverErr != nil || recovered != 1 {
 		t.Fatal("outbox recovery", recoverErr)
 	}
 	packageValue := validationworkflow.PackageDocument{ProjectID: "project-1", RunID: "run-1", PackageID: "package-1", MediaType: "application/json", SchemaVersion: "featureproof.package/v1", ArtifactDigest: integrationDigest("artifact"), BindingDigest: cutoverHead.EpochDigest, BackendEpoch: cutoverHead.Epoch, BackendIdentity: "pg-test", Document: []byte(`{"proof":true}`), CreatedAt: now}
@@ -2303,7 +2711,10 @@ func TestPostgresGate(t *testing.T) {
 	}
 	workflowAdapter := store.WorkflowStore()
 	workflow := validationworkflow.Record{Version: 1, Handle: "workflow-1", Principal: "principal-1", IdempotencyKey: "workflow-key", RequestDigest: integrationDigest("workflow-request"), RepositoryID: "repository-1", Revision: strings.Repeat("a", 40), Phase: validationworkflow.PhaseAdmitted}
-	workflow, created, workflowCtx, err := workflowAdapter.ReserveBound(ctx, workflow, "workflow-worker", now, time.Minute)
+	if err := integrationRegisterProject(ctx, store, "organization", workflow.RepositoryID); err != nil {
+		t.Fatal(err)
+	}
+	workflow, created, workflowCtx, err := workflowAdapter.ReserveBound(integrationAdmissionContext(workflow.Handle, workflow.RepositoryID), workflow, "workflow-worker", now, time.Minute)
 	if err != nil || !created {
 		t.Fatal("workflow reserve", err)
 	}
@@ -2312,7 +2723,7 @@ func TestPostgresGate(t *testing.T) {
 	if err != nil {
 		t.Fatal("workflow save", err)
 	}
-	workflowEvents, err := workflowAdapter.Events(ctx, workflow.Handle)
+	workflowEvents, err := workflowAdapter.Events(workflowCtx, workflow.Handle)
 	if err != nil || len(workflowEvents) != 2 {
 		t.Fatal("workflow events", err)
 	}
@@ -2327,11 +2738,11 @@ func TestPostgresGate(t *testing.T) {
 	for index, faultCase := range faultCases {
 		faultRecord := validationworkflow.Record{Version: 1, Handle: fmt.Sprintf("fault-workflow-%d", index), Principal: "principal-1", IdempotencyKey: fmt.Sprintf("fault-key-%d", index), RequestDigest: integrationDigest(faultCase.name), RepositoryID: "repository-1", Revision: strings.Repeat("b", 40), Phase: validationworkflow.PhaseAdmitted}
 		var faultCtx context.Context
-		faultRecord, _, faultCtx, err = workflowAdapter.ReserveBound(ctx, faultRecord, "fault-worker", now, time.Minute)
+		faultRecord, _, faultCtx, err = workflowAdapter.ReserveBound(integrationAdmissionContext(faultRecord.Handle, faultRecord.RepositoryID), faultRecord, "fault-worker", now, time.Minute)
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, faultEpoch, loadErr := store.Load(ctx, faultRecord.Handle)
+		_, faultEpoch, loadErr := store.Load(ctx, integrationScope(faultRecord.RepositoryID), faultRecord.Handle)
 		if loadErr != nil {
 			t.Fatal(loadErr)
 		}
@@ -2343,7 +2754,7 @@ func TestPostgresGate(t *testing.T) {
 		var causalJob *controlplane.Job
 		var causalEffect *controlplane.EffectIntent
 		if faultCase.effect {
-			causalEffect = &controlplane.EffectIntent{OperationID: fmt.Sprintf("fault-effect-%d", index), IdempotencyKey: fmt.Sprintf("fault-effect-key-%d", index), ProjectID: faultEpoch.ProjectID, RunID: faultRecord.Handle, Phase: controlplane.PhasePublish, BindingDigest: faultEpoch.Digest, InputDigest: integrationDigest("input"), ReconcileMethod: "poll"}
+			causalEffect = &controlplane.EffectIntent{OrganizationID: "organization", OperationID: fmt.Sprintf("fault-effect-%d", index), IdempotencyKey: fmt.Sprintf("fault-effect-key-%d", index), ProjectID: faultEpoch.ProjectID, RunID: faultRecord.Handle, Phase: controlplane.PhasePublish, BindingDigest: faultEpoch.Digest, InputDigest: integrationDigest("input"), ReconcileMethod: "poll"}
 		} else {
 			causalJob = &faultJob
 		}
@@ -2358,7 +2769,7 @@ func TestPostgresGate(t *testing.T) {
 		if saveErr == nil {
 			t.Fatalf("fault %s did not fire", faultCase.name)
 		}
-		reloaded, reloadErr := workflowAdapter.Load(ctx, faultRecord.Handle)
+		reloaded, reloadErr := workflowAdapter.Load(faultCtx, faultRecord.Handle)
 		if reloadErr != nil {
 			t.Fatal(reloadErr)
 		}
@@ -2387,7 +2798,7 @@ func TestPostgresGate(t *testing.T) {
 	if err = functionalAdapter.ConfirmTerminal(flowCtx, terminal); err != nil {
 		t.Fatal("functional terminal", err)
 	}
-	if _, found, terminalErr := functionalAdapter.Terminal(ctx, "flow-run", 1, "step-1"); terminalErr != nil || !found {
+	if _, found, terminalErr := functionalAdapter.Terminal(flowCtx, "flow-run", 1, "step-1"); terminalErr != nil || !found {
 		t.Fatal("functional reload", terminalErr)
 	}
 	integrationReserveBackend(t, store, "environment-run", "project-1", now)
@@ -2463,7 +2874,7 @@ func TestPostgresGate(t *testing.T) {
 		t.Fatal("correction update", correctionErr)
 	}
 	packageDocument, _ := controlplane.SealImportDocument(controlplane.ImportDocument{Stream: "packages", RelationKey: "typed-packages", Document: []byte(`{"items":[]}`)})
-	manifest, err := controlplane.SealImportManifest(controlplane.ImportManifest{ImportID: "import-1", RunID: "run-1", ProjectID: "project-1", SourceIdentity: "local-1", ExpectedHeadDigest: head.Digest, ExpectedEpoch: head.Epoch, Counts: map[string]uint64{"packages": 1}, StreamDigests: map[string]string{"packages": packageDocument.Digest}, RelationDigests: map[string]string{"packages": integrationDigest("typed-packages")}, State: controlplane.ImportFrozen, CreatedAt: now})
+	manifest, err := controlplane.SealImportManifest(controlplane.ImportManifest{OrganizationID: "organization", ImportID: "import-1", RunID: "run-1", ProjectID: "project-1", SourceIdentity: "local-1", ExpectedHeadDigest: head.Digest, ExpectedEpoch: head.Epoch, Counts: map[string]uint64{"packages": 1}, StreamDigests: map[string]string{"packages": packageDocument.Digest}, RelationDigests: map[string]string{"packages": integrationDigest("typed-packages")}, State: controlplane.ImportFrozen, CreatedAt: now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2529,10 +2940,10 @@ func TestPostgresProductDispatchSurvivesWorkerRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	admission := integrationAdmission(now, "product-restart")
-	if _, err := store.Admit(ctx, admission); err != nil {
+	if _, err := integrationAdmit(ctx, store, admission); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: admission.Job.ProjectID, WorkerID: "product-worker", Now: now, Lease: time.Minute, Limit: 1})
+	claimed, err := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope(admission.Job.ProjectID), WorkerID: "product-worker", Now: now, Lease: time.Minute, Limit: 1})
 	if err != nil || len(claimed) != 1 {
 		t.Fatal("claim", err)
 	}
@@ -2542,7 +2953,9 @@ func TestPostgresProductDispatchSurvivesWorkerRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflowRecord := validationworkflow.Record{Version: 1, Handle: "product-workflow", Principal: "product-principal", IdempotencyKey: "product-workflow-key", RequestDigest: admission.Job.InputDigest, RepositoryID: admission.Job.ProjectID, Revision: strings.Repeat("f", 40), Phase: validationworkflow.PhaseAdmitted}
-	if _, created, _, reserveErr := domains.Workflow.ReserveBound(ctx, workflowRecord, "product-workflow-worker", now, time.Minute); reserveErr != nil || !created {
+	workflowAdmissionCtx := integrationAdmissionContext(workflowRecord.Handle, workflowRecord.RepositoryID)
+	_, created, workflowCtx, reserveErr := domains.Workflow.ReserveBound(workflowAdmissionCtx, workflowRecord, "product-workflow-worker", now, time.Minute)
+	if reserveErr != nil || !created {
 		t.Fatal("workflow reserve", reserveErr)
 	}
 	ctx = integrationBoundContext(t, store, admission.Job.RunID)
@@ -2555,11 +2968,11 @@ func TestPostgresProductDispatchSurvivesWorkerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nextJob, err := controlplane.SealJob(controlplane.Job{JobID: "product-next-job", ProjectID: admission.Job.ProjectID, RunID: admission.Job.RunID, BackendEpoch: admission.Job.BackendEpoch, BindingDigest: admission.Job.BindingDigest, Phase: controlplane.PhaseCleanup, State: controlplane.JobQueued, InputDigest: admission.Job.InputDigest, CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour)})
+	nextJob, err := controlplane.SealJob(controlplane.Job{OrganizationID: "organization", JobID: "product-next-job", ProjectID: admission.Job.ProjectID, RunID: admission.Job.RunID, BackendEpoch: admission.Job.BackendEpoch, BindingDigest: admission.Job.BindingDigest, Phase: controlplane.PhaseCleanup, State: controlplane.JobQueued, InputDigest: admission.Job.InputDigest, CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	effect := controlplane.EffectIntent{OperationID: "product-environment-effect", IdempotencyKey: "product-environment", ProjectID: admission.Job.ProjectID, RunID: admission.Job.RunID, Phase: controlplane.PhaseExecute, BindingDigest: admission.Job.BindingDigest, InputDigest: admission.Job.InputDigest, ReconcileMethod: "reload_environment"}
+	effect := controlplane.EffectIntent{OrganizationID: "organization", OperationID: "product-environment-effect", IdempotencyKey: "product-environment", ProjectID: admission.Job.ProjectID, RunID: admission.Job.RunID, Phase: controlplane.PhaseExecute, BindingDigest: admission.Job.BindingDigest, InputDigest: admission.Job.InputDigest, ReconcileMethod: "reload_environment"}
 	environmentRecord.State, environmentRecord.ReleaseRequired, environmentRecord.UpdatedAt = environment.StateAcquiring, true, now
 	for _, boundary := range []string{"environment.after_projection", "environment.after_event", "environment.after_job", "environment.after_outbox"} {
 		store.fault = func(candidate string) error {
@@ -2580,7 +2993,7 @@ func TestPostgresProductDispatchSurvivesWorkerRestart(t *testing.T) {
 	if err = store.pool.QueryRow(ctx, `SELECT count(*) FROM effect_intents WHERE run_id=$1`, admission.Job.RunID).Scan(&effects); err != nil || effects != 2 {
 		t.Fatal("causal effect", effects, err)
 	}
-	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "pg-test", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "pg-test", MaxConnections: 4, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2592,14 +3005,14 @@ func TestPostgresProductDispatchSurvivesWorkerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workflow, err := restartedDomains.Workflow.Load(ctx, workflowRecord.Handle)
+	workflow, err := restartedDomains.Workflow.Load(workflowCtx, workflowRecord.Handle)
 	if err != nil || workflow.Phase != validationworkflow.PhaseAdmitted {
 		t.Fatal("workflow restart", err)
 	}
-	if _, err = restarted.LoadIngress(ctx, admission.Job.RunID); err != nil {
+	if _, err = restarted.LoadIngress(ctx, integrationScope(admission.Job.ProjectID), admission.Job.RunID); err != nil {
 		t.Fatal("ingress restart", err)
 	}
-	claim, err := restarted.ClaimEffect(ctx, admission.Intent.OperationID, "restarted-dispatcher", now, time.Minute)
+	claim, err := restarted.ClaimEffect(ctx, integrationScope(admission.Intent.ProjectID), admission.Intent.OperationID, "restarted-dispatcher", now, time.Minute)
 	if err != nil {
 		t.Fatal("claim causal ingress effect", err)
 	}
@@ -2610,7 +3023,7 @@ func TestPostgresProductDispatchSurvivesWorkerRestart(t *testing.T) {
 	if err = restarted.ConfirmEffectAndJob(ctx, claim, causalJob, integrationDigest("remote-receipt"), now.Add(time.Second)); err != nil {
 		t.Fatal("causal terminal", err)
 	}
-	if terminal, completeErr := restarted.Complete(ctx, causalJob.JobID, causalJob.Owner, causalJob.Fence, causalJob.CancelRevision, now.Add(time.Second), controlplane.JobSucceeded, ""); completeErr != nil || terminal.State != controlplane.JobSucceeded {
+	if terminal, completeErr := restarted.Complete(ctx, integrationScope(causalJob.ProjectID), causalJob.JobID, causalJob.Owner, causalJob.Fence, causalJob.CancelRevision, now.Add(time.Second), controlplane.JobSucceeded, ""); completeErr != nil || terminal.State != controlplane.JobSucceeded {
 		t.Fatal("causal terminal replay", completeErr)
 	}
 	var outboxState string
@@ -2630,6 +3043,10 @@ func TestPostgresDomainSessionFenceRejectsCutoverLateWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	workflow := validationworkflow.Record{Version: 1, Handle: "domain-fence-run", Principal: "domain-principal", IdempotencyKey: "domain-key", RequestDigest: integrationDigest("domain-workflow"), RepositoryID: "domain-fence-project", Revision: strings.Repeat("d", 40), Phase: validationworkflow.PhaseAdmitted}
+	ctx = integrationAdmissionContext(workflow.Handle, workflow.RepositoryID)
+	if err := integrationRegisterProject(ctx, store, "organization", workflow.RepositoryID); err != nil {
+		t.Fatal(err)
+	}
 	_, created, _, err := store.WorkflowStore().ReserveBound(ctx, workflow, "domain-owner", now, time.Minute)
 	if err != nil || !created {
 		t.Fatal(err)
@@ -2641,18 +3058,18 @@ func TestPostgresDomainSessionFenceRejectsCutoverLateWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	head, epoch, err := store.Load(ctx, workflow.Handle)
+	head, epoch, err := store.Load(ctx, integrationScope(workflow.RepositoryID), workflow.Handle)
 	if err != nil {
 		t.Fatal(err)
 	}
-	next := controlplane.BackendEpoch{RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 2, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now.Add(time.Second), PreviousDigest: epoch.Digest}
+	next := controlplane.BackendEpoch{OrganizationID: "organization", RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 2, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now.Add(time.Second), PreviousDigest: epoch.Digest}
 	if _, err = store.Cutover(ctx, head, next); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = store.WorkflowStore().RequestCancel(staleContext, workflow.Handle, now, validationworkflow.Event{Type: "stale-cancel"}); err == nil {
 		t.Fatal("first mutation prepared under the stale read crossed cutover")
 	}
-	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute})
+	restarted, err := Open(ctx, Config{DSN: store.pool.Config().ConnString(), BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: 5 * time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2680,25 +3097,25 @@ func TestPostgresGateRejectsInvalidAndStaleOperations(t *testing.T) {
 	if _, err := store.Claim(ctx, controlplane.ClaimRequest{}); !errors.Is(err, controlplane.ErrInvalid) {
 		t.Fatal("invalid claim")
 	}
-	if _, err := store.Heartbeat(ctx, "missing", "worker-1", 1, 0, now, time.Minute); !errors.Is(err, controlplane.ErrNotFound) {
+	if _, err := store.Heartbeat(ctx, integrationScope("project-1"), "missing", "worker-1", 1, 0, now, time.Minute); !errors.Is(err, controlplane.ErrNotFound) {
 		t.Fatal("missing heartbeat")
 	}
-	if _, err := store.Complete(ctx, "missing", "worker-1", 1, 0, now, controlplane.JobSucceeded, ""); !errors.Is(err, controlplane.ErrNotFound) {
+	if _, err := store.Complete(ctx, integrationScope("project-1"), "missing", "worker-1", 1, 0, now, controlplane.JobSucceeded, ""); !errors.Is(err, controlplane.ErrNotFound) {
 		t.Fatal("missing complete")
 	}
-	if _, err := store.Retry(ctx, "missing", "worker-1", 1, 0, now, controlplane.RetryDecision{}, now); !errors.Is(err, controlplane.ErrInvalid) {
+	if _, err := store.Retry(ctx, integrationScope("project-1"), "missing", "worker-1", 1, 0, now, controlplane.RetryDecision{}, now); !errors.Is(err, controlplane.ErrInvalid) {
 		t.Fatal("invalid retry")
 	}
-	if _, err := store.Cancel(ctx, "missing", 1); !errors.Is(err, controlplane.ErrNotFound) {
+	if _, err := store.Cancel(ctx, integrationScope("project-1"), "missing", 1); !errors.Is(err, controlplane.ErrNotFound) {
 		t.Fatal("missing cancel")
 	}
-	if _, err := store.Recover(ctx, now, 0); !errors.Is(err, controlplane.ErrInvalid) {
+	if _, err := store.Recover(ctx, integrationScope("project-1"), now, 0); !errors.Is(err, controlplane.ErrInvalid) {
 		t.Fatal("invalid recover")
 	}
-	if _, err := store.ClaimOutbox(ctx, "", now, time.Minute, 1); !errors.Is(err, controlplane.ErrInvalid) {
+	if _, err := store.ClaimOutbox(ctx, integrationScope("project-1"), "", now, time.Minute, 1); !errors.Is(err, controlplane.ErrInvalid) {
 		t.Fatal("invalid outbox claim")
 	}
-	if _, err := store.RecoverOutbox(ctx, now, 0); !errors.Is(err, controlplane.ErrInvalid) {
+	if _, err := store.RecoverOutbox(ctx, integrationScope("project-1"), now, 0); !errors.Is(err, controlplane.ErrInvalid) {
 		t.Fatal("invalid outbox recover")
 	}
 	if _, err := store.CommitPackage(ctx, validationworkflow.PackageDocument{}); !errors.Is(err, controlplane.ErrInvalid) {
@@ -2722,16 +3139,17 @@ func TestPostgresGateRejectsInvalidAndStaleOperations(t *testing.T) {
 	if err := store.Migrate(cancelled); !errors.Is(err, controlplane.ErrCancelled) {
 		t.Fatal("cancelled migrate")
 	}
-	if _, _, err := store.Load(cancelled, "missing"); !errors.Is(err, controlplane.ErrCancelled) {
+	if _, _, err := store.Load(cancelled, integrationScope("project-1"), "missing"); !errors.Is(err, controlplane.ErrCancelled) {
 		t.Fatal("cancelled load")
 	}
 	if _, err := store.Enqueue(cancelled, integrationJob(now, "cancelled-job", 1, integrationDigest("binding"))); !errors.Is(err, controlplane.ErrCancelled) {
 		t.Fatal("cancelled enqueue")
 	}
-	if _, err := store.Claim(cancelled, controlplane.ClaimRequest{ProjectID: "project-1", WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1}); !errors.Is(err, controlplane.ErrCancelled) {
+	if _, err := store.Claim(cancelled, controlplane.ClaimRequest{Scope: integrationScope("project-1"), WorkerID: "worker-1", Now: now, Lease: time.Minute, Limit: 1}); !errors.Is(err, controlplane.ErrCancelled) {
 		t.Fatal("cancelled claim")
 	}
-	if _, err := store.DeleteTerminalBefore(cancelled, now.Unix(), 1); !errors.Is(err, controlplane.ErrCancelled) {
+	retentionCancelled := controlplane.WithBackendCoordinate(cancelled, controlplane.BackendCoordinate{OrganizationID: "organization", ProjectID: "project-1"})
+	if _, err := store.DeleteTerminalBefore(retentionCancelled, now.Unix(), 1); !errors.Is(err, controlplane.ErrCancelled) {
 		t.Fatal("cancelled retention")
 	}
 }
@@ -2756,7 +3174,7 @@ func TestPostgresIngressRollbackAndUnknownCommit(t *testing.T) {
 			}
 			return nil
 		}
-		if _, err := store.Admit(ctx, admission); err == nil {
+		if _, err := integrationAdmit(ctx, store, admission); err == nil {
 			t.Fatalf("boundary %s did not fail", boundary.name)
 		}
 		store.fault = nil
@@ -2768,7 +3186,7 @@ func TestPostgresIngressRollbackAndUnknownCommit(t *testing.T) {
 			t.Fatalf("boundary %s left heads=%d", boundary.name, heads)
 		}
 		if boundary.committed {
-			if created, err := store.Admit(ctx, admission); err != nil || created {
+			if created, err := integrationAdmit(ctx, store, admission); err != nil || created {
 				t.Fatal("unknown commit was not reconciled", err)
 			}
 		}
@@ -2784,15 +3202,15 @@ func TestPostgresQueueFencesCutoverCancelExpiryOrderingAndSecrets(t *testing.T) 
 	}
 	now := time.Now().UTC()
 	reserve := func(runID string) (controlplane.BindingHead, controlplane.BackendEpoch) {
-		epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: runID, ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
-		head, err := store.ReserveInitial(ctx, epoch)
+		epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: runID, ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
+		head, err := integrationReserveInitial(ctx, store, epoch)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return head, epoch
 	}
 	boundJob := func(runID, jobID string, epoch uint64, digest string, created, available time.Time) controlplane.Job {
-		job, _ := controlplane.SealJob(controlplane.Job{JobID: jobID, ProjectID: "project-1", RunID: runID, BackendEpoch: epoch, BindingDigest: digest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest(jobID), CreatedAt: created, AvailableAt: available, Deadline: available.Add(time.Hour)})
+		job, _ := controlplane.SealJob(controlplane.Job{OrganizationID: "organization", JobID: jobID, ProjectID: "project-1", RunID: runID, BackendEpoch: epoch, BindingDigest: digest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest(jobID), CreatedAt: created, AvailableAt: available, Deadline: available.Add(time.Hour)})
 		return job
 	}
 	head, epoch := reserve("stale-run")
@@ -2800,11 +3218,11 @@ func TestPostgresQueueFencesCutoverCancelExpiryOrderingAndSecrets(t *testing.T) 
 	if _, err := store.Enqueue(ctx, job); err != nil {
 		t.Fatal(err)
 	}
-	claimed, err := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: "project-1", WorkerID: "worker-stale", Now: now, Lease: time.Minute, Limit: 1})
+	claimed, err := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope("project-1"), WorkerID: "worker-stale", Now: now, Lease: time.Minute, Limit: 1})
 	if err != nil || len(claimed) != 1 {
 		t.Fatal("stale claim", err)
 	}
-	grant, _ := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{ProjectID: "project-1", RunID: epoch.RunID, BackendEpoch: epoch.Epoch, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "target-1", TargetBindingDigest: integrationDigest("target"), SecretReferenceIDs: []string{"secret-1"}})
+	grant, _ := controlplane.SealAuthorityGrant(controlplane.AuthorityGrant{OrganizationID: "organization", ProjectID: "project-1", RunID: epoch.RunID, BackendEpoch: epoch.Epoch, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, AllowedCapabilities: []string{"http.execute"}, TargetBindingRef: "target-1", TargetBindingDigest: integrationDigest("target"), SecretReferenceIDs: []string{"secret-1"}})
 	if err = store.SaveAuthorityGrant(ctx, grant); err != nil {
 		t.Fatal(err)
 	}
@@ -2826,11 +3244,11 @@ func TestPostgresQueueFencesCutoverCancelExpiryOrderingAndSecrets(t *testing.T) 
 	if _, err = controlplane.ResolvePersistedSecrets(ctx, store, authority, claimed[0].Owner, now, resolver); err != nil || resolver.calls != 1 {
 		t.Fatal("authorized JIT resolution", err)
 	}
-	next := controlplane.BackendEpoch{RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 2, Mode: controlplane.BackendLocal, BackendIdentity: "local-archive", SchemaVersion: 1, CreatedAt: now.Add(time.Second), PreviousDigest: epoch.Digest}
+	next := controlplane.BackendEpoch{OrganizationID: "organization", RunID: epoch.RunID, ProjectID: epoch.ProjectID, Epoch: 2, Mode: controlplane.BackendLocal, BackendIdentity: "local-archive", SchemaVersion: 1, CreatedAt: now.Add(time.Second), PreviousDigest: epoch.Digest}
 	if _, err = store.Cutover(ctx, head, next); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.Complete(ctx, claimed[0].JobID, claimed[0].Owner, claimed[0].Fence, claimed[0].CancelRevision, now.Add(time.Second), controlplane.JobSucceeded, ""); !errors.Is(err, controlplane.ErrConflict) {
+	if _, err = store.Complete(ctx, integrationScope(claimed[0].ProjectID), claimed[0].JobID, claimed[0].Owner, claimed[0].Fence, claimed[0].CancelRevision, now.Add(time.Second), controlplane.JobSucceeded, ""); !errors.Is(err, controlplane.ErrConflict) {
 		t.Fatal("stale epoch completed")
 	}
 	if _, err = controlplane.ResolvePersistedSecrets(ctx, store, authority, claimed[0].Owner, now.Add(time.Second), resolver); err == nil || resolver.calls != 1 {
@@ -2839,7 +3257,7 @@ func TestPostgresQueueFencesCutoverCancelExpiryOrderingAndSecrets(t *testing.T) 
 	_, cancelEpoch := reserve("cancel-run")
 	cancelJob := boundJob(cancelEpoch.RunID, "cancel-race-job", 1, cancelEpoch.Digest, now, now)
 	store.Enqueue(ctx, cancelJob)
-	cancelClaim, _ := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: "project-1", WorkerID: "worker-cancel", Now: now, Lease: time.Minute, Limit: 1})
+	cancelClaim, _ := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope("project-1"), WorkerID: "worker-cancel", Now: now, Lease: time.Minute, Limit: 1})
 	var owned controlplane.Job
 	for _, candidate := range cancelClaim {
 		if candidate.JobID == cancelJob.JobID {
@@ -2849,23 +3267,23 @@ func TestPostgresQueueFencesCutoverCancelExpiryOrderingAndSecrets(t *testing.T) 
 	if owned.JobID == "" {
 		t.Fatal("cancel job was not claimed")
 	}
-	if _, err = store.Cancel(ctx, owned.JobID, 1); err != nil {
+	if _, err = store.Cancel(ctx, integrationScope(owned.ProjectID), owned.JobID, 1); err != nil {
 		t.Fatal(err)
 	}
 	var cleanupJobs int
 	if err = store.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE run_id=$1 AND phase='cleanup' AND state='queued'`, owned.RunID).Scan(&cleanupJobs); err != nil || cleanupJobs != 1 {
 		t.Fatal("cancel did not schedule convergence cleanup", err)
 	}
-	if _, err = store.Complete(ctx, owned.JobID, owned.Owner, owned.Fence, owned.CancelRevision, now, controlplane.JobSucceeded, ""); !errors.Is(err, controlplane.ErrConflict) {
+	if _, err = store.Complete(ctx, integrationScope(owned.ProjectID), owned.JobID, owned.Owner, owned.Fence, owned.CancelRevision, now, controlplane.JobSucceeded, ""); !errors.Is(err, controlplane.ErrConflict) {
 		t.Fatal("cancelled owner completed")
 	}
 	_, expiryEpoch := reserve("expiry-run")
 	expiryJob := boundJob(expiryEpoch.RunID, "expiry-race-job", 1, expiryEpoch.Digest, now.Add(-3*time.Second), now.Add(-3*time.Second))
 	store.Enqueue(ctx, expiryJob)
-	expiryClaims, _ := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: "project-1", WorkerID: "worker-expiry", Now: now.Add(-2 * time.Second), Lease: time.Second, Limit: 10})
+	expiryClaims, _ := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope("project-1"), WorkerID: "worker-expiry", Now: now.Add(-2 * time.Second), Lease: time.Second, Limit: 10})
 	for _, candidate := range expiryClaims {
 		if candidate.JobID == expiryJob.JobID {
-			if _, err = store.Complete(ctx, candidate.JobID, candidate.Owner, candidate.Fence, candidate.CancelRevision, now, controlplane.JobSucceeded, ""); !errors.Is(err, controlplane.ErrConflict) {
+			if _, err = store.Complete(ctx, integrationScope(candidate.ProjectID), candidate.JobID, candidate.Owner, candidate.Fence, candidate.CancelRevision, now, controlplane.JobSucceeded, ""); !errors.Is(err, controlplane.ErrConflict) {
 				t.Fatal("expired owner completed")
 			}
 		}
@@ -2877,7 +3295,7 @@ func TestPostgresQueueFencesCutoverCancelExpiryOrderingAndSecrets(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	orderedClaims, err := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: "project-1", WorkerID: "worker-order", Now: available, Lease: time.Minute, Limit: 10})
+	orderedClaims, err := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope("project-1"), WorkerID: "worker-order", Now: available, Lease: time.Minute, Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2893,9 +3311,9 @@ func TestPostgresQueueFencesCutoverCancelExpiryOrderingAndSecrets(t *testing.T) 
 // runWorkflowStoreContract verifies identical consumer semantics across local and PostgreSQL stores.
 func runWorkflowStoreContract(t *testing.T, store validationworkflow.WorkflowStore) {
 	t.Helper()
-	ctx := context.Background()
 	now := time.Now().UTC()
-	record := validationworkflow.Record{Version: 1, Handle: "contract-workflow", Principal: "principal-1", IdempotencyKey: "contract-key", RequestDigest: integrationDigest("contract-request"), Phase: validationworkflow.PhaseAdmitted}
+	record := validationworkflow.Record{Version: 1, Handle: "contract-workflow", Principal: "principal-1", IdempotencyKey: "contract-key", RequestDigest: integrationDigest("contract-request"), RepositoryID: "contract-project", Phase: validationworkflow.PhaseAdmitted}
+	ctx := integrationAdmissionContext(record.Handle, record.RepositoryID)
 	var reserved validationworkflow.Record
 	var created bool
 	var err error
@@ -2945,6 +3363,9 @@ func TestWorkflowStoreContractLocalAndPostgres(t *testing.T) {
 	t.Run("postgres", func(t *testing.T) {
 		store := integrationStore(t)
 		if err := store.Migrate(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := integrationRegisterProject(context.Background(), store, "organization", "contract-project"); err != nil {
 			t.Fatal(err)
 		}
 		runWorkflowStoreContract(t, store.WorkflowStore())
@@ -3049,7 +3470,7 @@ func TestPostgresMigrationLedgerFailsClosed(t *testing.T) {
 func TestPostgresMigrationRequiresDDLPermission(t *testing.T) {
 	ctx := context.Background()
 	dsn := os.Getenv("FEATUREPROOF_POSTGRES_TEST_DSN")
-	admin, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute})
+	admin, err := Open(ctx, Config{DSN: dsn, BackendIdentity: "pg-test", MaxConnections: 2, StatementTimeout: 5 * time.Second, MaxLease: time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3072,7 +3493,7 @@ func TestPostgresMigrationRequiresDDLPermission(t *testing.T) {
 	query := parsed.Query()
 	query.Set("search_path", schema)
 	parsed.RawQuery = query.Encode()
-	limited, err := Open(ctx, Config{DSN: parsed.String(), BackendIdentity: "pg-test", MaxConnections: 1, StatementTimeout: 5 * time.Second, MaxLease: time.Minute})
+	limited, err := Open(ctx, Config{DSN: parsed.String(), BackendIdentity: "pg-test", MaxConnections: 1, StatementTimeout: 5 * time.Second, MaxLease: time.Minute, IsolatedLoopbackTest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3098,15 +3519,16 @@ func TestPostgresOfflineImportCutoverRecovery(t *testing.T) {
 	if err = local.Put(ctx, document); err != nil {
 		t.Fatal(err)
 	}
-	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: "import-run", ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendLocal, BackendIdentity: "local-import", SchemaVersion: 1, CreatedAt: now})
-	head, err := store.ReserveInitial(ctx, epoch)
+	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: "import-run", ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendLocal, BackendIdentity: "local-import", SchemaVersion: 1, CreatedAt: now})
+	head, err := integrationReserveInitial(ctx, store, epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := local.Freeze(ctx, "real-import", epoch.RunID, epoch.ProjectID, head.Digest, head.Epoch, now)
+	manifest, err := local.Freeze(ctx, epoch.OrganizationID, "real-import", epoch.RunID, epoch.ProjectID, head.Digest, head.Epoch, now)
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx = controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID, RunID: epoch.RunID})
 	if _, err = store.SaveImport(ctx, manifest, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -3168,7 +3590,7 @@ func TestPostgresOfflineImportCutoverRecovery(t *testing.T) {
 	if err = local.Archive(ctx, receipt); err != nil {
 		t.Fatal(err)
 	}
-	loadedHead, loadedEpoch, err := store.Load(ctx, epoch.RunID)
+	loadedHead, loadedEpoch, err := store.Load(ctx, integrationScope(epoch.ProjectID), epoch.RunID)
 	if err != nil || loadedHead.Epoch != 2 || loadedEpoch.Mode != controlplane.BackendPostgres {
 		t.Fatal("cutover authority", err)
 	}
@@ -3188,15 +3610,16 @@ func TestPostgresConcurrentImportsPublishOneHead(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: "double-import-run", ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendLocal, BackendIdentity: "local-double", SchemaVersion: 1, CreatedAt: now})
-	head, err := store.ReserveInitial(ctx, epoch)
+	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: "double-import-run", ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendLocal, BackendIdentity: "local-double", SchemaVersion: 1, CreatedAt: now})
+	head, err := integrationReserveInitial(ctx, store, epoch)
 	if err != nil {
 		t.Fatal(err)
 	}
+	ctx = controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID, RunID: epoch.RunID})
 	document := controlplane.ImportDocument{Stream: "packages", RelationKey: "typed-packages", Document: []byte(`{"items":[]}`)}
 	sealedDocument, _ := controlplane.SealImportDocument(document)
 	for _, importID := range []string{"double-import-a", "double-import-b"} {
-		manifest, _ := controlplane.SealImportManifest(controlplane.ImportManifest{ImportID: importID, RunID: epoch.RunID, ProjectID: epoch.ProjectID, SourceIdentity: "local-double", ExpectedHeadDigest: head.Digest, ExpectedEpoch: head.Epoch, Counts: map[string]uint64{"packages": 1}, StreamDigests: map[string]string{"packages": sealedDocument.Digest}, RelationDigests: map[string]string{"packages": integrationDigest("typed-packages")}, State: controlplane.ImportFrozen, CreatedAt: now})
+		manifest, _ := controlplane.SealImportManifest(controlplane.ImportManifest{OrganizationID: "organization", ImportID: importID, RunID: epoch.RunID, ProjectID: epoch.ProjectID, SourceIdentity: "local-double", ExpectedHeadDigest: head.Digest, ExpectedEpoch: head.Epoch, Counts: map[string]uint64{"packages": 1}, StreamDigests: map[string]string{"packages": sealedDocument.Digest}, RelationDigests: map[string]string{"packages": integrationDigest("typed-packages")}, State: controlplane.ImportFrozen, CreatedAt: now})
 		if _, err = store.SaveImport(ctx, manifest, ""); err != nil {
 			t.Fatal(err)
 		}
@@ -3242,7 +3665,7 @@ func TestPostgresImportCutoverRejectsMissingBindingHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := controlplane.SealImportManifest(controlplane.ImportManifest{
+	manifest, err := controlplane.SealImportManifest(controlplane.ImportManifest{OrganizationID: "organization",
 		ImportID:           "missing-head-import",
 		RunID:              "missing-head-run",
 		ProjectID:          "project-1",
@@ -3258,6 +3681,10 @@ func TestPostgresImportCutoverRejectsMissingBindingHead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err = integrationRegisterProject(ctx, store, manifest.OrganizationID, manifest.ProjectID); err != nil {
+		t.Fatal(err)
+	}
+	ctx = controlplane.WithBackendCoordinate(ctx, controlplane.BackendCoordinate{OrganizationID: manifest.OrganizationID, ProjectID: manifest.ProjectID, RunID: manifest.RunID})
 	if _, err = store.SaveImport(ctx, manifest, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -3282,61 +3709,61 @@ func TestPostgresKeysetRetentionAndObserver(t *testing.T) {
 	}
 	observer := &failingObserver{}
 	store.observer = observer
-	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: "query-run", ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
-	if _, err := store.ReserveInitial(ctx, epoch); err != nil {
+	epoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: "query-run", ProjectID: "project-1", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
+	if _, err := integrationReserveInitial(ctx, store, epoch); err != nil {
 		t.Fatal(err)
 	}
 	for index, id := range []string{"query-a", "query-b"} {
 		created := now.Add(time.Duration(index) * time.Nanosecond)
-		job, _ := controlplane.SealJob(controlplane.Job{JobID: id, ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: 1, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest(id), CreatedAt: created, AvailableAt: created, Deadline: now.Add(time.Hour)})
+		job, _ := controlplane.SealJob(controlplane.Job{OrganizationID: "organization", JobID: id, ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: 1, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest(id), CreatedAt: created, AvailableAt: created, Deadline: now.Add(time.Hour)})
 		if _, err := store.Enqueue(ctx, job); err != nil {
 			t.Fatal(err)
 		}
 	}
 	codec, _ := controlplane.NewCursorCodec([]byte("0123456789abcdef0123456789abcdef"))
 	queryNow := now.Add(time.Second)
-	first, err := store.ListJobs(ctx, controlplane.JobQuery{ProjectID: epoch.ProjectID, Limit: 1, Now: queryNow, CursorTTL: time.Hour}, codec)
+	first, err := store.ListJobs(ctx, controlplane.JobQuery{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID, Limit: 1, Now: queryNow, CursorTTL: time.Hour}, codec)
 	if err != nil || len(first.Jobs) != 1 || first.NextCursor == "" {
 		t.Fatal("first page", err)
 	}
-	late, _ := controlplane.SealJob(controlplane.Job{JobID: "query-late", ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: 1, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest("late"), CreatedAt: queryNow.Add(time.Second), AvailableAt: queryNow.Add(time.Second), Deadline: queryNow.Add(time.Hour)})
+	late, _ := controlplane.SealJob(controlplane.Job{OrganizationID: "organization", JobID: "query-late", ProjectID: epoch.ProjectID, RunID: epoch.RunID, BackendEpoch: 1, BindingDigest: epoch.Digest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest("late"), CreatedAt: queryNow.Add(time.Second), AvailableAt: queryNow.Add(time.Second), Deadline: queryNow.Add(time.Hour)})
 	if _, err = store.Enqueue(ctx, late); err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.ListJobs(ctx, controlplane.JobQuery{ProjectID: epoch.ProjectID, Limit: 10, Now: queryNow, CursorTTL: time.Hour, Cursor: first.NextCursor}, codec)
+	second, err := store.ListJobs(ctx, controlplane.JobQuery{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID, Limit: 10, Now: queryNow, CursorTTL: time.Hour, Cursor: first.NextCursor}, codec)
 	if err != nil || len(second.Jobs) != 1 || second.Jobs[0].JobID == late.JobID {
 		t.Fatal("snapshot page", err)
 	}
-	claims, err := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: epoch.ProjectID, WorkerID: "retention-worker", Now: queryNow.Add(2 * time.Second), Lease: time.Minute, Limit: 10})
+	claims, err := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope(epoch.ProjectID), WorkerID: "retention-worker", Now: queryNow.Add(2 * time.Second), Lease: time.Minute, Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, job := range claims {
 		if job.JobID == "query-a" || job.JobID == "query-b" {
-			if _, err = store.Complete(ctx, job.JobID, job.Owner, job.Fence, job.CancelRevision, queryNow.Add(3*time.Second), controlplane.JobSucceeded, ""); err != nil {
+			if _, err = store.Complete(ctx, integrationScope(job.ProjectID), job.JobID, job.Owner, job.Fence, job.CancelRevision, queryNow.Add(3*time.Second), controlplane.JobSucceeded, ""); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	otherEpoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{RunID: "query-other-run", ProjectID: "project-2", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
-	if _, err = store.ReserveInitial(ctx, otherEpoch); err != nil {
+	otherEpoch, _ := controlplane.SealBackendEpoch(controlplane.BackendEpoch{OrganizationID: "organization", RunID: "query-other-run", ProjectID: "project-2", Epoch: 1, Mode: controlplane.BackendPostgres, BackendIdentity: "pg-test", SchemaVersion: 1, CreatedAt: now})
+	if _, err = integrationReserveInitial(ctx, store, otherEpoch); err != nil {
 		t.Fatal(err)
 	}
-	otherJob, _ := controlplane.SealJob(controlplane.Job{JobID: "query-other", ProjectID: otherEpoch.ProjectID, RunID: otherEpoch.RunID, BackendEpoch: 1, BindingDigest: otherEpoch.Digest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest("other"), CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour)})
+	otherJob, _ := controlplane.SealJob(controlplane.Job{OrganizationID: "organization", JobID: "query-other", ProjectID: otherEpoch.ProjectID, RunID: otherEpoch.RunID, BackendEpoch: 1, BindingDigest: otherEpoch.Digest, Phase: controlplane.PhaseExecute, State: controlplane.JobQueued, InputDigest: integrationDigest("other"), CreatedAt: now, AvailableAt: now, Deadline: now.Add(time.Hour)})
 	if _, err = store.Enqueue(ctx, otherJob); err != nil {
 		t.Fatal(err)
 	}
-	otherClaims, claimErr := store.Claim(ctx, controlplane.ClaimRequest{ProjectID: otherEpoch.ProjectID, WorkerID: "other-retention-worker", Now: queryNow.Add(2 * time.Second), Lease: time.Minute, Limit: 1})
+	otherClaims, claimErr := store.Claim(ctx, controlplane.ClaimRequest{Scope: integrationScope(otherEpoch.ProjectID), WorkerID: "other-retention-worker", Now: queryNow.Add(2 * time.Second), Lease: time.Minute, Limit: 1})
 	if claimErr != nil || len(otherClaims) != 1 {
 		t.Fatal("other project claim", claimErr)
 	}
-	if _, err = store.Complete(ctx, otherClaims[0].JobID, otherClaims[0].Owner, otherClaims[0].Fence, otherClaims[0].CancelRevision, queryNow.Add(3*time.Second), controlplane.JobSucceeded, ""); err != nil {
+	if _, err = store.Complete(ctx, integrationScope(otherClaims[0].ProjectID), otherClaims[0].JobID, otherClaims[0].Owner, otherClaims[0].Fence, otherClaims[0].CancelRevision, queryNow.Add(3*time.Second), controlplane.JobSucceeded, ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = store.pool.Exec(ctx, `INSERT INTO retention_references(project_id,job_id,reference_kind,reference_id,live) VALUES($1,'query-b','evidence','evidence-1',true)`, epoch.ProjectID); err != nil {
 		t.Fatal(err)
 	}
-	deleted, err := store.DeleteProjectTerminalBefore(ctx, epoch.ProjectID, queryNow.Add(time.Hour).Unix(), 1)
+	deleted, err := store.DeleteProjectTerminalBefore(ctx, controlplane.ProjectScope{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID}, queryNow.Add(time.Hour).Unix(), 1)
 	if err != nil || deleted != 1 {
 		t.Fatal("retention", deleted, err)
 	}
@@ -3351,13 +3778,13 @@ func TestPostgresKeysetRetentionAndObserver(t *testing.T) {
 	if err = store.pool.QueryRow(ctx, `SELECT count(*) FROM jobs WHERE job_id='query-other'`).Scan(&otherCount); err != nil || otherCount != 1 {
 		t.Fatal("project-scoped retention crossed boundary", err)
 	}
-	if deleted, err = store.DeleteProjectTerminalBefore(ctx, epoch.ProjectID, queryNow.Add(time.Hour).Unix(), 10); err != nil || deleted != 0 {
+	if deleted, err = store.DeleteProjectTerminalBefore(ctx, controlplane.ProjectScope{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID}, queryNow.Add(time.Hour).Unix(), 10); err != nil || deleted != 0 {
 		t.Fatal("live reference deleted", deleted, err)
 	}
 	if _, err = store.pool.Exec(ctx, `UPDATE retention_references SET live=false WHERE job_id='query-b'`); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err = store.DeleteProjectTerminalBefore(ctx, epoch.ProjectID, queryNow.Add(time.Hour).Unix(), 10); err != nil || deleted != 1 {
+	if deleted, err = store.DeleteProjectTerminalBefore(ctx, controlplane.ProjectScope{OrganizationID: epoch.OrganizationID, ProjectID: epoch.ProjectID}, queryNow.Add(time.Hour).Unix(), 10); err != nil || deleted != 1 {
 		t.Fatal("released reference retained", deleted, err)
 	}
 	attempts := 0

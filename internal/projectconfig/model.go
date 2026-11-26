@@ -96,21 +96,22 @@ var digestPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // ProjectKey scopes every version, authority and query to one repository.
 type ProjectKey struct {
-	ProjectID    string `json:"project_id"`
-	RepositoryID string `json:"repository_id"`
+	OrganizationID string `json:"organization_id"`
+	ProjectID      string `json:"project_id"`
+	RepositoryID   string `json:"repository_id"`
 }
 
 // NewProjectKey validates durable identifiers before they can reach paths or SQL.
-func NewProjectKey(projectID, repositoryID string) (ProjectKey, error) {
-	if !canonicalID.MatchString(projectID) || !canonicalID.MatchString(repositoryID) {
+func NewProjectKey(organizationID, projectID, repositoryID string) (ProjectKey, error) {
+	if !canonicalID.MatchString(organizationID) || !canonicalID.MatchString(projectID) || !canonicalID.MatchString(repositoryID) {
 		return ProjectKey{}, invalid("project_key", "project_id")
 	}
-	return ProjectKey{ProjectID: projectID, RepositoryID: repositoryID}, nil
+	return ProjectKey{OrganizationID: organizationID, ProjectID: projectID, RepositoryID: repositoryID}, nil
 }
 
 // Validate rechecks a ProjectKey received across an adapter boundary.
 func (key ProjectKey) Validate() error {
-	_, err := NewProjectKey(key.ProjectID, key.RepositoryID)
+	_, err := NewProjectKey(key.OrganizationID, key.ProjectID, key.RepositoryID)
 	return err
 }
 
@@ -165,11 +166,12 @@ type Constraints struct {
 
 // Document is the strict public configuration document before trusted merge.
 type Document struct {
-	Schema       string              `json:"schema"`
-	ProjectID    string              `json:"project_id"`
-	RepositoryID string              `json:"repository_id"`
-	References   []ResourceReference `json:"references"`
-	Constraints  Constraints         `json:"constraints"`
+	Schema         string              `json:"schema"`
+	OrganizationID string              `json:"organization_id"`
+	ProjectID      string              `json:"project_id"`
+	RepositoryID   string              `json:"repository_id"`
+	References     []ResourceReference `json:"references"`
+	Constraints    Constraints         `json:"constraints"`
 }
 
 // Clone returns a defensive copy for validation and query boundaries.

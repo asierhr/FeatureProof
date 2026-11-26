@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/asierhr/featureProof/internal/controlplane"
 	cleanup "github.com/asierhr/featureProof/internal/environment/cleanup"
 	"github.com/jackc/pgx/v5"
 )
@@ -23,11 +24,15 @@ func (store *Store) CleanupCapacityLedger() *PostgresCleanupCapacityLedger {
 
 // Reserve atomically admits one exact cleanup capacity request.
 func (ledger *PostgresCleanupCapacityLedger) Reserve(ctx context.Context, request cleanup.CapacityRequest) (cleanup.CapacityReceipt, bool, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID != request.ProjectID || coordinate.RunID != request.RunID {
+		return cleanup.CapacityReceipt{}, false, cleanupFailure(cleanup.CategoryInvalid, "capacity_scope")
+	}
 	policy, err := cleanup.SealCapacityPolicy(request.Policy)
 	if err != nil || policy.Digest != request.Policy.Digest {
 		return cleanup.CapacityReceipt{}, false, cleanupFailure(cleanup.CategoryInvalid, "capacity_reserve")
 	}
-	id := digestBytes([]byte(request.ProjectID + "\x00" + request.AcquisitionKey))
+	id := digestBytes([]byte(coordinate.OrganizationID + "\x00" + request.ProjectID + "\x00" + request.AcquisitionKey))
 	wanted := cleanup.CapacityReceipt{ID: id, ProjectID: request.ProjectID, RunID: request.RunID, AcquisitionKey: request.AcquisitionKey, SelectionDigest: request.SelectionDigest, PolicyDigest: policy.Digest, Demand: request.Demand, TTL: request.TTL}
 	wanted.Digest = digestBytes(mustCanonical(wanted))
 	data, _ := canonical(wanted)
@@ -38,7 +43,7 @@ func (ledger *PostgresCleanupCapacityLedger) Reserve(ctx context.Context, reques
 		}
 		result, changed = wanted, true
 		var priorData []byte
-		if scanErr := tx.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE project_id=$1 AND acquisition_key=$2 FOR UPDATE`, request.ProjectID, request.AcquisitionKey).Scan(&priorData); scanErr == nil {
+		if scanErr := tx.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND acquisition_key=$3 FOR UPDATE`, coordinate.OrganizationID, request.ProjectID, request.AcquisitionKey).Scan(&priorData); scanErr == nil {
 			var prior cleanup.CapacityReceipt
 			if json.Unmarshal(priorData, &prior) != nil || prior.RunID != wanted.RunID || prior.SelectionDigest != wanted.SelectionDigest || prior.PolicyDigest != wanted.PolicyDigest || prior.Demand != wanted.Demand || prior.TTL != wanted.TTL {
 				return cleanupFailure(cleanup.CategoryConflict, "capacity_redelivery")
@@ -49,7 +54,7 @@ func (ledger *PostgresCleanupCapacityLedger) Reserve(ctx context.Context, reques
 			return scanErr
 		}
 		var used cleanup.ResourceDemand
-		rows, queryErr := tx.Query(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE project_id=$1 AND state<>'released' FOR UPDATE`, request.ProjectID)
+		rows, queryErr := tx.Query(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND state<>'released' FOR UPDATE`, coordinate.OrganizationID, request.ProjectID)
 		if queryErr != nil {
 			return queryErr
 		}
@@ -72,7 +77,7 @@ func (ledger *PostgresCleanupCapacityLedger) Reserve(ctx context.Context, reques
 		if addErr != nil || total.Environments > policy.MaxEnvironments || total.CPUMilli > policy.MaxCPUMilli || total.MemoryBytes > policy.MaxMemoryBytes || total.ObjectCount > policy.MaxObjectCount {
 			return cleanupFailure(cleanup.CategoryConflict, "capacity_limit")
 		}
-		if _, execErr := tx.Exec(ctx, `INSERT INTO cleanup_capacity_receipts(receipt_id,project_id,run_id,acquisition_key,state,receipt,digest) VALUES($1,$2,$3,$4,'reserved',$5,$6)`, wanted.ID, wanted.ProjectID, wanted.RunID, wanted.AcquisitionKey, data, wanted.Digest); execErr != nil {
+		if _, execErr := tx.Exec(ctx, `INSERT INTO cleanup_capacity_receipts(organization_id,receipt_id,project_id,run_id,acquisition_key,state,receipt,digest) VALUES($1,$2,$3,$4,$5,'reserved',$6,$7)`, coordinate.OrganizationID, wanted.ID, wanted.ProjectID, wanted.RunID, wanted.AcquisitionKey, data, wanted.Digest); execErr != nil {
 			return execErr
 		}
 		if eventErr := ledger.appendCapacityEvent(ctx, tx, wanted, "capacity_reserved"); eventErr != nil {
@@ -88,8 +93,12 @@ func (ledger *PostgresCleanupCapacityLedger) Reserve(ctx context.Context, reques
 
 // Receipt returns one integrity-checked durable receipt.
 func (ledger *PostgresCleanupCapacityLedger) Receipt(ctx context.Context, id string) (cleanup.CapacityReceipt, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return cleanup.CapacityReceipt{}, cleanupFailure(cleanup.CategoryInvalid, "capacity_scope")
+	}
 	var data []byte
-	if err := ledger.store.pool.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE receipt_id=$1`, id).Scan(&data); err != nil {
+	if err := ledger.store.pool.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND receipt_id=$3`, coordinate.OrganizationID, coordinate.ProjectID, id).Scan(&data); err != nil {
 		return cleanup.CapacityReceipt{}, cleanupFailure(cleanup.CategoryInvalid, "capacity_receipt")
 	}
 	var value cleanup.CapacityReceipt
@@ -151,10 +160,14 @@ func (ledger *PostgresCleanupCapacityLedger) ConfirmEnvironment(ctx context.Cont
 
 // AdoptUnknown persists fail-closed capacity for an owned orphan whose original receipt cannot be recovered.
 func (ledger *PostgresCleanupCapacityLedger) AdoptUnknown(ctx context.Context, project, runID, acquisition, authority string, demand cleanup.ResourceDemand, ttl time.Duration) (cleanup.CapacityReceipt, bool, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID != project || coordinate.RunID != runID {
+		return cleanup.CapacityReceipt{}, false, cleanupFailure(cleanup.CategoryInvalid, "capacity_scope")
+	}
 	if project == "" || runID == "" || acquisition == "" || len(authority) != 64 || demand.Environments != 1 || ttl <= 0 {
 		return cleanup.CapacityReceipt{}, false, cleanupFailure(cleanup.CategoryInvalid, "capacity_orphan")
 	}
-	id := digestBytes(mustCanonical(struct{ Project, Acquisition string }{project, acquisition}))
+	id := digestBytes(mustCanonical(struct{ Organization, Project, Acquisition string }{coordinate.OrganizationID, project, acquisition}))
 	wanted := cleanup.CapacityReceipt{ID: id, ProjectID: project, RunID: runID, AcquisitionKey: acquisition, Demand: demand, TTL: ttl, AuthorityDigest: authority, Unknown: true}
 	wanted.Digest = digestBytes(mustCanonical(wanted))
 	data, _ := canonical(wanted)
@@ -164,7 +177,7 @@ func (ledger *PostgresCleanupCapacityLedger) AdoptUnknown(ctx context.Context, p
 			return verifyErr
 		}
 		var priorData []byte
-		if scanErr := tx.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE receipt_id=$1 FOR UPDATE`, id).Scan(&priorData); scanErr == nil {
+		if scanErr := tx.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND receipt_id=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, id).Scan(&priorData); scanErr == nil {
 			var prior cleanup.CapacityReceipt
 			if json.Unmarshal(priorData, &prior) != nil || prior.Digest != authority && prior.AuthorityDigest != authority {
 				return cleanupFailure(cleanup.CategoryConflict, "capacity_orphan")
@@ -174,7 +187,7 @@ func (ledger *PostgresCleanupCapacityLedger) AdoptUnknown(ctx context.Context, p
 		} else if scanErr != pgx.ErrNoRows {
 			return scanErr
 		}
-		if _, execErr := tx.Exec(ctx, `INSERT INTO cleanup_capacity_receipts(receipt_id,project_id,run_id,acquisition_key,state,receipt,digest) VALUES($1,$2,$3,$4,'reserved',$5,$6)`, id, project, runID, acquisition, data, wanted.Digest); execErr != nil {
+		if _, execErr := tx.Exec(ctx, `INSERT INTO cleanup_capacity_receipts(organization_id,receipt_id,project_id,run_id,acquisition_key,state,receipt,digest) VALUES($1,$2,$3,$4,$5,'reserved',$6,$7)`, coordinate.OrganizationID, id, project, runID, acquisition, data, wanted.Digest); execErr != nil {
 			return execErr
 		}
 		if eventErr := ledger.appendCapacityEvent(ctx, tx, wanted, "capacity_orphan_adopted"); eventErr != nil {
@@ -187,17 +200,21 @@ func (ledger *PostgresCleanupCapacityLedger) AdoptUnknown(ctx context.Context, p
 
 // BlockUnknown records malformed owned inventory as a durable admission block.
 func (ledger *PostgresCleanupCapacityLedger) BlockUnknown(ctx context.Context, project, identity string) (cleanup.CapacityReceipt, bool, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID != project {
+		return cleanup.CapacityReceipt{}, false, cleanupFailure(cleanup.CategoryInvalid, "capacity_scope")
+	}
 	if project == "" || len(identity) != 64 {
 		return cleanup.CapacityReceipt{}, false, cleanupFailure(cleanup.CategoryInvalid, "capacity_unknown")
 	}
-	id := digestBytes(mustCanonical(struct{ Project, Identity string }{project, identity}))
+	id := digestBytes(mustCanonical(struct{ Organization, Project, Identity string }{coordinate.OrganizationID, project, identity}))
 	wanted := cleanup.CapacityReceipt{ID: id, ProjectID: project, Unknown: true}
 	wanted.Digest = digestBytes(mustCanonical(wanted))
 	data, _ := canonical(wanted)
 	result, changed := wanted, true
 	err := retryTransactionObserved(ctx, ledger.store.pool, ledger.store.maxTxAttempts, "cleanup_capacity.block_unknown", ledger.store.observer, func(tx pgx.Tx) error {
 		var priorData []byte
-		if scanErr := tx.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE receipt_id=$1 FOR UPDATE`, id).Scan(&priorData); scanErr == nil {
+		if scanErr := tx.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND receipt_id=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, id).Scan(&priorData); scanErr == nil {
 			if json.Unmarshal(priorData, &result) != nil {
 				return cleanupFailure(cleanup.CategoryIntegrity, "capacity_unknown")
 			}
@@ -206,7 +223,7 @@ func (ledger *PostgresCleanupCapacityLedger) BlockUnknown(ctx context.Context, p
 		} else if scanErr != pgx.ErrNoRows {
 			return scanErr
 		}
-		if _, execErr := tx.Exec(ctx, `INSERT INTO cleanup_capacity_receipts(receipt_id,project_id,run_id,acquisition_key,state,receipt,digest) VALUES($1,$2,'inventory-discovery',$3,'reserved',$4,$5)`, id, project, id, data, wanted.Digest); execErr != nil {
+		if _, execErr := tx.Exec(ctx, `INSERT INTO cleanup_capacity_receipts(organization_id,receipt_id,project_id,run_id,acquisition_key,state,receipt,digest) VALUES($1,$2,$3,'inventory-discovery',$4,'reserved',$5,$6)`, coordinate.OrganizationID, id, project, id, data, wanted.Digest); execErr != nil {
 			return execErr
 		}
 		return ledger.appendCapacityEvent(ctx, tx, wanted, "capacity_unknown_blocked")
@@ -216,8 +233,12 @@ func (ledger *PostgresCleanupCapacityLedger) BlockUnknown(ctx context.Context, p
 
 // ReleaseConfirmed resolves the exact receipt binding before applying its one-time absence proof.
 func (ledger *PostgresCleanupCapacityLedger) ReleaseConfirmed(ctx context.Context, project, acquisition, expectedDigest, cleanupID, confirmation string) (cleanup.CapacityReceipt, bool, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID != project {
+		return cleanup.CapacityReceipt{}, false, cleanupFailure(cleanup.CategoryInvalid, "capacity_scope")
+	}
 	var data []byte
-	if err := ledger.store.pool.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE project_id=$1 AND acquisition_key=$2`, project, acquisition).Scan(&data); err != nil {
+	if err := ledger.store.pool.QueryRow(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND acquisition_key=$3`, coordinate.OrganizationID, project, acquisition).Scan(&data); err != nil {
 		return cleanup.CapacityReceipt{}, false, cleanupFailure(cleanup.CategoryConflict, "capacity_release_binding")
 	}
 	var current cleanup.CapacityReceipt
@@ -251,7 +272,11 @@ func (ledger *PostgresCleanupCapacityLedger) ScanReceipts(ctx context.Context, c
 	if limit <= 0 {
 		return nil, "", cleanupFailure(cleanup.CategoryInvalid, "capacity_scan")
 	}
-	rows, err := ledger.store.pool.Query(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE receipt_id>$1 ORDER BY receipt_id LIMIT $2`, cursor, limit+1)
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" {
+		return nil, "", cleanupFailure(cleanup.CategoryInvalid, "capacity_scope")
+	}
+	rows, err := ledger.store.pool.Query(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND receipt_id>$3 ORDER BY receipt_id LIMIT $4`, coordinate.OrganizationID, coordinate.ProjectID, cursor, limit+1)
 	if err != nil {
 		return nil, "", cleanupFailure(cleanup.CategoryTransient, "capacity_scan")
 	}
@@ -274,8 +299,12 @@ func (ledger *PostgresCleanupCapacityLedger) ScanReceipts(ctx context.Context, c
 }
 
 // Snapshot returns the current aggregate quota projection for one project.
-func (ledger *PostgresCleanupCapacityLedger) Snapshot(project string) (cleanup.CapacitySnapshot, error) {
-	rows, err := ledger.store.pool.Query(context.Background(), `SELECT receipt FROM cleanup_capacity_receipts WHERE project_id=$1 AND state<>'released'`, project)
+func (ledger *PostgresCleanupCapacityLedger) Snapshot(ctx context.Context, project string) (cleanup.CapacitySnapshot, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID != project {
+		return cleanup.CapacitySnapshot{}, cleanupFailure(cleanup.CategoryInvalid, "capacity_scope")
+	}
+	rows, err := ledger.store.pool.Query(ctx, `SELECT receipt FROM cleanup_capacity_receipts WHERE organization_id=$1 AND project_id=$2 AND state<>'released'`, coordinate.OrganizationID, project)
 	if err != nil {
 		return cleanup.CapacitySnapshot{}, cleanupFailure(cleanup.CategoryTransient, "capacity_snapshot")
 	}
@@ -307,12 +336,16 @@ func (ledger *PostgresCleanupCapacityLedger) updateReceipt(ctx context.Context, 
 	current.Digest = digestBytes(mustCanonical(current))
 	data, _ := canonical(current)
 	err := retryTransactionObserved(ctx, ledger.store.pool, ledger.store.maxTxAttempts, "cleanup_capacity.update", ledger.store.observer, func(tx pgx.Tx) error {
+		coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+		if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID != current.ProjectID {
+			return cleanupFailure(cleanup.CategoryInvalid, "capacity_scope")
+		}
 		if current.RunID != "" {
 			if _, _, verifyErr := ledger.store.verifyWorkflowBackendTx(ctx, tx, current.RunID); verifyErr != nil {
 				return verifyErr
 			}
 		}
-		tag, execErr := tx.Exec(ctx, `UPDATE cleanup_capacity_receipts SET state=$1,receipt=$2,digest=$3 WHERE receipt_id=$4 AND digest=$5`, state, data, current.Digest, current.ID, expected)
+		tag, execErr := tx.Exec(ctx, `UPDATE cleanup_capacity_receipts SET state=$1,receipt=$2,digest=$3 WHERE organization_id=$4 AND project_id=$5 AND receipt_id=$6 AND digest=$7`, state, data, current.Digest, coordinate.OrganizationID, coordinate.ProjectID, current.ID, expected)
 		if execErr != nil {
 			return execErr
 		}
@@ -335,9 +368,13 @@ func (ledger *PostgresCleanupCapacityLedger) updateReceipt(ctx context.Context, 
 
 // appendCapacityEvent inserts one content-free ledger event in the same transaction.
 func (ledger *PostgresCleanupCapacityLedger) appendCapacityEvent(ctx context.Context, tx pgx.Tx, receipt cleanup.CapacityReceipt, kind string) error {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID != receipt.ProjectID {
+		return cleanupFailure(cleanup.CategoryInvalid, "capacity_scope")
+	}
 	event := cleanup.CapacityEvent{ID: kind + "-" + receipt.ID[:16], ProjectID: receipt.ProjectID, ReceiptID: receipt.ID, Owner: receipt.RunID, Kind: kind}
 	data, _ := canonical(event)
-	_, err := tx.Exec(ctx, `INSERT INTO cleanup_capacity_events(project_id,event_id,receipt_id,event) VALUES($1,$2,$3,$4)`, receipt.ProjectID, event.ID, receipt.ID, data)
+	_, err := tx.Exec(ctx, `INSERT INTO cleanup_capacity_events(organization_id,project_id,event_id,receipt_id,event) VALUES($1,$2,$3,$4,$5)`, coordinate.OrganizationID, receipt.ProjectID, event.ID, receipt.ID, data)
 	if err != nil {
 		return cleanupFailure(cleanup.CategoryTransient, "capacity_event")
 	}

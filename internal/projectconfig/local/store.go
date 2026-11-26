@@ -304,12 +304,12 @@ func (store *Store) read(ctx context.Context, key pc.ProjectKey, fn func(*state)
 
 // lockPath derives a contained filename only from validated identifiers.
 func (store *Store) lockPath(key pc.ProjectKey) string {
-	return filepath.Join(store.root, key.ProjectID+"--"+key.RepositoryID+".lock")
+	return filepath.Join(store.root, key.OrganizationID+"--"+key.ProjectID+"--"+key.RepositoryID+".lock")
 }
 
 // dataPath derives the authoritative snapshot path for one project scope.
 func (store *Store) dataPath(key pc.ProjectKey) string {
-	return filepath.Join(store.root, key.ProjectID+"--"+key.RepositoryID+".json")
+	return filepath.Join(store.root, key.OrganizationID+"--"+key.ProjectID+"--"+key.RepositoryID+".json")
 }
 
 // load verifies the envelope before decoding durable projections.

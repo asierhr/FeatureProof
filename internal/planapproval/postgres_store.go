@@ -62,19 +62,31 @@ func NewFencedPostgresApprovalStore(connection any, backendIdentity string) (*Po
 // verifyBackendTx locks the active head inside the caller's transaction so a
 // cutover cannot race an approval snapshot or journal mutation.
 func (store *PostgresApprovalStore) verifyBackendTx(ctx context.Context, tx pgx.Tx, runID string) (string, error) {
-	if store.backendIdentity == "" {
-		return "", nil
-	}
 	coordinate, presented := controlplane.BackendCoordinateFromContext(ctx)
-	if !presented || coordinate.RunID != runID || coordinate.BackendIdentity != store.backendIdentity || coordinate.Epoch == 0 || coordinate.BindingDigest == "" {
+	if !presented || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != runID {
+		return "", typedError(CategoryRevisionConflict, "backend_fence", "coordinate", nil)
+	}
+	if store.backendIdentity == "" {
+		return coordinate.BindingDigest, nil
+	}
+	if coordinate.BackendIdentity != store.backendIdentity || coordinate.Epoch == 0 || coordinate.BindingDigest == "" {
 		return "", typedError(CategoryRevisionConflict, "backend_fence", "coordinate", nil)
 	}
 	var digest string
-	err := tx.QueryRow(ctx, `SELECT h.epoch_digest FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.run_id=h.run_id AND e.epoch=h.epoch AND e.digest=h.epoch_digest WHERE h.run_id=$1 AND h.epoch=$2 AND h.epoch_digest=$3 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$4 AND convert_from(e.document,'UTF8')::jsonb->>'mode'='postgres' FOR UPDATE OF h`, runID, coordinate.Epoch, coordinate.BindingDigest, store.backendIdentity).Scan(&digest)
+	err := tx.QueryRow(ctx, `SELECT h.epoch_digest FROM backend_binding_heads h JOIN backend_binding_epochs e ON e.organization_id=h.organization_id AND e.project_id=h.project_id AND e.run_id=h.run_id AND e.epoch=h.epoch AND e.digest=h.epoch_digest WHERE h.organization_id=$1 AND h.project_id=$2 AND h.run_id=$3 AND h.epoch=$4 AND h.epoch_digest=$5 AND convert_from(e.document,'UTF8')::jsonb->>'backend_identity'=$6 AND convert_from(e.document,'UTF8')::jsonb->>'mode'='postgres' FOR UPDATE OF h`, coordinate.OrganizationID, coordinate.ProjectID, runID, coordinate.Epoch, coordinate.BindingDigest, store.backendIdentity).Scan(&digest)
 	if err != nil || digest != coordinate.BindingDigest {
 		return "", typedError(CategoryRevisionConflict, "backend_fence", "active_head", nil)
 	}
 	return digest, nil
+}
+
+// approvalScope extracts the sealed tenant coordinate shared by every approval read and write.
+func approvalScope(ctx context.Context, runID string) (controlplane.BackendCoordinate, error) {
+	coordinate, ok := controlplane.BackendCoordinateFromContext(ctx)
+	if !ok || coordinate.OrganizationID == "" || coordinate.ProjectID == "" || coordinate.RunID != runID {
+		return controlplane.BackendCoordinate{}, typedError(CategoryRevisionConflict, "backend_fence", "coordinate", nil)
+	}
+	return coordinate, nil
 }
 
 // BindRun registers one in-process aggregate identity and durable approval stream.
@@ -100,7 +112,8 @@ func (store *PostgresApprovalStore) BindRun(ctx context.Context, run *harness.Ru
 	if fenceErr != nil {
 		return nil, fenceErr
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO approval_runs(run_id) VALUES($1) ON CONFLICT DO NOTHING`, run.ID); err != nil {
+	coordinate, _ := approvalScope(ctx, run.ID)
+	if _, err = tx.Exec(ctx, `INSERT INTO approval_runs(organization_id,project_id,run_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, run.ID); err != nil {
 		return nil, typedError(CategoryStorageFailure, "bind_run", "store", nil)
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -113,7 +126,11 @@ func (store *PostgresApprovalStore) BindRun(ctx context.Context, run *harness.Ru
 
 // Events returns the detached append-only approval journal.
 func (store *PostgresApprovalStore) Events(ctx context.Context, runID string) ([]ApprovalEvent, error) {
-	rows, err := store.pool.Query(ctx, `SELECT event FROM approval_events WHERE run_id=$1 ORDER BY revision`, runID)
+	coordinate, scopeErr := approvalScope(ctx, runID)
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
+	rows, err := store.pool.Query(ctx, `SELECT event FROM approval_events WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 ORDER BY revision`, coordinate.OrganizationID, coordinate.ProjectID, runID)
 	if err != nil {
 		return nil, typedError(CategoryStorageFailure, "events", "store", nil)
 	}
@@ -135,9 +152,13 @@ func (store *PostgresApprovalStore) Events(ctx context.Context, runID string) ([
 
 // Request returns one detached private request snapshot.
 func (store *PostgresApprovalStore) Request(ctx context.Context, runID string, revision uint64) (approvalRequest, error) {
+	coordinate, scopeErr := approvalScope(ctx, runID)
+	if scopeErr != nil {
+		return approvalRequest{}, scopeErr
+	}
 	var data []byte
 	var storedDigest string
-	if err := store.pool.QueryRow(ctx, `SELECT snapshot,snapshot_digest FROM approval_requests WHERE run_id=$1 AND revision=$2`, runID, revision).Scan(&data, &storedDigest); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT snapshot,snapshot_digest FROM approval_requests WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4`, coordinate.OrganizationID, coordinate.ProjectID, runID, revision).Scan(&data, &storedDigest); err != nil {
 		return approvalRequest{}, typedError(CategoryIntegrityFailure, "request", "revision", nil)
 	}
 	if approvalDigest(data) != storedDigest {
@@ -167,7 +188,8 @@ func (store *PostgresApprovalStore) SaveRequest(ctx context.Context, request app
 	if _, err = store.verifyBackendTx(ctx, tx, request.runID); err != nil {
 		return err
 	}
-	tag, err := tx.Exec(ctx, `INSERT INTO approval_requests(run_id,revision,snapshot,snapshot_digest) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, request.runID, request.revision, data, digest)
+	coordinate, _ := approvalScope(ctx, request.runID)
+	tag, err := tx.Exec(ctx, `INSERT INTO approval_requests(organization_id,project_id,run_id,revision,snapshot,snapshot_digest) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`, coordinate.OrganizationID, coordinate.ProjectID, request.runID, request.revision, data, digest)
 	if err != nil {
 		return typedError(CategoryStorageFailure, "save_request", "store", nil)
 	}
@@ -178,7 +200,7 @@ func (store *PostgresApprovalStore) SaveRequest(ctx context.Context, request app
 		return nil
 	}
 	var prior string
-	if err = tx.QueryRow(ctx, `SELECT snapshot_digest FROM approval_requests WHERE run_id=$1 AND revision=$2`, request.runID, request.revision).Scan(&prior); err != nil || prior != digest {
+	if err = tx.QueryRow(ctx, `SELECT snapshot_digest FROM approval_requests WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND revision=$4`, coordinate.OrganizationID, coordinate.ProjectID, request.runID, request.revision).Scan(&prior); err != nil || prior != digest {
 		return typedError(CategoryRevisionConflict, "save_request", "revision", nil)
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -197,9 +219,10 @@ func (store *PostgresApprovalStore) CompareAndAppend(ctx context.Context, runID 
 	if _, err = store.verifyBackendTx(ctx, tx, runID); err != nil {
 		return ApprovalEvent{}, false, err
 	}
+	coordinate, _ := approvalScope(ctx, runID)
 	if decisionID != "" {
 		var data []byte
-		scanErr := tx.QueryRow(ctx, `SELECT event FROM approval_events WHERE run_id=$1 AND convert_from(event,'UTF8')::jsonb->>'decision_id'=$2`, runID, decisionID).Scan(&data)
+		scanErr := tx.QueryRow(ctx, `SELECT event FROM approval_events WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 AND convert_from(event,'UTF8')::jsonb->>'decision_id'=$4`, coordinate.OrganizationID, coordinate.ProjectID, runID, decisionID).Scan(&data)
 		if scanErr == nil {
 			var prior ApprovalEvent
 			if json.Unmarshal(data, &prior) != nil {
@@ -215,7 +238,7 @@ func (store *PostgresApprovalStore) CompareAndAppend(ctx context.Context, runID 
 		}
 	}
 	var current uint64
-	if err = tx.QueryRow(ctx, `SELECT revision FROM approval_runs WHERE run_id=$1 FOR UPDATE`, runID).Scan(&current); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT revision FROM approval_runs WHERE organization_id=$1 AND project_id=$2 AND run_id=$3 FOR UPDATE`, coordinate.OrganizationID, coordinate.ProjectID, runID).Scan(&current); err != nil {
 		return ApprovalEvent{}, false, typedError(CategoryStorageFailure, "append", "run", nil)
 	}
 	if current != expectedSequence {
@@ -226,10 +249,10 @@ func (store *PostgresApprovalStore) CompareAndAppend(ctx context.Context, runID 
 		return ApprovalEvent{}, false, err
 	}
 	data, _ := json.Marshal(event)
-	if _, err = tx.Exec(ctx, `INSERT INTO approval_events(run_id,revision,event_id,event) VALUES($1,$2,$3,$4)`, runID, event.Sequence, event.EventID, data); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO approval_events(organization_id,project_id,run_id,revision,event_id,event) VALUES($1,$2,$3,$4,$5,$6)`, coordinate.OrganizationID, coordinate.ProjectID, runID, event.Sequence, event.EventID, data); err != nil {
 		return ApprovalEvent{}, false, typedError(CategoryStorageFailure, "append", "event", nil)
 	}
-	if _, err = tx.Exec(ctx, `UPDATE approval_runs SET revision=$1 WHERE run_id=$2 AND revision=$3`, event.Sequence, runID, expectedSequence); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE approval_runs SET revision=$1 WHERE organization_id=$2 AND project_id=$3 AND run_id=$4 AND revision=$5`, event.Sequence, coordinate.OrganizationID, coordinate.ProjectID, runID, expectedSequence); err != nil {
 		return ApprovalEvent{}, false, typedError(CategoryStorageFailure, "append", "run", nil)
 	}
 	if err = tx.Commit(ctx); err != nil {

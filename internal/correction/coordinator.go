@@ -148,7 +148,7 @@ func NewCoordinator(ctx context.Context, deps Dependencies) (*Coordinator, error
 	}
 	coordinator.mu.Unlock()
 	for index, recovery := range recoveries {
-		go coordinator.resumeComparison(recovery, workers[index])
+		go coordinator.resumeComparison(ctx, recovery, workers[index])
 	}
 	return coordinator, nil
 }
@@ -291,7 +291,7 @@ func (c *Coordinator) Close(ctx context.Context) error {
 // run invokes external boundaries outside store locks and finalizes through bounded contexts.
 func (c *Coordinator) run(ctx context.Context, record Record, parent localvalidation.PackageIndex, selection TrustedSelection, policy RegressionSnapshot, owned *ownedRun) {
 	defer func() {
-		c.deps.Store.ReleaseOwner(record.Link.Handle)
+		c.deps.Store.ReleaseOwner(ctx, record.Link.Handle)
 		close(owned.done)
 		c.mu.Lock()
 		delete(c.runs, record.Link.Handle)
@@ -561,9 +561,9 @@ func (c *Coordinator) run(ctx context.Context, record Record, parent localvalida
 }
 
 // resumeComparison completes a durable publication intent claimed after its former process lost ownership.
-func (c *Coordinator) resumeComparison(record Record, owned *ownedRun) {
+func (c *Coordinator) resumeComparison(ctx context.Context, record Record, owned *ownedRun) {
 	defer func() {
-		c.deps.Store.ReleaseOwner(record.Link.Handle)
+		c.deps.Store.ReleaseOwner(ctx, record.Link.Handle)
 		close(owned.done)
 		c.mu.Lock()
 		delete(c.runs, record.Link.Handle)

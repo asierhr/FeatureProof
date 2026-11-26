@@ -197,5 +197,5 @@ func artifactKey(descriptor ResourceDescriptor) (ResourceArtifactKey, error) {
 
 // path maps one validated immutable identity to its unique non-overlapping durable artifact location.
 func (store *LocalResourceArtifactStore) path(key ResourceArtifactKey) string {
-	return filepath.Join(store.root, key.ProjectKey.ProjectID, key.ProjectKey.RepositoryID, string(key.Kind), key.ID, strconv.FormatUint(key.Version, 10), fmt.Sprintf("%s.json", key.Digest))
+	return filepath.Join(store.root, key.ProjectKey.OrganizationID, key.ProjectKey.ProjectID, key.ProjectKey.RepositoryID, string(key.Kind), key.ID, strconv.FormatUint(key.Version, 10), fmt.Sprintf("%s.json", key.Digest))
 }

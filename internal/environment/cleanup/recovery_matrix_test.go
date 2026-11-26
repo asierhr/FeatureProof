@@ -85,7 +85,7 @@ func TestOptimisticPersistenceAllowsIndependentProgress(t *testing.T) {
 	if _, _, err = ledger.Reserve(context.Background(), request("project-b", "run-b", policyB)); err != nil {
 		t.Fatalf("independent project could not progress: %v", err)
 	}
-	if snapshot, snapshotErr := ledger.Snapshot("project-b"); snapshotErr != nil || snapshot.Reserved.Environments != 1 {
+	if snapshot, snapshotErr := ledger.Snapshot(context.Background(), "project-b"); snapshotErr != nil || snapshot.Reserved.Environments != 1 {
 		t.Fatalf("independent project not visible: %#v %v", snapshot, snapshotErr)
 	}
 	close(release)
@@ -321,7 +321,7 @@ func TestOrphanLedgerRecoveryMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, _ := reopened.Snapshot("project")
+	snapshot, _ := reopened.Snapshot(context.Background(), "project")
 	if snapshot.Unknown || snapshot.Reserved.Environments != 0 || confirmed.EnvironmentDigest == "" {
 		t.Fatalf("orphan release did not survive reopen: %#v", snapshot)
 	}
@@ -386,7 +386,7 @@ func TestLedgerPublicationFaultsRollbackInMemoryAndDisk(t *testing.T) {
 			if _, _, err := ledger.Reserve(context.Background(), request); !IsCategory(err, CategoryIntegrity) {
 				t.Fatalf("fault %s was not surfaced: %v", boundary, err)
 			}
-			snapshot, _ := ledger.Snapshot("project")
+			snapshot, _ := ledger.Snapshot(context.Background(), "project")
 			if snapshot.Reserved.Environments != 0 {
 				t.Fatalf("fault %s retained partial in-memory reservation: %#v", boundary, snapshot)
 			}
@@ -394,7 +394,7 @@ func TestLedgerPublicationFaultsRollbackInMemoryAndDisk(t *testing.T) {
 			if err != nil {
 				t.Fatalf("fault %s corrupted durable ledger: %v", boundary, err)
 			}
-			snapshot, _ = reopened.Snapshot("project")
+			snapshot, _ = reopened.Snapshot(context.Background(), "project")
 			if snapshot.Reserved.Environments != 0 {
 				t.Fatalf("fault %s published partial reservation: %#v", boundary, snapshot)
 			}

@@ -130,8 +130,13 @@ type LocalStore struct {
 	uncertain     atomic.Bool
 }
 
-// witnessReconcileTimeout bounds detached reads used to classify an ambiguous external CAS result.
+// witnessReconcileTimeout is retained only for the contract test that models
+// a witness implementation ignoring cancellation; production uses attempts.
 const witnessReconcileTimeout = 2 * time.Second
+
+// postCommitRetryLimit bounds local publication by attempted state changes,
+// not scheduler wall time, so race/load cannot expire a confirmed commit.
+const postCommitRetryLimit = 2048
 
 // NewLocalStore creates a private store bound to an external non-replayable monotonic witness.
 func NewLocalStore(ctx context.Context, root, witnessStream string, witness projectmemory.MonotonicWitness) (*LocalStore, error) {
@@ -251,8 +256,7 @@ func (s *LocalStore) CommitSnapshot(ctx context.Context, key string, request Req
 	if err != nil {
 		return Snapshot{}, false, err
 	}
-	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
+	loadCtx := context.WithoutCancel(ctx)
 	loaded, err := s.loadSnapshot(loadCtx, snapshot.Digest)
 	return loaded, created, err
 }
@@ -303,8 +307,7 @@ func (s *LocalStore) CommitBinding(ctx context.Context, key string, binding Cont
 	if err != nil {
 		return ContextBinding{}, false, err
 	}
-	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
+	loadCtx := context.WithoutCancel(ctx)
 	loaded, err := s.loadBinding(loadCtx, binding.Digest)
 	return loaded, created, err
 }
@@ -423,9 +426,7 @@ func (s *LocalStore) commitAttempt(ctx context.Context, kind, key, requestDigest
 		return false, false, s.rollbackCandidate(directory, objectDigest, entry.Digest)
 	}
 	if casErr := s.witness.CompareAndAdvance(ctx, expectedState, nextState); casErr != nil {
-		reconcileCtx, cancel := context.WithTimeout(context.Background(), witnessReconcileTimeout)
-		actual, readErr := s.witness.Read(reconcileCtx, s.witnessStream)
-		cancel()
+		actual, readErr := s.witness.Read(ctx, s.witnessStream)
 		switch {
 		case readErr == nil && actual == nextState:
 			// The authority committed this candidate even though its response was lost.
@@ -503,22 +504,14 @@ func (s *LocalStore) waitForWitnessState(ctx context.Context, target projectmemo
 
 // finalizeConfirmedCandidate completes journal and receipt publication under the bounded postcommit context reserved by the protocol.
 func (s *LocalStore) finalizeConfirmedCandidate(ctx context.Context, entry journalEntry, raw []byte, receiptPath string, value receipt) error {
-	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
-	for {
+	finishCtx := context.WithoutCancel(ctx)
+	for attempt := 0; attempt < postCommitRetryLimit; attempt++ {
 		if err := s.publishJournalCandidate(finishCtx, entry, raw); err == nil {
 			return s.writeConfirmedReceipt(finishCtx, receiptPath, value)
-		} else if finishCtx.Err() != nil {
-			return err
 		}
-		timer := time.NewTimer(time.Millisecond)
-		select {
-		case <-finishCtx.Done():
-			timer.Stop()
-			return &Error{Category: CategoryPersistence, Stage: "store", Path: "postcommit"}
-		case <-timer.C:
-		}
+		time.Sleep(time.Millisecond)
 	}
+	return &Error{Category: CategoryPersistence, Stage: "store", Path: "postcommit"}
 }
 
 // stageJournalCandidate durably records a non-addressable journal successor without changing the confirmed journal chain.
@@ -575,21 +568,22 @@ func (s *LocalStore) retainContentObject(_, _ string) error {
 }
 
 // reconcileUncertain classifies one preserved ambiguous tail before accepting a redelivery in the same process.
-func (s *LocalStore) reconcileUncertain(_ context.Context) error {
-	reconcileCtx, cancel := context.WithTimeout(context.Background(), witnessReconcileTimeout)
-	defer cancel()
-	entries, tail, err := s.validateJournal(reconcileCtx)
+func (s *LocalStore) reconcileUncertain(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return contextFailureFromContext("store", ctx)
+	}
+	entries, tail, err := s.validateJournal(ctx)
 	if err != nil {
 		return err
 	}
-	external, readErr := s.witness.Read(reconcileCtx, s.witnessStream)
+	external, readErr := s.witness.Read(ctx, s.witnessStream)
 	if readErr != nil {
 		return &Error{Category: CategoryUncertain, Stage: "store", Path: "witness"}
 	}
-	if err = s.reconcileStagedCandidates(reconcileCtx, tail, external); err == nil {
+	if err = s.reconcileStagedCandidates(ctx, tail, external); err == nil {
 		return nil
 	}
-	return s.reconcilePendingTail(reconcileCtx, entries, tail, external)
+	return s.reconcilePendingTail(ctx, entries, tail, external)
 }
 
 // reconcileStagedCandidates completes the unique witness-selected candidate or discards candidates proven to remain precommit.
@@ -692,24 +686,15 @@ func receiptFileName(kind, keyDigest string) string {
 // writeConfirmedReceipt finishes a witness-confirmed commit under a detached bounded context.
 func (s *LocalStore) writeConfirmedReceipt(ctx context.Context, path string, value receipt) error {
 	raw, _ := json.Marshal(value)
-	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
-	for {
+	finishCtx := context.WithoutCancel(ctx)
+	for attempt := 0; attempt < postCommitRetryLimit; attempt++ {
 		err := s.atomicWrite(finishCtx, path, raw)
 		if err == nil || errors.Is(err, os.ErrExist) {
 			return nil
 		}
-		if finishCtx.Err() != nil {
-			return err
-		}
-		timer := time.NewTimer(time.Millisecond)
-		select {
-		case <-finishCtx.Done():
-			timer.Stop()
-			return err
-		case <-timer.C:
-		}
+		time.Sleep(time.Millisecond)
 	}
+	return &Error{Category: CategoryPersistence, Stage: "store", Path: "receipt"}
 }
 
 // recoverConfirmedTail restores only the receipt already irreversibly confirmed by the external witness.
@@ -894,19 +879,17 @@ func (s *LocalStore) openStoreDirectory(name string) (*os.File, error) {
 	return directory, nil
 }
 
-// listJSON enumerates canonical object names and waits briefly for authenticated in-flight temporary names to disappear.
+// listJSON enumerates canonical object names and bounds in-flight temporary
+// reconciliation by observations rather than scheduler wall time.
 func (s *LocalStore) listJSON(name string) ([]string, error) {
-	deadline := time.Now().Add(witnessReconcileTimeout)
-	for {
+	for attempt := 0; attempt < postCommitRetryLimit; attempt++ {
 		result, transient, err := s.listJSONAttempt(name)
 		if err != nil || !transient {
 			return result, err
 		}
-		if time.Now().After(deadline) {
-			return nil, &Error{Category: CategoryPersistence, Stage: "store", Path: name + ".temporary"}
-		}
 		time.Sleep(time.Millisecond)
 	}
+	return nil, &Error{Category: CategoryPersistence, Stage: "store", Path: name + ".temporary"}
 }
 
 // listJSONAttempt takes one descriptor-relative directory snapshot and distinguishes only the store's exact private temporary grammar.

@@ -107,7 +107,7 @@ type CapacityLedgerPort interface {
 	BlockUnknown(context.Context, string, string) (CapacityReceipt, bool, error)
 	ConfirmEnvironment(context.Context, CapacityReceipt, string, string) (CapacityReceipt, error)
 	ReleaseConfirmed(context.Context, string, string, string, string, string) (CapacityReceipt, bool, error)
-	Snapshot(string) (CapacitySnapshot, error)
+	Snapshot(context.Context, string) (CapacitySnapshot, error)
 }
 
 // localCapacityLedgerContract prevents the local implementation from drifting from controller semantics.
